@@ -8,8 +8,10 @@ from typing import Any
 import structlog
 import structlog.contextvars
 from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
@@ -19,6 +21,7 @@ from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.body_limit import RequestBodyLimitMiddleware
+from app.core.denial_audit import audit_unrecorded_denial
 from app.core.maintenance_mode import MaintenanceModeMiddleware
 from app.core.openapi_compat import collapse_nullable_unions
 from app.core.request_meta import LoggingTrustedHostMiddleware, TrustedProxyMiddleware
@@ -109,6 +112,17 @@ async def _assert_demo_mode_not_on_prod_data() -> None:
         )
 
 
+_BCRYPT_HASH_RE = re.compile(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
+
+
+def _initial_admin_hash(value: str) -> str:
+    """The configured initial admin hash when it is a well-formed bcrypt hash,
+    else ``""`` (the default account). A malformed value must not become an
+    account nobody can log into."""
+    value = (value or "").strip()
+    return value if _BCRYPT_HASH_RE.fullmatch(value) else ""
+
+
 async def _seed_default_admin() -> None:
     """Create the default admin user if no users exist yet."""
     from sqlalchemy import func, select
@@ -130,23 +144,41 @@ async def _seed_default_admin() -> None:
                 # sticks for the next visitor); skip the
                 # force-password-change flag so the demo lands on the
                 # dashboard instead of a redirect to a 403'd form.
+                # #4548 — an install that was handed a password hash (the
+                # appliance installer) starts on it, with no forced change.
+                # The hash is never logged.
+                preset = _initial_admin_hash(settings.initial_admin_password_hash)
+                if settings.initial_admin_password_hash.strip() and not preset:
+                    # Never the value itself.
+                    logger.warning(
+                        "initial_admin_password_hash_ignored",
+                        message="INITIAL_ADMIN_PASSWORD_HASH is not a bcrypt hash; "
+                        "using the default admin account",
+                    )
                 admin = User(
                     username="admin",
                     email="admin@localhost",
                     display_name="Administrator",
-                    hashed_password=hash_password("admin"),
+                    hashed_password=preset or hash_password("admin"),
                     is_superadmin=True,
                     is_active=True,
                     auth_source="local",
-                    force_password_change=not settings.demo_mode,
+                    force_password_change=False if preset else not settings.demo_mode,
                 )
                 session.add(admin)
                 await session.commit()
-                logger.warning(
-                    "default_admin_created",
-                    username="admin",
-                    message="Default admin created with password 'admin' — change it immediately",
-                )
+                if preset:
+                    logger.info(
+                        "default_admin_created",
+                        username="admin",
+                        message="Admin created with the password set at install",
+                    )
+                else:
+                    logger.warning(
+                        "default_admin_created",
+                        username="admin",
+                        message="Default admin created with password 'admin' — change it immediately",
+                    )
         except Exception as exc:
             # Table may not exist yet (pre-migration). Skip silently.
             logger.debug("default_admin_seed_skipped", reason=str(exc))
@@ -984,6 +1016,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 wake_subscription,
             )
             from app.services.appliance.bootstrap import (  # noqa: PLC0415
+                retry_bootstrap_if_no_active_cert,
                 sync_active_cert_to_secret,
             )
 
@@ -994,7 +1027,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     if result is WakeResult.UNAVAILABLE:
                         await asyncio.sleep(30)  # Redis down: tick-only
                     out = await sync_active_cert_to_secret()
-                    if out.get("status") not in ("in-sync", "locked", "no-active-cert"):
+                    if out.get("status") == "no-active-cert":
+                        # The startup bootstrap lost the reconcile lock to a
+                        # sibling and nothing else issues the first cert (#4442).
+                        await retry_bootstrap_if_no_active_cert()
+                    elif out.get("status") not in ("in-sync", "locked", "no-active-cert"):
                         logger.info("appliance_cert_deploy_sync", **out)
                 except asyncio.CancelledError:
                     raise
@@ -1258,6 +1295,15 @@ def create_app() -> FastAPI:
         OperationalError as SAOperationalError,
     )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_audited(request: Request, exc: StarletteHTTPException) -> Response:
+        """The stock HTTPException response, plus (#3644) a ``denied`` audit row
+        for a 403 decided inside a handler, which writes none of its own. The
+        row is skipped when a gate or ``refuse_and_audit`` already wrote one."""
+        if exc.status_code == 403:
+            await audit_unrecorded_denial(request, exc.detail)
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(SAInterfaceError)
     @app.exception_handler(SAOperationalError)
     async def _transient_db_connection(request: Request, exc: Exception) -> Response:
@@ -1384,6 +1430,7 @@ def create_app() -> FastAPI:
         FOREIGN_KEY_VIOLATION,
         classify_foreign_key_violation,
         extract_detail,
+        unique_violation_constraint,
         unique_violation_message,
     )
 
@@ -1466,7 +1513,11 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(
             status_code=409,
-            content={"detail": unique_violation_message(extract_detail(exc))},
+            content={
+                "detail": unique_violation_message(
+                    extract_detail(exc), unique_violation_constraint(exc)
+                )
+            },
         )
 
     @app.exception_handler(SADBAPIError)

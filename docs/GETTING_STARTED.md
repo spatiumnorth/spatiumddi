@@ -15,7 +15,7 @@ SpatiumDDI has a few internal dependencies between modules (records need zones, 
 
 Three kinds of readers land on this page. Start where you actually are:
 
-- **"I'm evaluating whether this fits my org."** Read [Project status](#project-status) for what to expect from a beta and the lowest-risk way to trial it, then [Concepts in two minutes](#concepts-in-two-minutes) for what a [DDI](#ddi) platform does, then skim [Common setup shapes](#common-setup-shapes) to see which deployment matches your environment. You can stop there — everything in between is the how.
+- **"I'm evaluating whether this fits my org."** Read [Project status](#project-status) for what to expect from a stable 1.0 release and the lowest-risk way to trial it, then [Concepts in two minutes](#concepts-in-two-minutes) for what a [DDI](#ddi) platform does, then skim [Common setup shapes](#common-setup-shapes) to see which deployment matches your environment. You can stop there — everything in between is the how.
 - **"I know DDI. Get me running."** Go straight to the [TL;DR](#tldr--the-order) and work down the numbered steps. Plain-language framing sits in one lead sentence per step and in collapsible blocks — skip past both and the mechanics read as before.
 - **"I run networks, but DDI vocabulary is new to me."** Read [Concepts in two minutes](#concepts-in-two-minutes) first, then work through [Before you start](#before-you-start) and follow the numbered steps in order. Each step opens with what it does and why, a [worked example](#the-worked-example--ridgeline-college) runs through the whole sequence, and unfamiliar terms link to the [glossary](#glossary).
 
@@ -23,7 +23,7 @@ Three kinds of readers land on this page. Start where you actually are:
 
 ## Project status
 
-SpatiumDDI is **beta software** under active development. Core IPAM / DNS / DHCP / appliance surfaces have stabilised since the `2026.04.16-1` alpha cut, but expect occasional schema changes between releases and roadmap features still in flight. It is a good fit today for labs, homelabs, and pilots in front of non-critical client populations; production deploys in front of business-critical DHCP should pin to a tested release and snapshot Postgres before upgrading.
+SpatiumDDI 1.0.0 is a stable release and the first to use [SemVer](https://semver.org/) versioning. Fixes ship as patch releases (1.0.x), so pin to a tested release for anything business-critical and take a Postgres backup before every upgrade. Releases before 1.0.0 were CalVer; an install on CalVer upgrades to 1.0.0 through the `2026.10.02-1` bridge release, as described in [Upgrading to 1.0.0](deployment/APPLIANCE.md#upgrading-to-100). Commercial support, deployment and migration help are available from [SpatiumNorth](https://www.spatiumnorth.com/spatiumddi/pricing).
 
 **The lowest-risk way to try it: IPAM-only evaluation.** You do not have to hand SpatiumDDI control of anything on day one. Run it as the source of truth for your address plan — spaces, blocks, subnets, allocations — while your existing DNS and DHCP servers keep serving live traffic untouched. If you run Windows DHCP, register it read-only (Path A) so live [leases](#dhcp-lease) mirror into IPAM and you get real visibility with zero write path to production. That is the third of the [Common setup shapes](#common-setup-shapes) below. When you're ready, enable write paths one subnet or one zone at a time.
 

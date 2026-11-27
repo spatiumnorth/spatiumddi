@@ -43,6 +43,8 @@ const HOOK: WebhookSubscription = {
 };
 
 const update = vi.fn();
+// What the server holds now; the page's list reads it.
+let stored: WebhookSubscription = HOOK;
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -56,7 +58,7 @@ vi.mock("@/lib/api", async () => {
     },
     webhooksApi: {
       ...actual.webhooksApi,
-      list: async () => [HOOK],
+      list: async () => [stored],
       listEventTypes: async () => ["ip_address.created"],
       listDeliveries: () => new Promise(() => {}),
       update: (...args: unknown[]) => update(...args),
@@ -69,6 +71,7 @@ const { WebhooksPage } = await import("./WebhooksPage");
 afterEach(() => {
   cleanup();
   update.mockReset();
+  stored = HOOK;
 });
 
 async function openEdit(): Promise<HTMLElement> {
@@ -81,8 +84,11 @@ async function openEdit(): Promise<HTMLElement> {
     </QueryClientProvider>,
   );
   fireEvent.click(await screen.findByRole("button", { name: /Edit/ }));
-  return screen.getByRole("dialog", { name: /Edit webhook subscription/ });
+  return screen.findByRole("dialog", { name: /Edit webhook subscription/ });
 }
+
+const maxAttemptsField = (dialog: HTMLElement) =>
+  dialog.querySelector<HTMLInputElement>('input[type="number"][max="20"]')!;
 
 /** Save the dialog; the body the PUT carried. */
 async function save(dialog: HTMLElement): Promise<{ secret?: string | null }> {
@@ -102,8 +108,13 @@ const secretField = (dialog: HTMLElement) =>
 
 describe("Edit webhook: the stored secret", () => {
   it("an untouched Rotate secret field keeps it (control)", async () => {
-    const body = await save(await openEdit());
-    expect(body.secret, "an untouched field must keep the secret").toBeNull();
+    const dialog = await openEdit();
+    fireEvent.change(maxAttemptsField(dialog), { target: { value: "4" } });
+    const body = await save(dialog);
+    expect(
+      "secret" in body,
+      "an untouched field must not send the secret",
+    ).toBe(false);
   });
 
   it("a typed secret rotates it (control)", async () => {
@@ -125,9 +136,10 @@ describe("Edit webhook: the stored secret", () => {
       );
     fireEvent.change(secretField(dialog), { target: { value: "x" } });
     fireEvent.change(secretField(dialog), { target: { value: "" } });
+    fireEvent.change(maxAttemptsField(dialog), { target: { value: "4" } });
     const body = await save(dialog);
     expect(
-      body.secret,
+      body.secret ?? null,
       promisesClear
         ? `the hint says clearing the field stores no secret, but Save sent ${JSON.stringify(body.secret)}, which keeps it: "${hint}"`
         : "a cleared field is a blank field: the hint says blank keeps the secret",
@@ -150,5 +162,60 @@ describe("Edit webhook: the stored secret", () => {
       "while the secret is being removed, no new one can be typed",
     ).toBe(true);
     expect((await save(dialog)).secret).toBe("");
+  });
+});
+
+describe("Edit webhook saves only what changed (#4236)", () => {
+  it("sends only the changed field, not what another client stored since the list loaded", async () => {
+    const dialog = await openEdit();
+    // Another client changes the URL and description after the list loaded
+    // and the dialog opened; the dialog still holds the old values.
+    fireEvent.change(maxAttemptsField(dialog), { target: { value: "4" } });
+    update.mockResolvedValue({ ...HOOK, secret_plaintext: null });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    const [, body] = update.mock.calls[0] as [string, Record<string, unknown>];
+    expect(body).toEqual({ max_attempts: 4 });
+  });
+
+  it("reads the subscription fresh when it opens", async () => {
+    stored = { ...HOOK, url: "https://192.0.2.11/b", description: "newer" };
+    const dialog = await openEdit();
+    expect(
+      dialog.querySelector<HTMLInputElement>(
+        'input[value="https://192.0.2.11/b"]',
+      ),
+    ).not.toBeNull();
+  });
+
+  it("a Save with nothing changed sends no request and closes", async () => {
+    const dialog = await openEdit();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: /Edit webhook subscription/ }),
+      ).toBeNull(),
+    );
+    expect(update).not.toHaveBeenCalled();
+  });
+});
+
+describe("Webhooks header (#4373)", () => {
+  it("does not promise a signature to every enabled subscription", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <WebhooksPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const p = (await screen.findByText(/Typed-event subscriptions/))
+      .textContent as string;
+    expect(p).toMatch(/HMAC-signed when the subscription has a secret/);
+    expect(p).toMatch(/unsigned when it has none/);
+    expect(p).not.toMatch(/receives one\s+HMAC-signed POST/);
   });
 });

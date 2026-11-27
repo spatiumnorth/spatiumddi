@@ -74,7 +74,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `circuit`         | WAN circuit (#93)                                     |
 | `network_service` | Service-catalog row (#94) — bundles VRF/Subnet/IPBlock/DNSZone/DHCPScope/Circuit/Site/OverlayNetwork into a customer deliverable |
 | `overlay_network` | SD-WAN overlay topology + sites (#95)                 |
-| `routing_policy`  | Per-overlay declarative routing policies (#95)        |
+| `routing_policy`  | Per-overlay declarative routing policies (#95). Creating, editing or deleting a policy needs this type **and** `overlay_network`; listing them needs only `overlay_network` |
 | `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
 | `looking_glass_collector` | BGP Looking Glass receive-only GoBGP collectors — register / CRUD + learned-route reads (#566) |
 | `bgp_lg_peer`     | BGP Looking Glass configured peer sessions within a collector (#566) |
@@ -97,8 +97,8 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `address_set`     | Named IP range within a subnet carrying its own RBAC scope — delegates edit of a slice without subnet-wide write (#103). Creating a set / resizing its range additionally requires write on the parent subnet. |
 | `change_request`  | Queued two-person-approval change requests (#62) — `approve` + `read` for the second-person decision (the underlying operation's permission is *also* required server-side). |
 | `provisioning_request` | Self-service request portal (#696) — `write` submits a request for an IP / subnet / DNS record / DHCP reservation, `read` sees your own. Deliberately confers **no** provisioning ability: submitting skips the underlying operation's permission (that inversion is the feature), and the request only becomes a change when a *different* operator who **does** hold that permission approves it. Submitting also needs `read` on the resource the request names (the subnet, block, zone or scope); one the requester cannot read is refused exactly like an id that does not exist, the same filter the request form's picker applies. Approving runs the operation under the approver, with the REST create's own per-resource gate: an address needs `write` on its subnet, or on an address set covering it. Deciding a portal request reuses `approve,change_request`. |
-| `wol_schedule`    | Scheduled Wake-on-LAN jobs + run history (#586) — recurring, tag-targeted, calendar-gated fleet wake |
-| `wol_calendar`    | Subscribed iCal / CalDAV calendars whose all-day spans gate scheduled wakes (#586) |
+| `wol_schedule`    | Scheduled Wake-on-LAN jobs + run history (#586) — recurring, tag-targeted, calendar-gated fleet wake. Every `/wake-scheduler` schedule and run route admits this type **or** `use_network_tools` |
+| `wol_calendar`    | Subscribed iCal / CalDAV calendars whose all-day spans gate scheduled wakes (#586). Every `/wake-scheduler/calendars` route admits this type **or** `use_network_tools`; listing calendars also admits `wol_schedule` (the schedule editor's picker) |
 | `av_flow`         | AV-over-IP flow descriptors + operator-declared reserved multicast ranges (#540) — the Dante / AES67 / SMPTE 2110 layer over the multicast registry |
 | `bacnet_device`   | BACnet/IP device registry (#541) — internetwork-unique device instance numbers, vendor/model metadata, BBMD flag + BDT/FDT snapshots |
 | `dicom_ae`        | DICOM Application Entity registry (#723) — institution-wide-unique AE Titles, their host/port bindings, and the configured AE→AE association map. Network identity only; this permission never grants access to imaging data, which SpatiumDDI does not store |
@@ -114,7 +114,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `nat_mapping`     | NAT mappings (1:1, PAT, hide) recorded against IPAM addresses and subnets |
 | `dnsbl`           | DNS blocklist (DNSBL) reputation checks — the `/api/v1/dnsbl/` routes, behind the `security.dnsbl` module |
 | `e911_location`   | E911 dispatchable location (#972) — Emergency Response Locations, bindings, resolver lookups and the HELD / provisioning surfaces (`/api/v1/e911/`), behind the `network.e911` module |
-| `use_network_tools` | The Tools page (ping / traceroute / dig / whois and the rest), plus Wake-on-LAN sends |
+| `use_network_tools` | The Tools page (ping / traceroute / dig / whois and the rest), plus Wake-on-LAN sends and, alongside `wol_schedule` / `wol_calendar`, the Wake Scheduler |
 | `*`               | Wildcard — match any resource type                    |
 
 ## Evaluation rules
@@ -492,9 +492,13 @@ when there are none.
 
 Every 403 the permission gates produce leaves a `denied` audit row, including a
 refusal from a route that takes `SuperAdmin` (recorded as `access` on
-`superadmin`, #2304). A handler that is superadmin-only must take the `SuperAdmin`
-dependency rather than check `is_effective_superadmin` and raise by hand, or its
-refusal is invisible to the audit log and the security dashboard.
+`superadmin`, #2304). A 403 a handler raises itself, after its own
+`user_has_permission` check, is recorded too (#3644): the API's 403 handler writes
+a `denied` row (`endpoint` as the resource, the method and path as the display)
+when the caller was authenticated and no gate already wrote one. Prefer a gate,
+or `SuperAdmin` for a superadmin-only handler, because the row then names the
+permission refused. A refusal with no request to attribute (the approval engine)
+leaves no row.
 
 ## The console mirrors the server, it does not enforce
 

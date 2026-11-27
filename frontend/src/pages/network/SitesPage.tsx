@@ -34,11 +34,14 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSessionState } from "@/lib/useSessionState";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -85,7 +88,7 @@ const KIND_LABELS: Record<SiteKind, string> = {
   customer_premise: "Customer premise",
 };
 
-function SiteEditorModal({
+export function SiteEditorModal({
   existing,
   sites,
   onClose,
@@ -121,7 +124,11 @@ function SiteEditorModal({
           parent_site_id: parentId || null,
           notes,
         };
-        return sitesApi.update(existing.id, body);
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(existing, body);
+        if (Object.keys(diff).length === 0) return existing;
+        return sitesApi.update(existing.id, diff);
       }
       const body: SiteCreate = {
         name,
@@ -209,6 +216,13 @@ function SiteEditorModal({
               onChange={(e) => setParentId(e.target.value)}
             >
               <option value="">— none —</option>
+              {/* A parent the role may not read is not in the list; keep
+                  it selected and say so rather than drawing "none" (#4188). */}
+              {parentId && !sites.some((s) => s.id === parentId) && (
+                <option value={parentId}>
+                  Linked (not visible to your role)
+                </option>
+              )}
               {sites
                 .filter((s) => !cycleBlockedIds.has(s.id))
                 .map((s) => (
@@ -230,7 +244,7 @@ function SiteEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -360,7 +374,7 @@ function MoveSiteModal({
             </button>
           ))}
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <FormError className="text-sm">{error}</FormError>}
       </div>
     </Modal>
   );
@@ -572,15 +586,22 @@ function SiteTreeRow({
 
 function SiteTreeView({
   sites,
+  listError,
   onEdit,
   onMove,
   onDelete,
 }: {
   sites: SiteRead[];
+  /** The list query's error, so a refused read isn't drawn as an empty tree. */
+  listError?: unknown;
   onEdit: (s: SiteRead) => void;
   onMove: (s: SiteRead) => void;
   onDelete: (s: SiteRead) => void;
 }) {
+  const writeGate = permissionGate(
+    usePermissions().can("write", "site"),
+    "Requires write permission on sites",
+  );
   const qc = useQueryClient();
   const [activeId, setActiveId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -667,15 +688,18 @@ function SiteTreeView({
   return (
     <div className="space-y-2">
       {error && (
-        <p className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
           {error}
+        </FormError>
+      )}
+      {!writeGate.disabled && (
+        <p className="text-xs text-muted-foreground">
+          Drag the <GripVertical className="inline h-3 w-3" /> handle onto
+          another site to re-parent, or use the{" "}
+          <Move className="inline h-3 w-3" /> Move button. Drop on the zone
+          above to make a site top-level.
         </p>
       )}
-      <p className="text-xs text-muted-foreground">
-        Drag the <GripVertical className="inline h-3 w-3" /> handle onto another
-        site to re-parent, or use the <Move className="inline h-3 w-3" /> Move
-        button. Drop on the zone above to make a site top-level.
-      </p>
       <DndContext
         sensors={sensors}
         onDragStart={handleDragStart}
@@ -686,7 +710,10 @@ function SiteTreeView({
         <div className="divide-y rounded-lg border text-sm">
           {roots.length === 0 ? (
             <p className="px-3 py-6 text-center text-muted-foreground">
-              No sites yet — click “New site” to add one.
+              <ListEmpty error={listError} what="sites">
+                No sites yet.
+                {!writeGate.disabled && " Click “New site” to add one."}
+              </ListEmpty>
             </p>
           ) : (
             roots.map((s) => (
@@ -885,7 +912,7 @@ export function SitesPage() {
                     ? "bg-muted font-medium"
                     : "text-muted-foreground hover:bg-muted/50",
                 )}
-                title="Hierarchy tree (drag to re-parent)"
+                title={`Hierarchy tree${writeGate.disabled ? "" : " (drag to re-parent)"}`}
               >
                 <ListTree className="h-3.5 w-3.5" />
                 Tree
@@ -968,6 +995,7 @@ export function SitesPage() {
           ) : (
             <SiteTreeView
               sites={allSites}
+              listError={allSitesQuery.error}
               onEdit={(s) => setEditing(s)}
               onMove={(s) => setMoving(s)}
               onDelete={askDelete}
@@ -1019,8 +1047,10 @@ export function SitesPage() {
                           setSearch("");
                           setKindFilter("");
                         }}
+                        gate={writeGate}
+                        hint={`Click "New site" to add one.`}
                       >
-                        No sites yet — click "New site" to add one.
+                        No sites yet.
                       </ListEmpty>
                     </td>
                   </tr>
@@ -1098,11 +1128,20 @@ export function SitesPage() {
           />
         )}
         {editing && (
-          <SiteEditorModal
-            existing={editing}
-            sites={allSites}
+          <FreshEdit
+            row={editing}
+            load={() => sitesApi.get(editing.id)}
+            title="Edit site"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <SiteEditorModal
+                existing={fresh}
+                sites={allSites}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         {moving && (
           <MoveSiteModal

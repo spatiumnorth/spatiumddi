@@ -15,7 +15,7 @@
   <a href="https://github.com/spatiumnorth/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
   <a href="https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
-  <img src="https://img.shields.io/badge/status-release%20candidate-blue" alt="Status"/>
+  <img src="https://img.shields.io/badge/status-stable-brightgreen" alt="Status"/>
 </p>
 
 <p align="center">
@@ -42,7 +42,7 @@
 
 ---
 
-> **1.0.0 release candidate.** `1.0.0-rc.3` is the release candidate for SpatiumDDI 1.0.0: the code is frozen, and only fixes for serious issues land before 1.0.0 ships after a clean soak. Upgrading from CalVer? Read [Upgrading to 1.0.0](docs/deployment/APPLIANCE.md#upgrading-to-100) first. Install the [latest release](https://github.com/spatiumnorth/spatiumddi/releases/latest), take a Postgres backup before every upgrade, and consider [commercial support](https://www.spatiumnorth.com/spatiumddi/pricing) for a production rollout. Feedback is very welcome: open an issue or start a discussion on GitHub.
+> **SpatiumDDI 1.0.0 is released.** Upgrading from CalVer? Read [Upgrading to 1.0.0](docs/deployment/APPLIANCE.md#upgrading-to-100) first. Install the [latest release](https://github.com/spatiumnorth/spatiumddi/releases/latest), take a Postgres backup before every upgrade, and consider [commercial support](https://www.spatiumnorth.com/spatiumddi/pricing) for a production rollout. Feedback is very welcome: open an issue or start a discussion on GitHub.
 
 ---
 

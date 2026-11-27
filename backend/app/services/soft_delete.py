@@ -41,13 +41,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSView, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
 from app.services.dns.cname_conflict import describe_cname_conflict
-from app.services.ipam.orphan_aliases import orphan_record_owners, orphan_record_reason
+from app.services.ipam.orphan_aliases import (
+    orphan_record_owners,
+    orphan_record_reason,
+    superseded_record_owners,
+    superseded_record_reason,
+)
 
 # Types the trash UI browses, and that ``restore_row`` /
 # ``permanent_delete_from_trash`` accept as an addressable target. Cascade-only
@@ -558,6 +563,45 @@ async def _record_cname_conflicts(
     return found
 
 
+async def _record_view_conflicts(
+    db: AsyncSession, batch_id: uuid.UUID
+) -> dict[uuid.UUID, tuple[str, str]]:
+    """The batch's records scoped to a view their live zone is no longer pinned to (#3920).
+
+    A pinned zone renders into its pin alone, so a record scoped to another
+    view is served in no view. The record API refuses writing that state and
+    Edit Zone refuses re-pinning into it (#3839), but a record waiting in the
+    Trash is counted by neither, so Restore was a door to it. Returns
+    ``{record id: (label, reason)}``. A zone in the Trash is
+    ``_record_parent_conflicts``'s case, and a record in a restored zone's own
+    batch keeps the pin it was deleted under.
+    """
+    zone = aliased(DNSZone)
+    pin = aliased(DNSView)
+    own = aliased(DNSView)
+    stmt: Any = (
+        select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type, own.name, pin.name)
+        .join(zone, zone.id == DNSRecord.zone_id)
+        .join(own, own.id == DNSRecord.view_id)
+        .join(pin, pin.id == zone.view_id)
+        .where(
+            DNSRecord.deletion_batch_id == batch_id,
+            zone.deleted_at.is_(None),
+            DNSRecord.view_id != zone.view_id,
+        )
+        .execution_options(include_deleted=True)
+    )
+    return {
+        row_id: (
+            _record_label(fqdn, rtype),
+            f"it is scoped to view '{own_name}' but its zone is now pinned to view "
+            f"'{pin_name}', so it would be served in no view — move the zone's pin "
+            "back, or restore it after changing the zone's view",
+        )
+        for row_id, fqdn, rtype, own_name, pin_name in (await db.execute(stmt)).tuples()
+    }
+
+
 async def _record_parent_conflicts(
     db: AsyncSession, batch_id: uuid.UUID
 ) -> dict[uuid.UUID, tuple[str, str, DNSZone]]:
@@ -765,7 +809,13 @@ async def restore_batch(
     record_conflicts: dict[uuid.UUID, str] = {}
     record_parent_conflicts: dict[uuid.UUID, str] = {}
     record_cname_conflicts: dict[uuid.UUID, str] = {}
+    record_view_conflicts: dict[uuid.UUID, str] = {}
     if conflict_check is not None:
+        for rid, (label, reason) in (await _record_view_conflicts(db, batch_id)).items():
+            record_view_conflicts[rid] = reason
+            result.conflicts.append(
+                {"type": "dns_record", "id": str(rid), "display": label, "reason": reason}
+            )
         record_conflicts = await _record_conflicts(db, batch_id)
         for rid, (label, reason) in (await _record_cname_conflicts(db, batch_id)).items():
             if rid in record_conflicts:
@@ -807,6 +857,21 @@ async def restore_batch(
                     "id": str(rid),
                     "display": _record_label(fqdn, rtype),
                     "reason": orphan_record_reason(address),
+                }
+            )
+        # #4361 — and one whose address was renamed (or blanked) meanwhile.
+        for rid, (fqdn, rtype, address) in (
+            await superseded_record_owners(db, batch_id=batch_id)
+        ).items():
+            if rid in record_conflicts or rid in record_parent_conflicts:
+                continue
+            record_parent_conflicts[rid] = superseded_record_reason(address)
+            result.conflicts.append(
+                {
+                    "type": "dns_record",
+                    "id": str(rid),
+                    "display": _record_label(fqdn, rtype),
+                    "reason": superseded_record_reason(address),
                 }
             )
 
@@ -856,6 +921,7 @@ async def restore_batch(
         if r.id not in record_conflicts
         and r.id not in record_parent_conflicts
         and r.id not in record_cname_conflicts
+        and r.id not in record_view_conflicts
     )
 
     if result.conflicts and not skip_conflicts:
@@ -1001,7 +1067,12 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
 
         try:
             covered = await _assert_no_block_overlap(
-                db, obj.space_id, str(obj.network), obj.parent_block_id, exclude_id=obj.id
+                db,
+                obj.space_id,
+                str(obj.network),
+                obj.parent_block_id,
+                exclude_id=obj.id,
+                for_restore=True,
             )
         except HTTPException as exc:
             return str(exc.detail)
@@ -1098,6 +1169,21 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active zone {obj.name!r} already exists in this group/view"
+        # #4226 — a zone cites ACLs and TSIG keys by name. The delete guards
+        # of those count a zone in the Trash now, but a row trashed before that,
+        # or a name removed by another path, leaves a citation the group no
+        # longer defines: BIND would refuse the config, and the bundle renders
+        # the emptied list as ``none``. The zone API refuses the same value
+        # with a 422, so a restore must not write it.
+        from app.services.dns.zone_citations import undefined_zone_citations  # noqa: PLC0415
+
+        missing = await undefined_zone_citations(db, obj)
+        if missing:
+            return (
+                f"Zone {obj.name!r} cites {', '.join(missing)}, which its server group no "
+                "longer defines. Create it again on the group's ACLs / TSIG keys tab, or "
+                "edit the zone's citation, then restore the zone."
+            )
         # #3855 — the single-signer rule (#1762). A signed zone in the Trash is
         # not counted when a second server joins its group, so the restore must
         # hold it to the same rule the direct sign does, or the group ends up
@@ -1150,10 +1236,39 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
 
                 try:
                     await _assert_no_overlapping_group_cidr(
-                        db, obj.group_id, subnet, exclude_scope_id=obj.id
+                        db,
+                        obj.group_id,
+                        subnet,
+                        exclude_scope_id=obj.id,
+                        restoring=True,
                     )
                 except HTTPException as exc:
                     return str(exc.detail)
+
+    elif isinstance(obj, DHCPPool):
+        # #4362: a restore brings the pool back with its class restriction, and
+        # the class may have stopped being rendered meanwhile (a PXE / phone
+        # profile disabled, a class removed). Kea accepts the dangling reference
+        # and never matches it, so apply the rule the pool API applies to a new
+        # pool rather than restore a pool that serves no client.
+        if obj.class_restriction:
+            from app.api.v1.dhcp.pools import _check_class_family  # noqa: PLC0415
+
+            pool_scope_stmt: Any = (
+                select(DHCPScope)
+                .where(DHCPScope.id == obj.scope_id)
+                .execution_options(include_deleted=True)
+            )
+            pool_scope = (await db.execute(pool_scope_stmt)).scalar_one_or_none()
+            if pool_scope is not None:
+                try:
+                    await _check_class_family(db, pool_scope, obj.class_restriction)
+                except HTTPException as exc:
+                    return (
+                        f"Pool {obj.start_ip}-{obj.end_ip} is restricted to a client class "
+                        f"that is no longer available: {exc.detail} Clear or change the "
+                        "pool's class restriction, or re-enable the class's profile, first."
+                    )
 
     elif isinstance(obj, DHCPStaticAssignment):
         # A reservation's MAC is unique across the whole group, not just the

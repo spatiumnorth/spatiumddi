@@ -78,6 +78,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
         "docker-compose.yml",
         "docker-compose.dev.yml",
     ),
+    # #4416 — the frontend's host time zone alias table must mirror the backend's.
+    "test_host_timezone_4416.py": "frontend/src/lib/hostTimezones.ts",
     "test_ci_tested_on_pr_head.py": (
         ".github/scripts/ci-tested-on-pr-head.sh",
         ".github/scripts/ci-full-suite-passed.sh",
@@ -98,10 +100,15 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_lint_versions.py": "scripts/lint_versions.py",
     "test_lint_docs_drift.py": "scripts/lint_docs_drift.py",
     "test_check_blocklist_catalog.py": "scripts/check_blocklist_catalog.py",
+    "test_check_nginx_fixed_versions.py": (
+        "scripts/check_nginx_fixed_versions.py",
+        "scripts/testdata/nginx_fixed_versions_page.html",
+    ),
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_lint_image_upgrades.py": "scripts/lint_image_upgrades.py",
     "test_release_version_script.py": "scripts/release_version.py",
     "test_changelog_assemble.py": "scripts/changelog_assemble.py",
+    "test_alembic_heads_script.py": ".github/scripts/alembic_heads.py",
     "test_format_release_notes.py": "scripts/format_release_notes.py",
     "test_check_contributors.py": (
         ".github/scripts/check_contributors.py",
@@ -144,6 +151,17 @@ _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     # live preview, so an edit to them must run the server's half too.
     "test_ipam_bulk_allocate_template_vectors_2071.py": (
         "frontend/src/lib/bulk-allocate-template.vectors.json"
+    ),
+    # #4143 — the delete dialogs' cascade registry is read by the console too.
+    "test_delete_cascade_copy_4143.py": ("frontend/src/lib/delete-cascade.json"),
+    # #4334 — console paths named in Copilot text must exist in the console.
+    "test_ai_tool_nav_paths_4334.py": (
+        "frontend/src/lib/navigation.ts",
+        "frontend/src/components/layout/Sidebar.tsx",
+        "frontend/src/pages/SettingsPage.tsx",
+        "frontend/src/pages/dns/DNSPage.tsx",
+        "frontend/src/pages/appliance/",
+        "frontend/src/pages/admin/",
     ),
     # #3119 — every resource type the server checks must be offered by New Role.
     "test_grant_vocabulary_covers_routes_3119.py": ("frontend/src/lib/permissionVocabulary.ts"),

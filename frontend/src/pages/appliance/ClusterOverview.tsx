@@ -75,6 +75,7 @@ import {
   useCanReadApplianceLogs,
 } from "@/hooks/useApplianceAdmin";
 import { VarDiskWarning } from "./VarDiskWarning";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Cluster → Overview (#402 / #416) — one cohesive, near-real-time dashboard
@@ -1271,10 +1272,10 @@ function LiveLogPane({ workload }: { workload: string }) {
         )}
       </div>
       {error && (
-        <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+        <FormError className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>{error}</span>
-        </div>
+        </FormError>
       )}
       <div
         ref={boxRef}
@@ -1712,11 +1713,9 @@ export function ClusterOverview({
             The host will power-cycle in ~10 seconds. Existing DHCP leases keep
             their state (DB-backed); DNS zones reload from the served config;
             the web UI will be unreachable for ~1 minute.
-            {rebootError && (
-              <span className="mt-2 block text-destructive">{rebootError}</span>
-            )}
           </span>
         }
+        error={rebootError}
         confirmLabel="Reboot now"
         tone="destructive"
         requireCheckboxLabel="I understand the appliance will go offline for ~1 minute."

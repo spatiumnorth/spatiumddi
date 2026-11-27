@@ -590,3 +590,136 @@ jobs:
             } else {
               core.info('Every non-held pin is current; no open drift issue to close.');
             }
+
+  # ── nginx's own list of affected and fixed versions (#4816) ─────────────────
+  # The scan above cannot see nginx: the official nginx:*-alpine image installs
+  # nginx from nginx.org's own Alpine repository, which Alpine's database does
+  # not track, so a scan of the pinned image was clean while a newer nginx
+  # release fixed problems in the pinned one. nginx.org publishes the affected
+  # and fixed versions of everything it fixes; this compares them with the
+  # `nginx` pin in versions.json.
+  #
+  # Separate job for the same reason as pin-drift: no Docker, and a failure
+  # elsewhere must not take it down. Unlike pin-drift it FAILS the run when the
+  # page cannot be read or parsed (exit 3) and files nothing, so "could not
+  # tell" is never reported as clean.
+  nginx-fixed:
+    name: nginx — affected-range check
+    if: github.repository_owner == 'spatiumnorth'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Compare the nginx pin with nginx.org's list
+        id: nginx
+        run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/nginx-fixed.md"
+
+          # The ``if`` form, not ``cmd; rc=$?``: Actions runs this under
+          # ``bash -e`` (see the pin-drift job above).
+          if python3 scripts/check_nginx_fixed_versions.py \
+               > "$report" 2>"$RUNNER_TEMP/nginx-fixed.err"; then
+            rc=0
+          else
+            rc=$?
+          fi
+
+          if [ "$rc" -eq 0 ]; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          elif [ "$rc" -eq 1 ]; then
+            echo "status=affected" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=unknown" >> "$GITHUB_OUTPUT"
+            echo "::error::nginx affected-range check could not run (rc=$rc)"
+            sed 's/^/  /' "$RUNNER_TEMP/nginx-fixed.err" >&2
+            {
+              echo "## nginx affected-range check"
+              echo ""
+              echo "⚠️ The check could not read or parse nginx.org's page (rc=$rc). See the run log."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          {
+            echo "## nginx affected-range check"
+            echo ""
+            cat "$report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open, update or close the nginx tracking issue
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          NGINX_STATUS: ${{ steps.nginx.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().slice(0, 10);
+
+            // Same fail-safe as the jobs above: an unreadable page, or a step
+            // that never wrote its output, leaves any existing issue as it is.
+            const status = process.env.NGINX_STATUS;
+            if (status !== 'affected' && status !== 'clean') {
+              core.warning(
+                `nginx check produced no definitive result (status=${JSON.stringify(status)}); ` +
+                `leaving any tracking issue untouched.`);
+              return;
+            }
+
+            const label = 'dependencies';
+            const title = 'Pinned nginx is in an affected version range';
+            const marker = '<!-- nginx-fixed-versions -->';
+
+            const open = (await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            })).data.filter(i => !i.pull_request).find(i => (i.body || '').includes(marker));
+
+            if (status === 'affected') {
+              let table = '(report file missing — see the run log)';
+              const path = `${process.env.RUNNER_TEMP}/nginx-fixed.md`;
+              if (fs.existsSync(path)) table = fs.readFileSync(path, 'utf8');
+              let body =
+                `${marker}\n\n` +
+                `The \`nginx\` pin in [\`versions.json\`](../blob/main/versions.json) is ` +
+                `inside a range that nginx.org lists as affected, and no fixed ` +
+                `version in its list covers the pin. Trivy does not see this: the ` +
+                `image's nginx comes from nginx.org's own package repository.\n\n` +
+                `- Check run: ${runUrl}\n- Last updated: ${today}\n\n` +
+                `${table}\n\n---\n` +
+                `Reproduce locally with \`make nginx-fixed-check\`. Bump \`nginx\` in ` +
+                `\`versions.json\` and every file it lists, then \`make versions-check\`. ` +
+                `This issue auto-closes when the pin is no longer in an affected range.`;
+              if (body.length > 60000) body = body.slice(0, 60000) + '\n\n_…truncated._';
+
+              if (open) {
+                await github.rest.issues.update({ owner, repo, issue_number: open.number, body });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: open.number,
+                  body: `🔁 Still affected as of ${today} — ${runUrl}`,
+                });
+                core.info(`Updated nginx issue #${open.number}`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo, title, labels: [label], body,
+                });
+                core.info(`Opened nginx issue #${created.data.number}`);
+              }
+            } else if (open) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: open.number,
+                body: `✅ The pin is outside every listed affected range as of ${today} — ${runUrl}. Closing.`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: open.number, state: 'closed',
+              });
+              core.info(`Closed nginx issue #${open.number} (now clean)`);
+            } else {
+              core.info('Pin is clean; no open nginx issue to close.');
+            }

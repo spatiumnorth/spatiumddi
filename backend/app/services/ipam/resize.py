@@ -98,7 +98,12 @@ from app.services.ipam.subnet_boundary import (
     boundary_host_conflicts,
     ensure_boundary_rows,
 )
-from app.services.ipam.subnet_placeholders import add_gateway_row, gateway_target_problem
+from app.services.ipam.subnet_placeholders import (
+    add_gateway_row,
+    find_untouched_gateway_row,
+    gateway_target_problem,
+    registry_referenced_ip_ids,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -769,6 +774,11 @@ async def preview_subnet_resize(
     # Placeholder classification — independent of conflicts so the UI can
     # show the distribution even when the preview is otherwise blocked.
     default_named, renamed = await _load_boundary_placeholders(db, subnet.id, old_net)
+    # A row a registry record names is kept by the commit (#3958), so the
+    # preview lists it as kept, not as "will be replaced".
+    _kept = await registry_referenced_ip_ids(db, [r.id for r in default_named])
+    renamed = renamed + [r for r in default_named if r.id in _kept]
+    default_named = [r for r in default_named if r.id not in _kept]
     placeholders_default_named = [
         {
             "ip": str(row.address),
@@ -1236,12 +1246,24 @@ async def commit_subnet_resize(
     # Snapshot old state for audit + summary.
     old_gateway = str(subnet.gateway) if subnet.gateway else None
     old_total = subnet.total_ips
+    # The old Gateway row Move gateway retires: the one Edit Subnet retires too
+    # (``untouched_gateway_row``, #3042), and only while it is still the bare
+    # row create made. Read before the gateway column changes, since the test
+    # compares the row with the stored gateway (#4280).
+    untouched_old_gateway_id: uuid.UUID | None = None
+    if move_gateway_to_first_usable and replace_default_placeholders and old_gateway:
+        found = await find_untouched_gateway_row(db, subnet)
+        untouched_old_gateway_id = found.id if found is not None else None
 
     # 1. Delete default-named placeholder rows at the old boundaries.
     # ``_load_boundary_placeholders`` routes any row with ``dns_record_id
     # IS NOT NULL`` into ``renamed`` (preserved), so ``default_named`` is
     # guaranteed to have no attached DNS records here.
     default_named, _renamed = await _load_boundary_placeholders(db, subnet.id, old_net)
+    # A row a registry record (E911 binding, device) is keyed to is the
+    # operator's, whatever its name: it is kept (#3958).
+    _registry_kept = await registry_referenced_ip_ids(db, [r.id for r in default_named])
+    default_named = [r for r in default_named if r.id not in _registry_kept]
     placeholders_deleted = 0
     if replace_default_placeholders:
         for row in default_named:
@@ -1272,27 +1294,22 @@ async def commit_subnet_resize(
 
     # 3b. A moved gateway is reserved the way create_subnet reserves a new
     # subnet's gateway, so Next available never offers it to a host (#2413).
-    # The old default "Gateway" row is retired with the other default rows;
-    # a renamed / DNS-bearing one is the operator's and is kept.
+    # The old Gateway row is retired only while it is untouched, by Edit
+    # Subnet's rule: one the operator renamed, tagged, gave a MAC, an owner or
+    # custom fields, or that a registry record (E911 binding, device) is keyed
+    # to, is theirs and is kept (#3958, #4280).
     gateway_row: IPAddress | None = None
     if move_gateway_to_first_usable and subnet.gateway and str(subnet.gateway) != old_gateway:
         new_gateway = str(subnet.gateway)
-        if replace_default_placeholders and old_gateway:
+        if untouched_old_gateway_id is not None:
             old_row = await db.scalar(
-                select(IPAddress).where(
-                    IPAddress.subnet_id == subnet.id,
-                    IPAddress.address == old_gateway,
-                    IPAddress.status == "reserved",
-                    IPAddress.hostname == "gateway",
-                    IPAddress.description == "Gateway",
-                    IPAddress.dns_record_id.is_(None),
-                )
+                select(IPAddress).where(IPAddress.id == untouched_old_gateway_id)
                 # Locked before the sync takes its zones: an address row comes
                 # before a zone row (``app.services.lock_order``), as a
                 # permanent zone delete takes them (#3691).
                 .with_for_update()
             )
-            if old_row is not None:
+            if old_row is not None and not await registry_referenced_ip_ids(db, [old_row.id]):
                 # Retract its auto A / PTR first, as Edit Subnet's gateway
                 # move does (#3709): a bare delete leaves the PTR served.
                 # The sync takes the zones it writes in id order (#3617).

@@ -187,6 +187,13 @@ async def test_message_less_exception_never_surfaces_blank(
         (TimeoutError("timed out"), "did not answer in time", "allow-transfer"),
         # The server DID answer and said no — now the ACL is the right hint.
         (ValueError("Zone transfer error: REFUSED"), "allow-transfer", "could not be reached"),
+        # SERVFAIL: answered, so TCP/53 is open and the ACL did not refuse; the
+        # server cannot serve this zone (#3941).
+        (
+            ValueError("Zone transfer error: SERVFAIL"),
+            "could not serve this zone",
+            "allow-transfer permits",
+        ),
     ],
 )
 async def test_hint_matches_the_failure_cause(

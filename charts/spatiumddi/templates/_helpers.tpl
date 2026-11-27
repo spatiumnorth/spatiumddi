@@ -69,7 +69,9 @@ Control-plane image — pass `imageName` (e.g. "spatiumddi-api") via merge:
 */}}
 {{- define "spatiumddi.image" -}}
 {{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s/%s/%s:%s" .Values.image.registry .Values.image.repository .imageName $tag -}}
+{{- /* #3913 — ``image.tagSuffix`` ("-ubi") selects the Red Hat UBI variant of
+       the same version; empty (the default) leaves every tag as it was. */ -}}
+{{- printf "%s/%s/%s:%s%s" .Values.image.registry .Values.image.repository .imageName $tag (.Values.image.tagSuffix | default "") -}}
 {{- end -}}
 
 {{/*
@@ -633,6 +635,24 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
     secretKeyRef:
       name: {{ include "spatiumddi.appSecretName" . }}
       key: secret-key
+# #1358 — the dedicated key stored credentials are encrypted under. Optional:
+# a Secret supplied through auth.existingSecret may not carry it, and the api
+# then derives the key from SECRET_KEY as before.
+- name: CREDENTIAL_ENCRYPTION_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: credential-key
+      optional: true
+# #1358 — the release whose rollout added credential-key to a running
+# install; while the api runs that release it reads the key but does not
+# write with it (see templates/secret.yaml). Optional, like the key.
+- name: CREDENTIAL_KEY_SINCE
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: credential-key-since
+      optional: true
 # #1159 — the /metrics scrape token. Optional: a Secret supplied through
 # auth.existingSecret may not carry it, and then only API tokens can scrape.
 - name: PROMETHEUS_METRICS_TOKEN
@@ -640,6 +660,15 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
     secretKeyRef:
       name: {{ include "spatiumddi.appSecretName" . }}
       key: metrics-token
+      optional: true
+# #4548 — bcrypt hash the very first `admin` user is created with, instead of
+# admin / admin (and without a forced password change). Optional: absent on
+# every install that did not choose one, which keeps the old default account.
+- name: INITIAL_ADMIN_PASSWORD_HASH
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: initial-admin-password-hash
       optional: true
 - name: DATABASE_URL
   value: "postgresql+asyncpg://{{ include "spatiumddi.postgresUser" . }}:$(POSTGRES_PASSWORD)@{{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}/{{ include "spatiumddi.postgresDatabase" . }}"
@@ -799,8 +828,19 @@ URL comes from commonEnv.
         # Revision lines only: a failure prints a multi-line explanation.
         CUR=$(printf '%s\n' "$OUT" | awk '$1 ~ /^[0-9a-f]+$/ {print $1}' | sort | tr '\n' ',')
         if [ -n "$CUR" ] && [ "$CUR" = "$HEADS" ]; then
-          echo "alembic at head ($CUR)"
-          break
+          # #4678 — a restore replays the archive's head before it migrates
+          # up, so head alone is not enough while one is running. Exit 3
+          # means it is; anything else (no module, no database, an error)
+          # passes, so this can only ever add waiting.
+          GATE=0
+          python -m app.core.restore_gate || GATE=$?
+          if [ "$GATE" -ne 3 ]; then
+            echo "alembic at head ($CUR)"
+            break
+          fi
+          echo "alembic at head ($CUR), but a backup restore is running; waiting"
+          sleep 3
+          continue
         fi
         # #1227 — a database a NEWER release migrated never reaches this
         # image's head, so this loop cannot end on its own. env.py names the

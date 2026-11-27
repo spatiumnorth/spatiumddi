@@ -41,6 +41,7 @@ from app.services.dhcp.class_refs import (
     phone_class_name,
     phone_profile_rendered,
     pools_restricted_to,
+    trash_hint,
 )
 from app.services.dhcp.option_validation import (
     check_vendor_class_match,
@@ -228,15 +229,25 @@ async def refuse_if_phone_class_stops_rendering(
     otherwise: a profile that renders nothing today can still be tidied up.
     ``exclude_scope_id``'s own pools leave with that scope, so they don't
     count."""
+    # A disable counts the Trash: a restore re-attaches the profile and brings
+    # its pools back, to a class a disabled profile no longer renders (#4362).
+    # A detach leaves a trashed scope's attachment (and so its class) alone.
+    trashed = always or enabled is False
     if not always:
-        if not await phone_profile_rendered(db, p):
+        if not await phone_profile_rendered(db, p, include_trashed=trashed):
             return
         if await phone_profile_rendered(
-            db, p, enabled=enabled, scope_ids=scope_ids, exclude_scope_id=exclude_scope_id
+            db,
+            p,
+            enabled=enabled,
+            scope_ids=scope_ids,
+            exclude_scope_id=exclude_scope_id,
         ):
             return
     name = phone_class_name(p.id)
-    pools = await pools_restricted_to(db, p.group_id, name, exclude_scope_id=exclude_scope_id)
+    pools = await pools_restricted_to(
+        db, p.group_id, name, exclude_scope_id=exclude_scope_id, include_trashed=trashed
+    )
     if pools:
         raise HTTPException(
             status_code=409,
@@ -244,7 +255,7 @@ async def refuse_if_phone_class_stops_rendering(
                 f"Cannot {verb}: phone profile '{p.name}' generates class '{name}', which is "
                 f"still referenced by {len(pools)} pool(s) ({describe_pools(pools)}). Kea "
                 "accepts a reference to an undefined class and the pool would silently "
-                "match no client. Clear or change those references first."
+                "match no client. Clear or change those references first." + trash_hint(pools)
             ),
         )
 

@@ -34,6 +34,7 @@ import ipaddress
 import os
 import re
 import shlex
+import socket
 import tempfile
 import time
 import uuid
@@ -133,15 +134,67 @@ _HOSTNAME_RE: Final = re.compile(
 )
 
 
+_NUMERIC_LABEL_RE: Final = re.compile(r"^[0-9-]+$")
+
+
+_BLOCKED_TARGET_MESSAGE = (
+    "target is in a blocked range (loopback / link-local / cloud-metadata) " "and cannot be scanned"
+)
+
+
+def _blocked_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    from app.services.nettools.schemas import _BLOCKED_NETWORKS
+
+    return _BLOCKED_NETWORKS
+
+
+def _refuse_blocked(value: str) -> None:
+    from app.services.nettools.schemas import is_blocked_target
+
+    if is_blocked_target(value):
+        raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
+
+
+async def resolve_target(target: str) -> str:
+    """Resolve a hostname target once, refuse a blocked answer, and return the
+    address to scan.
+
+    A literal address or a CIDR passes through unchanged. For a name, every
+    address of the one lookup is checked against the blocked ranges and the
+    first is returned, so the address that was checked is the address nmap
+    scans: handing nmap the name would make it resolve a second time, and the
+    two answers can differ. Runs on the loop's resolver, not a blocking call.
+    """
+    target = target.strip()
+    try:
+        ipaddress.ip_address(target)
+        return target
+    except ValueError:
+        pass
+    if "/" in target or not _HOSTNAME_RE.match(target):
+        return target
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(target, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        raise NmapArgError(f"target {target!r} does not resolve") from exc
+    addrs = [str(i[4][0]).split("%", 1)[0] for i in infos if isinstance(i[4][0], str)]
+    if not addrs:
+        raise NmapArgError(f"target {target!r} does not resolve")
+    for addr in addrs:
+        _refuse_blocked(addr)
+    return addrs[0]
+
+
 def _validate_target(target: str) -> str:
     """Accept a literal IPv4/IPv6 address, a CIDR range, or a hostname / FQDN.
 
     Hostname mode is a deliberate extension over the original IP-only
     contract — operators routinely want to scan ``router1.lan``
-    without first looking up its IP. nmap performs DNS resolution
-    itself, so we just need to validate the syntax tightly enough
-    that the argv builder can pass the value through to nmap without
-    risk of injection. The hostname regex rejects shell metachars,
+    without first looking up its IP. The name is resolved once, by
+    :func:`resolve_target`, and nmap is handed that address; here we
+    only validate the syntax tightly enough that the value is safe
+    to pass on. The hostname regex rejects shell metachars,
     spaces, slashes, and anything else that isn't a valid DNS label
     character.
 
@@ -156,9 +209,11 @@ def _validate_target(target: str) -> str:
         raise NmapArgError("target is required")
     try:
         addr = ipaddress.ip_address(target)
-        return str(addr)
     except ValueError:
         pass
+    else:
+        _refuse_blocked(target)
+        return str(addr)
     if "/" in target:
         try:
             net = ipaddress.ip_network(target, strict=False)
@@ -169,8 +224,22 @@ def _validate_target(target: str) -> str:
                 f"CIDR is too large ({net.num_addresses} hosts) — limit is "
                 f"{MAX_CIDR_HOST_COUNT} (≤ /{net.max_prefixlen - MAX_CIDR_HOST_BITS} for IPv4)"
             )
+        _refuse_blocked(str(net.network_address))
+        _refuse_blocked(str(net.broadcast_address))
+        if any(blocked.overlaps(net) for blocked in _blocked_networks()):
+            raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
         return str(net)
     if _HOSTNAME_RE.match(target):
+        # nmap reads dotted digit / dash spellings (``10.0.0.1-20``,
+        # ``10.0-255.0-255.0-255``) as octet ranges, expanding to many hosts.
+        # A real name's final label is never made of digits and dashes only
+        # (RFC 3696 section 2), so refuse that shape instead of passing it on.
+        if _NUMERIC_LABEL_RE.match(target.rstrip(".").rsplit(".", 1)[-1]):
+            raise NmapArgError(
+                f"target looks like an address range, which is not supported (got {target!r}); "
+                "use a single address, a CIDR, or a hostname"
+            )
+        _refuse_blocked(target)
         return target
     raise NmapArgError(
         f"target must be a valid IPv4/IPv6 address, CIDR, or hostname (got {target!r})"
@@ -691,8 +760,9 @@ async def run_scan(scan_id: uuid.UUID) -> None:
             xml_path = xml_tmp.name
 
             try:
+                scan_target = await resolve_target(str(scan.target_ip))
                 argv = build_argv(
-                    str(scan.target_ip),
+                    scan_target,
                     scan.preset,
                     scan.port_spec,
                     scan.extra_args,
@@ -970,6 +1040,7 @@ __all__ = [
     "PRESETS",
     "NmapArgError",
     "build_argv",
+    "resolve_target",
     "parse_nmap_xml",
     "run_scan",
     "stream_scan_lines",

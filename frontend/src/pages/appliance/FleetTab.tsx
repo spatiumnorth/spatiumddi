@@ -86,6 +86,7 @@ import { UpgradeImagesTable } from "./UpgradeImagesTable";
 import { CertificatesTab } from "./CertificatesTab";
 import { ClusterUpgradeTab } from "./ClusterUpgradeTab";
 import { ReleasesTab } from "./ReleasesTab";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -1677,8 +1678,14 @@ export function FleetTab({
           confirmLabel="Reject"
           tone="destructive"
           loading={reject.isPending}
+          error={
+            reject.error ? formatApiError(reject.error, "Action failed") : null
+          }
           onConfirm={() => reject.mutate(rejectTarget.id)}
-          onClose={() => setRejectTarget(null)}
+          onClose={() => {
+            setRejectTarget(null);
+            reject.reset();
+          }}
         />
       )}
 
@@ -1836,8 +1843,14 @@ export function FleetTab({
           }
           confirmLabel="Re-key"
           loading={rekey.isPending}
+          error={
+            rekey.error ? formatApiError(rekey.error, "Action failed") : null
+          }
           onConfirm={() => rekey.mutate(rekeyTarget.id)}
-          onClose={() => setRekeyTarget(null)}
+          onClose={() => {
+            setRekeyTarget(null);
+            rekey.reset();
+          }}
         />
       )}
 
@@ -1870,8 +1883,16 @@ export function FleetTab({
           }
           confirmLabel="Evict + mint replacement code"
           loading={replace.isPending}
+          error={
+            replace.error
+              ? formatApiError(replace.error, "Action failed")
+              : null
+          }
           onConfirm={() => replace.mutate(replaceTarget.id)}
-          onClose={() => setReplaceTarget(null)}
+          onClose={() => {
+            setReplaceTarget(null);
+            replace.reset();
+          }}
         />
       )}
 
@@ -1915,8 +1936,16 @@ export function FleetTab({
           }
           confirmLabel="Clear stuck state"
           loading={clearClusterState.isPending}
+          error={
+            clearClusterState.error
+              ? formatApiError(clearClusterState.error, "Action failed")
+              : null
+          }
           onConfirm={() => clearClusterState.mutate(clearStateTarget.id)}
-          onClose={() => setClearStateTarget(null)}
+          onClose={() => {
+            setClearStateTarget(null);
+            clearClusterState.reset();
+          }}
         />
       )}
 
@@ -3119,10 +3148,11 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
         Service health
       </h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Supervisor watchdog snapshot — refreshed every 5 min. ``missing`` /
-        ``unhealthy`` for more than one cadence means the auto-heal kicker
-        didn&apos;t bring the container back; SSH in and check{" "}
-        <code>docker logs &lt;service&gt;</code>.
+        Supervisor watchdog snapshot — refreshed every 5 min.{" "}
+        <code className="font-mono">missing</code> /
+        <code className="font-mono">unhealthy</code> for more than one cadence
+        means the auto-heal kicker didn&apos;t bring the container back; SSH in
+        and check <code>docker logs &lt;service&gt;</code>.
       </p>
       {stale && (
         <div
@@ -3519,7 +3549,7 @@ function MountDiskModal({
             This appliance already has a mount named “{name}”.
           </p>
         )}
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && <FormError>{error}</FormError>}
         <div className="flex justify-end gap-2 pt-1">
           <HeaderButton variant="secondary" onClick={onClose}>
             Cancel
@@ -3754,14 +3784,11 @@ function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
           // here. The operator wants their disk back, and refusing would
           // leave them pulling it anyway with the filesystem un-flushed.
           message={
-            ejectError ? (
-              <span className="text-destructive">{ejectError}</span>
-            ) : (
-              `The disk is flushed and unmounted, so it is safe to pull once the node ` +
-              `reports it gone. Any backup destination pointing at ${ejecting.path} ` +
-              `will fail — loudly — until you mount it again.`
-            )
+            `The disk is flushed and unmounted, so it is safe to pull once the node ` +
+            `reports it gone. Any backup destination pointing at ${ejecting.path} ` +
+            `will fail — loudly — until you mount it again.`
           }
+          error={ejectError}
           confirmLabel="Eject"
           tone="destructive"
           loading={eject.isPending}
@@ -4056,10 +4083,47 @@ const HOSTCFG_PLANE_LABELS: Record<string, string> = {
   console_mode: "Console mode",
 };
 
-function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
+// Each plane's host runner logs to its own file under
+// /var/log/spatiumddi/ (#3814); the runner script names are not all
+// ``<plane>-reload``; the firewall runner has no log file, only the journal (resolver → resolved-reload, console_mode →
+// verbose-boot-reload, timezone → tz-reload).
+const HOSTCFG_PLANE_LOGS: Record<string, string> = {
+  ntp: "chrony-reload.log",
+  snmp: "snmp-reload.log",
+  lldp: "lldp-reload.log",
+  syslog: "syslog-reload.log",
+  ssh: "ssh-reload.log",
+  resolver: "resolved-reload.log",
+  timezone: "tz-reload.log",
+  removable: "removable-reload.log",
+  apt: "apt-reload.log",
+  console_mode: "verbose-boot-reload.log",
+};
+
+function hostConfigLogHint(planes: string[]): string {
+  const hints = planes.map((p) =>
+    p === "firewall"
+      ? "journalctl -u spatium-firewall-reload"
+      : HOSTCFG_PLANE_LOGS[p]
+        ? `/var/log/spatiumddi/${HOSTCFG_PLANE_LOGS[p]}`
+        : "",
+  );
+  const uniq = [...new Set(hints.filter(Boolean))];
+  return uniq.length ? uniq.join(", ") : "/var/log/spatiumddi/";
+}
+
+export function ApplianceHostConfigHealthSection({
+  row,
+}: {
+  row: ApplianceRow;
+}) {
   const entries = Object.entries(row.host_config_health ?? {});
   entries.sort(([a], [b]) => a.localeCompare(b));
   const anyFailing = entries.some(([, h]) => h.state === "failing");
+  const anyRetrying = entries.some(([, h]) => h.state === "retrying");
+  const failingPlanes = entries
+    .filter(([, h]) => h.state === "failing")
+    .map(([p]) => p);
   return (
     <div className="border-t pt-4">
       <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -4074,8 +4138,12 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
         )}
       >
         {anyFailing
-          ? "A host-config change keeps failing to apply on this appliance — the supervisor is retrying with backoff. Check the host runner log (e.g. /var/log/spatiumddi/chrony-reload.log) for the cause."
-          : "A host-config change is still being applied (retrying)."}
+          ? "A host-config change keeps failing to apply on this appliance — the supervisor is retrying with backoff. Check the host runner log (" +
+            hostConfigLogHint(failingPlanes) +
+            ") for the cause."
+          : anyRetrying
+            ? "A host-config change is still being applied (retrying)."
+            : "A host-config change is being applied."}
       </p>
       <div className="mt-2 overflow-hidden rounded-md border">
         <table className="w-full text-xs">
@@ -4102,7 +4170,9 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
                         "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
                         failing
                           ? "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300"
-                          : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
+                          : h.state === "applying"
+                            ? "bg-muted text-muted-foreground"
+                            : "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
                       )}
                     >
                       <Icon
@@ -4113,6 +4183,12 @@ function ApplianceHostConfigHealthSection({ row }: { row: ApplianceRow }) {
                       />
                       {h.state}
                     </span>
+                    {h.reason && (
+                      <div className="mt-1 text-[11px] text-rose-700 dark:text-rose-300">
+                        Host refused{h.requested ? ` "${h.requested}"` : ""}:{" "}
+                        {h.reason.replace(/_/g, " ")}
+                      </div>
+                    )}
                   </td>
                   <td className="px-3 py-1.5 text-muted-foreground">
                     {h.attempts}
@@ -6080,7 +6156,10 @@ function ApplianceOsUpgradeSection({
         </p>
       )}
       {slotError && (
-        <p className="mt-1 text-xs text-rose-700 dark:text-rose-300">
+        <p
+          role="alert"
+          className="mt-1 text-xs text-rose-700 dark:text-rose-300"
+        >
           {formatApiError(slotError)}
         </p>
       )}
@@ -6283,8 +6362,14 @@ function ApplianceOsUpgradeSection({
           confirmLabel="Reboot"
           tone="destructive"
           loading={reboot.isPending}
+          error={
+            reboot.error ? formatApiError(reboot.error, "Reboot failed") : null
+          }
           onConfirm={() => reboot.mutate()}
-          onClose={() => setRebootConfirm(false)}
+          onClose={() => {
+            setRebootConfirm(false);
+            reboot.reset();
+          }}
           requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
         />
       )}

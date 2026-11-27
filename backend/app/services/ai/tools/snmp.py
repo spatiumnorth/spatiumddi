@@ -10,7 +10,7 @@ booleans, never plaintext.
 Why no ``propose_update_snmp_settings`` here:
 
 * Updating SNMP touches multiple Fernet-encrypted fields + an atomic-
-  replace merge for v3 users. The dedicated Settings → Appliance →
+  replace merge for v3 users. The dedicated Appliance → Fleet →
   SNMP form is the friendly path; a Copilot ``propose_*`` over the
   same surface would re-implement that complexity without much benefit.
 * SNMP is a low-frequency operator task. Read visibility is the high

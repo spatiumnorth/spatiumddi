@@ -154,6 +154,12 @@ PINNED_DIGESTS: dict[int, dict[str, str]] = {
         "plain": "af022478ea75fc1b23f6fac003a76d8d8d0d53165668cc5db9ec53ba23e6ade5",
         "views": "22c8d8f537d3b0ea47263eeca1c1218ee6ad6344e8680dd1e131d6d57fbd0940",
     },
+    # #4594: the bundle options gain query_log_severity,
+    # query_log_print_category and query_log_print_severity.
+    18: {
+        "plain": "87c823765ab7406e0f444b12b69d76a9e39189ffd6320860712e1d384313f3ed",
+        "views": "8c24562300c855fbfa2640d462021514fbdb9a30df8bb85c9ea99ea4a4930a53",
+    },
 }
 
 

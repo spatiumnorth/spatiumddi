@@ -172,9 +172,10 @@ function ConfirmBulkDeleteModal({
         <p>
           Delete <span className="font-semibold">{count}</span> ASN
           {count === 1 ? "" : "s"}? The ASN's RPKI ROA rows, BGP peerings (on
-          either side) and communities are deleted with it. IP blocks, subnets,
-          VRFs, routers and providers that carry it are kept and have their ASN
-          cleared.
+          either side), communities, BGP tracked prefixes (hand-tracked ones
+          too) and hijack detections are deleted with it. IP spaces, IP blocks,
+          VRFs, routers, providers and Looking Glass peers and routes that carry
+          it are kept and have their ASN cleared.
         </p>
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -507,7 +508,9 @@ export function AsnsPage() {
               Clear
             </button>
             {bulkError && (
-              <span className="ml-2 text-xs text-red-600">{bulkError}</span>
+              <span role="alert" className="ml-2 text-xs text-red-600">
+                {bulkError}
+              </span>
             )}
           </div>
         )}
@@ -536,8 +539,10 @@ export function AsnsPage() {
                     setSearch("");
                     setTagFilters([]);
                   }}
+                  gate={writeGate}
+                  hint="Add one to start the registry."
                 >
-                  No ASNs tracked yet — add one to start the registry.
+                  No ASNs tracked yet.
                 </ListEmpty>
               </p>
               <button

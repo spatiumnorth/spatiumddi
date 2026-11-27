@@ -28,13 +28,13 @@ import structlog
 from fastapi import HTTPException, Request, status
 from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.agent_wake import collecting_wakes
 from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
-from app.models.auth import User
+from app.models.auth import Group, User
 from app.models.change_request import CHANGE_REQUEST_ORIGINS, ChangeRequest
 from app.services.api_token_scopes import enforce_operation_token_scope
 
@@ -218,6 +218,52 @@ async def get_change_request(
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
+def _filtered(
+    stmt: Any,
+    *,
+    state: str | None,
+    resource_type: str | None,
+    requested_by_user_id: UUID | None,
+    origin: str | None,
+) -> Any:
+    if origin is not None:
+        stmt = stmt.where(ChangeRequest.origin == origin)
+    if state is not None:
+        # Several states as a comma list ("executed,rejected"): the admin
+        # History reads the decided ones without the pending ones eating its
+        # window (#4383).
+        states = [x.strip() for x in state.split(",") if x.strip()]
+        stmt = stmt.where(
+            ChangeRequest.state == states[0]
+            if len(states) == 1
+            else ChangeRequest.state.in_(states)
+        )
+    if resource_type is not None:
+        stmt = stmt.where(ChangeRequest.resource_type == resource_type)
+    if requested_by_user_id is not None:
+        stmt = stmt.where(ChangeRequest.requested_by_user_id == requested_by_user_id)
+    return stmt
+
+
+async def count_change_requests(
+    db: AsyncSession,
+    *,
+    state: str | None = None,
+    resource_type: str | None = None,
+    requested_by_user_id: UUID | None = None,
+    origin: str | None = None,
+) -> int:
+    """How many rows :func:`list_change_requests` would match with no window."""
+    stmt = _filtered(
+        select(func.count()).select_from(ChangeRequest),
+        state=state,
+        resource_type=resource_type,
+        requested_by_user_id=requested_by_user_id,
+        origin=origin,
+    )
+    return int(await db.scalar(stmt) or 0)
+
+
 async def list_change_requests(
     db: AsyncSession,
     *,
@@ -234,24 +280,53 @@ async def list_change_requests(
     live in this table, and each surface passes its own value so neither
     ever renders the other's rows.
     """
-    stmt = select(ChangeRequest)
-    if origin is not None:
-        stmt = stmt.where(ChangeRequest.origin == origin)
-    if state is not None:
-        stmt = stmt.where(ChangeRequest.state == state)
-    if resource_type is not None:
-        stmt = stmt.where(ChangeRequest.resource_type == resource_type)
-    if requested_by_user_id is not None:
-        stmt = stmt.where(ChangeRequest.requested_by_user_id == requested_by_user_id)
-    stmt = stmt.order_by(ChangeRequest.created_at.desc()).limit(limit).offset(offset)
+    stmt = _filtered(
+        select(ChangeRequest),
+        state=state,
+        resource_type=resource_type,
+        requested_by_user_id=requested_by_user_id,
+        origin=origin,
+    )
+    # id tiebreak: paging needs a total order (#3937).
+    stmt = (
+        stmt.order_by(ChangeRequest.created_at.desc(), ChangeRequest.id).limit(limit).offset(offset)
+    )
     return list((await db.execute(stmt)).scalars().all())
 
 
 # ── State transitions (each guarded + audited) ─────────────────────────────
 
 
+_DECIDED_WORDS = {
+    "approved": "approved",
+    "executed": "approved and provisioned",
+    "failed": "approved, and its provisioning failed",
+    "rejected": "rejected",
+    "cancelled": "cancelled",
+    "expired": "expired",
+}
+
+
+def already_decided_text(cr: ChangeRequest) -> str:
+    """Plain words for a decision refused because the request is not pending
+    (#3935): what happened, who did it and when, with no id or schema state
+    name. The Requests page's own vocabulary (Provisioned, Cancelled, ...)."""
+    what = _DECIDED_WORDS.get(cr.state, cr.state)
+    who = f" by {cr.decided_by_display}" if cr.decided_by_display else ""
+    at = (
+        f" at {cr.decided_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
+        if cr.decided_at is not None
+        else ""
+    )
+    if cr.state == "expired":
+        return "This request has already expired and can no longer be decided."
+    return f"This request was already {what}{who}{at}. Refresh to see its current state."
+
+
 def _require_state(cr: ChangeRequest, expected: str) -> None:
     if cr.state != expected:
+        if expected == "pending":
+            raise ChangeRequestStateError(already_decided_text(cr))
         raise ChangeRequestStateError(
             f"change request {cr.id} is {cr.state!r}, expected {expected!r}"
         )
@@ -452,6 +527,7 @@ async def mark_failed(
     requester_id: UUID | None,
     request: Request | None,
     error: str,
+    audit_error: str | None = None,
 ) -> ChangeRequest:
     """``approved`` → ``failed`` (terminal). ``apply()`` (or its
     re-preview stale-state guard) failed at execution time. Like
@@ -471,7 +547,7 @@ async def mark_failed(
             "state": "approved",
             "requested_by": str(requester_id) if requester_id is not None else None,
         },
-        new_value={"state": "failed", "error": error},
+        new_value={"state": "failed", "error": audit_error or error},
     )
     logger.warning(
         "change_request.failed",
@@ -556,7 +632,39 @@ class DecisionUnprocessable(DecisionError):
     status_code = 422
 
 
-def _refusal_text(detail: Any) -> str:
+_SAFE_KEYS = ("fqdn", "mac_address", "ptr_name", "address")
+_SAFE_FALLBACK = "The request conflicts with something that already exists."
+# What a requester is told for each collision warning: the name, MAC or
+# address they asked for is theirs to read, what it collides with is not.
+_SAFE_WARNING_TEXT = {
+    "fqdn_collision": "The name {fqdn} is already in use.",
+    "mac_collision": "MAC {mac_address} is already assigned to another address.",
+    "ptr_collision": "The reverse name {ptr_name} already points to another address.",
+    "dynamic_pool": (
+        "The address {address} now falls inside a DHCP dynamic pool, so the DHCP"
+        " server may hand it to another device."
+    ),
+}
+
+# What a non-HTTP failure at apply is stored as. ``str(exc)`` of a database
+# error is raw driver text (SQL, column names, parameter values); the cause is
+# in the server log only (not on the request or its audit row; #3642).
+_INTERNAL_FAILURE_TEXT = (
+    "The request could not be applied because of an internal error. "
+    "An administrator can find the details in the server log."
+)
+
+
+def _exception_text(exc: Exception) -> str:
+    """Worded text for an exception that is not an HTTP refusal. A ValueError
+    is an operation's own sentence; anything else (a database error above all)
+    is not fit to show."""
+    if type(exc) is ValueError or hasattr(exc, "requester_text"):
+        return str(exc)
+    return _INTERNAL_FAILURE_TEXT
+
+
+def _refusal_text(detail: Any, *, requester_safe: bool = False) -> str:
     """The text an HTTPException's ``detail`` puts on a failed request.
 
     The requester reads ``error`` on the portal (#2911), so it must be a
@@ -565,7 +673,11 @@ def _refusal_text(detail: Any) -> str:
     True}`` — the REST UI's "save anyway" prompt — which has no confirm step
     at approve time, so each warning is spelled out instead (collisions, a
     dynamic DHCP pool, a public-facing zone). Anything else falls back to
-    JSON."""
+    JSON.
+
+    ``requester_safe`` words the same warnings without naming the address,
+    subnet or pool bounds they found: the approver may read those, the
+    requester who gets the text may not (#3642)."""
     if isinstance(detail, str):
         return detail
     if isinstance(detail, dict) and isinstance(detail.get("warnings"), list):
@@ -575,7 +687,11 @@ def _refusal_text(detail: Any) -> str:
                 parts.append(str(w))
                 continue
             kind = w.get("kind")
-            if kind == "fqdn_collision":
+            if requester_safe and kind in _SAFE_WARNING_TEXT:
+                parts.append(_SAFE_WARNING_TEXT[kind].format(**{k: w.get(k) for k in _SAFE_KEYS}))
+            elif requester_safe and not (isinstance(w.get("message"), str) and w["message"]):
+                parts.append(_SAFE_FALLBACK)
+            elif kind == "fqdn_collision":
                 parts.append(
                     f"The name {w.get('fqdn')} is already used by {w.get('existing_ip')}"
                     f" in {w.get('existing_subnet')}."
@@ -608,6 +724,8 @@ def _refusal_text(detail: Any) -> str:
                 parts.append(json.dumps(w, sort_keys=True, default=str))
         if parts:
             return " ".join(parts)
+    if requester_safe:
+        return _SAFE_FALLBACK
     return json.dumps(detail, sort_keys=True, default=str)
 
 
@@ -664,6 +782,64 @@ async def _relock_after_failed_apply(
     )
 
 
+async def _requester_error(
+    db: AsyncSession,
+    cr: ChangeRequest,
+    *,
+    error: str,
+    detail: Any,
+    rerun_preview: bool,
+    requester_text: str | None = None,
+) -> str:
+    """The failure text a portal requester may read (#3642).
+
+    ``error`` names whatever the APPROVER could read. Here: a target the
+    requester cannot read is answered as an unknown id, as at submit; a
+    refused re-preview is re-run under the requester so it words itself from
+    their reads; collision warnings drop what they collided with. A text that
+    is a plain sentence about the request itself passes through."""
+    from app.services.ai.operations import (  # noqa: PLC0415 — avoid cycle
+        get_operation,
+        previewing_for_requester,
+        unreadable_target_detail,
+    )
+
+    requester = None
+    if cr.requested_by_user_id is not None:
+        requester = (
+            await db.execute(
+                select(User)
+                .where(User.id == cr.requested_by_user_id)
+                .options(selectinload(User.groups).selectinload(Group.roles))
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+    op = get_operation(cr.operation)
+    if requester is None or op is None:
+        return _SAFE_FALLBACK
+    try:
+        args = op.args_model.model_validate(cr.args or {})
+        hidden = unreadable_target_detail(requester, op, args)
+        if hidden is not None:
+            return hidden
+        if requester_text is not None:
+            # The refusal carried its own wording for the requester
+            # (:mod:`app.services.refusal`); ``error`` keeps the full one.
+            return requester_text
+        if rerun_preview:
+            with previewing_for_requester():
+                again = await op.preview(db, requester, args)
+            if not again.ok:
+                return again.detail or _SAFE_FALLBACK
+            return _SAFE_FALLBACK
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("change_request.requester_error_failed", error=str(exc))
+        return _SAFE_FALLBACK
+    if detail is not None:
+        return _refusal_text(detail, requester_safe=True)
+    return error
+
+
 async def _stamp_apply_failed(
     db: AsyncSession,
     cr_id: UUID,
@@ -672,6 +848,9 @@ async def _stamp_apply_failed(
     request: Request | None,
     note: str | None,
     error: str,
+    detail: Any = None,
+    rerun_preview: bool = False,
+    requester_text: str | None = None,
 ) -> ChangeRequest:
     """Re-lock the (rolled-back) row and stamp ``pending → approved → failed``.
 
@@ -681,15 +860,36 @@ async def _stamp_apply_failed(
     before ``mark_failed`` — unless ``apply()`` had already committed it, in
     which case only the failure is stamped (one ``approved`` audit row, not
     two). Raises :class:`DecisionConflict` if the row vanished or another
-    actor decided it mid-apply."""
+    actor decided it mid-apply.
+
+    ``error`` was composed under the approver's reads, so on a portal request
+    the requester-facing ``cr.error`` is re-composed under the requester's own
+    (:func:`_requester_error`); the audit row keeps the approver's text
+    (#3642)."""
     cr, approval_committed = await _relock_after_failed_apply(db, cr_id, approver=approver)
     requester_id = cr.requested_by_user_id
     if not approval_committed:
         # apply()'s commit carries the stamp and its audit row together
         # (#3549), so a committed approval is already audited.
         await mark_approved(db, cr, approver=approver, request=request, note=note)
+    shown = error
+    if cr.origin == "portal":
+        shown = await _requester_error(
+            db,
+            cr,
+            error=error,
+            detail=detail,
+            rerun_preview=rerun_preview,
+            requester_text=requester_text,
+        )
     await mark_failed(
-        db, cr, approver=approver, requester_id=requester_id, request=request, error=error
+        db,
+        cr,
+        approver=approver,
+        requester_id=requester_id,
+        request=request,
+        error=shown,
+        audit_error=error,
     )
     await db.commit()
     # ``modified_at`` is a server-side onupdate, so the flush expired it; the
@@ -702,6 +902,99 @@ async def _stamp_apply_failed(
         error=error,
     )
     return cr
+
+
+REQUESTER_GONE_MESSAGE = (
+    "The requester's account no longer exists, so this request cannot be "
+    "provisioned. Reject it; the requester can submit it again from a current account."
+)
+
+
+SCOPE_CHANGED_MESSAGE = (
+    "The change's scope changed since it was requested, so it can no longer be "
+    "approved as reviewed. Reject it; the requester can cancel it and submit it "
+    "again to capture the new scope."
+)
+
+
+def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
+    """Why ``approver`` may not approve ``cr``, or ``None`` when they may.
+
+    The identity and permission checks of :func:`approve_change_request`
+    (steps 2-4b), in the order it makes them. Shared with the list API's
+    per-row ``can_approve`` (#4189) so the queue offers Approve to exactly the
+    approvers the server admits. Does not look at the row's state or expiry.
+    """
+    from app.services.ai import operations  # noqa: PLC0415
+    from app.services.ai.operations import OperationPermissionError  # noqa: PLC0415
+    from app.services.ai.operations_control import (  # noqa: PLC0415
+        CONTROL_OPERATION_NAMES,
+    )
+
+    # Fail CLOSED when the requester row is gone (#5). ON DELETE SET NULL
+    # nulls ``requested_by_user_id`` if the requester is deleted; the
+    # self-approval guard below would then fail OPEN (None != approver.id
+    # is always true), letting anyone rubber-stamp an orphaned request and
+    # defeating two-person. Refuse instead. The words name what the APPROVER
+    # can do (#4242): they cannot cancel (requester / superadmin only), they
+    # can reject, and the requester can submit it again.
+    if cr.requested_by_user_id is None:
+        return DecisionConflict(REQUESTER_GONE_MESSAGE)
+    # Self-approval is forbidden — the whole point of two-person.
+    if approver.id == cr.requested_by_user_id:
+        return DecisionForbidden("You cannot approve your own change request")
+
+    op = operations.get_operation(cr.operation)
+    if op is None:
+        return DecisionError(f"Operation {cr.operation!r} is not registered")
+
+    # Approver holds the approve capability.
+    if not _can_approve(approver):
+        return DecisionForbidden("Permission denied: need 'approve' on 'change_request'")
+
+    # Approver holds the underlying operation's own permission.
+    try:
+        operations.enforce_operation_permission(approver, op)
+    except OperationPermissionError as exc:
+        return DecisionForbidden(str(exc))
+
+    # Self-governance control ops (#62) are SUPERADMIN-ONLY to approve — IN
+    # ADDITION to the checks above. A control op weakens the approval control
+    # plane itself, so only a *different* superadmin may sign off. Without
+    # this, a plain {approve, change_request} + {admin, approval_control}
+    # holder could rubber-stamp turning the whole workflow off.
+    if cr.operation in CONTROL_OPERATION_NAMES and not is_effective_superadmin(approver):
+        return DecisionForbidden(
+            "Approving a control-plane change to the approval workflow requires superadmin"
+        )
+    return None
+
+
+async def approval_refusal_at_target(
+    db: AsyncSession, approver: User, cr: ChangeRequest
+) -> DecisionError | None:
+    """:func:`approval_refusal` plus the operation's per-object gate (#4382).
+
+    ``approval_refusal`` asks only the operation's type-wide permission, which
+    admits a grant scoped to one subnet for an address request in another. An
+    operation that declares ``target_refusal`` has the same function run by its
+    ``apply``, so a row's ``can_approve`` matches what the press does. One
+    ``db.get`` per row, served from the identity map for a repeated target.
+    """
+    from app.services.ai import operations  # noqa: PLC0415
+
+    refusal = approval_refusal(approver, cr)
+    if refusal is not None:
+        return refusal
+    op = operations.get_operation(cr.operation)
+    if op is None or op.target_refusal is None:
+        return None
+    try:
+        args = op.args_model.model_validate(cr.args or {})
+    except Exception:  # noqa: BLE001 — the approve answers a stale schema itself
+        return None
+    target = await op.target_refusal(db, approver, args)
+    return DecisionForbidden(str(target)) if target is not None else None
 
 
 async def approve_change_request(
@@ -736,7 +1029,7 @@ async def approve_change_request(
     #     Before the expiry branch, which writes (mark_expired + commit).
     _enforce_token_scope(request, cr.operation)
     if cr.state != "pending":
-        raise DecisionConflict(f"Change request is not pending (state={cr.state!r})")
+        raise DecisionConflict(already_decided_text(cr))
     # #10: one expiry convention everywhere — ``expires_at <= now`` means expired
     # (matches the sweep select + recheck), so a request can't be approved in the
     # same instant the sweep would expire it.
@@ -747,52 +1040,14 @@ async def approve_change_request(
         await db.commit()
         raise DecisionConflict("Change request has expired")
 
-    # 2a. Fail CLOSED when the requester row is gone (#5). ON DELETE SET NULL
-    #     nulls ``requested_by_user_id`` if the requester is deleted; the
-    #     self-approval guard below would then fail OPEN (None != approver.id
-    #     is always true), letting anyone rubber-stamp an orphaned request and
-    #     defeating two-person. Refuse instead — the requester must recreate.
-    if cr.requested_by_user_id is None:
-        raise DecisionConflict(
-            "Requester no longer exists; cancel and recreate this change request"
-        )
-
-    # 2b. Self-approval is forbidden — the whole point of two-person.
-    if approver.id == cr.requested_by_user_id:
-        raise DecisionForbidden("You cannot approve your own change request")
-
+    # 2-4b. Who may approve this row (requester gone, self-approval, the approve
+    #     grant, the operation's own permission, control ops). One helper so the
+    #     queue's ``can_approve`` (#4189) asks exactly what this asks.
+    refusal = approval_refusal(approver, cr)
+    if refusal is not None:
+        raise refusal
     op = operations.get_operation(cr.operation)
-    if op is None:
-        raise DecisionError(f"Operation {cr.operation!r} is not registered")
-
-    # 3. Approver holds the approve capability.
-    if not _can_approve(approver):
-        raise DecisionForbidden(
-            "Permission denied: need 'approve' on 'change_request'",
-        )
-
-    # 4. Approver holds the underlying operation's own permission.
-    try:
-        operations.enforce_operation_permission(approver, op)
-    except OperationPermissionError as exc:
-        raise DecisionForbidden(str(exc)) from exc
-
-    # 4b. Self-governance control ops (#62) are SUPERADMIN-ONLY to approve —
-    #     IN ADDITION to the {approve, change_request} + required_permission
-    #     checks above. A control op weakens the approval control plane
-    #     itself, so only a *different* superadmin may sign off (the
-    #     "different" half is the step-2b self-approval block above; this
-    #     half is the superadmin requirement). Without this, a plain
-    #     {approve, change_request} + {admin, approval_control} holder could
-    #     rubber-stamp turning the whole workflow off.
-    from app.services.ai.operations_control import (  # noqa: PLC0415
-        CONTROL_OPERATION_NAMES,
-    )
-
-    if cr.operation in CONTROL_OPERATION_NAMES and not is_effective_superadmin(approver):
-        raise DecisionForbidden(
-            "Approving a control-plane change to the approval workflow requires superadmin"
-        )
+    assert op is not None  # approval_refusal refused an unregistered operation
 
     # Re-validate frozen args (guards the rare redeploy-mid-flight schema change).
     # #6: never echo the Pydantic ValidationError back to the client — it
@@ -817,6 +1072,7 @@ async def approve_change_request(
     #     weakening change under approver authority whose rationale is gone. The
     #     flag is read FOR UPDATE so this can't race a concurrent flip.
     from app.services.ai.operations_control import (  # noqa: PLC0415
+        CONTROL_OPERATION_NAMES,
         ModifyApprovalControlArgs,
         control_gate_premise_lost,
     )
@@ -868,11 +1124,21 @@ async def approve_change_request(
             request=request,
             note=note,
             error=_refusal_text(exc.detail),
+            detail=exc.detail,
+            rerun_preview=True,
         )
     except Exception as exc:  # noqa: BLE001
         await _safe_rollback(db)
+        logger.warning(
+            "change_request.preview_failed", change_request_id=str(cr_id), error=str(exc)
+        )
         return await _stamp_apply_failed(
-            db, cr_id, approver=approver, request=request, note=note, error=str(exc)
+            db,
+            cr_id,
+            approver=approver,
+            request=request,
+            note=note,
+            error=_exception_text(exc),
         )
     if not preview.ok and preview.forbidden_detail is not None:
         # The target exists, but THIS approver can neither read nor act on
@@ -900,6 +1166,7 @@ async def approve_change_request(
             request=request,
             note=note,
             error=preview.detail or "The operation can no longer be applied.",
+            rerun_preview=True,
         )
 
     # 5a. Idempotent resolution (#62 concurrent break-glass). When the op's
@@ -945,7 +1212,8 @@ async def approve_change_request(
     #     request and approval (e.g. the requester added 50 IPs to a subnet
     #     queued for soft-delete) — refuse so the approver never rubber-stamps
     #     a scope larger than the one they reviewed. Treat any drift as stale;
-    #     the requester must cancel and re-submit to capture the new scope.
+    #     the approver can only reject it (#4381) and the requester cancel and
+    #     re-submit to capture the new scope.
     #     This closes the TOCTOU for both soft and permanent paths via one rule.
     #
     #     GATE ROWS ONLY (#696). The rule assumes the preview describes a
@@ -975,10 +1243,7 @@ async def approve_change_request(
             frozen_preview=cr.preview_text,
             fresh_preview=preview.preview_text,
         )
-        raise DecisionConflict(
-            "The change's scope changed since it was requested — cancel and "
-            "re-submit to capture the new scope."
-        )
+        raise DecisionConflict(SCOPE_CHANGED_MESSAGE)
 
     requester_id = cr.requested_by_user_id
 
@@ -1034,13 +1299,22 @@ async def approve_change_request(
             request=request,
             note=note,
             error=_refusal_text(exc.detail),
+            detail=exc.detail,
+            requester_text=getattr(exc, "requester_text", None),
         )
     except Exception as exc:  # noqa: BLE001
         # apply() rolled back its own transaction; reload + lock to stamp the
         # failure (the approval transition was rolled back too).
         await _safe_rollback(db)
+        logger.warning("change_request.apply_raised", change_request_id=str(cr_id), error=str(exc))
         return await _stamp_apply_failed(
-            db, cr_id, approver=approver, request=request, note=note, error=str(exc)
+            db,
+            cr_id,
+            approver=approver,
+            request=request,
+            note=note,
+            error=_exception_text(exc),
+            requester_text=getattr(exc, "requester_text", None),
         )
 
     if not approval_audit["written"]:
@@ -1112,6 +1386,9 @@ def _can_approve(user: User) -> bool:
 
 
 __all__ = [
+    "REQUESTER_GONE_MESSAGE",
+    "approval_refusal",
+    "approval_refusal_at_target",
     "ChangeRequestStateError",
     "DecisionConflict",
     "DecisionError",

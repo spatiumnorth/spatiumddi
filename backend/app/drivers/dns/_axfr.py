@@ -100,6 +100,16 @@ def _hint(exc: BaseException, port: int) -> str:
             "allow-transfer permits the SpatiumDDI control plane, and that it is "
             "authoritative for this zone."
         )
+    if "SERVFAIL" in text:
+        # The server answered (so TCP is open and the ACL did not refuse), but
+        # could not serve this zone: a secondary that never transferred it from
+        # its primary, or a primary that has not loaded it.
+        return (
+            " The server answered but could not serve this zone (SERVFAIL) — for a "
+            "secondary zone, check that its primary's address is right, that the "
+            "primary answers, and that it allows this server to transfer the "
+            "zone; for a primary zone, check that the server has loaded it."
+        )
     # A signed transfer the server rejected on the signature itself. Sending
     # the operator to allow-transfer here would be actively wrong — the ACL
     # matched, the key didn't. dnspython signals these by exception TYPE and

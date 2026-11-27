@@ -50,7 +50,6 @@ import asyncio
 import os
 import secrets
 import tempfile
-import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +58,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from app.core.restore_gate import RESTORE_LOCK_HOLDERS_SQL, RESTORE_LOCK_KEY
+from app.services.backup import appliance_identity
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
@@ -148,6 +149,8 @@ class RestoreOutcome:
     # Backup targets whose ``in_progress`` claim came back inside the
     # archive and was settled (#2097). Empty when none.
     reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
+    # Appliance rows of this install kept across the restore (#4677).
+    adopted_appliances: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -1027,26 +1030,17 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-#: Session-level Postgres advisory lock serialising restores (#1571).
-#: Neither restore endpoint took any lock, so two concurrent restores
-#: interleaved their schema clear and replay — each replaying over
-#: the other's half-cleared schema. Fixed key (this is a whole-install
-#: operation, there is only ever one restore at a time), derived from
-#: a label rather than hand-picked so it cannot collide with the
-#: crc32-based per-resource keys elsewhere by accident.
-_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+#: Session-level Postgres advisory lock serialising restores (#1571). The key
+#: lives in ``app.core.restore_gate``, which the chart's ``wait-for-migrate``
+#: init container also reads (#4678).
+_RESTORE_LOCK_KEY = RESTORE_LOCK_KEY
 
 #: The backend holding the restore lock, if any: the running restore's own
 #: lock connection, which ``_terminate_other_db_connections`` must not end
 #: (#1648). ``pg_locks`` shows a bigint key as its high half in ``classid``
 #: and its low half in ``objid``, with ``objsubid`` 1. ``pid IS NOT NULL``
 #: keeps a prepared transaction's lock from turning ``NOT IN`` into NULL.
-_RESTORE_LOCK_HOLDERS_SQL = (
-    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
-    "AND pid IS NOT NULL AND objsubid = 1 "
-    f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
-    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
-)
+_RESTORE_LOCK_HOLDERS_SQL = RESTORE_LOCK_HOLDERS_SQL
 
 
 async def restore_lock_held(db) -> bool:
@@ -1317,6 +1311,16 @@ async def _apply_backup_restore_inner(
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
+    # The appliance registry is replaced by a full restore, and by a selective
+    # one whose TRUNCATE ... CASCADE reaches it. Capture the live rows first
+    # so the running supervisor stays known to the restored database (#4677).
+    identity_snapshot = None
+    identity_snapshot_error: str | None = None
+    try:
+        identity_snapshot = await appliance_identity.snapshot(db_url)
+    except Exception as exc:  # noqa: BLE001 — never block a restore on the capture
+        logger.error("backup_restore_identity_snapshot_failed", error=str(exc))
+        identity_snapshot_error = str(exc)
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -1439,6 +1443,7 @@ async def _apply_backup_restore_inner(
     # Runs AFTER the alembic upgrade so the schema is at the local
     # code's expected shape (encrypted columns may have moved /
     # been renamed across migrations).
+    from app.config import credential_key_writes_deferred  # noqa: PLC0415
     from app.config import settings as _settings  # noqa: PLC0415
 
     if "platform_secret_key" not in secrets_payload:
@@ -1454,6 +1459,10 @@ async def _apply_backup_restore_inner(
                 or "",
                 dest_secret_key=_settings.secret_key,
                 dest_credential_key=_settings.credential_encryption_key or "",
+                # #1358 — honour the same write deferral as app.core.crypto.
+                dest_defer_dedicated_writes=credential_key_writes_deferred(
+                    _settings.credential_key_since, _settings.version
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             # Rewrap failure shouldn't blow away the whole restore —
@@ -1471,6 +1480,26 @@ async def _apply_backup_restore_inner(
             rewrap_outcome = RewrapOutcome()
             rewrap_outcome.aborted = True
             rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
+
+    # Phase 7b (#4677): put this install's own appliance identity back.
+    adoption = appliance_identity.AdoptionOutcome()
+    if identity_snapshot_error is not None:
+        adoption.warnings.append(
+            "This install's appliance identity could not be read before the restore "
+            f"({identity_snapshot_error}), so it was not kept. The appliance will be refused "
+            "by the control plane until it is paired again."
+        )
+    if identity_snapshot is not None and (
+        restored_tables is None or "appliance" in restored_tables
+    ):
+        try:
+            adoption = await appliance_identity.adopt(db_url, identity_snapshot)
+        except Exception as exc:  # noqa: BLE001 — the data is in
+            logger.error("backup_restore_identity_adopt_failed", error=str(exc))
+            adoption.warnings.append(
+                f"This install's appliance identity could not be kept ({exc}). The appliance "
+                "will be refused by the control plane until it is paired again."
+            )
 
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
     # DNSSEC-enabled zones and surface a registrar-republish
@@ -1525,6 +1554,7 @@ async def _apply_backup_restore_inner(
         post_warnings.insert(0, schema_override_warning)
     if fold_warning:
         post_warnings.append(fold_warning)
+    post_warnings.extend(adoption.warnings)
 
     # Say plainly that the restore reached past the ticked sections.
     # An operator who picked "DNS" and finds their IPAM rows reverted
@@ -1589,4 +1619,5 @@ async def _apply_backup_restore_inner(
         rewrap=rewrap_outcome,
         warnings=post_warnings,
         reconciled_backup_targets=reconciled,
+        adopted_appliances=adoption.adopted,
     )

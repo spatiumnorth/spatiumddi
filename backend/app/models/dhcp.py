@@ -105,7 +105,8 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     # Kea HA hook tuning — rendered into libdhcp_ha.so config when the
-    # group is an HA pair. Defaults mirror Kea's documented recommendations.
+    # group is an HA pair. Defaults mirror Kea's documented ones except the
+    # heartbeat, which is 2000 ms rather than Kea's 10000 (#3779, #3854).
     heartbeat_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     max_response_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=60000)
     max_ack_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
@@ -346,6 +347,10 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # carries the field. Read by the server-list chip and the
     # ``agent_spool_trimmed`` alert.
     spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # #4193 — the agent's actual memory use as last reported on the heartbeat
+    # (container used / peak / limit, Kea's and the agent's RSS, reported_at).
+    # NULL = never reported: UNKNOWN, never 0.
+    memory_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # #1067 — the agent's own word about the Kea daemon, reported on every
     # heartbeat (``daemon: {status, reason}``; sync.py sets ``degraded`` when a
     # control socket is unreachable or a config was rejected, ``ok`` after a

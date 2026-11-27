@@ -44,6 +44,9 @@ class HeldZone(NamedTuple):
     #: True: the daemon keeps serving the zone's last good copy. False: the
     #: zone never loaded, so it is not served at all.
     served: bool
+    #: True: held for its NAME (too long for the agent's files, #3843), not for
+    #: anything in its data, so named-checkzone never saw it.
+    name_hold: bool = False
 
 
 class DriverBase(ABC):
@@ -163,6 +166,17 @@ class DriverBase(ABC):
         loop reports both kinds as the same partial apply.
         """
         return list(self._refused_zones)
+
+    def control_plane_confirmed(self) -> None:
+        """The control plane just answered that the live bundle is its current
+        one: a 304 for it, or a 200 whose structure is the one applied.
+
+        The hook for work that must never run off a cached bundle while the
+        control plane is unreachable (non-negotiable #5); the PowerDNS driver
+        deletes the zones the bundle dropped here (#4564). Called on the sync
+        thread, possibly on every poll, so it must be cheap when idle.
+        """
+        return None
 
     def apply_config(self, bundle: dict[str, Any]) -> None:
         """Default orchestration: render → validate → swap+reload.

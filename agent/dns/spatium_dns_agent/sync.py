@@ -98,8 +98,10 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # (``periodic_served_serials``) is asked between changes. Named also moves a
 # zone's serial through updates this agent never sent (a third party's RFC
 # 2136 client, a DNSSEC key event on a signed zone); nothing else reports
-# those, and the zone would read in sync at a serial no longer served.
-SERVED_REPORT_SECONDS = 120.0
+# those, and the zone would read in sync at a serial no longer served. A
+# secondary's transfer is the same (#4065): named takes a newer serial, or a
+# first one, with no apply here.
+SERVED_REPORT_SECONDS = 60.0
 
 # #2309 — how often the key directory is re-checked between structural
 # applies, so a zone's key files go when its grace period ends.
@@ -147,6 +149,11 @@ def _serial_later(new: int, old: int) -> bool:
     return 0 < (new - old) % 2**32 < 2**31
 
 
+def _view_names(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """The bundle's views reduced to their names (#4053)."""
+    return [{"name": v.get("name")} for v in bundle.get("views") or [] if v.get("name")]
+
+
 def _zone_key(name: Any) -> str:
     """A zone name as the zone-state bookkeeping keys it: the bundle names
     zones with the trailing dot, and nothing here depends on whether an op
@@ -185,17 +192,26 @@ def _partial_apply_error(held: Sequence[HeldZone], refused: Sequence[str]) -> st
     No driver produces both today; if one ever did, both are named here.
     """
     parts: list[str] = []
-    if held:
+    # A zone held for its name (#3843) was never checked or refused by anything:
+    # no change to its data will load it, so it is worded apart from the zones
+    # named-checkzone refused (#1403).
+    for group, lead in (
+        ([h for h in held if not h.name_hold], "named-checkzone refused {count}, held back until the data loads"),
+        ([h for h in held if h.name_hold], "the agent holds back {count} whose name is too long for its files"),
+    ):
+        if not group:
+            continue
         zones = "; ".join(
             f"{h.zone}{f' (view {h.view})' if h.view else ''}: {h.reason} ("
             + ("still served from its last good copy" if h.served else "not served")
             + ")"
-            for h in held
+            for h in group
         )
-        count = "a zone file" if len(held) == 1 else f"{len(held)} zone files"
+        noun = "zone file" if lead.startswith("named") else "zone"
+        count = f"a {noun}" if len(group) == 1 else f"{len(group)} {noun}s"
         parts.append(
-            f"named-checkzone refused {count}, held back until the data loads; "
-            f"every other change in this config is live: {zones}"
+            lead.format(count=count)
+            + f"; every other change in this config is live: {zones}"
         )
     if refused:
         parts.append(
@@ -221,6 +237,10 @@ def _thaw(frozen: bytes | None) -> Any:
 
 
 class SyncLoop:
+    # Class default so a loop built without __init__ (tests) reads "not known".
+    _live_etag: str | None = None
+    _retire_held = False
+
     def __init__(
         self,
         cfg: AgentConfig,
@@ -241,6 +261,12 @@ class SyncLoop:
         # but leave structural_etag alone — the agent then drains record ops
         # via RFC 2136 over loopback without bouncing the daemon.
         self._current_structural_etag: str | None = None
+        # #4564 — full etag of the bundle whose structure the daemon runs, or
+        # None when that is not known to be any one bundle (a failed apply, a
+        # revert). ``_current_etag`` is not it: a quarantined bundle is parked
+        # on its etag while the last-known-good serves. See
+        # ``_confirm_live_bundle``.
+        self._live_etag: str | None = None
         # structural_etag of the bundle _apply_with_revert is applying, so a
         # failure is quarantined by structure (#2647).
         self._applying_structural: str | None = None
@@ -374,8 +400,10 @@ class SyncLoop:
         The startup path, and (#2019) the offline end of a startup hold, where
         ``before_sync`` is False: the control plane has been asked already."""
         self._current_etag = etag
+        self._live_etag = None
         try:
             self._guarded_apply(bundle, etag)
+            self._live_etag = etag
             self._current_structural_etag = self._applied_fingerprint(bundle)
             if not booting_from_previous:
                 # Zones refused or held back are reported, not reverted —
@@ -449,6 +477,54 @@ class SyncLoop:
                     )
                 self._bootstrap_fallback(etag, e, before_sync=before_sync)
             return False
+
+    def _confirm_live_bundle(self) -> None:
+        """Tell the driver the control plane vouches for the live bundle (#4564).
+
+        Reached only from an answer of the control plane's in this poll: a 304
+        for the bundle that is live, or a 200 whose structure is live. Never
+        from the cache at startup, a revert, or a boot-hold fallback, so what
+        the driver does here (PowerDNS deletes the zones the bundle dropped)
+        cannot happen while the control plane is unreachable."""
+        try:
+            self.driver.control_plane_confirmed()
+        except Exception:
+            log.exception("control_plane_confirmed_hook_failed")
+        self._report_retire_hold()
+
+    def _report_retire_hold(self) -> None:
+        """Surface a held zone-retire pass (#4564) as a warning on the server row.
+
+        Same channel as a partial apply (``reverted`` + the partial prefix, a
+        degraded daemon echo), since nothing here is a failure to revert and
+        the status vocabulary has no warning of its own. Cleared when a later
+        pass no longer holds."""
+        msg = getattr(self.driver, "retire_warning", None)
+        if msg:
+            error = truncate_error(PARTIAL_APPLY_PREFIX + msg)
+            self._retire_held = True
+            self._zones_refused = True
+            self.apply_status = ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=self._live_etag,
+                failed_etag=self._live_etag,
+                phase=PHASE_RELOAD,
+                error=error,
+            )
+            self.heartbeat.config_apply = self.apply_status
+            self.heartbeat.daemon_status = {
+                **self.heartbeat.daemon_status,
+                "status": "degraded",
+                "reason": f"config_apply_{STATUS_REVERTED}: {error}",
+            }
+        elif self._retire_held:
+            self._retire_held = False
+            self._zones_refused = False
+            self.apply_status = ApplyStatus(status=STATUS_OK, etag=self._live_etag)
+            self.heartbeat.config_apply = self.apply_status
+            reason = str(self.heartbeat.daemon_status.get("reason") or "")
+            if reason.startswith("config_apply_"):
+                self.heartbeat.daemon_status = {"status": "ok"}
 
     def _guarded_apply(self, bundle: dict[str, Any], etag: str | None) -> None:
         """``driver.apply_config`` under the #2019 death-during-apply marker.
@@ -850,15 +926,19 @@ class SyncLoop:
     def _dnssec_bundle(self, bundle: dict[str, Any] | None) -> None:
         if bundle is None:
             self._dnssec_frozen: bytes | None = None
+            self._applied_views: list[dict[str, Any]] = []
             return
         self._dnssec_frozen = _freeze(
             {
                 "zones": [
                     {k: v for k, v in zone.items() if k != "records"}
                     for zone in bundle.get("zones") or []
-                ]
+                ],
             }
         )
+        # #4053 — the view names alone (a few short strings), for the startup
+        # report's read-back after a re-registration.
+        self._applied_views = _view_names(bundle)
 
     # #1373 / #2223 — the serial last reported per zone. One entry per zone,
     # created while the bundle that carried it is still alive, so it pins the
@@ -888,10 +968,20 @@ class SyncLoop:
             return
         self._boot_report_frozen = _freeze(
             {
+                # #4053 — ``served_zone_serials`` picks what to read back from
+                # named by each zone's ``type`` and by the bundle's views; with
+                # neither kept, a secondary was read as a primary and a group
+                # with views as one without.
                 "zones": [
-                    {"name": zone.get("name"), "serial": zone.get("serial")}
+                    {
+                        "name": zone.get("name"),
+                        "serial": zone.get("serial"),
+                        # Absent stays absent: it reads as "primary".
+                        **({"type": zone["type"]} if "type" in zone else {}),
+                    }
                     for zone in bundle.get("zones") or []
-                ]
+                ],
+                "views": _view_names(bundle),
             }
         )
 
@@ -966,7 +1056,7 @@ class SyncLoop:
                     # Record ops moved it past the structural apply's serial.
                     zone = {**zone, "serial": served}
                 zones.append(zone)
-            self._boot_report_bundle = {"zones": zones}
+            self._boot_report_bundle = {"zones": zones, "views": self._applied_views}
             self._boot_report_attempts = 0
         self._reported_serials = {}
         self._dnssec_reported = None
@@ -1060,6 +1150,8 @@ class SyncLoop:
             return
 
         if resp.status_code == 304:
+            if self._live_etag is not None and self._live_etag == self._current_etag:
+                self._confirm_live_bundle()
             return
         if resp.status_code in (401, 404):
             # 401 = token expired/invalid. 404 = the server row was deleted
@@ -1195,8 +1287,10 @@ class SyncLoop:
 
             # DNSSEC (issue #49): BIND9 signs inline from the rendered
             # config, so after a structural reload we read each signed
-            # zone's DS + per-key state and report it. PowerDNS reports via
-            # the op path below instead (so its driver has no collector).
+            # zone's DS + per-key state and report it; Technitium does the
+            # same through its API (#1767), and so does PowerDNS (#4566: the
+            # reconcile signs a flagged zone that lost its keys, and this
+            # carries the new DS). PowerDNS also reports from the sign op below.
             self._dnssec_bundle = bundle
             self._refresh_dnssec_state(force=True)
 
@@ -1209,6 +1303,9 @@ class SyncLoop:
                 log.exception("rendered_config_push_failed")
 
         self._current_etag = etag
+        # Either applied just above or structurally what was already live.
+        self._live_etag = etag
+        self._confirm_live_bundle()
 
         # Drain pending record ops via RFC 2136 (no daemon reload)
         dnssec_states: list[dict[str, Any]] = []
@@ -1353,6 +1450,7 @@ class SyncLoop:
         needs the previous config put back on disk.
         """
         self._applying_structural = bundle.get("structural_etag")
+        self._live_etag = None
         try:
             self._guarded_apply(bundle, etag)
         except ConfigApplyError as e:

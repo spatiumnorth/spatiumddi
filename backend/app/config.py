@@ -2,6 +2,7 @@ import base64
 import binascii
 import re
 import sys
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -62,6 +63,19 @@ def signing_key_weakness(key: str) -> str | None:
     return None
 
 
+def credential_key_writes_deferred(since: str, version: str) -> bool:
+    """True while a dedicated credential key must be read but not written (#1358).
+
+    ``since`` is the version stamped when the key was added to a running
+    install; ``version`` is this process's own. Equal means this process is
+    part of the rollout that introduced the key, where a reader without it may
+    still be running. Any other version comes later (every reader since has
+    the key), so writes move onto it.
+    """
+    since = (since or "").strip()
+    return bool(since) and since == (version or "").strip()
+
+
 def credential_key_problem(key: str) -> str | None:
     """Why ``key`` cannot be the CREDENTIAL_ENCRYPTION_KEY, or None if it can.
 
@@ -102,6 +116,15 @@ class Settings(BaseSettings):
     task_db_command_timeout: float = 120
     task_db_long_command_timeout: float = 900
 
+    # Celery worker child recycling (#4306). A prefork child that grows is
+    # replaced after this many tasks or once its RSS passes the memory cap,
+    # so a slow leak is bounded per child rather than per pod. 0 disables
+    # either one. Memory is in KiB (Celery's unit): 409600 = 400 MiB, well
+    # under the worker's 2Gi pod limit at concurrency 4 (children rest near
+    # 130 MB). Only the worker reads these; beat ignores them.
+    worker_max_tasks_per_child: int = 1000
+    worker_max_memory_per_child_kib: int = 409600
+
     # Redis
     redis_url: str = "redis://redis:6379/0"
     # Redis Sentinel (#272 Phase 3). When ``redis_url`` /
@@ -118,6 +141,16 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
     credential_encryption_key: str = ""
+    # #1358 — the release that FIRST carried ``credential_encryption_key`` on
+    # this install, stamped by the Helm chart / appliance firstboot when they
+    # add a key to an install that was already running. While the running
+    # version equals it, the dedicated key is read but never written: the
+    # rollout that introduced it may still have pods (older image, or started
+    # before the Secret had the key) that can only read the SECRET_KEY-derived
+    # key, and a value written under the dedicated key would be unreadable to
+    # them. Empty (fresh install, compose, an operator-set key) = write with
+    # it straight away. See :func:`credential_key_writes_deferred`.
+    credential_key_since: str = ""
 
     # CORS — comma-separated allowed origins (e.g.
     # "https://ddi.example.com,https://ipam.example.com"). Default "*"
@@ -176,8 +209,9 @@ class Settings(BaseSettings):
 
     # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
     # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
-    # encrypted with the Fernet helper in app.core.crypto using
-    # credential_encryption_key (or falling back to secret_key).
+    # encrypted with the Fernet helper in app.core.crypto: new writes use
+    # credential_encryption_key when set (else a key derived from secret_key),
+    # and the derived key stays a read fallback (#1358).
 
     # Celery
     celery_broker_url: str = "redis://redis:6379/1"
@@ -200,6 +234,13 @@ class Settings(BaseSettings):
     prometheus_metrics_token: str = ""
     # False restores anonymous scraping. Not recommended: see above.
     prometheus_metrics_require_auth: bool = True
+
+    # #4548 — bcrypt hash the first ``admin`` user is created with, instead of
+    # admin / admin plus a forced password change. The appliance installer
+    # collects the web UI password and hands the hash over through the app
+    # Secret; Compose / Helm operators may set it themselves. Only read when
+    # the user table is empty; a value that is not a bcrypt hash is ignored.
+    initial_admin_password_hash: str = ""
 
     # DNS agent
     dns_agent_key: str = ""
@@ -395,6 +436,18 @@ class Settings(BaseSettings):
     # A request carrying the version header is always held to the current
     # form, whatever this says.
     appliance_legacy_signature_allowed: bool = True
+
+    # Re-registration of an appliance that is already paired returns a fresh
+    # session token, so a supervisor signs it with its own key. This is
+    # separate from the flag above, which covers heartbeat signatures only.
+    #   legacy - an unsigned re-registration is accepted when the appliance
+    #            has never reported that it signs AND its last reported
+    #            supervisor version is older than 1.0.1 (or unknown). Each one
+    #            is recorded in the audit log and counts against the
+    #            registration attempt budget.
+    #   never  - an unsigned re-registration is always refused.
+    # The default becomes ``never`` in 1.1.0.
+    appliance_unsigned_register_allowed: Literal["legacy", "never"] = "legacy"
 
     # #1003 item 2 — the OS installer's "Time source" answer, stamped into
     # the api's environment by spatiumddi-firstboot from the STATE config.

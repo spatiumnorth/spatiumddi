@@ -11,6 +11,7 @@ import {
   type SyslogTarget,
   type SyslogTargetWrite,
 } from "@/lib/api";
+import { SettingsRow } from "@/components/SettingsRow";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
 
@@ -19,28 +20,6 @@ interface Props {
   isSuperadmin: boolean;
   applianceMode: boolean;
   inputCls: string;
-}
-
-function Field({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-8 py-3">
-      <div className="max-w-xl">
-        <div className="text-sm font-medium">{label}</div>
-        {description && (
-          <div className="text-xs text-muted-foreground">{description}</div>
-        )}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
-  );
 }
 
 // Per-target editor draft. ``ca_cert_set`` carries whether a CA PEM is
@@ -185,7 +164,7 @@ export function SyslogSection({
         </div>
       )}
 
-      <Field
+      <SettingsRow
         label="Forward logs off-box"
         description="When on, rsyslog ships the appliance's journald + file log sources to the destinations below. Forwarding is outbound only — no inbound firewall port is opened."
       >
@@ -194,7 +173,7 @@ export function SyslogSection({
           onChange={setEnabled}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
       <div className="rounded-md border bg-muted/30 p-3">
         <div className="mb-2 flex items-center justify-between">
@@ -303,9 +282,9 @@ export function SyslogSection({
         )}
       </div>
 
-      <Field
+      <SettingsRow
         label="Filter (rsyslog selector)"
-        description="Which messages to forward, as an rsyslog selector (e.g. ``*.*`` for everything, ``authpriv.*`` for auth logs, ``*.warning`` for warnings and above). Empty defaults to ``*.*``."
+        description="Which messages to forward, as an rsyslog selector (e.g. ‘*.*’ for everything, ‘authpriv.*’ for auth logs, ‘*.warning’ for warnings and above). Empty defaults to ‘*.*’."
       >
         <input
           type="text"
@@ -315,9 +294,9 @@ export function SyslogSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-64 max-w-full font-mono")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Disk-assisted buffering"
         description="When on, each forward action uses a disk-backed queue so a brief collector outage doesn't drop logs (capped at 256 MB per target, saved across restarts). Adds disk I/O; leave off for high-volume/low-latency setups that prefer to drop on outage."
       >
@@ -326,7 +305,7 @@ export function SyslogSection({
           onChange={setBufferDisk}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
       <div className="mt-4 flex items-center gap-3 border-t pt-4">
         <button

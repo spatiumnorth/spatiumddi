@@ -19,6 +19,7 @@ from app.celery_app import (
     REDIS_SOCKET_CONNECT_TIMEOUT_S,
     REDIS_SOCKET_TIMEOUT_S,
     WORKER_TERMINATION_GRACE_S,
+    SpatiumConsumer,
     build_redis_transport_options,
     celery_app,
 )
@@ -273,3 +274,91 @@ def test_retry_rejected_by_the_broker_is_requeued(monkeypatch):
     with pytest.raises(Reject) as info:
         SpatiumTask.retry(task)
     assert info.value.requeue is False
+
+
+class _FakeBrokerConnection:
+    """Stands in for kombu's Connection after a Sentinel master was lost.
+
+    ``close`` raises what kombu 5.7.0's ``restore_unacked`` -> ``_connparams``
+    raises once ``collect()`` has dropped ``transport.client`` (#4159).
+    """
+
+    def __init__(self):
+        self.closed = False
+
+    def collect(self, socket_timeout=None):
+        pass
+
+    def close(self):
+        self.closed = True
+        raise AttributeError("'NoneType' object has no attribute 'hostname'")
+
+
+def test_consumer_reconnect_survives_failed_unacked_restore():
+    """The AttributeError from the channel close must not escape the consumer
+    loop as an unrecoverable error: the worker has to go on reconnecting."""
+    from types import SimpleNamespace
+
+    from app.celery_app import SpatiumConsumer
+
+    consumer = object.__new__(SpatiumConsumer)
+    consumer.app = SimpleNamespace(
+        conf=SimpleNamespace(
+            worker_enable_prefetch_count_reduction=False,
+            worker_cancel_long_running_tasks_on_connection_loss=False,
+        )
+    )
+    conn = _FakeBrokerConnection()
+    consumer.connection = conn
+
+    consumer.on_connection_error_after_connected(ConnectionError("refused"))
+
+    assert conn.closed is True
+    assert consumer.connection is None
+
+
+def test_stats_broker_info_is_json_native_on_sentinel_4330():
+    """``inspect stats`` replies carry the consumer connection's info(); a Sentinel
+    broker's ``sentinel_kwargs`` holds a redis ``Retry`` kombu cannot encode, and
+    the password, so the stats report must omit it (#4330)."""
+    from types import SimpleNamespace
+
+    from kombu import Connection
+    from kombu.utils.imports import symbol_by_name
+    from kombu.utils.json import dumps
+    from redis.retry import Retry
+
+    opts = build_redis_transport_options("sentinel://s:26379", "mymaster", "secret-pw")
+    conn = Connection("sentinel://s:26379", transport_options=opts)
+    # The connection itself keeps the retry-free Sentinel client config.
+    assert isinstance(conn.info()["transport_options"]["sentinel_kwargs"]["retry"], Retry)
+
+    # The step the worker's consumer blueprint really runs for the stats reply.
+    step_cls = symbol_by_name(SpatiumConsumer.Blueprint.default_steps[0])
+    step = step_cls.__new__(step_cls)
+    broker = step.info(SimpleNamespace(connection=conn))["broker"]
+    payload = dumps(broker)  # raised EncodeError before the fix
+    assert "secret-pw" not in payload
+    assert "sentinel_kwargs" not in broker["transport_options"]
+    assert broker["transport_options"]["master_name"] == "mymaster"
+    assert conn.info()["transport_options"]["sentinel_kwargs"]["retry"]  # untouched
+
+
+def test_consumer_blueprint_uses_spatium_connection_step_4330():
+    from celery.worker.consumer import Consumer
+
+    steps = SpatiumConsumer.Blueprint.default_steps
+    assert "app.celery_app:SpatiumConnectionStep" in steps
+    assert "celery.worker.consumer.connection:Connection" not in steps
+    assert len(steps) == len(Consumer.Blueprint.default_steps)
+
+
+def test_consumer_blueprint_holds_one_connection_step_4436():
+    """The subclass replaces the stock Connection step; it does not join it."""
+    from celery.worker.consumer.connection import Connection as StockConnection
+
+    blueprint = SpatiumConsumer.Blueprint()
+    steps = blueprint._finalize_steps(blueprint.claim_steps())
+    # ``_finalize_steps`` yields step classes, in start order.
+    connection_steps = [s for s in steps if issubclass(s, StockConnection)]
+    assert [s.__name__ for s in connection_steps] == ["SpatiumConnectionStep"], steps

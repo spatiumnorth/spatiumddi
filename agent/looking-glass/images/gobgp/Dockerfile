@@ -48,7 +48,7 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 # Stated in the PAST tense on purpose: Dependabot bumps the ``FROM`` line but
 # cannot touch this comment, so any wording that names the CURRENT pin goes
 # stale on the very next bump — which is exactly what happened at 1.26.6.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS gobgp-build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
 ARG TARGETARCH
@@ -187,3 +187,23 @@ ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/spatium-lg-entrypoint"]
 # "dev". Last, so a new version only rebuilds this layer.
 ARG APP_VERSION=dev
 ENV SPATIUM_AGENT_VERSION=${APP_VERSION}
+
+# #3913 — image metadata the OCI spec and Red Hat's preflight expect, plus the
+# project licence texts at /licenses. ``release`` is the image build number,
+# not the product version; ``version`` follows APP_VERSION from release.yml.
+ARG IMAGE_RELEASE=1
+COPY LICENSE NOTICE /licenses/
+LABEL name="looking-glass" \
+      vendor="Spatium North Inc." \
+      version="${APP_VERSION:-dev}" \
+      release="${IMAGE_RELEASE}" \
+      summary="SpatiumDDI BGP Looking Glass collector" \
+      description="Receive-only GoBGP collector with the SpatiumDDI agent for the BGP Looking Glass." \
+      maintainer="Spatium North Inc. <https://www.spatiumddi.com/>" \
+      url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.title="looking-glass" \
+      org.opencontainers.image.vendor="Spatium North Inc." \
+      org.opencontainers.image.url="https://www.spatiumddi.com/" \
+      org.opencontainers.image.source="https://github.com/spatiumnorth/spatiumddi" \
+      org.opencontainers.image.documentation="https://www.spatiumddi.com/" \
+      org.opencontainers.image.licenses="Apache-2.0"

@@ -60,6 +60,7 @@ from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.dns.agent_bundle_store import WIRE_JSON, BodyWriter
+from app.services.dns.blocklist_pack import EntryPacker, pack_entries
 from app.services.dns.dnssec_trust import (
     effective_dnssec_validation,
     render_as_initial_key,
@@ -671,6 +672,8 @@ class EncodedBody:
     structural_etag: str
     records: int
     has_views: bool
+    # #4040 — the blocklist entries went out as packed runs.
+    packed_blocklists: bool = False
 
 
 #: Blocklist entries read, serialised and hashed per step of the streamed
@@ -690,6 +693,8 @@ class _StreamedEntries:
     lists: list[Any]
     hash_mark: str | None = None
     hasher: Any = None
+    # #4040 — the server's agent reads packed runs of entries.
+    pack: bool = False
 
 
 @dataclass(frozen=True)
@@ -788,20 +793,54 @@ def _cut(text: str, marks: list[str], kwargs: dict[str, Any]) -> list[bytes]:
     return parts
 
 
+def _write_items(
+    items: list[dict[str, Any]],
+    first: bool,
+    hashes: tuple[Callable[[bytes], None], ...],
+    write: Callable[[bytes], None],
+) -> bool:
+    """Write ``items`` into a streamed ``entries`` list; the new ``first``."""
+    if not items:
+        return first
+    hashed = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
+    wire = json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8")
+    if not first:
+        # json.dumps's item separators: ", " by default, "," on the wire.
+        hashed = b", " + hashed
+        wire = WIRE_JSON["separators"][0].encode("utf-8") + wire
+    for update in hashes:
+        update(hashed)
+    write(wire)
+    return False
+
+
 async def _stream_zone_entries(
     db: AsyncSession,
     lists: list[Any],
     hashes: tuple[Callable[[bytes], None], ...],
     write: Callable[[bytes], None],
+    pack: bool = False,
+    content_hash: Callable[[bytes], None] | None = None,
 ) -> None:
     """Write one RPZ zone's ``entries`` list, a batch at a time: into the ETag
     hashes as ``json.dumps`` with ``_ETAG_JSON`` would serialise it, and into
     the body as ``WIRE_JSON`` would. A JSON list is its items joined by the
     item separator, so a batch serialised on its own, minus its brackets,
-    joins the next one exactly where the whole list would have."""
+    joins the next one exactly where the whole list would have.
+
+    ``pack`` (#4040): consecutive alike entries go out as one gzip + base64
+    run (``blocklist_pack``); a batch may then complete no item, or several.
+    ``content_hash`` (an RPZ zone's hasher, #2157) is always fed the per-entry
+    form, so a zone's hash — and the serial the agent derives from it — does
+    not depend on the shape, and a server whose agent starts reading packed
+    entries keeps the zone files it has."""
     first = True
+    first_plain = True
+    packer = EntryPacker() if pack else None
     for update in hashes:
         update(b"[")
+    if content_hash is not None:
+        content_hash(b"[")
     write(b"[")
     # ``aclosing``: a failure here (not in the generator) must close the
     # list's server-side cursor now, on this connection, rather than leave it
@@ -810,19 +849,20 @@ async def _stream_zone_entries(
     async with aclosing(stream_entries(db, lists, BLOCKLIST_RENDER_BATCH)) as batches:
         async for batch in batches:
             items = [_entry_dict(*entry) for entry in batch]
-            hashed = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
-            wire = json.dumps(items, **WIRE_JSON)[1:-1].encode("utf-8")
+            if content_hash is not None and items:
+                plain = json.dumps(items, **_ETAG_JSON)[1:-1].encode("utf-8")
+                content_hash(plain if first_plain else b", " + plain)
+                first_plain = False
+            if packer is not None:
+                items = packer.feed(items)
+            first = _write_items(items, first, hashes, write)
             del items
-            if not first:
-                # json.dumps's item separators: ", " by default, "," on the wire.
-                hashed = b", " + hashed
-                wire = WIRE_JSON["separators"][0].encode("utf-8") + wire
-            for update in hashes:
-                update(hashed)
-            write(wire)
-            first = False
+        if packer is not None:
+            first = _write_items(packer.finish(), first, hashes, write)
     for update in hashes:
         update(b"]")
+    if content_hash is not None:
+        content_hash(b"]")
     write(b"]")
 
 
@@ -1132,9 +1172,14 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
                 writer.write(json.dumps(value, **WIRE_JSON).encode("utf-8"))
                 continue
             hashes = (structural_hash.update, etag_hash.update)
-            if zone.hasher is not None:
-                hashes = (*hashes, zone.hasher.update)
-            await _stream_zone_entries(db, zone.lists, hashes, writer.write)
+            await _stream_zone_entries(
+                db,
+                zone.lists,
+                hashes,
+                writer.write,
+                zone.pack,
+                zone.hasher.update if zone.hasher is not None else None,
+            )
 
         structural_hash.update(structural_parts[n])
         structural_spool.drain(structural_hash.update)
@@ -1164,6 +1209,7 @@ async def encode_bundle_body(db: AsyncSession, server: DNSServer) -> EncodedBody
         structural_etag=structural_etag,
         records=records,
         has_views=assembled.has_views,
+        packed_blocklists=bool(server.agent_renders_packed_blocklists),
     )
 
 
@@ -1586,7 +1632,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # group flag can only ever tighten, never loosen, recursion.
     group_is_recursive = bool(getattr(grp, "is_recursive", True)) if grp else True
     opts_recursion_enabled = getattr(opts, "recursion_enabled", True) if opts else True
-    options_block = {
+    options_block: dict[str, Any] = {
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
         "recursion_enabled": opts_recursion_enabled and group_is_recursive,
@@ -1617,6 +1663,16 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
         "query_log_enabled": (bool(getattr(opts, "query_log_enabled", False)) if opts else False),
+        # #4594 — channel severity and print-* flags. The BIND9 agent reads
+        # them (``_query_log_channel_settings``); absent, every group rendered
+        # the historical defaults whatever the operator saved.
+        "query_log_severity": (getattr(opts, "query_log_severity", "info") if opts else "info"),
+        "query_log_print_category": (
+            bool(getattr(opts, "query_log_print_category", True)) if opts else True
+        ),
+        "query_log_print_severity": (
+            bool(getattr(opts, "query_log_print_severity", True)) if opts else True
+        ),
         # Response logging (#914) — same reasoning: it changes the rendered
         # named.conf, so it belongs in the fingerprint or a UI toggle would
         # not shift the etag and the agent would never re-render.
@@ -1679,6 +1735,11 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # an upgrade reloads nothing. BIND9-only: PowerDNS / Technitium have
         # no such setting and the API refuses a non-default value for them.
         options_block["allow_query_cache"] = list(opts.allow_query_cache or [])
+    # #4185 — the group's ``max-cache-size``. Shipped only when set, so a group
+    # that has not chosen one keeps the bundle (and etag) it had before; the
+    # BIND9 agent applies it to every recursive view's cache.
+    if grp is not None and grp.max_cache_size and server.driver == "bind9":
+        options_block["max_cache_size"] = grp.max_cache_size
     # #2263 — the group ``blackhole`` list. Accepted and validated since
     # #1244 and never shipped, so no agent could render it. Shipped only when
     # set: an absent key reads as empty on the agent, so a group that does not
@@ -1901,6 +1962,8 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     streamed: list[_StreamedEntries] = []
     # #2157 — only the BIND9 agent reads the per-zone content hash.
     rpz_hashes = server.driver == "bind9"
+    # #4040 — an agent that reads packed entries is sent them packed.
+    packs = bool(server.agent_renders_packed_blocklists)
 
     async def _streamed_zone(
         lists: list[Any] | None, rpz_zone_name: str, view_name: str | None
@@ -1926,9 +1989,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
                 lists=lists,
                 hash_mark=_placeholder(),
                 hasher=_rpz_hasher(rpz_zone_name, exceptions),
+                pack=packs,
             )
             if rpz_hashes
-            else _StreamedEntries(mark=mark, lists=lists)
+            else _StreamedEntries(mark=mark, lists=lists, pack=packs)
         )
         if zone.hash_mark is not None:
             zone_dict[RPZ_CONTENT_HASH_KEY] = zone.hash_mark
@@ -1943,6 +2007,10 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             hasher = _rpz_hasher(zone_dict["rpz_zone_name"], zone_dict["exceptions"])
             hasher.update(json.dumps(zone_dict["entries"], **_ETAG_JSON).encode("utf-8"))
             zone_dict[RPZ_CONTENT_HASH_KEY] = _rpz_hash_value(hasher)
+        if packs:
+            # After the hash, which is over the per-entry form (see
+            # ``_stream_zone_entries``).
+            zone_dict["entries"] = pack_entries(zone_dict["entries"])
         return zone_dict
 
     # #1706 — a view's own zone already folds in the group's lists, so the

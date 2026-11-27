@@ -18,6 +18,7 @@ import { pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
 import { safeExternalHref } from "@/lib/safeUrl";
 import { helmChartVersion } from "@/lib/versions";
+import { FormError } from "@/components/ui/form-error";
 
 // Number of most-recent releases rendered as full cards. Anything older
 // collapses behind a "Show N older releases" disclosure so the tab
@@ -78,9 +79,9 @@ export function ReleasesTab({
           banner is gone; on the appliance this catalog stays read-only
           (upgrades are driven by the orchestrator above / OS Versions). */}
       {error && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
           Failed to load releases: {formatApiError(error)}
-        </div>
+        </FormError>
       )}
 
       {isLoading ? (
@@ -324,7 +325,7 @@ function ReleaseCard({
 // Shown on docker / k8s control planes (no host-side update mechanism,
 // and no A/B slot flow either). The operator copies a command + runs it
 // against the deployment they manage.
-function ManualApplyModal({
+export function ManualApplyModal({
   tag,
   onClose,
 }: {
@@ -342,8 +343,10 @@ function ManualApplyModal({
   const chartVersion = helmChartVersion(tag);
   const k8sCmd = [
     "# On a workstation with kubectl + helm pointed at the cluster:",
-    "helm upgrade spatiumddi \\",
+    "# Use your own release name and namespace (`helm list -A` shows both):",
+    "helm upgrade <release> \\",
     "  oci://ghcr.io/spatiumnorth/charts/spatiumddi \\",
+    "  -n <namespace> \\",
     ...(chartVersion ? [`  --version ${chartVersion} \\`] : []),
     `  --set image.tag=${tag} \\`,
     "  --reuse-values",

@@ -53,8 +53,9 @@ from app.services.tags import apply_tag_filter
 
 # Single router; sub-paths live as separate decorated handlers below.
 # Permission gate applies once at the router level — every endpoint
-# requires admin on ``overlay_network`` (the routing-policy mutations
-# also re-check ``routing_policy``).
+# requires the method's action on ``overlay_network``; the routing-policy
+# mutations (POST / PUT / DELETE ``/{id}/policies``) also require it on
+# ``routing_policy`` (#4316).
 router = APIRouter(
     tags=["overlays"],
     dependencies=[Depends(require_resource_permission("overlay_network"))],
@@ -428,7 +429,7 @@ async def list_overlays(
         stmt = stmt.where(OverlayNetwork.name.ilike(needle))
     stmt = apply_tag_filter(stmt, OverlayNetwork.tags, tag)
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
-    stmt = stmt.order_by(OverlayNetwork.name.asc()).limit(limit).offset(offset)
+    stmt = stmt.order_by(OverlayNetwork.name.asc(), OverlayNetwork.id).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()
     items = [await _read_overlay(db, r) for r in rows]
     return OverlayListResponse(items=items, total=total, limit=limit, offset=offset)
@@ -803,6 +804,7 @@ async def list_policies(overlay_id: uuid.UUID, db: DB, _: CurrentUser) -> list[R
     "/{overlay_id:uuid}/policies",
     response_model=RoutingPolicyRead,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_resource_permission("routing_policy"))],
 )
 async def create_policy(
     overlay_id: uuid.UUID,
@@ -842,6 +844,7 @@ async def create_policy(
 @router.put(
     "/{overlay_id:uuid}/policies/{policy_id:uuid}",
     response_model=RoutingPolicyRead,
+    dependencies=[Depends(require_resource_permission("routing_policy"))],
 )
 async def update_policy(
     overlay_id: uuid.UUID,
@@ -889,6 +892,7 @@ async def update_policy(
 @router.delete(
     "/{overlay_id:uuid}/policies/{policy_id:uuid}",
     status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_resource_permission("routing_policy"))],
 )
 async def delete_policy(
     overlay_id: uuid.UUID,

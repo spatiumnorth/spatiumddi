@@ -16,6 +16,7 @@ from .config import AgentConfig
 from .config_apply import ApplyStatus
 from .drivers.base import DriverBase
 from .instance import AGENT_INSTANCE, AGENT_INSTANCE_HEADER
+from .memory_stats import memory_report
 from .oom_watch import cgroup_memory_limit_bytes
 from .spool import SpoolManager
 
@@ -67,6 +68,8 @@ class HeartbeatClient:
         # #3551 — same fallback for the memory limit, which a control plane
         # older than #3551 also refuses (extra="forbid").
         self._memory_field_unsupported = False
+        # #4193 — and for the ``memory`` block (container usage + RSS).
+        self._memory_block_unsupported = False
 
     # A failing probe must not be retried forever. Unlike the DHCP agent's
     # ``_kea_version``, which polls a control socket that is legitimately down
@@ -105,12 +108,12 @@ class HeartbeatClient:
     def stop(self) -> None:
         self._stop.set()
 
-    def _client(self) -> httpx.Client:
+    def _client(self, timeout: float = 15.0) -> httpx.Client:
         verify = self.cfg.httpx_verify()
         return httpx.Client(
             base_url=self.cfg.control_plane_url,
             verify=verify,
-            timeout=15.0,
+            timeout=timeout,
             headers=features.headers(),
         )
 
@@ -122,7 +125,24 @@ class HeartbeatClient:
             AGENT_INSTANCE_HEADER: AGENT_INSTANCE,
         }
 
-    def send_once(self) -> None:
+    def announce(self) -> None:
+        """Name this process to the control plane before the boot apply (#4139).
+
+        The first heartbeat of a new process, sent before the sync loop's
+        bootstrap apply (1.4 s to a minute when a zone will not load). Its
+        ``X-Spatium-Agent-Instance`` makes the control plane take the server
+        over from the previous process and retire that process's stale ``ok``
+        now, instead of at the first config poll, which comes only after the
+        boot apply. Best effort and short: with the control plane down the
+        agent boots from its cache at once (non-negotiable #5), and a control
+        plane that predates this simply records an ordinary heartbeat.
+        """
+        try:
+            self.send_once(announce=True)
+        except Exception as exc:  # noqa: BLE001 — never costs the boot
+            log.warning("dns_agent_announce_failed", error=str(exc))
+
+    def send_once(self, *, announce: bool = False) -> None:
         # #1232 — a snapshot, and only what it holds is removed on success.
         # The sync thread appends acks while this request is in flight, and
         # ``pending_acks.clear()`` after the response dropped any ack appended
@@ -142,7 +162,7 @@ class HeartbeatClient:
             # performs a one-way LMDB schema migration, so the operator has to
             # be told before they press Start. None = probe failed; the control
             # plane must treat that as "unknown", never as a specific version.
-            "daemon_version": self._daemon_version(),
+            "daemon_version": None if announce else self._daemon_version(),
             "daemon": self.daemon_status,
             # #882 — last config-apply verdict. Before #882 this field was
             # sent as a literal ``{}``: declared on the server's request
@@ -161,6 +181,13 @@ class HeartbeatClient:
         # the group's named memory against it and warns before an OOM loop.
         if not self._memory_field_unsupported:
             body["memory_limit_bytes"] = cgroup_memory_limit_bytes()
+        # #4193 — what the container and the daemon actually use. Best effort:
+        # an unreadable field is left out, and with nothing readable the block
+        # is not sent at all.
+        if not self._memory_block_unsupported:
+            mem = memory_report([self.driver.daemon_pid if self.driver is not None else None])
+            if mem is not None:
+                body["memory"] = mem
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the
         # supervisor's heartbeat (one producer instead of three).
@@ -168,7 +195,7 @@ class HeartbeatClient:
         # so it can no longer read those signals anyway.
         sent_token = self.token_ref[0]
         try:
-            with self._client() as c:
+            with (self._client(timeout=3.0) if announce else self._client()) as c:
                 resp = c.post(
                     "/api/v1/dns/agents/heartbeat",
                     json=body,
@@ -190,6 +217,12 @@ class HeartbeatClient:
                         log.warning("heartbeat_memory_field_unsupported")
                         self._memory_field_unsupported = True
                         body.pop("memory_limit_bytes")
+                        dropped = True
+                    # Quoted: ``"memory_limit_bytes"`` must not match it.
+                    if "memory" in body and '"memory"' in resp.text:
+                        log.warning("heartbeat_memory_block_unsupported")
+                        self._memory_block_unsupported = True
+                        body.pop("memory")
                         dropped = True
                     if dropped:
                         resp = c.post(

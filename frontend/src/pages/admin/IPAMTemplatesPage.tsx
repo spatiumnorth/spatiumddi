@@ -9,15 +9,21 @@ import {
   type IPAMTemplate,
   type IPAMTemplateAppliesTo,
   type IPAMTemplateCreate,
+  type TemplateReapplyAllResponse,
   type IPAMTemplateUpdate,
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { parseTtlInput } from "@/lib/dnsNames";
-import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import {
+  disabledBecause,
+  permissionGate,
+  usePermissions,
+} from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -263,9 +269,9 @@ function TemplateEditor({
     >
       <div className="space-y-4">
         {error && (
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex flex-wrap gap-1 border-b">
@@ -580,25 +586,72 @@ function TemplateEditor({
   );
 }
 
-function ReapplyConfirmModal({
+export function ReapplyConfirmModal({
   template,
   onClose,
   onConfirm,
   busy,
+  result,
+  error,
 }: {
   template: IPAMTemplate;
   onClose: () => void;
   onConfirm: () => void;
   busy: boolean;
+  result: TemplateReapplyAllResponse | null;
+  error: string;
 }) {
   const [typed, setTyped] = useState("");
+  if (result) {
+    return (
+      <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
+        <div className="space-y-3 text-sm" role="status">
+          <p>
+            Reapplied {result.instances_processed} of {result.instances_total}{" "}
+            instance{result.instances_total === 1 ? "" : "s"}
+            {result.instances_skipped > 0
+              ? `; skipped ${result.instances_skipped}, each left as it was`
+              : ""}
+            .
+          </p>
+          {result.cap_reached && (
+            <p className="text-amber-600">
+              More instances exist than the 200 handled per call; run Reapply
+              again for the rest.
+            </p>
+          )}
+          {result.skipped.length > 0 && (
+            <ul className="list-disc space-y-1 pl-5">
+              {result.skipped.map((sk) => (
+                <li key={sk.target_id}>
+                  <span className="font-mono text-xs">{sk.network}</span>:{" "}
+                  {sk.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex justify-end border-t pt-3">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
   return (
     <Modal title={`Reapply — ${template.name}`} onClose={onClose}>
       <div className="space-y-3 text-sm">
         <p>
           This will stamp the template across every recorded instance with
           <code className="mx-1">force=True</code>, overwriting any operator
-          overrides. Capped at 200 instances per call.
+          overrides of the template&apos;s fields. Tags and custom fields are
+          merged: the template&apos;s keys are set, and keys the template does
+          not hold are kept. Capped at 200 instances per call. An instance whose
+          child layout cannot be carved is skipped and left as it was.
         </p>
         <p>
           Type the template name to confirm:{" "}
@@ -609,6 +662,11 @@ function ReapplyConfirmModal({
           onChange={(e) => setTyped(e.target.value)}
           className={inputCls}
         />
+        {error && (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
         <div className="flex justify-end gap-2 border-t pt-3">
           <button
             onClick={onClose}
@@ -709,7 +767,6 @@ export function IPAMTemplatesPage() {
   const reapplyMut = useMutation({
     mutationFn: (id: string) => ipamApi.reapplyAllTemplate(id),
     onSuccess: () => {
-      setReapplyTarget(null);
       qc.invalidateQueries({ queryKey: ["ipam-templates"] });
     },
   });
@@ -814,6 +871,12 @@ export function IPAMTemplatesPage() {
           />
         </div>
 
+        <FormError className="text-sm">
+          {deleteMut.error
+            ? formatApiError(deleteMut.error, "Delete failed")
+            : null}
+        </FormError>
+
         <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
@@ -888,10 +951,13 @@ export function IPAMTemplatesPage() {
                   <td className="px-3 py-2 text-right">
                     <button
                       onClick={() => setReapplyTarget(t)}
-                      disabled={t.applied_count === 0}
                       className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
                       title="Reapply across all instances"
                       aria-label="Reapply across all instances"
+                      {...disabledBecause(
+                        t.applied_count === 0,
+                        "Not applied anywhere yet: nothing to reapply.",
+                      )}
                       {...writeGate}
                     >
                       <RefreshCw className="h-3 w-3" />
@@ -910,6 +976,7 @@ export function IPAMTemplatesPage() {
                     </button>
                     <button
                       onClick={() => {
+                        deleteMut.reset();
                         if (
                           confirm(
                             `Delete template "${t.name}"? Applied instances are not removed; their applied_template_id is cleared.`,
@@ -960,9 +1027,18 @@ export function IPAMTemplatesPage() {
         {reapplyTarget && (
           <ReapplyConfirmModal
             template={reapplyTarget}
-            onClose={() => setReapplyTarget(null)}
+            onClose={() => {
+              setReapplyTarget(null);
+              reapplyMut.reset();
+            }}
             onConfirm={() => reapplyMut.mutate(reapplyTarget.id)}
             busy={reapplyMut.isPending}
+            result={reapplyMut.data ?? null}
+            error={
+              reapplyMut.isError
+                ? formatApiError(reapplyMut.error, "Reapply failed")
+                : ""
+            }
           />
         )}
       </div>

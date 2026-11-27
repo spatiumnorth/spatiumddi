@@ -54,6 +54,7 @@ import { cn } from "@/lib/utils";
 import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
+import { FormError } from "@/components/ui/form-error";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -417,9 +418,9 @@ export function FirewallLogsSection() {
       </div>
 
       {err && (
-        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+        <FormError className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
           {err}
-        </div>
+        </FormError>
       )}
 
       <div
@@ -550,10 +551,11 @@ function EnforcementCard() {
         </div>
       )}
 
-      {set.isError && (
-        <p className="mt-2 text-xs text-destructive">
+      {/* While a confirm is open it draws the refusal itself. */}
+      {set.isError && confirm === null && (
+        <FormError className="mt-2 text-xs text-destructive">
           {formatApiError(set.error)}
-        </p>
+        </FormError>
       )}
 
       <ConfirmModal
@@ -568,8 +570,12 @@ function EnforcementCard() {
           </>
         }
         confirmLabel="Enable"
+        error={set.error ? formatApiError(set.error) : null}
         onConfirm={() => set.mutate({ enabled: true })}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          set.reset();
+        }}
       />
       <ConfirmModal
         open={confirm === "enable-override"}
@@ -587,10 +593,14 @@ function EnforcementCard() {
           </>
         }
         confirmLabel="Enable anyway"
+        error={set.error ? formatApiError(set.error) : null}
         onConfirm={() =>
           set.mutate({ enabled: true, override_unhardened: true })
         }
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          set.reset();
+        }}
       />
       <ConfirmModal
         open={confirm === "disable"}
@@ -598,8 +608,12 @@ function EnforcementCard() {
         loading={set.isPending}
         message="The fleet falls back to the in-pod (dark) render. Always safe — nothing tightens on disable."
         confirmLabel="Disable"
+        error={set.error ? formatApiError(set.error) : null}
         onConfirm={() => set.mutate({ enabled: false })}
-        onClose={() => setConfirm(null)}
+        onClose={() => {
+          setConfirm(null);
+          set.reset();
+        }}
       />
     </div>
   );
@@ -681,10 +695,10 @@ function PoliciesSection() {
         ))}
       </div>
 
-      {posture.isError && (
-        <p className="text-xs text-destructive">
+      {posture.isError && confirmPreset === null && (
+        <FormError className="text-xs text-destructive">
           {formatApiError(posture.error)}
-        </p>
+        </FormError>
       )}
 
       <div className="flex items-center justify-between">
@@ -808,9 +822,9 @@ function PoliciesSection() {
       )}
 
       {toggle.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(toggle.error)}
-        </p>
+        </FormError>
       )}
 
       {showNew && (
@@ -844,8 +858,12 @@ function PoliciesSection() {
           </>
         }
         confirmLabel="Delete"
+        error={del.error ? formatApiError(del.error) : null}
         onConfirm={() => confirmDelete && del.mutate(confirmDelete.id)}
-        onClose={() => setConfirmDelete(null)}
+        onClose={() => {
+          setConfirmDelete(null);
+          del.reset();
+        }}
       />
       <ConfirmModal
         open={confirmPreset !== null}
@@ -861,8 +879,12 @@ function PoliciesSection() {
           </>
         }
         confirmLabel="Apply preset"
+        error={posture.error ? formatApiError(posture.error) : null}
         onConfirm={() => confirmPreset && posture.mutate(confirmPreset)}
-        onClose={() => setConfirmPreset(null)}
+        onClose={() => {
+          setConfirmPreset(null);
+          posture.reset();
+        }}
       />
     </div>
   );
@@ -956,9 +978,9 @@ function NewPolicyModal({
           </label>
         )}
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1237,9 +1259,9 @@ function RuleEditorModal({
         </p>
         <RuleRowsEditor rows={rows} setRows={setRows} />
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1434,9 +1456,9 @@ function NewAliasModal({
           />
         </label>
         {save.isError && (
-          <p className="text-xs text-destructive">
+          <FormError className="text-xs text-destructive">
             {formatApiError(save.error)}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-1">
           <button
@@ -1532,7 +1554,9 @@ function EffectiveSection() {
       </div>
 
       {error && (
-        <p className="text-xs text-destructive">{formatApiError(error)}</p>
+        <FormError className="text-xs text-destructive">
+          {formatApiError(error)}
+        </FormError>
       )}
 
       {eff && (
@@ -1665,9 +1689,9 @@ function PreviewSection() {
       <RuleRowsEditor rows={rows} setRows={setRows} />
 
       {preview.isError && (
-        <p className="text-xs text-destructive">
+        <FormError className="text-xs text-destructive">
           {formatApiError(preview.error)}
-        </p>
+        </FormError>
       )}
 
       {preview.data && (

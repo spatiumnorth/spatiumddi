@@ -1,4 +1,6 @@
 import { ListEmpty } from "@/components/ui/list-read-error";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -16,6 +18,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -74,7 +77,7 @@ function ProviderEditorModal({
     mutationFn: async () => {
       if (!name.trim()) throw new Error("Name is required");
       if (existing) {
-        const body: ProviderUpdate = {
+        const full: ProviderUpdate = {
           name,
           kind,
           account_number: accountNumber || null,
@@ -83,6 +86,10 @@ function ProviderEditorModal({
           default_asn_id: defaultAsnId || null,
           notes,
         };
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const body = changedFields(existing, full);
+        if (Object.keys(body).length === 0) return Promise.resolve(existing);
         return providersApi.update(existing.id, body);
       }
       const body: ProviderCreate = {
@@ -179,6 +186,7 @@ function ProviderEditorModal({
             <select
               className={inputCls}
               value={defaultAsnId}
+              aria-label="Default ASN"
               onChange={(e) => setDefaultAsnId(e.target.value)}
               disabled={asnsQuery.isLoading || !canReadAsns}
               title={
@@ -221,7 +229,9 @@ function ProviderEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -477,8 +487,10 @@ export function ProvidersPage() {
                         setSearch("");
                         setKindFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New provider" to add one.`}
                     >
-                      No providers yet — click "New provider" to add one.
+                      No providers yet.
                     </ListEmpty>
                   </td>
                 </tr>
@@ -567,10 +579,19 @@ export function ProvidersPage() {
           />
         )}
         {editing && (
-          <ProviderEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            queryKeys={[["providers", search, kindFilter]]}
+            title="Edit Provider"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <ProviderEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

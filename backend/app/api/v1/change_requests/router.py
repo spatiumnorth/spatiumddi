@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -61,7 +61,9 @@ from app.services.approvals.policy import (
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
+    approval_refusal,
     approve_change_request,
+    count_change_requests,
     get_change_request,
     list_change_requests,
     mark_cancelled,
@@ -96,6 +98,12 @@ class ChangeRequestResponse(BaseModel):
     executed_at: datetime | None
     created_at: datetime
     modified_at: datetime
+    # Whether the CALLER may approve this row, asked of the same check the
+    # approve endpoint makes (#4189); the server stays authoritative. False on
+    # a row that is no longer pending. ``approve_blocked_reason`` is the
+    # server's own refusal text when a pending row is refused.
+    can_approve: bool = False
+    approve_blocked_reason: str | None = None
 
 
 class DecisionBody(BaseModel):
@@ -147,8 +155,11 @@ class ApprovalPolicyUpdate(BaseModel):
 # ── Serialisers ──────────────────────────────────────────────────────────────
 
 
-def _cr_to_response(cr: ChangeRequest) -> ChangeRequestResponse:
+def _cr_to_response(cr: ChangeRequest, viewer: User) -> ChangeRequestResponse:
+    refusal = approval_refusal(viewer, cr) if cr.state == "pending" else None
     return ChangeRequestResponse(
+        can_approve=cr.state == "pending" and refusal is None,
+        approve_blocked_reason=str(refusal) if refusal is not None else None,
         id=cr.id,
         operation=cr.operation,
         resource_type=cr.resource_type,
@@ -287,6 +298,7 @@ def _can_see_all_change_requests(user: User) -> bool:
 async def list_requests(
     current_user: CurrentUser,
     db: DB,
+    response: Response,
     state: str | None = None,
     resource_type: str | None = None,
     mine: bool = False,
@@ -294,7 +306,11 @@ async def list_requests(
     offset: int = 0,
 ) -> list[ChangeRequestResponse]:
     """List change requests newest-first. ``mine=true`` scopes to the
-    caller's own requests; ``state`` / ``resource_type`` filter.
+    caller's own requests; ``state`` / ``resource_type`` filter (``state``
+    takes a comma list, e.g. ``executed,rejected``). ``offset`` pages past
+    ``limit`` and ``X-Total-Count`` carries the number of requests matching
+    the filters *before* the window, so a client can say "200 of 208" rather
+    than present a cut list as the whole history (#4383).
 
     READ RULE (#1): a caller who isn't a superadmin / approve-holder is
     ALWAYS scoped to their own requests regardless of the ``mine`` flag — a
@@ -308,6 +324,15 @@ async def list_requests(
     else:
         # Force own-scope — ignore the requested ``mine`` value.
         scope_user_id = current_user.id
+    response.headers["X-Total-Count"] = str(
+        await count_change_requests(
+            db,
+            state=state,
+            resource_type=resource_type,
+            requested_by_user_id=scope_user_id,
+            origin="gate",
+        )
+    )
     rows = await list_change_requests(
         db,
         state=state,
@@ -320,7 +345,7 @@ async def list_requests(
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
-    return [_cr_to_response(r) for r in rows]
+    return [_cr_to_response(r, current_user) for r in rows]
 
 
 # ── Approval policies (operator-tunable rules) ─────────────────────────────
@@ -394,7 +419,9 @@ async def update_policy(
 ):  # noqa: ANN201 — ApprovalPolicyResponse OR a 202 JSONResponse (gated)
     policy = await db.get(ApprovalPolicy, policy_id)
     if policy is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Approval policy not found"
+        )
     changes = body.model_dump(exclude_unset=True)
     # Validate the post-update (action, resource_type) — an operator can't
     # repoint a policy at an action/type that isn't wired yet (#4).
@@ -459,7 +486,9 @@ async def delete_policy(
 ):  # noqa: ANN201 — 204 (deleted) OR a 202 JSONResponse (gated)
     policy = await db.get(ApprovalPolicy, policy_id)
     if policy is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Approval policy not found"
+        )
     if policy.is_builtin:
         # Built-in policies are kept for the registry-completeness check;
         # toggle ``enabled`` off instead of deleting them.
@@ -497,8 +526,6 @@ async def delete_policy(
         name=name,
     )
     await db.commit()
-    from fastapi import Response  # noqa: PLC0415
-
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -519,8 +546,10 @@ async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Ch
             and cr.requested_by_user_id != current_user.id
         )
     ):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    return _cr_to_response(cr)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Change request not found"
+        )
+    return _cr_to_response(cr, current_user)
 
 
 async def _assert_gate_row(db: DB, cr_id: uuid.UUID) -> None:
@@ -536,7 +565,9 @@ async def _assert_gate_row(db: DB, cr_id: uuid.UUID) -> None:
     """
     cr = await get_change_request(db, cr_id)
     if cr is None or cr.origin != "gate":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Change request not found"
+        )
 
 
 @router.post("/{cr_id}/approve", response_model=ChangeRequestResponse)
@@ -569,7 +600,8 @@ async def approve_request(
        they cannot reach — answers 403 and the row stays ``pending`` for
        another approver (#2934). If it still succeeds but its scope
        differs from what the approver reviewed, the approve answers 409 and
-       the row stays ``pending``: the requester can cancel and re-submit.
+       the row stays ``pending``: the approver can reject it, and the requester
+       can cancel and re-submit.
     6. ``apply()`` dispatches under the **approver's** identity; the audit
        ``executed`` row carries the approver as actor and the requester id
        in ``old_value.requested_by``. If ``apply()`` refuses — a 4xx, a 5xx
@@ -594,7 +626,7 @@ async def approve_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 @router.post("/{cr_id}/reject", response_model=ChangeRequestResponse)
@@ -616,7 +648,7 @@ async def reject_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 @router.post("/{cr_id}/cancel", response_model=ChangeRequestResponse)
@@ -632,7 +664,9 @@ async def cancel_request(
     cr = await get_change_request(db, cr_id, for_update=True)
     # #696 — gate rows only; a portal row is cancelled via /requests.
     if cr is None or cr.origin != "gate":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Change request not found"
+        )
     enforce_operation_token_scope(request, cr.operation)  # #3302
     is_requester = (
         cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id
@@ -652,7 +686,7 @@ async def cancel_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await db.commit()
     await db.refresh(cr)
-    return _cr_to_response(cr)
+    return _cr_to_response(cr, current_user)
 
 
 __all__ = ["router"]

@@ -276,12 +276,15 @@ function heatmapLegend(
 function InventoryStat({
   value,
   label,
+  singular,
   to,
   title,
   tone,
 }: {
   value: string | number;
   label: string;
+  /** Label for a value of exactly 1 (#4372); omit for non-count labels. */
+  singular?: string;
   to: string;
   title?: string;
   tone?: "warn" | "bad";
@@ -304,7 +307,9 @@ function InventoryStat({
       >
         {value}
       </span>
-      <span className="text-muted-foreground">{label}</span>
+      <span className="text-muted-foreground">
+        {value === 1 && singular ? singular : label}
+      </span>
     </Link>
   );
 }
@@ -875,12 +880,14 @@ function OpenAlertsPanel({
 
 // ── ASN Summary card ─────────────────────────────────────────────────────────
 
-function AsnSummaryCard() {
+export function AsnSummaryCard() {
+  // The page behind "Add one" gates its create button on this (#4314).
+  const canAdd = usePermissions().can("write", "manage_asns");
   const { enabled, ready } = useFeatureModules();
   // Gate on ``ready`` so the query waits for the real module state (``enabled``
   // is optimistically true while loading → a one-shot 404 on hard load).
   const moduleOn = ready && enabled("network.asn");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["asns-summary"],
     queryFn: () => asnsApi.list({ limit: 200 }),
     staleTime: 30_000,
@@ -907,8 +914,8 @@ function AsnSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load ASN data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="ASNs" />
         </p>
       );
     }
@@ -917,12 +924,14 @@ function AsnSummaryCard() {
       return (
         <div className="mt-3 flex-1 flex flex-col justify-between">
           <p className="text-xs text-muted-foreground">No ASNs configured.</p>
-          <Link
-            to="/network/asns"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Add one →
-          </Link>
+          {canAdd && (
+            <Link
+              to="/network/asns"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Add one →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1015,13 +1024,16 @@ function AsnSummaryCard() {
 
 // ── VRF Summary card ─────────────────────────────────────────────────────────
 
-function VrfSummaryCard() {
+export function VrfSummaryCard() {
+  // The page behind "Add one" gates its create button on this (#4314).
+  const canAdd = usePermissions().can("write", "vrf");
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.vrf");
   const {
     data: vrfs = [],
     isLoading,
     isError,
+    error,
   } = useQuery<VRF[]>({
     queryKey: ["vrfs-summary"],
     queryFn: () => vrfsApi.list(),
@@ -1049,8 +1061,8 @@ function VrfSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load VRF data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="VRFs" />
         </p>
       );
     }
@@ -1058,12 +1070,14 @@ function VrfSummaryCard() {
       return (
         <div className="mt-3 flex-1 flex flex-col justify-between">
           <p className="text-xs text-muted-foreground">No VRFs configured.</p>
-          <Link
-            to="/network/vrfs"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Add one →
-          </Link>
+          {canAdd && (
+            <Link
+              to="/network/vrfs"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Add one →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1113,12 +1127,14 @@ function VrfSummaryCard() {
 
 // ── Domains Summary card ──────────────────────────────────────────────────────
 
-function DomainsSummaryCard() {
+export function DomainsSummaryCard() {
+  // The page behind "Add one" gates its create button on this (#4314).
+  const canAdd = usePermissions().can("write", "manage_domains");
   const { enabled, ready } = useFeatureModules();
   // Wait for the real module state: ``enabled`` is optimistically true while
   // loading, which would fire one 404 on a hard load with the module off.
   const moduleOn = ready && enabled("network.domains");
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError, error } = useQuery({
     queryKey: ["domains-summary"],
     queryFn: () => domainsApi.list({ page_size: 200 }),
     staleTime: 30_000,
@@ -1142,8 +1158,8 @@ function DomainsSummaryCard() {
     }
     if (isError) {
       return (
-        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
-          Failed to load domain data.
+        <p className="mt-3 text-xs">
+          <ListReadError error={error} what="domains" />
         </p>
       );
     }
@@ -1154,12 +1170,14 @@ function DomainsSummaryCard() {
           <p className="text-xs text-muted-foreground">
             No domains configured.
           </p>
-          <Link
-            to="/admin/domains"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Add one →
-          </Link>
+          {canAdd && (
+            <Link
+              to="/admin/domains"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Add one →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1348,6 +1366,8 @@ function SubnetDecomCard() {
 function LookingGlassHealthCard() {
   const { enabled, ready } = useFeatureModules();
   const moduleOn = ready && enabled("network.looking_glass");
+  // Add Peer on the Looking Glass page is a write on bgp_lg_peer (#4116).
+  const canConfigure = usePermissions().can("write", "bgp_lg_peer");
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["lg-dashboard-summary"],
     queryFn: () => lookingGlassApi.getDashboardSummary(),
@@ -1389,12 +1409,14 @@ function LookingGlassHealthCard() {
           <p className="text-xs text-muted-foreground">
             No Looking Glass peers configured.
           </p>
-          <Link
-            to="/network/looking-glass"
-            className="mt-2 text-[11px] text-primary hover:underline"
-          >
-            Configure a peer →
-          </Link>
+          {canConfigure && (
+            <Link
+              to="/network/looking-glass"
+              className="mt-2 text-[11px] text-primary hover:underline"
+            >
+              Configure a peer →
+            </Link>
+          )}
         </div>
       );
     }
@@ -1779,10 +1801,9 @@ export function DashboardPage() {
       ? (rows ?? []).filter((s) => ipamSpaceFilter.includes(s.space_id))
       : (rows ?? []);
 
-  // Derived stats — every utilization-driven counter reads from
-  // `reportSubnets` so small PTP / loopback subnets don't skew the
-  // dashboard. `subnets` (the unfiltered list) is still used for
-  // inventory counts like "N subnets". Both feed through `filterSpaces`
+  // Derived stats — the heatmap, Top Subnets and threshold counters read
+  // from `reportSubnets` so small PTP / loopback subnets don't skew them;
+  // the address totals and inventory counts read the unfiltered list. Both feed through `filterSpaces`
   // so the IPAM-tab filter, when active, scopes every downstream number.
   const reporting = filterSpaces(reportSubnets);
   const subnetsScoped = filterSpaces(subnets);
@@ -1791,8 +1812,12 @@ export function DashboardPage() {
   // meaningless (a single /64 swamps every IPv4 subnet combined). Restrict
   // the top-line counters to IPv4. The heatmap + per-subnet stats keep
   // IPv6 since per-subnet utilization_percent is still meaningful.
-  const reportingV4 = reporting.filter((s) => !s.network.includes(":"));
-  const reportingV6 = reporting.filter((s) => s.network.includes(":"));
+  // The totals count EVERY subnet's addresses (#3785): the
+  // utilization_max_prefix_* cut is for the heatmap, Top Subnets and alerts,
+  // and a total that left a /30's addresses out beside a Subnets card that
+  // counts the /30 told two stories.
+  const reportingV4 = subnetsScoped.filter((s) => !s.network.includes(":"));
+  const reportingV6 = subnetsScoped.filter((s) => s.network.includes(":"));
   const totalIPs = reportingV4.reduce((s, n) => s + n.total_ips, 0);
   const allocatedIPs = reportingV4.reduce((s, n) => s + n.allocated_ips, 0);
   const freeIPs = totalIPs - allocatedIPs;
@@ -2317,6 +2342,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={spaces?.length ?? 0}
                 label="spaces"
+                singular="space"
                 to="/ipam"
               />
             )}
@@ -2324,6 +2350,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={subnetsScoped.length}
                 label="subnets"
+                singular="subnet"
                 to="/ipam"
               />
             )}
@@ -2354,6 +2381,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={totalZones}
                 label="DNS zones"
+                singular="DNS zone"
                 title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
                 to="/dns"
               />
@@ -2362,6 +2390,7 @@ export function DashboardPage() {
               <InventoryStat
                 value={allServers.length}
                 label="servers"
+                singular="server"
                 title={`${activeServers} active`}
                 to="/dns"
               />
@@ -2621,7 +2650,10 @@ export function DashboardPage() {
                     </div>
                   ) : !recent || recent.items.length === 0 ? (
                     <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                      No recent activity. Try creating a subnet or a DNS record.
+                      No recent activity.
+                      {(canRead("write", "subnet") ||
+                        canRead("write", "dns_record")) &&
+                        " Try creating a subnet or a DNS record."}
                     </div>
                   ) : (
                     recent.items.slice(0, 12).map((entry) => (
@@ -3077,7 +3109,14 @@ export function IpamSpaceFilter({
             <div className="border-t px-3 py-2">
               <button
                 type="button"
-                onClick={() => onChange([])}
+                onClick={() => {
+                  onChange([]);
+                  // The button is drawn only while a filter is set, so it
+                  // removes itself: close the list and hand focus to the
+                  // trigger, as Esc does, rather than the page body (#4222).
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
                 className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
               >
                 <X className="h-3 w-3" />
@@ -3117,7 +3156,7 @@ function ConfigApplyChip({
     return (
       <StatusChip
         tone="amber"
-        label="zones refused"
+        label="zones held back"
         title={`${PARTIAL_APPLY_EXPLAIN}\n\n${partialApplyDetail(error)}`}
       />
     );
@@ -3284,6 +3323,8 @@ function ServerRow({
  * either would render as a red exhaustion bar for behaving correctly.
  */
 export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
+  // Add Pool on a scope is a write on dhcp_pool (#4314).
+  const canAddPool = usePermissions().can("write", "dhcp_pool");
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
@@ -3321,8 +3362,9 @@ export function DhcpPoolPressure({ dhcpOn }: { dhcpOn: boolean }) {
   if (!data || data.pool_count === 0) {
     return (
       <div className="rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground">
-        No dynamic DHCP pools configured. Add a pool to a scope to see
-        allocation pressure here.
+        No dynamic DHCP pools configured.
+        {canAddPool &&
+          " Add a pool to a scope to see allocation pressure here."}
       </div>
     );
   }
@@ -4903,6 +4945,7 @@ export function ConformityPanel() {
 //     soon (left), circuit alerts + orphan services + overlay
 //     impact (right).
 function NetworkPanel() {
+  const canAddAsn = usePermissions().can("write", "manage_asns");
   const { data, isLoading, isError, error } = useQuery<NetworkDashboardSummary>(
     {
       queryKey: ["dashboards", "network"],
@@ -4958,7 +5001,7 @@ function NetworkPanel() {
             hint={NV}
           />
         ) : (
-          <RpkiExpiringKpi data={data} />
+          <RpkiExpiringKpi data={data} canAddAsn={canAddAsn} />
         )}
         {!w.asn && !rpkiUntracked && rpkiExpiryUnmeasured(data) ? (
           <NetworkKpi
@@ -4981,11 +5024,7 @@ function NetworkPanel() {
                   : "good"
             }
             hint={w.asn ? NV : rpkiUntracked ? "no ROAs tracked" : undefined}
-            title={
-              rpkiUntracked
-                ? "No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
-                : undefined
-            }
+            title={rpkiUntracked ? rpkiUntrackedTitle(canAddAsn) : undefined}
             to="/network/asns"
           />
         )}
@@ -5230,7 +5269,24 @@ const RPKI_NO_LIFETIME_HINT = "source has no ROA lifetimes";
 const RPKI_NO_LIFETIME_TITLE =
   "The configured ROA source does not publish each ROA's certificate lifetime, so expiry is not measured. This is not an all-clear.";
 
-function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
+// The "add a public ASN" half is drawn only for a user New ASN is offered to
+// (#4588).
+function rpkiUntrackedTitle(canAddAsn: boolean): string {
+  return (
+    "No RPKI ROAs have been pulled yet." +
+    (canAddAsn
+      ? " Add a public ASN and the hourly refresh will populate them."
+      : "")
+  );
+}
+
+function RpkiExpiringKpi({
+  data,
+  canAddAsn,
+}: {
+  data: NetworkDashboardSummary;
+  canAddAsn: boolean;
+}) {
   const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
   const checkedAt = data.rpki_last_checked_at;
   const ageMs = checkedAt ? Date.now() - new Date(checkedAt).getTime() : null;
@@ -5244,7 +5300,7 @@ function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
         tone="default"
         to="/network/asns"
         hint="no ROAs tracked"
-        title="No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+        title={rpkiUntrackedTitle(canAddAsn)}
       />
     );
   }

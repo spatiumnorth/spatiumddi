@@ -158,6 +158,7 @@ docs/PRIVACY.md
 # covered the day it lands; add it here too so editing it runs that test.
 .github/workflows/build-dns-images.yml
 .github/workflows/build-dhcp-images.yml
+.github/workflows/build-ubi-images.yml
 .github/workflows/build-looking-glass-images.yml
 .github/workflows/build-supervisor-image.yml
 
@@ -186,12 +187,25 @@ charts/spatiumddi/templates/frontend-tls-config.yaml
 # tested against; editing them must run the backend half, or the two sides
 # could disagree with only the frontend job noticing.
 frontend/src/lib/bulk-allocate-template.vectors.json
+# test_delete_cascade_copy_4143.py (#4143) walks the FK cascade graph against
+# the delete dialogs' registry.
+frontend/src/lib/delete-cascade.json
 
 # test_grant_vocabulary_covers_routes_3119.py (#3119) checks that the grant
 # vocabulary the role editor offers holds every resource type the routes,
 # copilot tools and search providers check. Dropping a type there is a
 # frontend-only edit, so without this the backend half would not run on it.
 frontend/src/lib/permissionVocabulary.ts
+
+# test_ai_tool_nav_paths_4334.py (#4334) checks every console path the Copilot's
+# text names ("Appliance → Cluster → etcd snapshots") against the labels these
+# files define, so renaming a page here must run the backend half.
+frontend/src/lib/navigation.ts
+frontend/src/components/layout/Sidebar.tsx
+frontend/src/pages/SettingsPage.tsx
+frontend/src/pages/dns/DNSPage.tsx
+frontend/src/pages/appliance/
+frontend/src/pages/admin/
 
 # test_frontend_tls_reload_1173.py (#1173) executes the frontend's TLS reload
 # watcher, and checks the Dockerfile copies it in and the chart's frontend
@@ -218,3 +232,12 @@ docker-compose.dev.yml
 # script as a subprocess, so editing it (or its ignore list) must run it.
 .github/scripts/check_contributors.py
 .github/contributors-ignore.txt
+
+# test_host_timezone_4416.py (#4416) checks the frontend's host time zone alias
+# table mirrors the backend's, so editing that table must run it.
+frontend/src/lib/hostTimezones.ts
+
+# test_alembic_heads_script.py loads the forward-merge workflow's Alembic
+# head check (release-forward-merge.yml), which decides whether a merge of one
+# release branch into the next left two migration heads.
+.github/scripts/alembic_heads.py

@@ -27,6 +27,10 @@ from app.core.agent_wake import (
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import (
+    require_secret_with_destination_change,
+    sent_server_credential,
+)
 from app.core.update_nulls import changed_keys, snapshot
 from app.drivers._winrm import validate_transport, winrm_settings_diff
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
@@ -42,6 +46,13 @@ from app.models.metrics import DHCPMetricSample
 from app.services.agents.container_oom import daemon_reported_by
 from app.services.agents.daemon_state import is_not_serving
 from app.services.agents.instance_ownership import duplicate_active as duplicate_agent_active
+from app.services.agents.memory_status import (
+    MAX_HISTORY_HOURS,
+    MemoryHistory,
+    MemoryStatus,
+    fresh_memory_status,
+    memory_history,
+)
 from app.services.agents.spool_status import SpoolStatus
 from app.services.api_token_scopes import token_outbound
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
@@ -263,6 +274,10 @@ class ServerResponse(BaseModel):
     # NULL when never reported (a pre-#1077 agent, or an agentless driver):
     # UNKNOWN, never "empty".
     spool_status: SpoolStatus | None = None
+    # #4193 — the agent's actual memory use as last reported on its heartbeat
+    # (container used / peak / limit, daemon and agent RSS). NULL when never
+    # reported (an older agent, an agentless driver): UNKNOWN, never 0.
+    memory_status: MemoryStatus | None = None
     # #1067 — the daemon state the agent reports on its heartbeat. ``ok`` or
     # ``degraded`` (the agent's own word); NULL when the agent has never
     # reported one — UNKNOWN, never "fine". ``daemon_status_since`` is when
@@ -367,6 +382,7 @@ class ServerResponse(BaseModel):
             config_failed_etag=s.config_failed_etag,
             config_apply_at=s.config_apply_at,
             spool_status=s.spool_status,
+            memory_status=fresh_memory_status(s.memory_status),
             daemon_status=s.daemon_status,
             daemon_reason=s.daemon_reason,
             daemon_status_since=s.daemon_status_since,
@@ -725,6 +741,15 @@ async def update_server(
         refusal = await server_join_refusal(db, s, target_group)
         if refusal is not None:
             raise HTTPException(status_code=422, detail=refusal)
+    require_secret_with_destination_change(
+        s,
+        {
+            **changes,
+            "credentials": sent_server_credential(body.windows_credentials, body.cloud_credentials),
+        },
+        destination=("host", "port"),
+        secrets={"credentials": s.credentials_encrypted},
+    )
     before = snapshot(s, changes)
     for k, v in changes.items():
         setattr(s, k, v)
@@ -1816,6 +1841,21 @@ class DHCPServerStatsResponse(BaseModel):
     range: str
     bucket_seconds: int
     rate_buckets: list[DHCPRateBucket]
+
+
+@router.get("/{server_id}/memory-history", response_model=MemoryHistory)
+async def get_server_memory_history(
+    server_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    hours: int = Query(6, ge=1, le=MAX_HISTORY_HOURS),
+) -> MemoryHistory:
+    """#4193 — the agent's memory samples (container used / peak, Kea and agent
+    RSS), one per minute, for the Server modal's sparkline. Empty for an agent
+    that does not report memory."""
+    if await db.get(DHCPServer, server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return await memory_history(db, DHCPMetricSample, server_id, hours)
 
 
 @router.get("/{server_id}/stats", response_model=DHCPServerStatsResponse)

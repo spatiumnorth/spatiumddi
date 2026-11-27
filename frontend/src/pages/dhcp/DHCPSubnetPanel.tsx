@@ -1,3 +1,4 @@
+import { ListReadError } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -309,7 +310,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
 export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
   const [showCreate, setShowCreate] = useState(false);
   const perms = usePermissions();
-  const { data: scopes = [], isLoading } = useQuery({
+  const {
+    data: scopes = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnetId],
     queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
   });
@@ -339,12 +344,20 @@ export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
 
       {isLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
 
-      {!isLoading && scopes.length === 0 && (
+      {!isLoading && error && (
+        <p className="text-sm">
+          <ListReadError error={error} what="this subnet's DHCP scopes" />
+        </p>
+      )}
+
+      {!isLoading && !error && scopes.length === 0 && (
         <div className="rounded-lg border border-dashed p-10 text-center">
           <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
           <p className="text-sm font-medium">No DHCP scopes on this subnet</p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Create a scope to start serving leases from a DHCP server.
+            {perms.can("write", "dhcp_scope")
+              ? "Create a scope to start serving leases from a DHCP server."
+              : "Scopes serve leases from a DHCP server."}
           </p>
         </div>
       )}

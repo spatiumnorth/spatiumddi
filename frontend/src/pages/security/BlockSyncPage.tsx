@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Network,
@@ -39,6 +40,7 @@ import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // Relative "time ago" for the sync/pushed columns. Cheap, no dependency.
 function timeAgo(iso: string): string {
@@ -150,7 +152,6 @@ export function BlockSyncPage() {
       invalidateAll();
       setLiftTarget(null);
     },
-    onError: (e) => setPageError(errMsg(e, "Failed to lift block")),
   });
 
   return (
@@ -514,8 +515,14 @@ export function BlockSyncPage() {
         tone="destructive"
         confirmLabel="Lift block"
         loading={liftMut.isPending}
+        error={
+          liftMut.error ? errMsg(liftMut.error, "Failed to lift block") : null
+        }
         onConfirm={() => liftTarget && liftMut.mutate(liftTarget.id)}
-        onClose={() => setLiftTarget(null)}
+        onClose={() => {
+          setLiftTarget(null);
+          liftMut.reset();
+        }}
       />
     </div>
   );
@@ -854,9 +861,9 @@ function ArmTargetModal({
         )}
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex justify-end gap-2 pt-2">
@@ -946,7 +953,11 @@ function RevealModal({
               placeholder="or 6-digit code"
               className={`${inputCls} font-mono`}
             />
-            {error && <p className="text-xs text-destructive">{error}</p>}
+            {error && (
+              <FormError className="text-xs text-destructive">
+                {error}
+              </FormError>
+            )}
             <div className="flex justify-end gap-2 pt-1">
               <button
                 type="button"
@@ -1150,7 +1161,9 @@ function NewBlockModal({
                   >
                     <span className="font-medium">{d.target_name}</span>
                     {d.error ? (
-                      <span className="text-destructive">{d.error}</span>
+                      <span role="alert" className="text-destructive">
+                        {d.error}
+                      </span>
                     ) : d.to_add.length > 0 ? (
                       <span className="text-emerald-600 dark:text-emerald-400">
                         + {d.to_add.join(", ")}
@@ -1168,9 +1181,9 @@ function NewBlockModal({
         </div>
 
         {error && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}
-          </div>
+          </FormError>
         )}
 
         <div className="flex justify-end gap-2 pt-1">
@@ -1225,7 +1238,9 @@ function ReconcilePreviewModal({
           {diff === null ? (
             <p className="text-muted-foreground">Reading device…</p>
           ) : diff.error ? (
-            <p className="text-destructive">{diff.error}</p>
+            <p role="alert" className="text-destructive">
+              {diff.error}
+            </p>
           ) : diff.to_add.length === 0 && diff.to_remove.length === 0 ? (
             <p className="text-muted-foreground">
               Already in sync — nothing to change.
@@ -1278,24 +1293,3 @@ function ReconcilePreviewModal({
 }
 
 // ── Small labelled field ──────────────────────────────────────────────
-function Field({
-  label,
-  hint,
-  className,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className={`space-y-1 ${className ?? ""}`}>
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
-    </div>
-  );
-}

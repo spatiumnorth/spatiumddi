@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import String, or_, select
 from sqlalchemy import cast as sa_cast
@@ -60,7 +60,10 @@ from app.services.api_token_scopes import enforce_operation_token_scope
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
+    _refusal_text,
+    approval_refusal_at_target,
     approve_change_request,
+    count_change_requests,
     get_change_request,
     list_change_requests,
     mark_cancelled,
@@ -137,6 +140,13 @@ class ProvisioningRequestResponse(BaseModel):
     # stamp. Only the name is exposed, never the template body. None when the
     # request names no template or it no longer exists.
     template_name: str | None = None
+    # Whether the CALLER may approve this row, from the same check the approve
+    # endpoint makes (#4241, #4242); the server re-checks on press. False once
+    # the row is no longer pending. ``approve_blocked_reason`` is the server's
+    # own refusal text for a pending row (no permission on the operation, the
+    # requester's account gone, ...).
+    can_approve: bool = False
+    approve_blocked_reason: str | None = None
 
 
 def _template_id(cr: ChangeRequest) -> uuid.UUID | None:
@@ -159,19 +169,29 @@ async def _template_names(db: DB, rows: list[ChangeRequest]) -> dict[uuid.UUID, 
     return {row[0]: row[1] for row in res.all()}
 
 
-async def _respond_all(db: DB, rows: list[ChangeRequest]) -> list[ProvisioningRequestResponse]:
+async def _respond_all(
+    db: DB, rows: list[ChangeRequest], viewer: User
+) -> list[ProvisioningRequestResponse]:
     names = await _template_names(db, rows)
-    return [_to_response(r, names.get(tid) if (tid := _template_id(r)) else None) for r in rows]
+    out: list[ProvisioningRequestResponse] = []
+    for r in rows:
+        # The same per-object gate the approve's apply runs (#4382), so a
+        # scoped approver is not offered Approve on a target they cannot write.
+        refusal = await approval_refusal_at_target(db, viewer, r) if r.state == "pending" else None
+        out.append(_to_response(r, refusal, names.get(tid) if (tid := _template_id(r)) else None))
+    return out
 
 
-async def _respond(db: DB, cr: ChangeRequest) -> ProvisioningRequestResponse:
-    return (await _respond_all(db, [cr]))[0]
+async def _respond(db: DB, cr: ChangeRequest, viewer: User) -> ProvisioningRequestResponse:
+    return (await _respond_all(db, [cr], viewer))[0]
 
 
 def _to_response(
-    cr: ChangeRequest, template_name: str | None = None
+    cr: ChangeRequest, refusal: DecisionError | None, template_name: str | None = None
 ) -> ProvisioningRequestResponse:
     return ProvisioningRequestResponse(
+        can_approve=cr.state == "pending" and refusal is None,
+        approve_blocked_reason=str(refusal) if refusal is not None else None,
         id=cr.id,
         operation=cr.operation,
         resource_type=cr.resource_type,
@@ -252,7 +272,7 @@ async def _load_visible(
         or cr.origin != _ORIGIN
         or (not _can_see_all(user) and cr.requested_by_user_id != user.id)
     ):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found")
     return cr
 
 
@@ -282,9 +302,9 @@ class ResourceOption(BaseModel):
 
 class ResourceOptionsResponse(BaseModel):
     options: list[ResourceOption]
-    # True when the permission scan hit its cap before filling ``limit`` —
-    # the caller's readable rows may exist beyond the scanned window, so the
-    # UI should say "keep typing to narrow" rather than "no matches".
+    # True when more readable rows match than ``options`` holds (one more was
+    # found past ``limit``) or the permission scan hit its cap before filling
+    # ``limit`` — the UI should say "keep typing to narrow", not "no matches".
     truncated: bool
 
 
@@ -344,9 +364,11 @@ def _zone_query(q: str) -> Select:
     return stmt
 
 
-def _zone_option(row: object) -> ResourceOption:
+def _zone_option(row: object, parent_readable: bool = True) -> ResourceOption:
     zone = row[0]  # type: ignore[index]
-    view_name = row[1]  # type: ignore[index]
+    # The view's name is the view's own data: shown only to a caller who may
+    # read the view's group (the views routes' gate), never on the zone grant.
+    view_name = row[1] if parent_readable else None  # type: ignore[index]
     parts = [p for p in (view_name, "reverse" if zone.kind == "reverse" else None) if p]
     return ResourceOption(
         id=str(zone.id),
@@ -372,14 +394,37 @@ def _scope_query(q: str) -> Select:
     return stmt
 
 
-def _scope_option(row: Any) -> ResourceOption:
+def _scope_option(row: Any, parent_readable: bool = True) -> ResourceOption:
     scope: DHCPScope = row[0]
-    network = row[1]
+    # The subnet's network is the subnet's own data: shown only to a caller
+    # who may read that subnet. An unnamed scope is then labelled by its id.
+    network = row[1] if parent_readable else None
     return ResourceOption(
         id=str(scope.id),
-        label=scope.name or str(network),
-        sublabel=str(network) if scope.name else None,
+        label=scope.name or (str(network) if network else f"scope {str(scope.id)[:8]}"),
+        sublabel=str(network) if scope.name and network else None,
     )
+
+
+def _zone_parent_readable(user: User, row: object) -> bool:
+    """May the caller read the zone's view? Views are served by the
+    ``dns_group`` routes, which gate on a type-level ``read`` there."""
+    if row[1] is None:  # type: ignore[index]
+        return True  # no view, nothing to name
+    return user_has_permission(user, "read", "dns_group")
+
+
+def _scope_parent_readable(user: User, row: object) -> bool:
+    """May the caller read the scope's subnet? The subnet routes admit a
+    ``read`` grant scoped to that subnet, so check it against the subnet id."""
+    return user_has_permission(user, "read", "subnet", row[0].subnet_id)  # type: ignore[index]
+
+
+# resource → whether the caller may see the row's parent-derived text.
+_PARENT_READABLE = {
+    "dns_zone": _zone_parent_readable,
+    "dhcp_scope": _scope_parent_readable,
+}
 
 
 # resource → (query builder, RBAC resource_type, row → option). The key is the
@@ -421,7 +466,9 @@ async def resource_options(
     out: list[ResourceOption] = []
     offset = 0
     exhausted = False
-    while len(out) < limit and offset < _PICKER_SCAN_CAP:
+    # Collect ONE past ``limit``: a readable match beyond the page is the only
+    # proof the list is cut (#3938).
+    while len(out) <= limit and offset < _PICKER_SCAN_CAP:
         rows = (await db.execute(query_fn(q).offset(offset).limit(_PICKER_PAGE))).all()
         if not rows:
             exhausted = True
@@ -431,16 +478,28 @@ async def resource_options(
             rid = row[0].id
             if not user_has_permission(current_user, "read", rtype, rid):
                 continue
-            out.append(to_option(row))
-            if len(out) >= limit:
+            parent_ok = _PARENT_READABLE.get(resource)
+            readable = parent_ok(current_user, row) if parent_ok else True
+            if q and not readable and resource == "dhcp_scope":
+                # The scope search also matches its subnet's network; without
+                # read on the subnet that match would reveal the network.
+                if q.lower() not in (row[0].name or "").lower():
+                    continue
+            out.append(to_option(row, readable) if parent_ok else to_option(row))
+            if len(out) > limit:
                 break
         if len(rows) < _PICKER_PAGE:
             exhausted = True
             break
-    # ``truncated`` = the caller's readable rows may exist beyond the scanned
-    # window (cap hit, or limit filled with candidates left) — the UI shows
-    # "keep typing to narrow" instead of a dead-end "no matches".
-    return ResourceOptionsResponse(options=out, truncated=not exhausted and len(out) < limit)
+    # ``truncated`` = the caller's readable rows may exist beyond what is
+    # returned: a further readable match was found past ``limit``, or the scan
+    # cap was hit first. The UI shows "keep typing to narrow" instead of a
+    # dead-end "no matches" or a list that reads as complete.
+    more = len(out) > limit
+    out = out[:limit]
+    return ResourceOptionsResponse(
+        options=out, truncated=more or (not exhausted and len(out) < limit)
+    )
 
 
 # ── Catalog ────────────────────────────────────────────────────────────────
@@ -482,6 +541,7 @@ async def get_catalog(current_user: CurrentUser) -> list[RequestKindResponse]:
 async def list_requests(
     current_user: CurrentUser,
     db: DB,
+    response: Response,
     state: str | None = None,
     mine: bool = False,
     limit: int = 100,
@@ -490,13 +550,21 @@ async def list_requests(
     """List self-service requests, newest first.
 
     A caller who cannot approve is ALWAYS scoped to their own rows regardless
-    of ``mine`` — same rule as #62's queue.
+    of ``mine`` — same rule as #62's queue. Still a bare list, but ``offset``
+    pages past ``limit`` and ``X-Total-Count`` carries the number of requests
+    matching the filters *before* the window, so a client can say "100 of 101"
+    instead of presenting a cut list as the whole queue (#3937).
     """
     _require_read(current_user)
     if _can_see_all(current_user):
         scope_user_id = current_user.id if mine else None
     else:
         scope_user_id = current_user.id
+    response.headers["X-Total-Count"] = str(
+        await count_change_requests(
+            db, state=state, requested_by_user_id=scope_user_id, origin=_ORIGIN
+        )
+    )
     rows = await list_change_requests(
         db,
         state=state,
@@ -505,7 +573,7 @@ async def list_requests(
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
-    return await _respond_all(db, list(rows))
+    return await _respond_all(db, list(rows), current_user)
 
 
 @router.post("", response_model=ProvisioningRequestResponse, status_code=status.HTTP_201_CREATED)
@@ -531,7 +599,7 @@ async def create_request(
     )
     await db.commit()
     await db.refresh(cr)
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 @router.get("/{req_id}", response_model=ProvisioningRequestResponse)
@@ -539,7 +607,82 @@ async def get_request(
     req_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> ProvisioningRequestResponse:
     _require_read(current_user)
-    return await _respond(db, await _load_visible(db, req_id, current_user))
+    return await _respond(db, await _load_visible(db, req_id, current_user), current_user)
+
+
+class CurrentPreviewResponse(BaseModel):
+    """What approving the request would do if pressed now (#3934)."""
+
+    # The preview re-run against the estate as it is now.
+    preview_text: str
+    # False when the operation can no longer be applied as submitted; ``detail``
+    # then says why. Pressing Approve would end the request ``failed``.
+    ok: bool
+    detail: str | None = None
+    # True when ``preview_text`` differs from the one stored at submit.
+    changed: bool
+
+
+@router.get("/{req_id}/current-preview", response_model=CurrentPreviewResponse)
+async def get_current_preview(
+    req_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> CurrentPreviewResponse:
+    """Re-run the operation's preview now, as the caller.
+
+    The stored ``preview_text`` was composed at submit; the approval runs
+    against the estate as it is at the press (a subnet may have been bound to
+    another DNS zone since), so the Approve dialog reads this instead (#3934).
+    Read-only. A request that is no longer pending answers its stored text.
+    """
+    _require_read(current_user)
+    cr = await _load_visible(db, req_id, current_user)
+    stored = CurrentPreviewResponse(preview_text=cr.preview_text, ok=True, changed=False)
+    if cr.state != "pending":
+        return stored
+    from app.services.ai import operations  # noqa: PLC0415
+    from app.services.ai.operations import previewing_for_requester  # noqa: PLC0415
+
+    op = operations.get_operation(cr.operation)
+    if op is None:
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text,
+            ok=False,
+            detail="Operation is not registered.",
+            changed=False,
+        )
+    try:
+        args = op.args_model.model_validate(cr.args or {})
+        if _can_see_all(current_user):
+            preview = await op.preview(db, current_user, args)
+        else:
+            # The requester re-reads their own request: same view as at submit.
+            with previewing_for_requester():
+                preview = await op.preview(db, current_user, args)
+    except HTTPException as exc:
+        await db.rollback()
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text, ok=False, detail=_refusal_text(exc.detail), changed=False
+        )
+    except Exception as exc:  # noqa: BLE001 — a refused preview is data, not a 500
+        await db.rollback()
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text,
+            ok=False,
+            detail=str(exc) or "The operation can no longer be applied.",
+            changed=False,
+        )
+    if not preview.ok:
+        return CurrentPreviewResponse(
+            preview_text=cr.preview_text,
+            ok=False,
+            detail=preview.detail or "The operation can no longer be applied.",
+            changed=False,
+        )
+    return CurrentPreviewResponse(
+        preview_text=preview.preview_text,
+        ok=True,
+        changed=preview.preview_text != cr.preview_text,
+    )
 
 
 # ── Decisions (delegated to the shared #62 spine) ──────────────────────────
@@ -572,7 +715,7 @@ async def approve_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 @router.post("/{req_id}/reject", response_model=ProvisioningRequestResponse)
@@ -593,7 +736,7 @@ async def reject_request(
         )
     except DecisionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 @router.post("/{req_id}/cancel", response_model=ProvisioningRequestResponse)
@@ -623,7 +766,7 @@ async def cancel_request(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     await db.commit()
     await db.refresh(cr)
-    return await _respond(db, cr)
+    return await _respond(db, cr, current_user)
 
 
 __all__ = ["router"]

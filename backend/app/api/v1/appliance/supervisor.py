@@ -78,6 +78,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pre_body_auth import header_only
 from app.api.v1.appliance.cluster import VarDiskFinding
+from app.config import settings
 from app.core.agent_wake import (
     HOSTCONFIG_ALL,
     WAKE_TICK_SECONDS,
@@ -96,9 +97,10 @@ from app.core.auth_throttle import (
     refund_pairing_attempt,
 )
 from app.core.db_transient import is_transient_db_error
+from app.core.denial_audit import note_denial_audited
 from app.core.permissions import is_effective_superadmin, require_permission
 from app.core.responses import PlainTextStreamResponse
-from app.core.versions import is_installed_target, upgrade_direction
+from app.core.versions import includes_release, is_installed_target, upgrade_direction
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -134,6 +136,11 @@ from app.services.appliance.ca import (
     generate_session_token,
     sign_supervisor_cert,
     verify_session_token,
+)
+from app.services.appliance.cert_auth import (
+    RegisterProofRefused,
+    RegisterProofUnavailable,
+    verify_register_proof,
 )
 from app.services.appliance.cluster_dns_group import (
     cluster_dns_group_refusal,
@@ -191,6 +198,7 @@ from app.services.appliance.var_disk import (
     var_disk_reading,
 )
 from app.services.dhcp.ha_firewall import dhcp_ha_firewall_inputs
+from app.services.host_timezone import canonical_host_timezone
 from app.services.upgrades import shared_tags as upgrade_shared_tags
 from app.services.upgrades.safety import assert_no_upgrade_in_flight
 from app.services.upgrades.schema_rollback import check_release_can_run
@@ -534,6 +542,11 @@ class SupervisorCapabilities(BaseModel):
     # join token, so a promote of it is refused up front rather than left to
     # wait for a token that will not come.
     sealed_join_token: bool = False
+    # A supervisor that reports this signs its registration with its own key
+    # (``proof_*`` on the register request). Once a row has reported it, a
+    # re-registration without that signature is refused, so the older,
+    # unsigned form is accepted only for supervisors that never sent one.
+    register_proof: bool = False
 
 
 class SupervisorRoleRestore(BaseModel):
@@ -600,6 +613,11 @@ class SupervisorRegisterRequest(BaseModel):
     # Fleet row went away. Honoured only on a self-bootstrap (auto-approve)
     # registration; see ``_restore_supervisor_roles``.
     restore_roles: SupervisorRoleRestore | None = None
+    # The registering key's signature over a fresh timestamp and nonce
+    # (``cert_auth.register_proof_payload``). Absent from older supervisors.
+    proof_timestamp: str | None = Field(default=None, max_length=64)
+    proof_nonce: str | None = Field(default=None, max_length=64)
+    proof_signature: str | None = Field(default=None, max_length=256)
 
     @field_validator("pairing_code")
     @classmethod
@@ -618,7 +636,8 @@ class SupervisorRegisterRequest(BaseModel):
 class SupervisorTlsPinsResponse(BaseModel):
     """The certificates the control plane serves, signed by the appliance CA
     (#1219). ``payload`` is base64 of canonical JSON
-    ``{"version": 1, "certs_sha256": [...], "issued_at": "..."}``;
+    ``{"version": 1, "certs_sha256": [...], "certs_pem": [...], "issued_at": "..."}``
+    (``certs_pem``, #4223: the leaf PEMs those fingerprints name);
     ``signature`` is the CA's signature over exactly those bytes."""
 
     payload: str
@@ -1040,6 +1059,45 @@ async def supervisor_tls_pins(db: DB) -> SupervisorTlsPinsResponse:
     return SupervisorTlsPinsResponse(**pin_set)
 
 
+_UNSIGNED_REGISTER_REFUSED = (
+    "Registration refused: an existing appliance must register with a signature "
+    "from its own key. Upgrade the appliance's supervisor to 1.0.1 or later, or "
+    "delete the appliance's row under Fleet and pair it again, or have an "
+    "administrator change APPLIANCE_UNSIGNED_REGISTER_ALLOWED."
+)
+
+# #4433 — why a registration proof was refused. The header carries the reason
+# for a supervisor that reads headers; the 403 body carries it too.
+REGISTER_REFUSAL_HEADER = "X-Register-Refusal"
+_REGISTER_PROOF_MESSAGES = {
+    "clock_skew": (
+        "Registration refused: the appliance's clock differs from this server's "
+        "by more than the allowed skew. Correct its clock; the pairing code is kept."
+    ),
+    "bad_signature": "Registration refused: the registration proof was not valid. Retrying.",
+    "replayed": "Registration refused: the registration proof was already used. Retrying.",
+}
+
+# First release whose supervisor signs its registration.
+_FIRST_SIGNING_RELEASE = "1.0.1"
+
+
+def _unsigned_register_permitted(row: Appliance) -> bool:
+    """Whether ``row`` may re-register without a signature.
+
+    Never once the row has reported it signs, never under
+    ``appliance_unsigned_register_allowed = never``, and never when its last
+    reported supervisor version already includes the first signing release.
+    A version that is missing, a dev build or a nightly counts as older: those
+    rows cannot be told apart from a supervisor that never signed.
+    """
+    if settings.appliance_unsigned_register_allowed != "legacy":
+        return False
+    if (row.capabilities or {}).get("register_proof"):
+        return False
+    return includes_release(row.supervisor_version, _FIRST_SIGNING_RELEASE) is not True
+
+
 @router.post(
     "/supervisor/register",
     response_model=SupervisorRegisterResponse,
@@ -1073,6 +1131,42 @@ async def supervisor_register(
     # 422s on a malformed pubkey shouldn't burn a real pairing code.
     pubkey_der, pubkey_fingerprint = _decode_pubkey(body.public_key_der_b64)
 
+    # A supervisor that signs its registration proves it holds the key. A
+    # signature that is present but wrong (or a repeat) is refused outright.
+    key_proven = False
+    if body.proof_signature is not None:
+        loaded_key = load_der_public_key(pubkey_der)
+        assert isinstance(loaded_key, Ed25519PublicKey)  # _decode_pubkey checked
+        try:
+            key_proven = await verify_register_proof(
+                loaded_key,
+                pubkey_fingerprint,
+                body.proof_timestamp or "",
+                body.proof_nonce or "",
+                body.proof_signature,
+            )
+        except RegisterProofRefused as exc:
+            # Still a 403 (an older supervisor reads that as "code rejected"),
+            # but with the reason in a header and the body so a current one
+            # keeps its pairing code and retries (#4433). Nothing here depends
+            # on the code, so there is no oracle to protect.
+            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                {
+                    "reason": exc.reason,
+                    "message": _REGISTER_PROOF_MESSAGES.get(exc.reason, "Registration refused."),
+                },
+                headers={REGISTER_REFUSAL_HEADER: exc.reason},
+            ) from None
+        except RegisterProofUnavailable:
+            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Registration is paused: the nonce store is unavailable. Retrying shortly.",
+                headers={"Retry-After": "30"},
+            ) from None
+
     submitted_hash = _hash_code(body.pairing_code)
     client_ip = _client_ip(request)
     now = datetime.now(UTC)
@@ -1089,16 +1183,81 @@ async def supervisor_register(
     existing_stmt = select(Appliance).where(Appliance.public_key_fingerprint == pubkey_fingerprint)
     existing = (await db.execute(existing_stmt)).scalar_one_or_none()
     if existing is not None:
+        # The row's owner is whoever holds the private key. A supervisor
+        # that has reported it signs its registrations is held to that. An
+        # unsigned one is accepted only under ``appliance_unsigned_register_
+        # allowed = legacy`` and only while the row's last-reported
+        # supervisor version predates the first one that signs (a missing or
+        # unreadable version counts as older). Each acceptance is audited
+        # and spends an attempt from the registration budget.
+        if not key_proven:
+            if not _unsigned_register_permitted(existing):
+                logger.warning(
+                    "supervisor_register_unsigned_refused",
+                    appliance_id=str(existing.id),
+                    ip=client_ip,
+                    last_reported_version=existing.supervisor_version,
+                )
+                await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    _UNSIGNED_REGISTER_REFUSED,
+                )
+            try:
+                allowed, _ip_failures, _global_failures = await claim_pairing_attempt(client_ip)
+            except PairingThrottleUnavailable:
+                await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Registration is paused: the attempt limiter is unavailable. Retrying shortly.",
+                    headers={"Retry-After": "60"},
+                ) from None
+            if not allowed:
+                await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+                raise HTTPException(
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    "Too many failed registration attempts. Try again in 15 minutes.",
+                    headers={"Retry-After": "900"},
+                )
+            db.add(
+                AuditLog(
+                    user_id=None,
+                    user_display_name="anonymous supervisor",
+                    auth_source="anonymous",
+                    source_ip=client_ip,
+                    action="appliance.supervisor_register_unsigned",
+                    resource_type="appliance",
+                    resource_id=str(existing.id),
+                    resource_display=existing.hostname or str(existing.id),
+                    result="success",
+                    new_value={
+                        "fingerprint": pubkey_fingerprint,
+                        "last_reported_version": existing.supervisor_version,
+                        "submitted_version": body.supervisor_version,
+                    },
+                )
+            )
+            logger.warning(
+                "supervisor_register_unsigned",
+                appliance_id=str(existing.id),
+                ip=client_ip,
+                hint="this supervisor registers without a key signature; upgrade it",
+            )
         # Idempotent re-register. Touch last_seen_at so the heartbeat
         # path stays useful even before A2+ ships a separate
         # heartbeat endpoint. Update capabilities + supervisor_version
-        # since the supervisor may have upgraded between calls.
+        # since the supervisor may have upgraded between calls, but only
+        # when the request is signed: the stored version decides whether an
+        # unsigned re-register is still allowed, so an unsigned body must
+        # not be able to move it (the heartbeat reports it authenticated).
         existing.last_seen_at = now
         existing.last_seen_ip = client_ip
-        if body.supervisor_version:
-            existing.supervisor_version = body.supervisor_version
-        if body.capabilities is not None:
-            existing.capabilities = body.capabilities.model_dump()
+        if key_proven:
+            if body.supervisor_version:
+                existing.supervisor_version = body.supervisor_version
+            if body.capabilities is not None:
+                existing.capabilities = body.capabilities.model_dump()
+            existing.capabilities = {**(existing.capabilities or {}), "register_proof": True}
         # Rotate the session token — supervisor must use the fresh one
         # for subsequent polls. Old cached tokens fail hash compare.
         # #411 — ALWAYS mint + return a fresh token, even for a cert'd
@@ -1292,7 +1451,10 @@ async def supervisor_register(
         public_key_der=pubkey_der,
         public_key_fingerprint=pubkey_fingerprint,
         supervisor_version=body.supervisor_version,
-        capabilities=(body.capabilities.model_dump() if body.capabilities else {}),
+        capabilities={
+            **(body.capabilities.model_dump() if body.capabilities else {}),
+            **({"register_proof": True} if key_proven else {}),
+        },
         session_token_hash=session_hash,
         paired_at=now,
         paired_from_ip=client_ip,
@@ -2387,6 +2549,35 @@ async def supervisor_heartbeat(
     response.headers[SIGNATURE_VERSIONS_HEADER] = SIGNATURE_VERSION
     try:
         return await _supervisor_heartbeat(body, request, db)
+    except HTTPException as exc:
+        # #4677 — a restore replays the appliance registry and only then puts
+        # the running appliance back, under the install-wide restore lock. A
+        # heartbeat landing between the two finds no row for its credential;
+        # answering that 403 is a revocation strike, and two in a row tear the
+        # node's roles down. While the lock is held the refusal is not a
+        # verdict on the row: 503 + Retry-After, which the supervisor retries
+        # without a strike (only a marked 403 counts).
+        if exc.status_code == status.HTTP_403_FORBIDDEN and REVOCATION_HEADER in (
+            exc.headers or {}
+        ):
+            from app.services.backup.restore import restore_lock_held  # noqa: PLC0415
+
+            try:
+                restoring = await restore_lock_held(db)
+            except Exception as lock_exc:  # noqa: BLE001 — the refusal below stands
+                logger.warning("supervisor_heartbeat_restore_check_failed", error=str(lock_exc))
+                restoring = False
+            if restoring:
+                logger.info(
+                    "supervisor_heartbeat_deferred_restore",
+                    appliance_id=str(body.appliance_id),
+                )
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "A restore is in progress. Retry.",
+                    headers={"Retry-After": "1"},
+                ) from exc
+        raise
     except Exception as exc:
         # #2845 — a CNPG switchover drops the connection under whichever
         # statement is in flight: most often the re-read after the long-poll
@@ -3427,7 +3618,9 @@ async def _supervisor_heartbeat(
     metallb_bgp_peers = list(cfg_row.metallb_bgp_peers or []) if cfg_row else []
     metallb_bgp_advertisements = list(cfg_row.metallb_bgp_advertisements or []) if cfg_row else []
     # Issue #165 — operator-set timezone. Empty string = no override.
-    desired_timezone = (cfg_row.timezone or "") if cfg_row else ""
+    # Canonicalised again here: a legacy alias saved before #4416 is still
+    # in the column, and the host image would refuse it.
+    desired_timezone = canonical_host_timezone((cfg_row.timezone or "") if cfg_row else "")
     # #393 — appliance console mode (grubenv-driven, applies next reboot).
     desired_console_mode = (cfg_row.console_mode or "dashboard") if cfg_row else "dashboard"
     # Issue #346 — host-config blocks for snmp / chrony / lldp. Built from the
@@ -4532,6 +4725,7 @@ async def delete_appliance(
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -4768,6 +4962,7 @@ async def permanent_delete_appliance(
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
+        note_denial_audited()
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -5137,27 +5332,19 @@ async def update_appliance_roles(
             retired_servers = dns_move.retired
             moved_servers.extend(dns_move.moved)
             row.assigned_dns_group_id = dns_group.id
-    # #1782 — Technitium cannot do catalog zones (#1766). The own-server move
-    # above refuses it for a server that already exists, but an appliance
-    # whose agent has not registered yet has none: the pointer alone would
-    # send a fresh Technitium agent into a catalog group, and registration
-    # cannot refuse it (a refused agent loops). So refuse it here, on change.
+    # #1858 — a Technitium appliance must not be pointed at a group holding a
+    # key Technitium cannot use. (Catalog zones are no longer refused here:
+    # the agent-managed driver supports them, #1766.) The own-server move
+    # above covers a server that exists; an appliance whose agent has not
+    # registered yet has none, so the pointer is checked here, on change.
     if row.assigned_dns_group_id is not None and "dns-technitium" in (row.assigned_roles or []):
         changed = (
             "dns-technitium" not in prev_dns_roles or row.assigned_dns_group_id != prev_dns_group_id
         )
         if changed:
             from app.models.dns import DNSServerGroup
-            from app.services.dns.server_move import catalog_unsupported_message
 
             target = await db.get(DNSServerGroup, row.assigned_dns_group_id)
-            if target is not None and target.catalog_zones_enabled:
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    f"DNS server group {target.name!r} has catalog zones enabled. "
-                    + catalog_unsupported_message({"technitium"}),
-                )
-            # #1858 — and not into a group holding a key Technitium cannot use.
             if target is not None:
                 from app.services.dns.tsig_algorithms import group_key_refusal
 
@@ -7827,6 +8014,13 @@ async def _cert_principal(request: Request, db: AsyncSession, *, body_streamed: 
     try:
         principal = await authenticate_cert(request, db, body_streamed=body_streamed)
     except CertAuthFailed as exc:
+        # #4677 — a restore replaying the registry leaves a moment with no row
+        # for this certificate. Not a verdict on it: 503, and the supervisor
+        # backs off without a strike. A replay (401) stays a refusal.
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            from app.core.restore_gate import defer_if_restoring  # noqa: PLC0415
+
+            await defer_if_restoring(db, "the request")
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
         raise HTTPException(exc.status_code, "Invalid appliance client cert.") from exc
     if principal is None:
@@ -8887,6 +9081,23 @@ def _require_k8s_name(field: str, value: str, *, pattern: str = _K8S_NAME_PATTER
         )
 
 
+#: The one namespace the supervisor's kubeapi proxy runs requests in (#3618:
+#: ``agent/supervisor/spatium_supervisor/k8s_proxy.py`` answers anything else
+#: 403 unexecuted). Refusing here keeps that refusal a caller error instead of
+#: a "502 kubeapi returned 403" for a request the kubeapi never received.
+_K8S_SERVED_NAMESPACE = "spatium"
+
+
+def _require_served_namespace(namespace: str) -> None:
+    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    if namespace != _K8S_SERVED_NAMESPACE:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"namespace: only {_K8S_SERVED_NAMESPACE!r} is served by the appliance "
+            f"kubeapi proxy, not {namespace!r}.",
+        )
+
+
 class ApplianceWorkloadsResponse(BaseModel):
     workloads: list[ApplianceWorkloadRow]
     #: Per-kind failures. Reported rather than raised so a cluster with an
@@ -8924,7 +9135,7 @@ async def k8s_list_workloads(
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
     from app.services.service_control import kube as _kube  # noqa: PLC0415
 
-    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    _require_served_namespace(namespace)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -9010,6 +9221,7 @@ async def k8s_rollout_restart(
     """
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
+    _require_served_namespace(body.namespace)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -9352,10 +9564,10 @@ async def k8s_list_pods(
 ) -> K8sPodListResponse:
     """List pods in the named namespace via the kubeapi proxy.
 
-    Default namespace ``spatium`` covers every chart-deployed pod.
-    Operators who want kube-system / default visibility pass the
-    namespace explicitly — same kubeapi surface as ``kubectl get
-    pods``.
+    Only ``spatium`` is served, which covers every chart-deployed pod:
+    the supervisor's kubeapi proxy refuses any other namespace (#3618),
+    so another one answers 422 here rather than a 502 from the proxy.
+    For kube-system / default use ``kubectl`` on the appliance.
     """
     from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
 
@@ -9368,7 +9580,7 @@ async def k8s_list_pods(
             f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
         )
 
-    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    _require_served_namespace(namespace)
     path = f"/api/v1/namespaces/{namespace}/pods"
     try:
         status_code, body = await _proxy.k8s_call(row.id, "GET", path, timeout=15.0)
@@ -9463,7 +9675,7 @@ async def k8s_get_pod_logs(
     # Reject path / query injection on operator-supplied strings —
     # the proxy concatenates them into the kubeapi URL (#3618).
     _require_k8s_name("pod", pod)
-    _require_k8s_name("namespace", namespace, pattern=_K8S_LABEL_PATTERN)
+    _require_served_namespace(namespace)
     if container:
         _require_k8s_name("container", container, pattern=_K8S_LABEL_PATTERN)
     tail = max(1, min(10_000, tail_lines))

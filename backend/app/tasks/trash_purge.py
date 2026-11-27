@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import and_, delete, exists, func, or_, select, union
+from sqlalchemy import String, and_, cast, delete, exists, func, or_, select, union
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
@@ -28,7 +28,8 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.models.e911 import ERLBinding
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
@@ -98,6 +99,7 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime, touched_subnets: set[
                 and_(
                     DHCPStaticAssignment.deleted_at.is_not(None),
                     DHCPStaticAssignment.deleted_at < cutoff,
+                    ~_bound_in_trashed_scope(),
                 ),
                 # The same predicate the scope DELETE uses: a scope held back
                 # because a live pool / reservation sits on it (#1957) keeps its
@@ -244,7 +246,10 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     page's permanent delete goes through the same helper and fails the same
     way (#1830).
     """
-    from app.services.dns.reverse_zone import hand_over_zone_to_trashed_sharer  # noqa: PLC0415
+    from app.services.dns.reverse_zone import (  # noqa: PLC0415
+        hand_over_zone_to_trashed_sharer,
+        trashed_sharers,
+    )
     from app.services.dns.zone_purge import purge_trashed_zone  # noqa: PLC0415
 
     res = await db.execute(
@@ -254,48 +259,79 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     )
     purged = 0
     skipped = 0
-    for zone in res.scalars().all():
+    zones = list(res.scalars().all())
+    # #3751 — every zone's address rows in ONE ascending pass, before any zone
+    # row: an auto-sync batch locks its rows in one ascending pass across zones
+    # (#3726), and a pass per zone interleaves with it into a 40P01. The sweep
+    # commits once at its end (never per zone), so these locks are held for all
+    # the purges below, whose own per-zone lock then re-takes rows already held.
+    # No sync gate here: #3726 found it deadlocks.
+    from app.services.lock_order import lock_addresses_of_zones  # noqa: PLC0415
+
+    await lock_addresses_of_zones(db, [z.id for z in zones])
+    for zone in zones:
+        # Read before the savepoint: rolling it back may expire the row.
+        zone_name, zone_id = zone.name, zone.id
         try:
-            # #3190 — a shared auto reverse zone holding the PTRs of a trashed
-            # subnet that has NOT expired is handed to that subnet's batch, not
-            # purged out from under it.
-            heir = await hand_over_zone_to_trashed_sharer(db, zone)
-            if heir is not None:
-                db.add(
-                    AuditLog(
-                        user_id=None,
-                        user_display_name="system",
-                        auth_source="system",
-                        action="update",
-                        resource_type="dns_zone",
-                        resource_id=str(zone.id),
-                        resource_display=zone.name,
-                        new_value={
-                            "handed_over_to_subnet": str(heir.id),
-                            "deletion_batch_id": str(heir.deletion_batch_id),
-                            "reason": "another trashed subnet's records still sit in the zone",
-                        },
-                        result="success",
+            # #3751 — a savepoint per zone: a database error here (a 40P01, a
+            # lock or statement timeout) aborts the transaction, and the
+            # sweep's closing COMMIT would then roll everything back without
+            # an error. Rolled back to the savepoint, only this zone is undone;
+            # the address locks above were taken outside it and stay held.
+            async with db.begin_nested():
+                # #3190 — a shared auto reverse zone holding the PTRs of a trashed
+                # subnet that has NOT expired is handed to that subnet's batch, not
+                # purged out from under it.
+                heir = await hand_over_zone_to_trashed_sharer(db, zone)
+                if heir is not None:
+                    db.add(
+                        AuditLog(
+                            user_id=None,
+                            user_display_name="system",
+                            auth_source="system",
+                            action="update",
+                            resource_type="dns_zone",
+                            resource_id=str(zone.id),
+                            resource_display=zone.name,
+                            new_value={
+                                "handed_over_to_subnet": str(heir.id),
+                                "deletion_batch_id": str(heir.deletion_batch_id),
+                                "reason": "another trashed subnet's records still sit in the zone",
+                            },
+                            result="success",
+                        )
                     )
-                )
-                continue
-            kept = await purge_trashed_zone(db, zone)
-            if kept:
-                # #3812: the copy another zone of the same name may use stays at
-                # the provider; say so where an operator will look for it.
-                db.add(
-                    AuditLog(
-                        user_id=None,
-                        user_display_name="system",
-                        auth_source="system",
-                        action="permanent_delete",
-                        resource_type="dns_zone",
-                        resource_id=str(zone.id),
-                        resource_display=zone.name,
-                        new_value={"provider_copies_kept": kept},
-                        result="success",
+                    continue
+                # #3889 — an expired zone the operator made (not handed over above)
+                # still holding another trashed subnet's records is kept until that
+                # subnet is purged or restored: its FK cascade would take them.
+                held_by = [] if zone.is_auto_generated else await trashed_sharers(db, zone)
+                if held_by:
+                    logger.info(
+                        "trash_purge.zone_held_for_trashed_subnet",
+                        zone=zone_name,
+                        zone_id=str(zone_id),
+                        subnets=[str(s.network) for s in held_by],
+                        hint="kept until those subnets leave the Trash",
                     )
-                )
+                    continue
+                kept = await purge_trashed_zone(db, zone)
+                if kept:
+                    # #3812: the copy another zone of the same name may use stays at
+                    # the provider; say so where an operator will look for it.
+                    db.add(
+                        AuditLog(
+                            user_id=None,
+                            user_display_name="system",
+                            auth_source="system",
+                            action="permanent_delete",
+                            resource_type="dns_zone",
+                            resource_id=str(zone_id),
+                            resource_display=zone_name,
+                            new_value={"provider_copies_kept": kept},
+                            result="success",
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001 — best-effort; retry next sweep
             # A dead / rejecting provider must NOT let the row Core-DELETE (that
             # orphans the hosted zone forever). Leave it soft-deleted + logged;
@@ -303,8 +339,8 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
             skipped += 1
             logger.warning(
                 "trash_purge.zone_retract_failed",
-                zone=zone.name,
-                zone_id=str(zone.id),
+                zone=zone_name,
+                zone_id=str(zone_id),
                 error=str(exc),
                 hint="left soft-deleted; next daily sweep retries the provider push",
             )
@@ -348,6 +384,23 @@ def _scopes_with_live_children() -> Any:
     )
 
 
+def _bound_in_trashed_scope() -> Any:
+    """SQL predicate: this reservation's address carries an E911 binding and its
+    scope is in the Trash. Such a reservation waits with its scope (#4286); one
+    trashed alone, under a live scope, is purged as always."""
+    return and_(
+        exists()
+        .where(
+            ERLBinding.ip_address_id == IPAddress.id,
+            IPAddress.static_assignment_id == cast(DHCPStaticAssignment.id, String),
+        )
+        .correlate(DHCPStaticAssignment),
+        exists()
+        .where(DHCPScope.id == DHCPStaticAssignment.scope_id, DHCPScope.deleted_at.is_not(None))
+        .correlate(DHCPStaticAssignment),
+    )
+
+
 def _expired_where(model: type, cutoff: datetime) -> list[Any]:
     """The rows of ``model`` the sweep may delete: expired, and with nothing LIVE under them.
 
@@ -378,7 +431,21 @@ def _expired_where(model: type, cutoff: datetime) -> list[Any]:
             ~subnet_e911_bound_clause(),
         ]
     elif model is DHCPScope:
-        where.append(DHCPScope.id.not_in(_scopes_with_live_children()))
+        where += [
+            DHCPScope.id.not_in(_scopes_with_live_children()),
+            # A reservation's address an E911 binding names is kept with its
+            # scope in the Trash; the purge would drop that binding, so the
+            # scope is held back for the operator to move it (#4286).
+            ~exists()
+            .where(
+                ERLBinding.ip_address_id == IPAddress.id,
+                IPAddress.static_assignment_id == cast(DHCPStaticAssignment.id, String),
+                DHCPStaticAssignment.scope_id == DHCPScope.id,
+            )
+            .correlate(DHCPScope),
+        ]
+    elif model is DHCPStaticAssignment:
+        where.append(~_bound_in_trashed_scope())
     elif model is Customer:
         # network_service.customer_id is RESTRICT: a customer with any service
         # (live, or trashed but not yet expired) waits for it (#2738).

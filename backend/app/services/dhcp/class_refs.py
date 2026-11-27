@@ -85,19 +85,34 @@ async def pools_restricted_to(
     name: str,
     *,
     exclude_scope_id: uuid.UUID | None = None,
+    include_trashed: bool = False,
 ) -> list[tuple[str, str, str]]:
     """``(scope name, start_ip, end_ip)`` of every pool in the group bound to
-    ``name``, leaving out ``exclude_scope_id``'s own pools."""
+    ``name``, leaving out ``exclude_scope_id``'s own pools.
+
+    ``include_trashed`` also counts pools in the Trash (a trashed pool, or any
+    pool of a trashed scope), their scope name suffixed ``, in Trash`` (#3928).
+    A delete or rename must pass it: a restore brings the pool back with its
+    restriction, so a class removed meanwhile leaves it serving no client."""
     q = (
-        select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip)
+        select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip, DHCPScope.deleted_at)
         .join(DHCPScope, DHCPPool.scope_id == DHCPScope.id)
         .where(DHCPScope.group_id == group_id, DHCPPool.class_restriction == name)
         .order_by(DHCPScope.name, DHCPPool.start_ip)
     )
     if exclude_scope_id is not None:
         q = q.where(DHCPScope.id != exclude_scope_id)
+    if include_trashed:
+        q = q.add_columns(DHCPPool.deleted_at).execution_options(include_deleted=True)
     rows = (await db.execute(q)).all()
-    return [(r[0] or "", str(r[1]), str(r[2])) for r in rows]
+    return [
+        (
+            (r[0] or "") + (", in Trash" if include_trashed and (r[3] or r[4]) else ""),
+            str(r[1]),
+            str(r[2]),
+        )
+        for r in rows
+    ]
 
 
 def calls_member(expr: str, name: str) -> bool:
@@ -136,6 +151,16 @@ def describe_pools(pools: list[tuple[str, str, str]]) -> str:
     shown = ", ".join(f"{s}-{e}" + (f" ({n})" if n else "") for n, s, e in pools[:5])
     more = f" and {len(pools) - 5} more" if len(pools) > 5 else ""
     return f"{shown}{more}"
+
+
+def trash_hint(pools: list[tuple[str, str, str]]) -> str:
+    """Way out of a refusal that counted pools in the Trash (#3928)."""
+    if not any(n.endswith(", in Trash") for n, _s, _e in pools):
+        return ""
+    return (
+        " Pools marked 'in Trash' come back with their restriction on restore: purge "
+        "their scope from Administration > Trash, or restore it and clear the pool's class."
+    )
 
 
 async def known_class_names(db: AsyncSession, group_id: uuid.UUID) -> set[str]:
@@ -212,7 +237,11 @@ async def _profile_rules(db: AsyncSession, profile: DHCPPXEProfile) -> list[DHCP
 
 
 async def pxe_pool_refs(
-    db: AsyncSession, profile: DHCPPXEProfile, *, scope_id: uuid.UUID | None = None
+    db: AsyncSession,
+    profile: DHCPPXEProfile,
+    *,
+    scope_id: uuid.UUID | None = None,
+    include_trashed: bool = False,
 ) -> list[tuple[str, list[tuple[str, str, str]]]]:
     """``(class name, pools)`` for each of the profile's rules named by a pool
     the class actually serves: a pool in a scope bound to the profile, or in
@@ -221,21 +250,35 @@ async def pxe_pool_refs(
     Since #2731 a PXE class is rendered ``only-in-additional-list`` and listed
     on the subnets of the scopes bound to its profile, so Kea evaluates it
     there and nowhere else. A pool in any other scope never matched; it is not
-    this profile's change that breaks it."""
+    this profile's change that breaks it.
+
+    ``include_trashed`` also counts pools in the Trash, suffixed ``, in Trash``
+    (#4362): a restore brings them back restricted to the class."""
     out = []
     for m in await _profile_rules(db, profile):
         name = pxe_class_name(profile.id, m.id)
         q = (
-            select(DHCPScope.name, DHCPPool.start_ip, DHCPPool.end_ip)
+            select(
+                DHCPScope.name,
+                DHCPPool.start_ip,
+                DHCPPool.end_ip,
+                DHCPScope.deleted_at,
+                DHCPPool.deleted_at,
+            )
             .join(DHCPScope, DHCPPool.scope_id == DHCPScope.id)
             .where(DHCPScope.group_id == profile.group_id, DHCPPool.class_restriction == name)
             .order_by(DHCPScope.name, DHCPPool.start_ip)
         )
+        if include_trashed:
+            q = q.execution_options(include_deleted=True)
         if scope_id is not None:
             q = q.where(DHCPScope.id == scope_id)
         else:
             q = q.where(DHCPScope.pxe_profile_id == profile.id)
-        pools = [(r[0] or "", str(r[1]), str(r[2])) for r in (await db.execute(q)).all()]
+        pools = [
+            ((r[0] or "") + (", in Trash" if r[3] or r[4] else ""), str(r[1]), str(r[2]))
+            for r in (await db.execute(q)).all()
+        ]
         if pools:
             out.append((name, pools))
     return out
@@ -248,12 +291,14 @@ async def phone_profile_rendered(
     enabled: bool | None = None,
     scope_ids: Iterable[uuid.UUID] | None = None,
     exclude_scope_id: uuid.UUID | None = None,
+    include_trashed: bool = False,
 ) -> bool:
     """Whether the bundle defines the profile's class: it is enabled AND
     attached to an active scope of its group (``_assemble_phone_classes``).
     ``enabled`` / ``scope_ids`` (the attachments after a replace) /
     ``exclude_scope_id`` (a scope being deleted or deactivated) ask the
-    question for a pending change."""
+    question for a pending change. ``include_trashed`` counts scopes in the Trash
+    too: not what the bundle renders, but what a restore brings back (#4362)."""
     if not (profile.enabled if enabled is None else enabled):
         return False
     q = select(DHCPScope.id).where(
@@ -267,6 +312,8 @@ async def phone_profile_rendered(
         )
     if exclude_scope_id is not None:
         q = q.where(DHCPScope.id != exclude_scope_id)
+    if include_trashed:
+        q = q.execution_options(include_deleted=True)
     return (await db.execute(q.limit(1))).first() is not None
 
 

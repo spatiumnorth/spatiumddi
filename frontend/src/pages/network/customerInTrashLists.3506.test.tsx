@@ -66,6 +66,12 @@ const CIRCUIT = {
   notes: "",
 };
 
+// The ownership fields follow their feature modules (#4101); these tests are
+// about the customer field itself, so every module is on.
+vi.mock("@/hooks/useFeatureModules", () => ({
+  useFeatureModules: () => ({ ready: true, enabled: () => true }),
+}));
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const pending = () => new Promise(() => {});
@@ -182,7 +188,7 @@ describe("a customer in the Trash is named as such (#3506)", () => {
     expect(screen.queryByText("(customer in Trash)")).toBeNull();
   });
 
-  it("multicast edit form keeps the id and Save sends it unchanged", async () => {
+  it("multicast edit form keeps the id and a Save never sends or nulls it", async () => {
     wrap(
       <MulticastGroupModal
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -197,10 +203,15 @@ describe("a customer in the Trash is named as such (#3506)", () => {
       ).toBeTruthy(),
     );
     expect(customerSelect().value).toBe("c-gone");
+    // Since #4379 a Save sends only what changed: the trashed customer is
+    // kept by not being sent.
+    fireEvent.change(screen.getByDisplayValue("Cam 1"), {
+      target: { value: "renamed" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(update).toHaveBeenCalled());
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((update.mock.calls[0] as any)[1].customer_id).toBe("c-gone");
+    expect((update.mock.calls[0] as any)[1]).toEqual({ name: "renamed" });
   });
 
   it("circuit edit form keeps the trashed customer selected", async () => {

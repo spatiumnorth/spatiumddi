@@ -33,11 +33,16 @@ from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
 from app.services.api_token_scopes import token_write
 from app.services.dns import technitium_api_scope
-from app.services.dns.pool_apply import apply_pool_state, withdraw_member_records
+from app.services.dns.pool_apply import (
+    apply_pool_state,
+    pool_name_refusal,
+    withdraw_member_records,
+)
 from app.services.dns.pool_health_staleness import (
     is_member_check_stale,
     member_check_age_seconds,
 )
+from app.services.dns.zone_synthesis import unauthored_zone_error
 
 logger = structlog.get_logger(__name__)
 
@@ -414,6 +419,10 @@ async def create_pool(
     await _refuse_on_technitium_api(db, group_id)
     if zone.zone_type == "forward":
         raise HTTPException(status_code=400, detail="Pools are not supported on forward zones")
+    # #3838 — a pool's A/AAAA rows would be served by nobody in a secondary / stub.
+    unauthored = unauthored_zone_error(zone, "pool")
+    if unauthored is not None:
+        raise HTTPException(status_code=422, detail=unauthored)
     # Pools render A/AAAA records, which only belong in a forward zone.
     # Reverse (in-addr.arpa / ip6.arpa) zones hold PTR records, so a pool
     # there could never render a valid record — reject it defensively
@@ -428,6 +437,13 @@ async def create_pool(
             status_code=409,
             detail=f"A pool already owns the record name {body.record_name!r} in this zone",
         )
+
+    # #4260 — the record API's rules for an A / AAAA owner, not just the general
+    # one: a refused name would make BIND hold the whole zone (underscore, 422;
+    # a CNAME at the name, 409).
+    refusal = await pool_name_refusal(db, zone, body.record_name, body.record_type)
+    if refusal is not None:
+        raise HTTPException(status_code=refusal[0], detail=refusal[1])
 
     for m in body.members or []:
         await _assert_site_exists(db, m.site_id)

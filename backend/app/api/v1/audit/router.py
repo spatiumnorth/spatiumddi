@@ -93,12 +93,36 @@ async def list_audit_log(
     count_q = select(func.count()).select_from(q.subquery())
     total = (await db.execute(count_q)).scalar_one()
 
-    q = q.order_by(AuditLog.timestamp.desc()).offset(offset).limit(limit)
+    q = q.order_by(AuditLog.timestamp.desc(), AuditLog.id.desc()).offset(offset).limit(limit)
     rows = (await db.execute(q)).scalars().all()
 
     return AuditLogPage(
         total=total,
         items=[_to_response(r, details=include_details) for r in rows],
+    )
+
+
+class AuditFacets(BaseModel):
+    actions: list[str]
+    resource_types: list[str]
+
+
+@router.get("/facets", response_model=AuditFacets)
+async def list_audit_facets(db: DB) -> AuditFacets:
+    """Every distinct ``action`` and ``resource_type`` the log holds (#4482).
+
+    Feeds the Audit Log page's Action / Resource filters, which were fixed
+    lists that could not reach most of what the build writes. Same
+    ``read:audit_log`` gate as the list; the list's equality filters take
+    any of these values.
+    """
+    actions = (await db.execute(select(AuditLog.action).distinct().order_by(AuditLog.action))).all()
+    types = (
+        await db.execute(select(AuditLog.resource_type).distinct().order_by(AuditLog.resource_type))
+    ).all()
+    return AuditFacets(
+        actions=[a for (a,) in actions if a],
+        resource_types=[t for (t,) in types if t],
     )
 
 

@@ -62,7 +62,7 @@ from app.models.dns import DNSRecord, DNSView, DNSZone
 from app.services.dns.cname_conflict import NameRow, refused_by_cname_rule
 from app.services.dns.ingest import EXTERNAL_IMPORT_SOURCE
 from app.services.integration_ownership import ACME_RECORD_TAG
-from app.services.ipam_io.export import FORMULA_TRIGGERS, sanitize_cell
+from app.services.ipam_io.export import sanitize_cell, unescape_cell
 
 RECORD_COLUMNS: list[str] = [
     "id",
@@ -278,20 +278,6 @@ def _norm_header(h: Any) -> str:
     return str(h).strip().lower().replace(" ", "_") if h is not None else ""
 
 
-def unescape_cell(value: Any) -> Any:
-    """Undo the export's formula escape, and nothing more.
-
-    A cell exported as ``'=x`` reads back as ``'=x`` (CSV, and openpyxl, keep
-    the apostrophe), so a round trip would otherwise change the value. Only an
-    apostrophe in front of a formula trigger is removed. Nothing is ever
-    evaluated: a leading ``=`` is text.
-    """
-    if isinstance(value, str) and len(value) > 1 and value[0] == "'":
-        if value[1:].startswith(FORMULA_TRIGGERS):
-            return value[1:]
-    return value
-
-
 def _cell(value: Any) -> Any:
     if value is None:
         return None
@@ -381,7 +367,8 @@ def parse_csv(data: bytes) -> list[SheetRow]:
         raise SpreadsheetError(f"CSV could not be read: {exc}") from exc
 
 
-def _check_xlsx_size(data: bytes) -> None:
+def check_xlsx_size(data: bytes) -> None:
+    """Refuse a workbook whose parts inflate past the cap (shared with the IPAM import)."""
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             total = sum(info.file_size for info in zf.infolist())
@@ -402,7 +389,7 @@ def parse_xlsx(data: bytes) -> list[SheetRow]:
     """
     from openpyxl import load_workbook
 
-    _check_xlsx_size(data)
+    check_xlsx_size(data)
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception as exc:  # noqa: BLE001 — any unreadable workbook is the file's fault

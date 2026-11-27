@@ -12,6 +12,7 @@ import {
   formatApiError,
   formatDialogError,
 } from "@/lib/api";
+import { SettingsRow } from "@/components/SettingsRow";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
 
@@ -71,9 +72,9 @@ function CommunityField({
     !isSet || replacing || (draft !== undefined && draft !== "");
 
   return (
-    <Field
+    <SettingsRow
       label="Community string (v2c)"
-      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the Reveal button surfaces the plaintext after a password re-confirm (every reveal is audited). ``public`` is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
+      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the Reveal button surfaces the plaintext after a password re-confirm (every reveal is audited). ‘public’ is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
     >
       <div className="flex flex-col items-end gap-2">
         {clearPending ? (
@@ -94,6 +95,7 @@ function CommunityField({
           <div className="flex items-center gap-2">
             <input
               type="password"
+              aria-label="Community string"
               autoComplete="off"
               spellCheck={false}
               value={draft ?? ""}
@@ -172,6 +174,7 @@ function CommunityField({
           >
             <input
               type="password"
+              aria-label="Password to reveal the community string"
               autoComplete="current-password"
               value={revealPassword}
               onChange={(e) => setRevealPassword(e.target.value)}
@@ -181,6 +184,7 @@ function CommunityField({
             />
             <input
               inputMode="numeric"
+              aria-label="Authenticator code to reveal the community string"
               autoComplete="one-time-code"
               value={revealTotp}
               onChange={(e) => setRevealTotp(e.target.value)}
@@ -243,29 +247,7 @@ function CommunityField({
           </div>
         )}
       </div>
-    </Field>
-  );
-}
-
-function Field({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-8 py-3">
-      <div className="max-w-xl">
-        <div className="text-sm font-medium">{label}</div>
-        {description && (
-          <div className="text-xs text-muted-foreground">{description}</div>
-        )}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
+    </SettingsRow>
   );
 }
 
@@ -440,18 +422,18 @@ export function SNMPSection({
         </div>
       )}
 
-      <Field
+      <SettingsRow
         label="Enable SNMP"
-        description="When on, the rendered snmpd.conf is shipped to every appliance host through the ConfigBundle long-poll, the host runner validates it via ``snmpd -t``, and starts snmpd."
+        description="When on, the rendered snmpd.conf is shipped to every appliance host through the ConfigBundle long-poll, the host runner checks it with a probe run of snmpd, and starts snmpd."
       >
         <Toggle
           checked={enabled}
           onChange={setEnabled}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Version"
         description="v2c — community-string auth; simplest setup, recommended for lab + small-shop monitoring. v3 — user-based auth + privacy; needed for compliance-driven SNMP."
       >
@@ -464,7 +446,7 @@ export function SNMPSection({
           <option value="v2c">v2c (community)</option>
           <option value="v3">v3 (USM)</option>
         </select>
-      </Field>
+      </SettingsRow>
 
       {version === "v2c" && (
         <CommunityField
@@ -606,9 +588,9 @@ export function SNMPSection({
         </div>
       )}
 
-      <Field
+      <SettingsRow
         label="Allowed source CIDRs"
-        description="Comma- or space-separated list of CIDRs allowed to query SNMP. The host firewall opens UDP 161 only to these sources, for v2c and v3. Empty = the port is open to any source (v2c still answers nothing until a source is listed; v3 is then protected only by its user credentials)."
+        description="Comma- or space-separated list of CIDRs allowed to query SNMP. The host firewall opens UDP 161 only to these sources, for v2c and v3. Empty = the port is open to any source (v2c still answers nothing until a source is listed; v3 is then protected only by its user credentials). A custom firewall_extra rule accepting UDP 161 adds its sources to this list."
       >
         <input
           type="text"
@@ -618,9 +600,9 @@ export function SNMPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-96 max-w-full font-mono")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="sysContact"
         description="Operator contact string returned by SNMPv2-MIB::sysContact.0. Free-form (email + on-call rotation is the canonical shape)."
       >
@@ -632,9 +614,9 @@ export function SNMPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-80 max-w-full")}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="sysLocation"
         description="Physical location returned by SNMPv2-MIB::sysLocation.0."
       >
@@ -646,7 +628,7 @@ export function SNMPSection({
           disabled={!isSuperadmin}
           className={cn(inputCls, "w-80 max-w-full")}
         />
-      </Field>
+      </SettingsRow>
 
       <div className="mt-4 flex items-center gap-3 border-t pt-4">
         <button

@@ -37,6 +37,7 @@ import {
   type SubnetResizeCommitResponse,
   type SubnetResizePreviewResponse,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Shared UI bits ────────────────────────────────────────────────────────
 
@@ -383,6 +384,12 @@ export function ResizeSubnetModal({
             }}
           />
           Move gateway to new first-usable IP
+          <span
+            className="ml-1 text-muted-foreground"
+            title='The old Gateway row is replaced when "Replace default-named" is ticked and nobody has edited it. A row with tags, a MAC, an owner, custom fields or a device record is kept.'
+          >
+            (?)
+          </span>
         </label>
         <label className="flex items-center gap-2 text-xs">
           <input
@@ -401,10 +408,10 @@ export function ResizeSubnetModal({
       </div>
 
       {error && (
-        <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
+        <FormError className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
           <span>{error}</span>
-        </div>
+        </FormError>
       )}
 
       {preview && (
@@ -706,10 +713,10 @@ export function ResizeBlockModal({
       </div>
 
       {error && (
-        <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
+        <FormError className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
           <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
           <span>{error}</span>
-        </div>
+        </FormError>
       )}
 
       {preview && (
