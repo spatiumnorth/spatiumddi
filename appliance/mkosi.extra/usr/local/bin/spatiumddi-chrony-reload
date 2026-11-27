@@ -101,8 +101,21 @@ update_sync_status() {
     #   Normal               — synchronised
     #   Insert/Delete second — synchronised (leap pending)
     #   Not synchronised     — unsynchronised
-    local leap
-    leap=$(chronyc -h 127.0.0.1 tracking 2>/dev/null | awk -F': *' '/^Leap status/ {print $2}')
+    local leap="" out host
+    # Read over chronyd's Unix command socket first (root can use it against
+    # either daemon), then UDP 127.0.0.1. The daemon running after a boot can
+    # be chronyd-restricted.service (-U: no IPv4/IPv6 command socket), where
+    # the 127.0.0.1 read gets "506 Cannot talk to daemon". A failed read is
+    # "unknown", never a failed run: set -e/pipefail must not end the script.
+    for host in "" 127.0.0.1; do
+        if [ -n "$host" ]; then
+            out=$(chronyc -h "$host" tracking 2>/dev/null) || out=""
+        else
+            out=$(chronyc tracking 2>/dev/null) || out=""
+        fi
+        leap=$(printf '%s\n' "$out" | awk -F': *' '/^Leap status/ {print $2}') || leap=""
+        [ -n "$leap" ] && break
+    done
     case "$leap" in
         "Normal"|"Insert second"|"Delete second")
             echo "synchronized" | state_write "$STATUS_SIDECAR"
