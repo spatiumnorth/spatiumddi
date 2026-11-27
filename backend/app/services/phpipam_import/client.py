@@ -19,7 +19,9 @@ client handles:
   caller's :data:`PULL_CEILING` row ceiling, and the per-subnet shape of the
   address pull (one request per subnet, never one request for everything).
 * **Retry / throttle** — 429 honours ``Retry-After``; 502 / 503 / 504 back off
-  exponentially, a bounded number of times.
+  exponentially, a bounded number of times, unless the body is phpIPAM's own
+  ``success: false`` envelope (a real refusal, e.g. 503 "SSL connection is
+  required for API" for a plain-http URL), which is raised at once.
 * **TLS** — verification is on; ``verify_tls=False`` is an explicit opt-out
   that logs a WARNING on every connect.
 """
@@ -163,6 +165,7 @@ class PhpipamClient:
             401: "unauthorised: bad token or credentials",
             403: "forbidden",
             404: "not found",
+            503: "refused by phpIPAM",
         }.get(code, "error")
         detail = ""
         if isinstance(body, dict):
@@ -188,11 +191,16 @@ class PhpipamClient:
                 await asyncio.sleep(float(retry_after) if retry_after.isdigit() else delay)
                 delay = min(delay * 2, _RETRY_BACKOFF_CAP)
                 continue
-            if status in (502, 503, 504):
+            body = self._envelope(raw)
+            # phpIPAM itself answers 503 with a JSON envelope for a refusal that
+            # retrying never fixes ("SSL connection is required for API" on a
+            # plain-http URL); only a 503 / 502 / 504 without one is a transient
+            # gateway failure.
+            phpipam_refusal = isinstance(body, dict) and body.get("success") is False
+            if status in (502, 503, 504) and not phpipam_refusal:
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, _RETRY_BACKOFF_CAP)
                 continue
-            body = self._envelope(raw)
             if status == 404 and isinstance(body, dict) and body.get("success") is False:
                 return 404, body
             if status >= 400:
