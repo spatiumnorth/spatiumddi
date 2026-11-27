@@ -20,6 +20,7 @@ const api = {
   update: vi.fn(),
   create: vi.fn(),
   del: vi.fn(),
+  test: vi.fn(),
 };
 
 vi.mock("@/lib/api", async () => {
@@ -32,6 +33,7 @@ vi.mock("@/lib/api", async () => {
       updateInfluxTarget: (id: string, body: unknown) => api.update(id, body),
       createInfluxTarget: (body: unknown) => api.create(body),
       deleteInfluxTarget: (id: string) => api.del(id),
+      testInfluxTarget: (id: string) => api.test(id),
     },
   };
 });
@@ -98,6 +100,7 @@ afterEach(() => {
   api.list.mockReset();
   api.update.mockReset();
   api.create.mockReset();
+  api.test.mockReset();
 });
 
 describe("stored secrets", () => {
@@ -308,5 +311,52 @@ describe("header copy (#4779)", () => {
     const text = (document.body.textContent ?? "").replace(/\s+/g, " ");
     expect(text).toMatch(/receives the metrics selected on it/);
     expect(text).not.toMatch(/receives DNS \+ DHCP counter deltas/);
+  });
+});
+
+describe("a Test result is announced (#4966)", () => {
+  it("announces a failed Test and keeps it past the old timeout", async () => {
+    api.test.mockResolvedValue({
+      ok: false,
+      message: "Connection timed out after 2s",
+      points: 0,
+    });
+    mount(BASE);
+    await screen.findByText("grafana");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await act(async () => {
+        fireEvent.click(
+          screen.getByTitle("Write one synthetic point to this target"),
+        );
+      });
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toContain("timed out after 2s");
+      await act(async () => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(screen.getByRole("alert").textContent).toContain(
+        "timed out after 2s",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not announce a successful Test", async () => {
+    api.test.mockResolvedValue({
+      ok: true,
+      message: "wrote 1 point",
+      points: 1,
+    });
+    mount(BASE);
+    await screen.findByText("grafana");
+    await act(async () => {
+      fireEvent.click(
+        screen.getByTitle("Write one synthetic point to this target"),
+      );
+    });
+    await screen.findByText(/wrote 1 point/);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

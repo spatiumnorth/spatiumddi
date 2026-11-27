@@ -166,8 +166,11 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
         [id]: { status: "error", msg: errorDetail(e, "test write failed") },
       }));
     }
+    // A success clears itself; a failure stays until the next Test, so it is
+    // still there for a screen-reader user who looks away (#4966).
     window.setTimeout(() => {
       setTestState((s) => {
+        if (s[id]?.status === "error") return s;
         const { [id]: _unused, ...rest } = s;
         return rest;
       });
@@ -313,20 +316,18 @@ export function InfluxDBTargets({ isSuperadmin }: { isSuperadmin: boolean }) {
                           <Check className="h-3 w-3" /> enabled
                         </span>
                       )}
-                      {ts && (
+                      {ts && ts.status === "error" && (
                         <span
-                          className={
-                            "ml-2 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] " +
-                            (ts.status === "ok"
-                              ? "bg-emerald-500/15 text-emerald-600"
-                              : "bg-red-500/15 text-red-600")
-                          }
+                          role="alert"
+                          className="ml-2 inline-flex items-center gap-1 rounded bg-red-500/15 px-1.5 py-0.5 text-[11px] text-red-600"
                         >
-                          {ts.status === "ok" ? (
-                            <Check className="h-3 w-3" />
-                          ) : (
-                            <X className="h-3 w-3" />
-                          )}
+                          <X className="h-3 w-3" aria-hidden="true" />
+                          {ts.msg}
+                        </span>
+                      )}
+                      {ts && ts.status === "ok" && (
+                        <span className="ml-2 inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[11px] text-emerald-600">
+                          <Check className="h-3 w-3" />
                           {ts.msg}
                         </span>
                       )}

@@ -91,6 +91,34 @@ export function plainTintedBoxes(source: string, rel = ""): string[] {
   return out;
 }
 
+// A red chip (`bg-red-500/15 text-red-600`) drawn with a `.msg`: a Test result
+// beside a row's status. Its class used to be built by string concatenation
+// under a condition that named no error, so none of the scans above could
+// read it (#4966); it is now a literal per state, and a literal red chip
+// needs a role too.
+const CHIP_OPENING =
+  /<(?<tag>span|div|p)\b(?<attrs>[^<>]*?\bclassName="(?<cls>[^"]*)"[^<>]*)>/g;
+
+export function plainRedChips(source: string): string[] {
+  if (!source.includes("Modal") && !source.includes("fixed inset")) return [];
+  const out: string[] = [];
+  for (const m of source.matchAll(CHIP_OPENING)) {
+    const { attrs, cls } = m.groups as { attrs: string; cls: string };
+    if (!/\bbg-red-\d+\/\d+/.test(cls)) continue;
+    if (!/\btext-red-\d+/.test(cls)) continue;
+    if (/role=/.test(attrs)) continue;
+    // Only a chip that draws a result's message (`{ts.msg}`); a static status
+    // label ("armed", "push failing") is standing state, not an answer.
+    const inner = source.slice(m.index + m[0].length, m.index + 600);
+    const end = inner.indexOf(`</${m.groups!.tag}>`);
+    if (!/\{[\w.]*\.msg\}/.test(end < 0 ? inner : inner.slice(0, end)))
+      continue;
+    const line = source.slice(0, m.index).split("\n").length;
+    out.push(`line ${line}`);
+  }
+  return out;
+}
+
 // Boxes that are stored or passive state, shown on page load rather than in
 // response to something the operator just did. A role="alert" there would be
 // announced on every load (FleetTab and ClusterUpgradeTab render many rows), so
@@ -135,6 +163,7 @@ for (const f of files(SRC)) {
     ...plainRefusalBoxes(text, true),
     ...plainErrorComponents(text),
     ...plainTintedBoxes(text, rel),
+    ...plainRedChips(text),
   ];
   const skip = STANDING_STATE[rel]?.names ?? [];
   const hits = all.filter((h) => !skip.includes(h));
@@ -192,6 +221,14 @@ describe("dialog refusals are announced (#3821)", () => {
     expect(plainTintedBoxes(box)).toEqual(["line 1"]);
     expect(
       plainTintedBoxes(box.replace("<div ", '<div role="alert" ')),
+    ).toEqual([]);
+  });
+
+  it("detects a red chip without a role (#4966)", () => {
+    const chip = `function XModal(){ return <Modal><span className="ml-2 rounded bg-red-500/15 px-1 text-red-600">{ts.msg}</span></Modal>; }`;
+    expect(plainRedChips(chip)).toEqual(["line 1"]);
+    expect(
+      plainRedChips(chip.replace("<span ", '<span role="alert" ')),
     ).toEqual([]);
   });
 
