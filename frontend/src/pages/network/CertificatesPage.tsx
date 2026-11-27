@@ -1,4 +1,6 @@
 import { useState, type ReactNode } from "react";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
@@ -253,7 +255,13 @@ function CertTargetEditorModal({
         interval_hours: parsedInterval,
         enabled,
       };
-      if (existing) return tlsCertsApi.update(existing.id, body);
+      if (existing) {
+        // Only what the operator changed against the row read when the
+        // dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return tlsCertsApi.update(existing.id, changed);
+      }
       return tlsCertsApi.create(body as TLSCertTargetCreate);
     },
     onSuccess: (saved) => {
@@ -286,10 +294,14 @@ function CertTargetEditorModal({
     >
       <div className="grid grid-cols-1 gap-3 pb-2 sm:grid-cols-2">
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="certificates-host"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Host
           </label>
           <input
+            id="certificates-host"
             className={inputCls}
             value={host}
             onChange={(e) => setHost(e.target.value)}
@@ -298,10 +310,14 @@ function CertTargetEditorModal({
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="certificates-port"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Port
           </label>
           <input
+            id="certificates-port"
             type="number"
             min={1}
             max={65535}
@@ -311,10 +327,14 @@ function CertTargetEditorModal({
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="certificates-server-name-sni-optional"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Server name (SNI, optional)
           </label>
           <input
+            id="certificates-server-name-sni-optional"
             className={inputCls}
             value={serverName}
             onChange={(e) => setServerName(e.target.value)}
@@ -322,10 +342,14 @@ function CertTargetEditorModal({
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="certificates-display-name-optional"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Display name (optional)
           </label>
           <input
+            id="certificates-display-name-optional"
             className={inputCls}
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
@@ -333,10 +357,14 @@ function CertTargetEditorModal({
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="certificates-check-interval-hours-optional"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Check interval (hours, optional)
           </label>
           <input
+            id="certificates-check-interval-hours-optional"
             type="number"
             min={1}
             max={168}
@@ -670,14 +698,18 @@ function CertDetailModal({
                   Querying crt.sh…
                 </p>
               ) : ctQuery.isError ? (
-                <p className="px-3 py-2 text-xs text-destructive">
+                <p role="alert" className="px-3 py-2 text-xs text-destructive">
                   CT-log lookup failed.
+                </p>
+              ) : ctQuery.data?.error ? (
+                // The API answers a crt.sh failure with 200 + `error`, so the
+                // isError branch above never sees it: announce it here (#4480).
+                <p role="alert" className="px-3 py-2 text-xs text-destructive">
+                  crt.sh: {ctQuery.data.error}
                 </p>
               ) : (ctQuery.data?.entries.length ?? 0) === 0 ? (
                 <p className="px-3 py-2 text-xs text-muted-foreground">
-                  {ctQuery.data?.error
-                    ? `crt.sh: ${ctQuery.data.error}`
-                    : "No CT-log entries found for this host."}
+                  No CT-log entries found for this host.
                 </p>
               ) : (
                 <table className="w-full text-[11px]">
@@ -1095,10 +1127,19 @@ export function CertificatesPage() {
           />
         )}
         {editing && (
-          <CertTargetEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => tlsCertsApi.get(editing.id)}
+            title="Edit certificate target"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CertTargetEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

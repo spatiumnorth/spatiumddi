@@ -39,6 +39,7 @@ import { formatBucket } from "@/lib/chart-time";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryPanel } from "@/components/AgentMemoryPanel";
 import { SpoolChip } from "@/components/SpoolChip";
 import { syncCard } from "@/lib/dhcp-sync-label";
 import { haPillTitle } from "@/lib/dhcpHa";
@@ -290,6 +291,13 @@ function OverviewTab({ server }: { server: DHCPServer }) {
         <SpoolChip server={server} />
         <DuplicateAgentChip server={server} kind="DHCP" />
       </div>
+      <AgentMemoryPanel
+        serverId={server.id}
+        status={server.memory_status}
+        daemonLabel="Kea"
+        fetchHistory={(id) => dhcpApi.getMemoryHistory(id)}
+        queryKeyPrefix="dhcp-server"
+      />
       <div className="grid grid-cols-2 gap-3">
         <InfoCard label="Status" value={server.status}>
           <StatusDot status={server.status} />
@@ -1057,7 +1065,10 @@ function ErrorBlock({ error, what }: { error?: unknown; what?: string }) {
     );
   }
   return (
-    <div className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive">
+    <div
+      role="alert"
+      className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive"
+    >
       <Activity className="h-4 w-4" />
       Failed to load — try again
     </div>

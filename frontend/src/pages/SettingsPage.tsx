@@ -249,6 +249,8 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   "dhcp-lease-sync": [
     "dhcp_pull_leases_enabled",
     "dhcp_pull_leases_interval_seconds",
+    "dhcp_health_interval_seconds",
+    "dhcp_mac_blocks_sync_interval_seconds",
   ],
   // Managed through the dedicated AuditForwardTargets component, not
   // the flat settings form. Legacy flat columns stay on
@@ -718,6 +720,16 @@ function OUILookupSection({
             ? new Date(status.last_updated_at).toLocaleString()
             : "never"}
         </span>
+        {status?.last_error_at && (
+          <p
+            role="alert"
+            className="mt-1 text-xs text-amber-700 dark:text-amber-400"
+          >
+            Last refresh failed at{" "}
+            {new Date(status.last_error_at).toLocaleString()}:{" "}
+            {status.last_error ?? "unknown error"}
+          </p>
+        )}
       </Field>
       <Field
         label="Vendor Count"
@@ -2119,7 +2131,7 @@ export function SettingsPage() {
                       </span>
                     )}
                     {rdnsRun === "error" && (
-                      <span className="text-xs text-destructive">
+                      <span role="alert" className="text-xs text-destructive">
                         Could not queue — broker unreachable?
                       </span>
                     )}
@@ -2209,6 +2221,52 @@ export function SettingsPage() {
                       disabled={
                         !canEdit("dhcp_pull_leases_interval_seconds") ||
                         !values.dhcp_pull_leases_enabled
+                      }
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">sec</span>
+                  </div>
+                </Field>
+                <Field
+                  label="Health Check Interval"
+                  description="How often agentless DHCP servers (Windows DHCP, FortiGate) are probed for reachability, in seconds (60 to 3600, default 60). Each probe is one WinRM or REST session per server. Agent-based servers (Kea) are unaffected: their status follows the agent heartbeat and is evaluated every minute."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={60}
+                      max={3600}
+                      value={values.dhcp_health_interval_seconds ?? 60}
+                      onChange={(e) =>
+                        set(
+                          "dhcp_health_interval_seconds",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={!canEdit("dhcp_health_interval_seconds")}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">sec</span>
+                  </div>
+                </Field>
+                <Field
+                  label="MAC Block Sync Interval"
+                  description="How often each agentless server's MAC deny list is reconciled against the active MAC blocks, in seconds (60 to 3600, default 60). Servers with no applicable blocks and nothing previously pushed are skipped without a connection. Changing a block in the UI still pushes immediately."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={60}
+                      max={3600}
+                      value={values.dhcp_mac_blocks_sync_interval_seconds ?? 60}
+                      onChange={(e) =>
+                        set(
+                          "dhcp_mac_blocks_sync_interval_seconds",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={
+                        !canEdit("dhcp_mac_blocks_sync_interval_seconds")
                       }
                       className={cn(inputCls, "w-24")}
                     />

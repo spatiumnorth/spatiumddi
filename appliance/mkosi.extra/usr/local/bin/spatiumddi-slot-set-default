@@ -13,8 +13,9 @@
 #   3. Renames the trigger to .done or .failed so the .path unit
 #      doesn't re-fire on the next watch
 #
-# Use to commit a trial boot once /health/live has proved the new
-# slot good, or to explicitly revert. Does NOT trigger a reboot —
+# Use to commit a trial boot the operator has judged good (firstboot commits
+# on its own once k3s is Ready, the slot's images are in and its control chart
+# has applied, #4707), or to explicitly revert. Does NOT trigger a reboot —
 # the operator's choice of "apply now (reboot)" vs "apply on next
 # maintenance window" stays separate from the durable commit.
 

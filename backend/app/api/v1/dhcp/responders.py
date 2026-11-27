@@ -21,7 +21,10 @@ from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPObservedResponder, DHCPResponderAllowlist
 
 router = APIRouter(
-    tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_server"))]
+    tags=["dhcp"],
+    dependencies=[
+        Depends(require_resource_permission("dhcp_server", audit_resource_type="dhcp_responder"))
+    ],
 )
 
 

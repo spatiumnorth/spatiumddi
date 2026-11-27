@@ -12,6 +12,7 @@ import {
 import {
   applianceReleasesApi,
   type ApplianceRelease,
+  type ApplianceReleasesResponse,
   formatApiError,
 } from "@/lib/api";
 import { pollUnlessRefused } from "@/lib/refusal";
@@ -24,6 +25,26 @@ import { FormError } from "@/components/ui/form-error";
 // collapses behind a "Show N older releases" disclosure so the tab
 // stays scannable even after dozens of releases have shipped.
 const FULL_CARDS = 3;
+
+/**
+ * Why the list is empty (#4799). Only a real 403 / 429 is blamed on rate
+ * limiting; an install with no route to GitHub is told so, in the wording
+ * the Upgrade images table already uses.
+ */
+function releasesEmptyText(
+  fetchError: ApplianceReleasesResponse["fetch_error"],
+): string {
+  if (fetchError === "unreachable") {
+    return "GitHub isn't reachable from the control plane, so no releases can be listed. Use Upload image… on the Fleet tab for an air-gap copy.";
+  }
+  if (fetchError === "rate_limited") {
+    return "GitHub is rate-limiting unauthenticated requests. Refresh in a minute.";
+  }
+  if (fetchError === "error") {
+    return "GitHub returned an error when listing releases. Refresh in a minute.";
+  }
+  return "No releases have been published for this repo yet.";
+}
 
 /**
  * Phase 4c — Release listing (read-only).
@@ -92,10 +113,7 @@ export function ReleasesTab({
         <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center text-sm text-muted-foreground">
           <RefreshCw className="mx-auto h-6 w-6 text-muted-foreground/50" />
           <p className="mt-3 font-medium">No releases found</p>
-          <p className="mt-1 text-xs">
-            GitHub API may be rate-limiting unauthenticated requests, or no
-            releases have been published for this repo yet. Refresh in a minute.
-          </p>
+          <p className="mt-1 text-xs">{releasesEmptyText(data?.fetch_error)}</p>
         </div>
       ) : (
         <ReleasesList releases={data.releases} applianceMode={applianceMode} />
@@ -325,7 +343,7 @@ function ReleaseCard({
 // Shown on docker / k8s control planes (no host-side update mechanism,
 // and no A/B slot flow either). The operator copies a command + runs it
 // against the deployment they manage.
-function ManualApplyModal({
+export function ManualApplyModal({
   tag,
   onClose,
 }: {
@@ -343,8 +361,10 @@ function ManualApplyModal({
   const chartVersion = helmChartVersion(tag);
   const k8sCmd = [
     "# On a workstation with kubectl + helm pointed at the cluster:",
-    "helm upgrade spatiumddi \\",
+    "# Use your own release name and namespace (`helm list -A` shows both):",
+    "helm upgrade <release> \\",
     "  oci://ghcr.io/spatiumnorth/charts/spatiumddi \\",
+    "  -n <namespace> \\",
     ...(chartVersion ? [`  --version ${chartVersion} \\`] : []),
     `  --set image.tag=${tag} \\`,
     "  --reuse-values",

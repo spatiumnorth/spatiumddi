@@ -17,7 +17,8 @@ k8s/
 One StatefulSet per DHCP server row, matching the DNS-agent topology.
 
 ```bash
-# Create the agent PSK secret (must match DHCP_AGENT_KEY on the control plane)
+# Create the agent PSK secret (must match DHCP_AGENT_KEY on the control plane,
+# i.e. the `dhcp-agent-key` key of spatiumddi-secrets read by base/api.yaml + worker.yaml, #4648)
 kubectl create secret generic spatium-dhcp-agent-key \
   --from-literal=SPATIUM_AGENT_KEY=$(openssl rand -hex 32) \
   -n spatiumddi
@@ -27,12 +28,14 @@ kubectl apply -f k8s/dhcp/kea-statefulset.yaml
 kubectl apply -f k8s/dhcp/service-dhcp.yaml
 ```
 
-DHCPv4 requires broadcast reception on the client LAN. In most clusters you
-either run the pod with `hostNetwork: true` or front it with a DHCP relay
-(option 82) pointed at a LoadBalancer Service on UDP/67. The stock
-manifests use that LoadBalancer Service: on a `NodePort` Service the
-declared `port: 67` is in-cluster only and the node-facing port is a
-random 30000–32767 pick, which a relay cannot target.
+A DHCPv4 client's broadcast never reaches a pod behind a Service. Either the
+gateway of each client VLAN relays to the server (`ip helper-address`), or the
+pod runs with `hostNetwork: true` on a node attached to the client VLAN. The
+stock manifests are the relay shape, a LoadBalancer Service on UDP/67: on a
+`NodePort` Service the declared `port: 67` is in-cluster only and the
+node-facing port is a random 30000–32767 pick, which a relay cannot target.
+Relay configuration, the return path and how to check it are in
+[Exposing DHCP to clients](../docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 
 
 ## Quick Start (single-node / dev)
@@ -392,6 +395,9 @@ The stock manifests in `k8s/dns/` and `k8s/dhcp/` still use
 UDP/53 or UDP/67 binds that host port on every node and captures the node's
 own resolver, so image pulls fail. Use MetalLB (with `--disable servicelb`)
 or another load balancer for those Services, not servicelb.
+Ports, fixed addresses, client source addresses and the DHCP relay shape are
+covered in [Exposing DNS to clients](../docs/deployment/KUBERNETES.md#exposing-dns-to-clients)
+and [Exposing DHCP to clients](../docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
 `ghcr.io/spatiumnorth/dns-powerdns` / `ghcr.io/spatiumnorth/dns-technitium`
 image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked
@@ -476,6 +482,15 @@ somewhere durable to remember it. See
 [`k8s/service-control/README.md`](service-control/README.md) for the
 scoping rationale.
 
+## Appliance registration (#4659)
+
+Appliance registration is off on a fresh install, so an appliance paired with a
+pairing code idles. To start a fresh install with it on, add
+`INITIAL_SUPERVISOR_REGISTRATION: "true"` to the `env` of the api and worker
+(the Helm chart sets it from `supervisorRegistration.initiallyEnabled`). It is
+read only when the settings row is first created; it never overrides a later
+choice in the UI.
+
 ## Image Tags
 
 All manifests default to `:latest`. Pin to a specific version tag (e.g., `2026.04.13-1`) for production:
@@ -502,7 +517,7 @@ kubectl apply -f base/migrate-job.yaml -n spatiumddi
 kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --timeout=10m
 ```
 
-Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart renders a new migrate Job per Helm revision (`<release>-migrate-r<revision>`, a regular Job, not a hook), and the api / worker / beat pods wait for it in their `wait-for-migrate` init containers.
+Helm chart users: `helm upgrade <release> charts/spatiumddi -n <namespace> --set image.tag=$NEW_TAG`. The chart renders a new migrate Job per Helm revision (`<release>-migrate-r<revision>`, a regular Job, not a hook), and the api / worker / beat pods wait for it in their `wait-for-migrate` init containers.
 
 **GitOps over these manifests.** `base/migrate-job.yaml` has a fixed name, and a Job's pod template is immutable. The `kubectl delete` above is what makes a re-apply work. A controller that only applies (Argo CD, Flux's `Kustomization`) cannot do that step, so the first image bump fails with `spec.template: field is immutable`. Patch the Job into a sync hook in your overlay instead of editing the base, e.g. for Argo CD:
 

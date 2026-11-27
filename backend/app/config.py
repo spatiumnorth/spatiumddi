@@ -2,6 +2,7 @@ import base64
 import binascii
 import re
 import sys
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -115,6 +116,15 @@ class Settings(BaseSettings):
     task_db_command_timeout: float = 120
     task_db_long_command_timeout: float = 900
 
+    # Celery worker child recycling (#4306). A prefork child that grows is
+    # replaced after this many tasks or once its RSS passes the memory cap,
+    # so a slow leak is bounded per child rather than per pod. 0 disables
+    # either one. Memory is in KiB (Celery's unit): 409600 = 400 MiB, well
+    # under the worker's 2Gi pod limit at concurrency 4 (children rest near
+    # 130 MB). Only the worker reads these; beat ignores them.
+    worker_max_tasks_per_child: int = 1000
+    worker_max_memory_per_child_kib: int = 409600
+
     # Redis
     redis_url: str = "redis://redis:6379/0"
     # Redis Sentinel (#272 Phase 3). When ``redis_url`` /
@@ -224,6 +234,13 @@ class Settings(BaseSettings):
     prometheus_metrics_token: str = ""
     # False restores anonymous scraping. Not recommended: see above.
     prometheus_metrics_require_auth: bool = True
+
+    # #4548 — bcrypt hash the first ``admin`` user is created with, instead of
+    # admin / admin plus a forced password change. The appliance installer
+    # collects the web UI password and hands the hash over through the app
+    # Secret; Compose / Helm operators may set it themselves. Only read when
+    # the user table is empty; a value that is not a bcrypt hash is ignored.
+    initial_admin_password_hash: str = ""
 
     # DNS agent
     dns_agent_key: str = ""
@@ -420,6 +437,18 @@ class Settings(BaseSettings):
     # form, whatever this says.
     appliance_legacy_signature_allowed: bool = True
 
+    # Re-registration of an appliance that is already paired returns a fresh
+    # session token, so a supervisor signs it with its own key. This is
+    # separate from the flag above, which covers heartbeat signatures only.
+    #   legacy - an unsigned re-registration is accepted when the appliance
+    #            has never reported that it signs AND its last reported
+    #            supervisor version is older than 1.0.1 (or unknown). Each one
+    #            is recorded in the audit log and counts against the
+    #            registration attempt budget.
+    #   never  - an unsigned re-registration is always refused.
+    # The default becomes ``never`` in 1.1.0.
+    appliance_unsigned_register_allowed: Literal["legacy", "never"] = "legacy"
+
     # #1003 item 2 — the OS installer's "Time source" answer, stamped into
     # the api's environment by spatiumddi-firstboot from the STATE config.
     #
@@ -432,6 +461,14 @@ class Settings(BaseSettings):
     # Space-separated, because that is the shape the installer prompt
     # collects and writes to STATE.
     initial_ntp_servers: str = ""
+    # #4659 — INITIAL ``platform_settings.supervisor_registration_enabled``
+    # on a fresh install (env ``INITIAL_SUPERVISOR_REGISTRATION``). Read only
+    # when the singleton row is first created, like ``initial_ntp_servers``,
+    # so an operator's later choice in Settings is never reverted. Default
+    # off (#1356, #2798): an install meant to take appliance agent nodes sets
+    # it on from the Compose ``.env`` or the Helm ``supervisorRegistration.
+    # initiallyEnabled`` value.
+    initial_supervisor_registration: bool = False
     appliance_version: str = ""
     appliance_hostname: str = ""
     # The k8s node this api pod runs on, from the downward API

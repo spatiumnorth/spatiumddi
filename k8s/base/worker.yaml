@@ -86,6 +86,12 @@ spec:
             - -Q
             - ipam,dns,dhcp,default,bundles
           env:
+            # #4306 — prefork child recycling (read by app/celery_app.py);
+            # memory is KiB, 0 disables. Mirrors the chart's worker.max* values.
+            - name: WORKER_MAX_TASKS_PER_CHILD
+              value: "1000"
+            - name: WORKER_MAX_MEMORY_PER_CHILD_KIB
+              value: "409600"
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -112,6 +118,21 @@ spec:
                 secretKeyRef:
                   name: spatiumddi-secrets
                   key: credential-key-since
+                  optional: true
+            # #4648 — agent PSKs the control plane verifies registrations
+            # against (in-cluster agents AND appliance agent nodes). Optional;
+            # see secrets.yaml.example.
+            - name: DNS_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: dns-agent-key
+                  optional: true
+            - name: DHCP_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: dhcp-agent-key
                   optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"

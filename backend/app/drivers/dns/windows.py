@@ -49,7 +49,7 @@ from app.drivers._winrm import (
 from app.drivers._winrm import (
     run_ps as _winrm_run_ps,
 )
-from app.drivers.dns._axfr import resolve_server_address
+from app.drivers.dns._axfr import resolve_server_address, send_rfc2136_update
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -289,7 +289,6 @@ class WindowsDNSDriver(DNSDriver):
     async def _apply_record_change_rfc2136(self, server: Any, change: RecordChange) -> None:
         import dns.message  # noqa: PLC0415
         import dns.name  # noqa: PLC0415
-        import dns.query  # noqa: PLC0415
         import dns.rdatatype  # noqa: PLC0415
         import dns.tsigkeyring  # noqa: PLC0415
         import dns.update  # noqa: PLC0415
@@ -297,7 +296,7 @@ class WindowsDNSDriver(DNSDriver):
         host = getattr(server, "host", None)
         if not host:
             raise RuntimeError("WindowsDNSDriver: server.host is required")
-        port = getattr(server, "api_port", None) or 53
+        port = getattr(server, "port", None) or 53
         rtype = change.record.record_type.upper()
 
         # TSIG is not modelled on DNSServer (the getattr shims were always None;
@@ -375,7 +374,13 @@ class WindowsDNSDriver(DNSDriver):
         # the AXFR path we take only the first address: this is a WRITE, and
         # retrying it against a second address risks applying it twice.
         addr = resolve_server_address(host, port, what=f"RFC 2136 update of {change.zone_name}")[0]
-        await asyncio.to_thread(dns.query.tcp, update, addr, port=port, timeout=10)
+        await asyncio.to_thread(
+            send_rfc2136_update,
+            update,
+            addr,
+            port,
+            what=f"RFC 2136 update of {change.zone_name}",
+        )
 
     async def _apply_record_change_winrm(self, server: Any, change: RecordChange) -> None:
         """Record create/update/delete via ``*-DnsServerResourceRecord``."""
@@ -584,11 +589,12 @@ class WindowsDNSDriver(DNSDriver):
         host = getattr(server, "host", None)
         if not host:
             raise RuntimeError("WindowsDNSDriver.pull_zone_records: server.host is required")
-        port = getattr(server, "api_port", None) or 53
+        port = getattr(server, "port", None) or 53
         return await axfr_zone_records(
             host=host,
             port=port,
             zone_name=zone_name,
+            connect_timeout=5,
             log_driver="windows_dns",
             server_id=str(getattr(server, "id", "")),
             tsig=tsig,

@@ -58,7 +58,9 @@ from app.services.dhcp.option_validation import check_vendor_class_match
 
 router = APIRouter(
     tags=["dhcp"],
-    dependencies=[Depends(require_resource_permission("dhcp_scope"))],
+    dependencies=[
+        Depends(require_resource_permission("dhcp_scope", audit_resource_type="dhcp_pxe_profile"))
+    ],
 )
 
 _VALID_MATCH_KINDS = {"first_stage", "ipxe_chain"}
@@ -363,14 +365,14 @@ async def refuse_if_pxe_pools_lose_class(
     renders nothing, so nothing is taken away."""
     if not p.enabled:
         return
-    for name, pools in await pxe_pool_refs(db, p, scope_id=scope_id):
+    for name, pools in await pxe_pool_refs(db, p, scope_id=scope_id, include_trashed=True):
         raise HTTPException(
             status_code=409,
             detail=(
                 f"Cannot {verb}: PXE profile '{p.name}' generates class '{name}', which is "
                 f"still referenced by {len(pools)} pool(s) ({describe_pools(pools)}). Kea "
                 "accepts a reference to an undefined class and the pool would silently "
-                "match no client. Clear or change those references first."
+                "match no client. Clear or change those references first." + trash_hint(pools)
             ),
         )
 

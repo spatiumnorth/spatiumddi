@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
@@ -106,7 +107,7 @@ export function FreeSpaceBand({
       const s = mapRange(
         fr.network,
         "free",
-        `Free ${fr.network} (${(cidrSpan(fr.network)?.size ?? BigInt(fr.size)).toLocaleString()} addrs)`,
+        `Free ${fr.network} (${(cidrSpan(fr.network)?.size ?? BigInt(fr.size)).toLocaleString()} ${pluralize(Number(cidrSpan(fr.network)?.size ?? fr.size), "addr")})`,
       );
       if (s) out.push(s);
     }

@@ -25,7 +25,10 @@ records whether a secret was set without recording it, and is exactly the
 detail an operator opens the entry to see.
 
 ``changed_fields`` is a list of field NAMES, not values, and is returned
-as stored.
+as stored. So is ``secret_changes`` (``["password_set", "token_cleared"]``):
+its key name contains "secret", but it lists what changed, never a value,
+so it is exempt from the key-name rule (its strings still go through the
+value patterns) (#4904).
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ _EXTRA_SECRET_KEY_RE = re.compile(
     r"|(^|_)enc$|service_account_json)",
     re.IGNORECASE,
 )
+# Keys whose LIST value is field names, not credentials (#4904). Exact match.
+_NAME_LIST_KEYS = frozenset({"secret_changes"})
 _PEM_PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
 
 
@@ -72,6 +77,7 @@ def redact_audit_value(value: Any, _depth: int = 0) -> Any:
         for k, v in value.items():
             if (
                 _secret_key(str(k))
+                and not (k in _NAME_LIST_KEYS and isinstance(v, list))
                 and v not in (None, "", [], {})
                 and not isinstance(v, bool | int)
             ):

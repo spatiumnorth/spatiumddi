@@ -23,7 +23,7 @@ import structlog
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 from app.core.dns_names import strip_control_chars
-from app.drivers.dns._axfr import resolve_server_address
+from app.drivers.dns._axfr import resolve_server_address, send_rfc2136_update
 from app.drivers.dns._caa import caa_presentation
 from app.drivers.dns._forwarders import bind_zone_forwarders, bind_zone_tls_statement
 from app.drivers.dns._txt import quote_txt as _quote_txt
@@ -473,7 +473,6 @@ class BIND9Driver(DNSDriver):
         import dns.inet
         import dns.message
         import dns.name
-        import dns.query
         import dns.rdatatype
         import dns.tsig
         import dns.tsigkeyring
@@ -534,7 +533,13 @@ class BIND9Driver(DNSDriver):
         # See the Windows driver's matching call: dns.query.tcp takes an IP
         # literal, and a write must not be retried across addresses.
         addr = resolve_server_address(host, port, what=f"RFC 2136 update of {change.zone_name}")[0]
-        await asyncio.to_thread(dns.query.tcp, update, addr, port=port, timeout=10)
+        await asyncio.to_thread(
+            send_rfc2136_update,
+            update,
+            addr,
+            port,
+            what=f"RFC 2136 update of {change.zone_name}",
+        )
 
     async def reload_config(self, server: Any) -> None:
         """Surface for the agent's ``rndc reconfig``. Control plane no-op."""
@@ -611,6 +616,8 @@ class BIND9Driver(DNSDriver):
             "name": "bind9",
             "views": True,
             "rpz": True,
+            # Renders the group's blocklists (RPZ) — see blocklist_capable().
+            "blocklist": True,
             # Per-query RCODE via BIND 9.20's ``responselog`` (#914).
             # Advertised as a capability rather than checked by driver
             # name so the query-log ingest never has to know which

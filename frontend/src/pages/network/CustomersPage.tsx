@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -76,7 +78,11 @@ function CustomerEditorModal({
           status,
           notes,
         };
-        return customersApi.update(existing.id, body);
+        // Only what changed against the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return customersApi.update(existing.id, changed);
       }
       const body: CustomerCreate = {
         name,
@@ -107,10 +113,14 @@ function CustomerEditorModal({
       <div className="space-y-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div className="space-y-1 sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="customers-name"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Name
             </label>
             <input
+              id="customers-name"
               className={inputCls}
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -119,10 +129,14 @@ function CustomerEditorModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="customers-account-number"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Account number
             </label>
             <input
+              id="customers-account-number"
               className={inputCls}
               value={accountNumber}
               onChange={(e) => setAccountNumber(e.target.value)}
@@ -130,10 +144,14 @@ function CustomerEditorModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="customers-status"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Status
             </label>
             <select
+              id="customers-status"
               className={inputCls}
               value={status}
               onChange={(e) => setStatus(e.target.value as CustomerStatus)}
@@ -146,10 +164,14 @@ function CustomerEditorModal({
             </select>
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="customers-contact-email"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Contact email
             </label>
             <input
+              id="customers-contact-email"
               className={inputCls}
               value={email}
               onChange={(e) => setEmail(e.target.value)}
@@ -157,10 +179,14 @@ function CustomerEditorModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="customers-contact-phone"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Contact phone
             </label>
             <input
+              id="customers-contact-phone"
               className={inputCls}
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
@@ -168,10 +194,14 @@ function CustomerEditorModal({
             />
           </div>
           <div className="space-y-1 sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="customers-address"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Address
             </label>
             <textarea
+              id="customers-address"
               className={cn(inputCls, "min-h-[60px]")}
               value={address}
               onChange={(e) => setAddress(e.target.value)}
@@ -179,10 +209,14 @@ function CustomerEditorModal({
             />
           </div>
           <div className="space-y-1 sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="customers-notes"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Notes
             </label>
             <textarea
+              id="customers-notes"
               className={cn(inputCls, "min-h-[80px]")}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
@@ -502,10 +536,19 @@ export function CustomersPage() {
           />
         )}
         {editing && (
-          <CustomerEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => customersApi.get(editing.id)}
+            title="Edit customer"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CustomerEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

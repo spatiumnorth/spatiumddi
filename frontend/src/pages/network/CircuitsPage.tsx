@@ -18,6 +18,8 @@ import {
 import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
@@ -246,7 +248,13 @@ export function CircuitEditorModal({
         status,
         notes,
       };
-      if (existing) return circuitsApi.update(existing.id, body);
+      if (existing) {
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(existing, body);
+        if (Object.keys(diff).length === 0) return existing;
+        return circuitsApi.update(existing.id, diff);
+      }
       return circuitsApi.create(body as CircuitCreate);
     },
     onSuccess: () => {
@@ -266,10 +274,14 @@ export function CircuitEditorModal({
     >
       <div className="space-y-3 pb-4">
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="circuits-name"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="circuits-name"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -293,10 +305,14 @@ export function CircuitEditorModal({
       {tab === "general" && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-carrier-circuit-id"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Carrier circuit ID
             </label>
             <input
+              id="circuits-carrier-circuit-id"
               className={inputCls}
               value={cktId}
               onChange={(e) => setCktId(e.target.value)}
@@ -304,10 +320,14 @@ export function CircuitEditorModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-provider"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Provider
             </label>
             <select
+              id="circuits-provider"
               className={inputCls}
               value={providerId}
               onChange={(e) => setProviderId(e.target.value)}
@@ -322,10 +342,14 @@ export function CircuitEditorModal({
           </div>
           {own.customer && (
             <div>
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="circuits-customer-optional"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Customer (optional)
               </label>
               <select
+                id="circuits-customer-optional"
                 className={inputCls}
                 value={customerId ?? ""}
                 onChange={(e) => setCustomerId(e.target.value || null)}
@@ -344,10 +368,14 @@ export function CircuitEditorModal({
             </div>
           )}
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-transport-class"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Transport class
             </label>
             <select
+              id="circuits-transport-class"
               className={inputCls}
               value={transportClass}
               onChange={(e) =>
@@ -362,10 +390,14 @@ export function CircuitEditorModal({
             </select>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-status"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Status
             </label>
             <select
+              id="circuits-status"
               className={inputCls}
               value={status}
               onChange={(e) => setStatus(e.target.value as CircuitStatus)}
@@ -378,10 +410,14 @@ export function CircuitEditorModal({
             </select>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-bandwidth-down-mbps"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Bandwidth down (Mbps)
             </label>
             <input
+              id="circuits-bandwidth-down-mbps"
               type="number"
               min={0}
               className={inputCls}
@@ -390,10 +426,14 @@ export function CircuitEditorModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-bandwidth-up-mbps"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Bandwidth up (Mbps)
             </label>
             <input
+              id="circuits-bandwidth-up-mbps"
               type="number"
               min={0}
               className={inputCls}
@@ -418,10 +458,14 @@ export function CircuitEditorModal({
               </div>
               {own.site && (
                 <div>
-                  <label className="text-xs font-medium text-muted-foreground">
+                  <label
+                    htmlFor="circuits-site"
+                    className="text-xs font-medium text-muted-foreground"
+                  >
                     Site
                   </label>
                   <select
+                    id="circuits-site"
                     className={inputCls}
                     value={aSiteId ?? ""}
                     onChange={(e) => setASiteId(e.target.value || null)}
@@ -437,10 +481,14 @@ export function CircuitEditorModal({
                 </div>
               )}
               <div>
-                <label className="text-xs font-medium text-muted-foreground">
+                <label
+                  htmlFor="circuits-subnet-uuid-optional"
+                  className="text-xs font-medium text-muted-foreground"
+                >
                   Subnet UUID (optional)
                 </label>
                 <input
+                  id="circuits-subnet-uuid-optional"
                   className={inputCls}
                   value={aSubnetId ?? ""}
                   onChange={(e) => setASubnetId(e.target.value || null)}
@@ -458,10 +506,14 @@ export function CircuitEditorModal({
               </div>
               {own.site && (
                 <div>
-                  <label className="text-xs font-medium text-muted-foreground">
+                  <label
+                    htmlFor="circuits-site-2"
+                    className="text-xs font-medium text-muted-foreground"
+                  >
                     Site
                   </label>
                   <select
+                    id="circuits-site-2"
                     className={inputCls}
                     value={zSiteId ?? ""}
                     onChange={(e) => setZSiteId(e.target.value || null)}
@@ -477,10 +529,14 @@ export function CircuitEditorModal({
                 </div>
               )}
               <div>
-                <label className="text-xs font-medium text-muted-foreground">
+                <label
+                  htmlFor="circuits-subnet-uuid-optional-2"
+                  className="text-xs font-medium text-muted-foreground"
+                >
                   Subnet UUID (optional)
                 </label>
                 <input
+                  id="circuits-subnet-uuid-optional-2"
                   className={inputCls}
                   value={zSubnetId ?? ""}
                   onChange={(e) => setZSubnetId(e.target.value || null)}
@@ -495,10 +551,14 @@ export function CircuitEditorModal({
       {tab === "term" && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-term-start"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Term start
             </label>
             <input
+              id="circuits-term-start"
               type="date"
               className={inputCls}
               value={termStart}
@@ -506,10 +566,14 @@ export function CircuitEditorModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-term-end"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Term end
             </label>
             <input
+              id="circuits-term-end"
               type="date"
               className={inputCls}
               value={termEnd}
@@ -520,10 +584,14 @@ export function CircuitEditorModal({
             </p>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-monthly-cost"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Monthly cost
             </label>
             <input
+              id="circuits-monthly-cost"
               type="text"
               inputMode="decimal"
               className={inputCls}
@@ -533,10 +601,14 @@ export function CircuitEditorModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="circuits-currency"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Currency
             </label>
             <input
+              id="circuits-currency"
               className={cn(inputCls, "uppercase")}
               maxLength={3}
               value={currency}
@@ -553,10 +625,14 @@ export function CircuitEditorModal({
 
       {tab === "notes" && (
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="circuits-notes"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Notes
           </label>
           <textarea
+            id="circuits-notes"
             className={cn(inputCls, "min-h-[160px]")}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
@@ -1003,10 +1079,19 @@ export function CircuitsPage() {
           />
         )}
         {editing && (
-          <CircuitEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => circuitsApi.get(editing.id)}
+            title="Edit circuit"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CircuitEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

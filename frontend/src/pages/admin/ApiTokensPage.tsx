@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { usePermissions } from "@/hooks/usePermissions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -25,6 +26,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { ReauthFields } from "@/components/ReauthFields";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   buildEnrolmentUri,
@@ -42,26 +44,6 @@ import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
 
 // ── Create Token Modal ─────────────────────────────────────────────────────
 
@@ -86,10 +68,24 @@ function CreateTokenModal({
     "none",
   );
   const [bindAction, setBindAction] = useState<"read" | "write" | "admin">(
-    "write",
+    "read",
   );
+  // #4846: offer only the access the caller holds on the picked type; the
+  // server stays the authority (a binding never exceeds its creator).
+  // Instance-scoped grants count: check the picked resource once there is
+  // one, and any grant of the action on the type before that.
+  const { can, hasAnyGrantFor } = usePermissions();
   const [bindGroupId, setBindGroupId] = useState("");
   const [bindResourceId, setBindResourceId] = useState("");
+  const mayBind = (action: "write" | "admin") =>
+    bindResourceId
+      ? can(action, bindType, bindResourceId)
+      : hasAnyGrantFor(action, bindType);
+  // A level picked before the resource falls back to read when the picked
+  // resource turns out not to allow it, so the select never shows (and the
+  // request never sends) a disabled option.
+  const effectiveBindAction =
+    bindAction !== "read" && !mayBind(bindAction) ? "read" : bindAction;
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -117,12 +113,17 @@ function CreateTokenModal({
     bindType !== "none" && bindResourceId
       ? [
           {
-            action: bindAction,
+            action: effectiveBindAction,
             resource_type: bindType,
             resource_id: bindResourceId,
           },
         ]
       : [];
+
+  // #4857: a binding type with nothing picked would send no grant, and a
+  // token with no grant carries its owner's whole permissions. Hold Create
+  // until the resource is picked (or the binding is set back to none).
+  const bindingIncomplete = bindType !== "none" && !bindResourceId;
 
   const mut = useMutation({
     mutationFn: () =>
@@ -151,6 +152,7 @@ function CreateTokenModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          if (bindingIncomplete) return;
           setError(null);
           mut.mutate();
         }}
@@ -181,34 +183,37 @@ function CreateTokenModal({
           label="Expires"
           hint="Long-lived tokens are a security risk — prefer a date unless you have a reason."
         >
-          <div className="flex items-center gap-3">
-            <label className="flex items-center gap-1.5 text-sm">
-              <input
-                type="radio"
-                checked={expiryMode === "days"}
-                onChange={() => setExpiryMode("days")}
-              />
-              <span>In</span>
-              <input
-                type="number"
-                min={1}
-                max={3650}
-                value={days}
-                onChange={(e) => setDays(Number(e.target.value))}
-                disabled={expiryMode !== "days"}
-                className={cn(inputCls, "w-20")}
-              />
-              <span>days</span>
-            </label>
-            <label className="flex items-center gap-1.5 text-sm">
-              <input
-                type="radio"
-                checked={expiryMode === "never"}
-                onChange={() => setExpiryMode("never")}
-              />
-              Never
-            </label>
-          </div>
+          {(control) => (
+            <div className="flex items-center gap-3">
+              <label className="flex items-center gap-1.5 text-sm">
+                <input
+                  type="radio"
+                  checked={expiryMode === "days"}
+                  onChange={() => setExpiryMode("days")}
+                />
+                <span>In</span>
+                <input
+                  {...control}
+                  type="number"
+                  min={1}
+                  max={3650}
+                  value={days}
+                  onChange={(e) => setDays(Number(e.target.value))}
+                  disabled={expiryMode !== "days"}
+                  className={cn(inputCls, "w-20")}
+                />
+                <span>days</span>
+              </label>
+              <label className="flex items-center gap-1.5 text-sm">
+                <input
+                  type="radio"
+                  checked={expiryMode === "never"}
+                  onChange={() => setExpiryMode("never")}
+                />
+                Never
+              </label>
+            </div>
+          )}
         </Field>
         <Field
           label="Scopes (optional)"
@@ -244,84 +249,118 @@ function CreateTokenModal({
           label="Bind to a resource (optional)"
           hint="Restrict this token to a single subnet or DNS zone — a leaked CI secret can't touch anything else. The binding can never exceed your own permissions."
         >
-          <div className="space-y-1.5">
-            <select
-              className={inputCls}
-              value={bindType}
-              onChange={(e) => {
-                setBindType(e.target.value as "none" | "subnet" | "dns_zone");
-                setBindResourceId("");
-                setBindGroupId("");
-              }}
-            >
-              <option value="none">No resource binding</option>
-              <option value="subnet">Subnet</option>
-              {(dnsOn || bindType === "dns_zone") && (
-                <option value="dns_zone">DNS zone</option>
-              )}
-            </select>
-            {bindType !== "none" && (
+          {(control) => (
+            <div className="space-y-1.5">
               <select
+                {...control}
                 className={inputCls}
-                value={bindAction}
-                onChange={(e) =>
-                  setBindAction(e.target.value as "read" | "write" | "admin")
-                }
+                value={bindType}
+                onChange={(e) => {
+                  setBindType(e.target.value as "none" | "subnet" | "dns_zone");
+                  setBindAction("read");
+                  setBindResourceId("");
+                  setBindGroupId("");
+                }}
               >
-                <option value="read">read</option>
-                <option value="write">write</option>
-                <option value="admin">admin</option>
+                <option value="none">No resource binding</option>
+                <option value="subnet">Subnet</option>
+                {(dnsOn || bindType === "dns_zone") && (
+                  <option value="dns_zone">DNS zone</option>
+                )}
               </select>
-            )}
-            {bindType === "subnet" && (
-              <select
-                className={inputCls}
-                value={bindResourceId}
-                onChange={(e) => setBindResourceId(e.target.value)}
-              >
-                <option value="">Select a subnet…</option>
-                {(subnetsQ.data ?? []).map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.network}
-                    {s.name ? ` — ${s.name}` : ""}
-                  </option>
-                ))}
-              </select>
-            )}
-            {bindType === "dns_zone" && (
-              <>
+              {bindType !== "none" && (
                 <select
+                  aria-label="Binding access"
                   className={inputCls}
-                  value={bindGroupId}
-                  onChange={(e) => {
-                    setBindGroupId(e.target.value);
-                    setBindResourceId("");
-                  }}
+                  value={effectiveBindAction}
+                  onChange={(e) =>
+                    setBindAction(e.target.value as "read" | "write" | "admin")
+                  }
                 >
-                  <option value="">Select a DNS group…</option>
-                  {(dnsGroupsQ.data ?? []).map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
+                  <option value="read">read</option>
+                  <option value="write" disabled={!mayBind("write")}>
+                    write
+                  </option>
+                  <option value="admin" disabled={!mayBind("admin")}>
+                    admin
+                  </option>
+                </select>
+              )}
+              {bindType === "subnet" && (
+                <select
+                  aria-label="Subnet to bind"
+                  className={inputCls}
+                  value={bindResourceId}
+                  onChange={(e) => setBindResourceId(e.target.value)}
+                >
+                  <option value="">Select a subnet…</option>
+                  {(subnetsQ.data ?? []).map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.network}
+                      {s.name ? ` — ${s.name}` : ""}
                     </option>
                   ))}
                 </select>
-                {bindGroupId && (
+              )}
+              {bindType === "subnet" && subnetsQ.isError && (
+                <ListReadError
+                  error={subnetsQ.error}
+                  what="subnets"
+                  className="text-xs"
+                />
+              )}
+              {bindType === "dns_zone" && (
+                <>
                   <select
+                    aria-label="DNS group to bind"
                     className={inputCls}
-                    value={bindResourceId}
-                    onChange={(e) => setBindResourceId(e.target.value)}
+                    value={bindGroupId}
+                    onChange={(e) => {
+                      setBindGroupId(e.target.value);
+                      setBindResourceId("");
+                    }}
                   >
-                    <option value="">Select a zone…</option>
-                    {(zonesQ.data ?? []).map((z) => (
-                      <option key={z.id} value={z.id}>
-                        {z.name}
+                    <option value="">Select a DNS group…</option>
+                    {(dnsGroupsQ.data ?? []).map((g) => (
+                      <option key={g.id} value={g.id}>
+                        {g.name}
                       </option>
                     ))}
                   </select>
-                )}
-              </>
-            )}
-          </div>
+                  {/* #4858: a refused read is not an empty list. */}
+                  {dnsGroupsQ.isError && (
+                    <ListReadError
+                      error={dnsGroupsQ.error}
+                      what="DNS groups"
+                      className="text-xs"
+                    />
+                  )}
+                  {bindGroupId && zonesQ.isError && (
+                    <ListReadError
+                      error={zonesQ.error}
+                      what="DNS zones"
+                      className="text-xs"
+                    />
+                  )}
+                  {bindGroupId && (
+                    <select
+                      aria-label="DNS zone to bind"
+                      className={inputCls}
+                      value={bindResourceId}
+                      onChange={(e) => setBindResourceId(e.target.value)}
+                    >
+                      <option value="">Select a zone…</option>
+                      {(zonesQ.data ?? []).map((z) => (
+                        <option key={z.id} value={z.id}>
+                          {z.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </>
+              )}
+            </div>
+          )}
         </Field>
         <div className="rounded-md border bg-muted/20 p-3">
           <p className="mb-2 text-xs text-muted-foreground">
@@ -350,7 +389,17 @@ function CreateTokenModal({
           </button>
           <button
             type="submit"
-            disabled={!name || (!stepPassword && !stepTotp) || mut.isPending}
+            disabled={
+              !name ||
+              (!stepPassword && !stepTotp) ||
+              bindingIncomplete ||
+              mut.isPending
+            }
+            title={
+              bindingIncomplete
+                ? "Pick the resource to bind, or choose No resource binding"
+                : undefined
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mut.isPending ? "Creating…" : "Create"}
@@ -654,7 +703,10 @@ export function RevealTokenModal({
             token and create a new one.
           </div>
           {copyFailed && (
-            <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+            <div
+              role="alert"
+              className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+            >
               Automatic copy failed (browser blocked the clipboard API — usually
               because the page is served over plain HTTP on a non-localhost
               host). The token is now visible below — select it manually and
@@ -834,7 +886,6 @@ export function ApiTokensPage() {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
       setRevokeTarget(null);
     },
-    onError: () => setRevokeTarget(null),
   });
   const deleteMut = useMutation({
     mutationFn: (id: string) => apiTokensApi.delete(id),
@@ -1046,7 +1097,15 @@ export function ApiTokensPage() {
           tone="destructive"
           autoFocusCancel
           loading={revokeMut.isPending}
-          onClose={() => setRevokeTarget(null)}
+          error={
+            revokeMut.error
+              ? formatApiError(revokeMut.error, "Revoke failed")
+              : null
+          }
+          onClose={() => {
+            setRevokeTarget(null);
+            revokeMut.reset();
+          }}
           onConfirm={() => revokeTarget && revokeMut.mutate(revokeTarget)}
         />
         {confirmDelete && (

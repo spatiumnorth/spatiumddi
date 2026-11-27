@@ -13,8 +13,24 @@ export const GATEWAY_HOSTNAME = "gateway";
 
 export const GATEWAY_FORWARD_SKIPPED_LABEL = "forward DNS skipped";
 
+const GATEWAY_FORWARD_SKIPPED_REASON =
+  "Hostnames named exactly 'gateway' get a PTR but no A/AAAA record, so every subnet's gateway doesn't collide on gateway.<zone>.";
+
+const GATEWAY_FORWARD_SKIPPED_ADVICE =
+  " Rename it (e.g. 'gw', 'core-rtr1') or add the A record by hand in the zone.";
+
+/** The note with its advice, for a surface only a user who can edit the
+ * address reaches (the create / edit forms). */
 export const GATEWAY_FORWARD_SKIPPED_NOTE =
-  "Hostnames named exactly 'gateway' get a PTR but no A/AAAA record, so every subnet's gateway doesn't collide on gateway.<zone>. Rename it (e.g. 'gw', 'core-rtr1') or add the A record by hand in the zone.";
+  GATEWAY_FORWARD_SKIPPED_REASON + GATEWAY_FORWARD_SKIPPED_ADVICE;
+
+/** The note for a surface every reader sees: the rename / add-record advice
+ * is kept for a user who may act on it (#4588). */
+export function gatewayForwardSkippedNote(canEdit: boolean): string {
+  return canEdit
+    ? GATEWAY_FORWARD_SKIPPED_NOTE
+    : GATEWAY_FORWARD_SKIPPED_REASON;
+}
 
 /** True for a stored hostname the forward-record rule skips. Exact match,
  * like the backend's ``ip.hostname == "gateway"``: a row an integration wrote
@@ -49,6 +65,8 @@ const STALE_REASON_TEXT: Record<string, string> = {
     "The address is still in IPAM, but a hostname named exactly 'gateway' gets a PTR and no A/AAAA record, so every subnet's gateway doesn't collide on gateway.<zone>. Rename the host (e.g. 'gw', 'core-rtr1') or keep this record by adding it by hand instead.",
   "no-forward-zone":
     "The subnet has no forward zone now, so there is no domain to build the name from and the record can't be kept in sync.",
+  "cname-at-label":
+    "The reverse zone holds a CNAME at this name (for example a classless RFC 2317 delegation), and a name with a CNAME can hold no other record, so the PTR stops the zone from loading. Deleting it lets the zone load; the CNAME stays.",
 };
 
 /** Plain-words sentence for a stale reason; unknown codes fall back to the code. */

@@ -353,3 +353,66 @@ def test_full_pass_waits_until_the_last_one_is_over_7_days_old_3044() -> None:
     assert FULL_PASS_INTERVAL == timedelta(days=7)
     assert _full_pass_reason(now - timedelta(days=7) + timedelta(minutes=1), now) is None
     assert _full_pass_reason(now - timedelta(days=7, minutes=1), now) == "stale"
+
+
+async def test_facets_list_every_distinct_action_and_resource_type_4482(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    for action, rtype in [
+        ("appliance.self_bootstrap_minted", "pairing_code"),
+        ("appliance.self_bootstrap_minted", "pairing_code"),
+        ("dns.server.approve", "dns_server"),
+    ]:
+        db_session.add(
+            AuditLog(
+                action=action,
+                resource_type=rtype,
+                resource_id="x",
+                resource_display="x",
+                user_display_name="u",
+                auth_source="local",
+                result="ok",
+            )
+        )
+    await db_session.commit()
+    h = await _admin(db_session)
+    body = (await client.get("/api/v1/audit/facets", headers=h)).json()
+    assert body["actions"] == ["appliance.self_bootstrap_minted", "dns.server.approve"]
+    assert body["resource_types"] == ["dns_server", "pairing_code"]
+    # Each facet value is accepted by the list's equality filters.
+    r = await client.get("/api/v1/audit?resource_type=pairing_code", headers=h)
+    assert r.json()["total"] == 2
+
+
+async def test_facets_need_read_audit_log_4482(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    u = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Nobody",
+        hashed_password=hash_password("x"),
+        is_superadmin=False,
+    )
+    db_session.add(u)
+    await db_session.flush()
+    h = {"Authorization": f"Bearer {create_access_token(str(u.id))}"}
+    assert (await client.get("/api/v1/audit/facets", headers=h)).status_code == 403
+
+
+def test_secret_changes_name_list_is_shown_but_real_secrets_stay_redacted() -> None:
+    """#4904: ``secret_changes`` lists field names, so it is not redacted."""
+    from app.services.audit_redact import REDACTED, redact_audit_value
+
+    out = redact_audit_value(
+        {
+            "secret_changes": ["password_set", "token_cleared"],
+            "password": "hunter2-real",
+            "api_secret": "s3cr3t-value",
+        }
+    )
+    assert out["secret_changes"] == ["password_set", "token_cleared"]
+    assert out["password"] == REDACTED
+    assert out["api_secret"] == REDACTED
+    # A non-list value under that key is still treated as a secret.
+    assert redact_audit_value({"secret_changes": "hunter2"})["secret_changes"] == REDACTED
