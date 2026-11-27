@@ -130,10 +130,14 @@ export function ZoneTemplateModal({
               </p>
 
               <div>
-                <label className="mb-0.5 block text-xs font-medium">
+                <label
+                  htmlFor="zone-template-zone-name"
+                  className="mb-0.5 block text-xs font-medium"
+                >
                   Zone name
                 </label>
                 <input
+                  id="zone-template-zone-name"
                   type="text"
                   value={zoneName}
                   onChange={(e) => setZoneName(e.target.value)}
@@ -155,13 +159,17 @@ export function ZoneTemplateModal({
 
               {selected.parameters.map((p) => (
                 <div key={p.key}>
-                  <label className="mb-0.5 block text-xs font-medium">
+                  <label
+                    htmlFor={`zone-template-param-${p.key}`}
+                    className="mb-0.5 block text-xs font-medium"
+                  >
                     {p.label}
                     {p.required && (
                       <span className="ml-1 text-destructive">*</span>
                     )}
                   </label>
                   <input
+                    id={`zone-template-param-${p.key}`}
                     type="text"
                     value={params[p.key] ?? ""}
                     onChange={(e) =>

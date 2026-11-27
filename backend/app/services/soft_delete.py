@@ -602,6 +602,42 @@ async def _record_view_conflicts(
     }
 
 
+async def _record_alias_conflicts(
+    db: AsyncSession, batch_id: uuid.UUID
+) -> dict[uuid.UUID, tuple[str, str]]:
+    """The batch's ALIAS records whose PowerDNS group has no Do53 forwarder (#4756).
+
+    The record API refuses an ALIAS in such a group, and the group-options guard
+    that keeps forwarders from being cleared under live ALIASes does not count a
+    record waiting in the Trash, so Restore was a door to a live ALIAS that
+    answers nothing. A record whose zone is in another batch is
+    ``_record_parent_conflicts``'s case. Returns ``{record id: (label, reason)}``.
+    """
+    from app.services.dns.powerdns_alias import (  # noqa: PLC0415
+        ALIAS_NO_FORWARDER_MESSAGE,
+        groups_without_alias_resolver,
+    )
+
+    zone = aliased(DNSZone)
+    stmt: Any = (
+        select(DNSRecord.id, DNSRecord.fqdn, DNSRecord.record_type, zone.group_id)
+        .join(zone, zone.id == DNSRecord.zone_id)
+        .where(
+            DNSRecord.deletion_batch_id == batch_id,
+            DNSRecord.record_type == "ALIAS",
+            or_(zone.deleted_at.is_(None), zone.deletion_batch_id == batch_id),
+        )
+        .execution_options(include_deleted=True)
+    )
+    rows = (await db.execute(stmt)).tuples().all()
+    bad = await groups_without_alias_resolver(db, {r[3] for r in rows})
+    return {
+        rid: (_record_label(fqdn, rtype), ALIAS_NO_FORWARDER_MESSAGE)
+        for rid, fqdn, rtype, gid in rows
+        if gid in bad
+    }
+
+
 async def _record_parent_conflicts(
     db: AsyncSession, batch_id: uuid.UUID
 ) -> dict[uuid.UUID, tuple[str, str, DNSZone]]:
@@ -810,9 +846,15 @@ async def restore_batch(
     record_parent_conflicts: dict[uuid.UUID, str] = {}
     record_cname_conflicts: dict[uuid.UUID, str] = {}
     record_view_conflicts: dict[uuid.UUID, str] = {}
+    record_alias_conflicts: dict[uuid.UUID, str] = {}
     if conflict_check is not None:
         for rid, (label, reason) in (await _record_view_conflicts(db, batch_id)).items():
             record_view_conflicts[rid] = reason
+            result.conflicts.append(
+                {"type": "dns_record", "id": str(rid), "display": label, "reason": reason}
+            )
+        for rid, (label, reason) in (await _record_alias_conflicts(db, batch_id)).items():
+            record_alias_conflicts[rid] = reason
             result.conflicts.append(
                 {"type": "dns_record", "id": str(rid), "display": label, "reason": reason}
             )
@@ -922,6 +964,7 @@ async def restore_batch(
         and r.id not in record_parent_conflicts
         and r.id not in record_cname_conflicts
         and r.id not in record_view_conflicts
+        and r.id not in record_alias_conflicts
     )
 
     if result.conflicts and not skip_conflicts:
@@ -1183,6 +1226,25 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
                 f"Zone {obj.name!r} cites {', '.join(missing)}, which its server group no "
                 "longer defines. Create it again on the group's ACLs / TSIG keys tab, or "
                 "edit the zone's citation, then restore the zone."
+            )
+        # #4708 — PowerDNS has no forward zone and runs a stub as a full
+        # secondary (#4570). A server may join the group while the zone is in
+        # the Trash (the join guard counts live zones only, deliberately: a
+        # trashed zone is not served), so the restore is where it is refused.
+        # Every restore path (single, bulk, view / zone cascade) runs here.
+        from app.models.dns import DNSServer  # noqa: PLC0415
+        from app.services.dns.server_move import powerdns_zone_type_refusal  # noqa: PLC0415
+
+        drivers = set(
+            (await db.execute(select(DNSServer.driver).where(DNSServer.group_id == obj.group_id)))
+            .scalars()
+            .all()
+        )
+        pdns_refusal = powerdns_zone_type_refusal(drivers, obj.zone_type)
+        if pdns_refusal:
+            return (
+                f"Zone {obj.name!r} cannot be restored: {pdns_refusal} "
+                "Move the PowerDNS server out of the group, then restore the zone."
             )
         # #3855 — the single-signer rule (#1762). A signed zone in the Trash is
         # not counted when a second server joins its group, so the restore must

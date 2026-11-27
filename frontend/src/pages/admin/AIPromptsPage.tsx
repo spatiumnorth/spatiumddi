@@ -9,6 +9,8 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { FormError } from "@/components/ui/form-error";
@@ -76,10 +78,14 @@ function PromptEditor({
         )}
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="aiprompts-name"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="aiprompts-name"
             value={form.name}
             onChange={(e) => set("name", e.target.value)}
             placeholder="e.g. Daily IPAM triage"
@@ -88,11 +94,15 @@ function PromptEditor({
         </div>
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="aiprompts-description"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Description{" "}
             <span className="text-muted-foreground/60">(optional)</span>
           </label>
           <input
+            id="aiprompts-description"
             value={form.description}
             onChange={(e) => set("description", e.target.value)}
             placeholder="What this prompt is for, in one line"
@@ -101,10 +111,14 @@ function PromptEditor({
         </div>
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="aiprompts-prompt-text"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Prompt text
           </label>
           <textarea
+            id="aiprompts-prompt-text"
             value={form.prompt_text}
             onChange={(e) => set("prompt_text", e.target.value)}
             placeholder={
@@ -412,25 +426,38 @@ export function AIPromptsPage() {
         />
       )}
       {editing && (
-        <PromptEditor
-          initial={formFromPrompt(editing)}
-          mode="edit"
-          canShare={canShare}
+        <FreshEdit
+          row={editing}
+          queryKeys={[["ai-prompts"]]}
+          title="Edit AI Prompt"
           onClose={() => setEditing(null)}
-          onSave={(form) =>
-            updateMut.mutate({
-              id: editing.id,
-              body: {
-                name: form.name.trim(),
-                description: form.description.trim(),
-                prompt_text: form.prompt_text,
-                is_shared: form.is_shared,
-              },
-            })
-          }
-          saving={updateMut.isPending}
-          error={error}
-        />
+        >
+          {(fresh) => (
+            <PromptEditor
+              initial={formFromPrompt(fresh)}
+              mode="edit"
+              canShare={canShare}
+              onClose={() => setEditing(null)}
+              onSave={(form) => {
+                // Only what the operator changed against the row read when
+                // the dialog opened (#4777), so another client's edit is kept.
+                const changed = changedFields(formFromPrompt(fresh), {
+                  name: form.name.trim(),
+                  description: form.description.trim(),
+                  prompt_text: form.prompt_text,
+                  is_shared: form.is_shared,
+                });
+                if (Object.keys(changed).length === 0) {
+                  setEditing(null);
+                  return;
+                }
+                updateMut.mutate({ id: fresh.id, body: changed });
+              }}
+              saving={updateMut.isPending}
+              error={error}
+            />
+          )}
+        </FreshEdit>
       )}
       {confirmDelete && (
         <ConfirmDelete

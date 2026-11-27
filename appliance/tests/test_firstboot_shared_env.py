@@ -46,8 +46,8 @@ def _values() -> dict:
         SPATIUMDDI_VERSION=0.0.0-test
         APP_KEY_SECRET=spatium-control-app-keys
         CHART_APP_SECRET=spatium-control-spatiumddi-app
-        DNS_AGENT_KEY_VAL=x
-        DHCP_AGENT_KEY_VAL=x
+        DNS_AGENT_KEY_VAL=dnskey123
+        DHCP_AGENT_KEY_VAL=dhcpkey456
         LG_AGENT_KEY_VAL=x
         APPLIANCE_HOSTNAME_VAL=test
         APPLIANCE_HOST_IPS_VAL=10.0.0.1
@@ -80,6 +80,21 @@ def test_no_shared_variable_is_left_on_the_api_alone() -> None:
     does not, and a duplicate name on the api container is order-dependent."""
     api_env = _names(_values()["api"].get("env"))
     assert not (SHARED & set(api_env)), sorted(SHARED & set(api_env))
+
+
+def test_agent_keys_have_one_source_the_chart_value_not_api_env() -> None:
+    """#4648: the chart injects DNS_AGENT_KEY / DHCP_AGENT_KEY into api and
+    worker itself, so the same names under api.env are a duplicate env entry
+    the helm controller's server-side apply refuses (no api, ever). The
+    appliance's own keys go in as the chart's agentKey.value instead, so api,
+    worker and the role pods all use the .env keys."""
+    vals = _values()
+    api_env = _names(vals["api"].get("env"))
+    assert "DNS_AGENT_KEY" not in api_env
+    assert "DHCP_AGENT_KEY" not in api_env
+    assert vals["dnsAgents"]["agentKey"]["value"] == "dnskey123"
+    assert vals["dhcpAgents"]["agentKey"]["value"] == "dhcpkey456"
+    assert "LG_AGENT_KEY" in api_env  # still api-only
 
 
 def test_appliance_version_is_a_value_of_its_own_not_a_shared_env_entry() -> None:

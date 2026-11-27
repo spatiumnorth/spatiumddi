@@ -1,4 +1,6 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useState, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useSharedSessionSet } from "./zoneTreeState";
@@ -95,6 +97,7 @@ import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import {
   NEEDS_SUPERADMIN,
+  disabledBecause,
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
@@ -157,7 +160,9 @@ import {
   parseTtlInput,
   recordOwnerError,
   zoneKindForName,
+  ancestorViewId,
 } from "@/lib/dnsNames";
+import { viewsUnsupportedReason } from "@/lib/dns-views";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
   ZONE_FORWARD_TRANSPORT_LABELS,
@@ -193,6 +198,7 @@ import {
   CHANGE_REQUEST_QUERY_KEY,
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
+import { countNoun } from "@/lib/count-noun";
 
 // #1338 — a read-only user is offered no DNS write it would be refused.
 // Each DNS route needs the HTTP method's action on the type it serves
@@ -1073,6 +1079,9 @@ function ImportZoneModal({
 interface DnsTreeNode {
   domain: string; // full domain name at this level, e.g. "test.com"
   zone?: DNSZone; // set if this node corresponds to a registered zone
+  // Further zones of the same name in other views of the group (split
+  // horizon, uq_dns_zone_group_view_name). Each gets its own row (#4843).
+  twins?: DNSZone[];
   children: DnsTreeNode[];
 }
 
@@ -1108,7 +1117,9 @@ function buildDnsTree(zones: DNSZone[]): DnsTreeNode[] {
       }
     }
 
-    getOrCreate(name).zone = z;
+    const node = getOrCreate(name);
+    if (node.zone) (node.twins ??= []).push(z);
+    else node.zone = z;
   }
 
   function sortNode(n: DnsTreeNode) {
@@ -1401,11 +1412,20 @@ function GroupModalForm({
               <input
                 type="checkbox"
                 checked={isRecursive}
+                disabled={group?.unapplied_fields?.is_recursive?.locked}
                 onChange={(e) => setIsRecursive(e.target.checked)}
                 className="h-4 w-4"
               />
               <span className="text-sm">Allow recursion</span>
             </label>
+            {/* #4562: from the API's per-driver table. */}
+            {group?.unapplied_fields?.is_recursive && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Not applied by{" "}
+                {group.unapplied_fields.is_recursive.drivers.join(" / ")}:{" "}
+                {group.unapplied_fields.is_recursive.note}.
+              </p>
+            )}
           </Field>
         </div>
 
@@ -1458,7 +1478,9 @@ function GroupModalForm({
               onChange={(e) => setCatalogZonesEnabled(e.target.checked)}
               className="h-4 w-4"
             />
-            <span className="text-sm font-medium">Use BIND9 catalog zones</span>
+            <span className="text-sm font-medium">
+              Publish a catalog zone (RFC 9432)
+            </span>
           </label>
           <p className="mt-1 text-[11px] text-muted-foreground">
             The group primary publishes a catalog of this group&apos;s zones for
@@ -1472,10 +1494,14 @@ function GroupModalForm({
           )}
           {catalogZonesEnabled && (
             <div className="mt-2">
-              <label className="mb-0.5 block text-xs font-medium">
+              <label
+                htmlFor="dnspage-catalog-zone-name"
+                className="mb-0.5 block text-xs font-medium"
+              >
                 Catalog zone name
               </label>
               <input
+                id="dnspage-catalog-zone-name"
                 className={inputCls}
                 value={catalogZoneName}
                 onChange={(e) => setCatalogZoneName(e.target.value)}
@@ -2681,6 +2707,14 @@ function DnssecCard({
     },
     onError: (e: ApiError) => setError(formatApiError(e, "Unsign failed")),
   });
+  const ackDsMut = useMutation({
+    mutationFn: () => dnsApi.ackZoneDnssecDsChange(groupId, zoneId),
+    onSuccess: () => {
+      setError(null);
+      invalidate();
+    },
+    onError: (e: ApiError) => setError(formatApiError(e, "Acknowledge failed")),
+  });
   const rolloverMut = useMutation({
     mutationFn: (keyTag: number) =>
       dnsApi.rolloverZoneDnssecKey(groupId, zoneId, keyTag),
@@ -2694,6 +2728,7 @@ function DnssecCard({
   const enabled = info.data?.dnssec_enabled ?? initiallyEnabled;
   const dsRecords = info.data?.dnssec_ds_records ?? [];
   const syncedAt = info.data?.dnssec_synced_at ?? null;
+  const dsChangedAt = info.data?.dnssec_ds_changed_at ?? null;
   const keys = info.data?.keys ?? [];
   const multiSigner = info.data?.dnssec_multi_signer ?? false;
   const signingServers = info.data?.signing_servers ?? 0;
@@ -2721,7 +2756,7 @@ function DnssecCard({
           className="rounded border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive"
         >
           <span className="font-medium">
-            Signed by {signingServers} servers.
+            Signed by {countNoun(signingServers, "server")}.
           </span>{" "}
           Every server in this group signs the zone with its own keys, so the DS
           below matches at most one of them and validating resolvers get
@@ -2729,6 +2764,14 @@ function DnssecCard({
           (delete or move the others — disabling a server does not stop it
           serving the zone), or unsign the zone. Re-signing is refused until
           then.
+        </div>
+      )}
+      {info.data?.unapplied_warning && (
+        <div
+          role="alert"
+          className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300"
+        >
+          {info.data.unapplied_warning}
         </div>
       )}
       {signingUnmanaged && (
@@ -2803,7 +2846,7 @@ function DnssecCard({
                 onChange={(e) => setPolicyId(e.target.value)}
                 className="rounded border bg-background px-2 py-1 text-xs"
                 aria-label="DNSSEC signing policy"
-                title="DNSSEC signing policy (BIND9)"
+                title="DNSSEC signing policy (applied by BIND9 and Technitium; PowerDNS ignores it)"
                 {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
               >
                 <option value="">default policy</option>
@@ -2902,6 +2945,35 @@ function DnssecCard({
             </div>
           ) : (
             <ul className="space-y-1">
+              {/* #4566: the server generated new keys (a zone re-created
+                  after a lost volume or on a replaced node is signed again)
+                  or rolled them, so the parent holds a DS that is going
+                  stale. */}
+              {dsChangedAt && (
+                <li
+                  role="alert"
+                  className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300"
+                >
+                  <span className="font-medium">
+                    DS records changed{" "}
+                    <time dateTime={dsChangedAt}>
+                      {new Date(dsChangedAt).toLocaleString()}
+                    </time>
+                    .
+                  </span>{" "}
+                  The server&apos;s keys were regenerated or rolled. Publish the
+                  records below at the parent zone: validating resolvers fail
+                  the zone while the parent holds only the earlier DS.{" "}
+                  <button
+                    type="button"
+                    className="underline"
+                    disabled={ackDsMut.isPending}
+                    onClick={() => ackDsMut.mutate()}
+                  >
+                    I have published it
+                  </button>
+                </li>
+              )}
               {dsRecords.map((ds, idx) => (
                 <li
                   key={idx}
@@ -2922,9 +2994,9 @@ function DnssecCard({
             </ul>
           )}
           <div className="mt-2 text-[11px] text-muted-foreground">
-            Multiple algorithms are normal — publish them all. Keys rotate
-            automatically per the policy (BIND9) or pdns schedule; this list
-            refreshes after each rollover.
+            Multiple algorithms are normal — publish them all. BIND9 and
+            Technitium roll keys per the policy; PowerDNS never rolls them. This
+            list refreshes after each rollover.
           </div>
         </div>
       )}
@@ -2939,6 +3011,10 @@ type ZoneModalProps = {
   views: DNSView[];
   zone?: DNSZone;
   initialName?: string;
+  // The view a new zone opens on. Sub-zone and the tree's "Create zone here"
+  // pass the parent's, so a child of a view-pinned zone stays in that view
+  // unless the operator picks otherwise; "No view" serves a zone in EVERY view.
+  initialViewId?: string | null;
   onClose: () => void;
 };
 
@@ -2969,6 +3045,7 @@ function ZoneModalForm({
   views,
   zone,
   initialName,
+  initialViewId,
   onClose,
 }: ZoneModalProps) {
   const own = useOwnershipModules();
@@ -2999,6 +3076,8 @@ function ZoneModalForm({
   const groupDrivers =
     groupList?.find((g) => g.id === groupId)?.server_drivers ?? [];
   const technitiumApi = groupDrivers.includes("technitium_api");
+  // PowerDNS serves primary and secondary zones only (#4570).
+  const powerdns = groupDrivers.includes("powerdns");
   // #3087 — Type and TTL start from Settings → DNS (Default Zone Type /
   // Default Zone TTL) until the operator changes them. An existing zone
   // shows its own values. The settings read is best-effort: a role that
@@ -3022,7 +3101,7 @@ function ZoneModalForm({
   // stock TTL (above), so a stored default it would refuse is not offered.
   const zoneType =
     pickedZoneType ??
-    (technitiumApi
+    (technitiumApi || powerdns
       ? "primary"
       : (dnsDefaults?.dns_default_zone_type ?? "primary"));
   const setZoneType = setPickedZoneType;
@@ -3042,7 +3121,9 @@ function ZoneModalForm({
   );
   const kind =
     pickedKind ?? (zoneType === "primary" ? zoneKindForName(name) : "forward");
-  const [viewId, setViewId] = useState(zone?.view_id ?? "");
+  const [viewId, setViewId] = useState(
+    zone ? (zone.view_id ?? "") : (initialViewId ?? ""),
+  );
   const [primaryNs, setPrimaryNs] = useState(zone?.primary_ns ?? "");
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
@@ -3308,12 +3389,14 @@ function ZoneModalForm({
               {(!technitiumApi || zoneType === "secondary") && (
                 <option value="secondary">Secondary</option>
               )}
-              {(!technitiumApi || zoneType === "stub") && (
-                <option value="stub">Stub</option>
-              )}
-              {(!technitiumApi || zoneType === "forward") && (
-                <option value="forward">Forward</option>
-              )}
+              {(!technitiumApi || zoneType === "stub") &&
+                (!powerdns || zone?.zone_type === "stub") && (
+                  <option value="stub">Stub</option>
+                )}
+              {(!technitiumApi || zoneType === "forward") &&
+                (!powerdns || zone?.zone_type === "forward") && (
+                  <option value="forward">Forward</option>
+                )}
             </select>
           </Field>
           <Field label="Kind">
@@ -3415,13 +3498,20 @@ function ZoneModalForm({
           </div>
         )}
         {views.length > 0 && (
-          <Field label="View (optional)">
+          <Field
+            label="View (optional)"
+            hint={
+              viewId
+                ? undefined
+                : "No view: the zone is shared and served to the clients of every view."
+            }
+          >
             <select
               className={inputCls}
               value={viewId}
               onChange={(e) => setViewId(e.target.value)}
             >
-              <option value="">— No view —</option>
+              <option value="">— No view (served in every view) —</option>
               {views.map((v) => (
                 <option key={v.id} value={v.id}>
                   {v.name}
@@ -3634,6 +3724,20 @@ type RecordModalProps = {
   record?: DNSRecord;
   onClose: () => void;
 };
+
+/** A record a DNS pool's health-check pipeline renders: the record API
+ * refuses to edit or delete it (422), so no list offers either (#4391, #4798). */
+const POOL_MANAGED_REASON =
+  "Managed by a DNS pool — edit the pool or its members on the Pools tab";
+function isPoolManagedRecord(r: { pool_member_id?: string | null }): boolean {
+  return !!r.pool_member_id;
+}
+function recordSource(r: {
+  auto_generated: boolean;
+  pool_member_id?: string | null;
+}): "pool" | "auto" | "user" {
+  return isPoolManagedRecord(r) ? "pool" : r.auto_generated ? "auto" : "user";
+}
 
 // Edit reads the record fresh on open (#3077): the row the page holds comes
 // from a cached records page that may predate a Save made a moment ago. It is
@@ -3890,6 +3994,13 @@ function RecordModalForm({
               placeholder={RECORD_VALUE_PLACEHOLDER[type] ?? "record value"}
               required
             />
+          )}
+          {type === "LUA" && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              LUA records are answered by PowerDNS servers only. A non-PowerDNS
+              secondary receives the record as an opaque type and cannot answer
+              it.
+            </p>
           )}
           {isSrv && (
             <p className="mt-1 text-[11px] text-muted-foreground">
@@ -4185,7 +4296,7 @@ const ACK_LABELS: Record<string, string> = {
     "I understand the listed dynamic-update grants will be deleted, and the clients using them can no longer update this zone.",
 };
 
-function MoveZoneModal({
+export function MoveZoneModal({
   zone,
   onClose,
   onMoved,
@@ -4243,7 +4354,10 @@ function MoveZoneModal({
       !!preview.tsig_algorithm_refusal ||
       !!preview.forward_transport_refusal ||
       !!preview.technitium_acl_refusal ||
-      !!preview.classless_refusal);
+      !!preview.classless_refusal ||
+      !!preview.powerdns_refusal ||
+      !!preview.dnssec_policy_refusal ||
+      !!preview.views_refusal);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
@@ -4281,7 +4395,10 @@ function MoveZoneModal({
         {preview && (
           <>
             {preview.name_collision && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 <strong>{preview.target_group_name}</strong> already has a zone
                 named <code>{preview.zone_name}</code> in the view this one
                 would land in. Rename or delete it first.
@@ -4290,7 +4407,10 @@ function MoveZoneModal({
             {/* Blockers no acknowledgement can waive — none leaves a state
                 the operator could inspect and fix afterwards. */}
             {preview.dnssec_unsupported_drivers.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone is DNSSEC-signed and{" "}
                 <strong>{preview.target_group_name}</strong> runs{" "}
                 <code>{preview.dnssec_unsupported_drivers.join(", ")}</code>,
@@ -4300,32 +4420,74 @@ function MoveZoneModal({
               </div>
             )}
             {preview.technitium_api_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.technitium_api_refusal}
               </div>
             )}
             {preview.tsig_algorithm_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.tsig_algorithm_refusal}
               </div>
             )}
             {preview.forward_transport_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.forward_transport_refusal}
               </div>
             )}
             {preview.technitium_acl_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.technitium_acl_refusal}
               </div>
             )}
             {preview.classless_refusal && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 {preview.classless_refusal}
               </div>
             )}
+            {preview.powerdns_refusal && (
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
+                {preview.powerdns_refusal}
+              </div>
+            )}
+            {preview.dnssec_policy_refusal && (
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
+                {preview.dnssec_policy_refusal}
+              </div>
+            )}
+            {preview.views_refusal && (
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
+                {preview.views_refusal}
+              </div>
+            )}
             {preview.acl_names_lost.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone names ACL(s){" "}
                 <code>{preview.acl_names_lost.join(", ")}</code> that{" "}
                 <strong>{preview.target_group_name}</strong> does not define.
@@ -4336,7 +4498,10 @@ function MoveZoneModal({
               </div>
             )}
             {preview.key_names_lost.length > 0 && (
-              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+              <div
+                role="alert"
+                className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300"
+              >
                 This zone names TSIG key(s){" "}
                 <code>{preview.key_names_lost.join(", ")}</code> that{" "}
                 <strong>{preview.target_group_name}</strong> does not define.
@@ -5482,7 +5647,10 @@ export function ZoneDetailView({
           </span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedRecords(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelectedRecords(new Set());
+              }}
               className="rounded-md border px-2 py-1 hover:bg-muted"
             >
               Clear
@@ -5566,7 +5734,9 @@ export function ZoneDetailView({
                     <th className="w-8 py-2 pl-3">
                       {(() => {
                         const manualIds = filtered
-                          .filter((r) => !r.auto_generated && !r.pool_member_id)
+                          .filter(
+                            (r) => !r.auto_generated && !isPoolManagedRecord(r),
+                          )
                           .map((r) => r.id);
                         const allSel =
                           manualIds.length > 0 &&
@@ -5737,7 +5907,7 @@ export function ZoneDetailView({
                         >
                           <td className="w-8 py-1.5 pl-3">
                             {!r.auto_generated &&
-                              !r.pool_member_id &&
+                              !isPoolManagedRecord(r) &&
                               canDeleteRecords && (
                                 <input
                                   type="checkbox"
@@ -5755,7 +5925,7 @@ export function ZoneDetailView({
                           </td>
                           <td className="py-1.5 pl-5 font-mono text-xs font-medium">
                             {r.auto_generated ||
-                            r.pool_member_id ||
+                            isPoolManagedRecord(r) ||
                             !canWriteRecords ? (
                               r.name
                             ) : (
@@ -5794,7 +5964,7 @@ export function ZoneDetailView({
                             {r.priority ?? "—"}
                           </td>
                           <td className="py-1.5 pr-3">
-                            {r.pool_member_id ? (
+                            {isPoolManagedRecord(r) ? (
                               <div className="flex items-center justify-end gap-1">
                                 <span
                                   title="This record is rendered by a DNS pool's health-check pipeline. Manage it from the Pools tab — direct edits are blocked."
@@ -5823,7 +5993,12 @@ export function ZoneDetailView({
                                   </span>
                                 ) : (
                                   <span
-                                    title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                                    title={`This record was created automatically by IPAM.${
+                                      can("write", "subnet") ||
+                                      can("write", "address_set")
+                                        ? " Edit the IP address in IPAM to change it."
+                                        : ""
+                                    }`}
                                     className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
                                   >
                                     <Lock className="h-2.5 w-2.5" />
@@ -5907,7 +6082,7 @@ export function ZoneDetailView({
                         >
                           Copy Value
                         </ContextMenuItem>
-                        {r.pool_member_id ? (
+                        {isPoolManagedRecord(r) ? (
                           <>
                             <ContextMenuSeparator />
                             <ContextMenuItem
@@ -6013,14 +6188,14 @@ export function ZoneDetailView({
       )}
       {confirmBulkDelete && (
         <DeleteChoiceModal
-          title={`Delete ${selectedRecords.size} records`}
+          title={`Delete ${countNoun(selectedRecords.size, "record")}`}
           intro={
             <>
               Delete the{" "}
               <span className="font-medium">{selectedRecords.size}</span>{" "}
-              selected records? Moved to Trash, a superadmin can restore them
-              from Administration → Trash. IPAM-managed records are excluded
-              automatically.
+              selected {selectedRecords.size === 1 ? "record" : "records"}?
+              Moved to Trash, a superadmin can restore them from Administration
+              → Trash. IPAM-managed records are excluded automatically.
             </>
           }
           softHeading="Move to Trash (reversible)"
@@ -6087,6 +6262,7 @@ export function ZoneDetailView({
           // Pre-fill with the parent suffix so the operator just types
           // the leading label at the cursor: "sub" + ".example.com".
           initialName={"." + zone.name.replace(/\.$/, "")}
+          initialViewId={zone.view_id}
           onClose={() => setShowAddSubzone(false)}
         />
       )}
@@ -6194,7 +6370,10 @@ export function SyncResultModal({
     return (
       <Modal title="Sync with server — failed" onClose={onClose}>
         <div className="space-y-3">
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+          <div
+            role="alert"
+            className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive"
+          >
             {result.error}
           </div>
           <p className="text-xs text-muted-foreground">
@@ -6310,7 +6489,10 @@ export function SyncResultModal({
             />
           )}
           {push_errors.length > 0 && (
-            <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-3">
+            <div
+              role="alert"
+              className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-3"
+            >
               <div className="mb-1 text-xs font-medium text-destructive">
                 Push errors ({push_errors.length})
               </div>
@@ -6591,7 +6773,7 @@ function ServedApexRows({
 
 // ── Servers Tab ────────────────────────────────────────────────────────────────
 
-function ServersTab({ group }: { group: DNSServerGroup }) {
+export function ServersTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
   const { isSuperadmin } = useDnsGrants();
@@ -6677,7 +6859,10 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
   return (
     <div>
       {resumeMut.isError && (
-        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
           <span>
             Resume failed: {formatApiError(resumeMut.error, "request failed")}
           </span>
@@ -6948,8 +7133,18 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           }
           checkLabel="I understand this deletes the server row, and a running agent will register it again."
           onConfirm={() => del.mutate(confirmDeleteServer)}
-          onClose={() => setConfirmDeleteServer(null)}
+          onClose={() => {
+            setConfirmDeleteServer(null);
+            del.reset();
+          }}
           isPending={del.isPending}
+          // A refused delete (404 when the server is already gone, or a
+          // future 409 guard) leaves this confirm open; say why in it (#4744).
+          error={
+            del.isError
+              ? formatApiError(del.error, "Failed to delete the DNS server")
+              : null
+          }
         />
       )}
     </div>
@@ -7030,10 +7225,10 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
   // a no-op on Windows / PowerDNS / cloud, and Technitium blocks natively
   // with no per-view concept. Saying so here beats an operator scoping a
   // list to a view and waiting for filtering that will never arrive.
-  const nonBindDrivers = Array.from(
-    new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
-  );
   const hasBind = servers.some((s) => s.driver === "bind9");
+  // #4565: only BIND9 serves views, and the API refuses a new one elsewhere.
+  // Views such a group already holds stay listed so they can be removed.
+  const viewsUnsupported = viewsUnsupportedReason(servers.map((s) => s.driver));
 
   const delMut = useMutation({
     // The modal lists the blocking lists scoped to the view, so confirming
@@ -7063,6 +7258,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
           onClick={() => {
             setCreating(true);
           }}
+          {...disabledBecause(viewsUnsupported != null, viewsUnsupported ?? "")}
           {...permissionGate(can("write", "dns_group"), NEEDS_GROUP_WRITE)}
         >
           <Plus className="h-3 w-3" /> New View
@@ -7083,11 +7279,14 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
         />
       )}
 
-      {servers.length > 0 && !hasBind && (
-        <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
-          <strong>This group runs no BIND9 server.</strong> Views and
-          view-scoped blocking lists are rendered by the BIND9 driver only — on{" "}
-          {nonBindDrivers.join(" / ")} they are stored but never applied.
+      {viewsUnsupported != null && (
+        <div
+          role="note"
+          className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400"
+        >
+          <strong>This group cannot serve views.</strong> {viewsUnsupported}
+          {views.length > 0 &&
+            " The views below were stored before this was refused: a zone that is the same in every view is served to every client, a zone that differs between views serves only the records identical in every view. Remove them."}
         </div>
       )}
 
@@ -7210,7 +7409,7 @@ export function ViewsTab({ group }: { group: DNSServerGroup }) {
                       <span
                         key={b.id}
                         className="inline-flex items-center rounded bg-rose-500/10 px-1.5 py-0.5 text-xs text-rose-600 dark:text-rose-400"
-                        title={`${b.entry_count.toLocaleString()} entries`}
+                        title={countNoun(b.entry_count, "entry", "entries")}
                       >
                         {b.name}
                       </span>
@@ -7593,9 +7792,12 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
 
         <div>
           <div className="mb-1 flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="dns-view-match-clients"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Match clients (one per line; prefix ! to negate)
-            </span>
+            </label>
             <button
               type="button"
               className="flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
@@ -7605,6 +7807,7 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
             </button>
           </div>
           <textarea
+            id="dns-view-match-clients"
             value={matchClients}
             onChange={(e) => setMatchClients(e.target.value)}
             className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-24 focus:outline-none focus:ring-1 focus:ring-ring"
@@ -7625,6 +7828,7 @@ function ViewModalForm({ groupId, view, onClose }: ViewModalProps) {
           </summary>
           <div className="mt-2">
             <textarea
+              aria-label="Match destinations (advanced)"
               value={matchDestinations}
               onChange={(e) => setMatchDestinations(e.target.value)}
               className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
@@ -8346,8 +8550,14 @@ function TSIGKeyModalForm({
     >
       <div className="space-y-3 text-sm">
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Name</label>
+          <label
+            htmlFor="dnspage-name"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Name
+          </label>
           <input
+            id="dnspage-name"
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -8360,8 +8570,14 @@ function TSIGKeyModalForm({
           </p>
         </div>
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Algorithm</label>
+          <label
+            htmlFor="dnspage-algorithm"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Algorithm
+          </label>
           <select
+            id="dnspage-algorithm"
             value={algorithm}
             onChange={(e) => setAlgorithm(e.target.value)}
             className="w-full rounded border bg-background px-2 py-1 text-xs"
@@ -8385,11 +8601,15 @@ function TSIGKeyModalForm({
         </div>
         {!isEdit && (
           <div>
-            <label className="mb-0.5 block text-xs font-medium">
+            <label
+              htmlFor="dnspage-secret-optional"
+              className="mb-0.5 block text-xs font-medium"
+            >
               Secret (optional)
             </label>
             <div className="flex items-center gap-2">
               <input
+                id="dnspage-secret-optional"
                 type="text"
                 value={secret}
                 onChange={(e) => setSecret(e.target.value)}
@@ -8412,10 +8632,14 @@ function TSIGKeyModalForm({
           </div>
         )}
         <div>
-          <label className="mb-0.5 block text-xs font-medium">
+          <label
+            htmlFor="dnspage-purpose-optional"
+            className="mb-0.5 block text-xs font-medium"
+          >
             Purpose (optional)
           </label>
           <input
+            id="dnspage-purpose-optional"
             type="text"
             value={purpose}
             onChange={(e) => setPurpose(e.target.value)}
@@ -8424,8 +8648,14 @@ function TSIGKeyModalForm({
           />
         </div>
         <div>
-          <label className="mb-0.5 block text-xs font-medium">Notes</label>
+          <label
+            htmlFor="dnspage-notes"
+            className="mb-0.5 block text-xs font-medium"
+          >
+            Notes
+          </label>
           <textarea
+            id="dnspage-notes"
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             rows={2}
@@ -8555,26 +8785,48 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   });
   const applianceMode = versionInfo?.appliance_mode ?? true;
 
-  // Options the agent-managed Technitium driver cannot apply (#1763): the
-  // API refuses a non-default value for a group holding such a server, so the
-  // controls are disabled with the reason rather than offered and ignored. A
-  // control holding a stored non-default value stays enabled so it can be
-  // cleared back to the default.
+  // The group's servers, for the value-specific rules below (Technitium's
+  // forward policy and TLS hostname, BIND9's trust-anchor requirement).
   const { data: groupServers = [] } = useQuery({
     queryKey: ["dns-servers", groupId],
     queryFn: () => dnsApi.listServers(groupId),
   });
   const techUnsupported = groupServers.some((s) => s.driver === "technitium");
-  const techLocked = {
-    minimal: techUnsupported && !opts?.minimal_responses,
-    tcpClients: techUnsupported && opts?.tcp_clients == null,
-    clientsPerQuery: techUnsupported && opts?.clients_per_query == null,
-    maxClientsPerQuery: techUnsupported && opts?.max_clients_per_query == null,
-    // #1764: Technitium always validates an encrypted upstream's certificate,
-    // and with forwarders set it never falls back to recursion ('only').
-    tlsVerify: techUnsupported && opts?.forward_tls_verify !== false,
-    forwardFirst: techUnsupported && opts?.forward_policy !== "first",
+  // #4562: which options the group's drivers apply comes from the API's
+  // per-driver table (``option_support`` on the options response), not from a
+  // copy kept here. ``locked`` = a driver does not apply the option and the
+  // stored value already does nothing, so the control is disabled; a stored
+  // value that would be ignored stays editable so it can be cleared.
+  const support = opts?.option_support ?? {};
+  const lock = (field: string) => support[field]?.locked ?? false;
+  const supportNote = (fields: string[], states: string[]) => {
+    const lines = Array.from(
+      new Set(
+        fields
+          .map((f) => support[f])
+          .filter((e) => e && states.includes(e.state))
+          .map(
+            (e) =>
+              `This group has a ${e!.drivers.join(" / ")} server: ${e!.note}.`,
+          ),
+      ),
+    );
+    return lines.map((line) => (
+      <p key={line} className="text-xs text-muted-foreground">
+        {line}
+      </p>
+    ));
   };
+  // Every limit of the named options, or only the ones not applied at all
+  // (where the card already explains a partial one in more detail).
+  const note = (...fields: string[]) =>
+    supportNote(fields, ["not_applied", "partial"]);
+  const noteUnapplied = (...fields: string[]) =>
+    supportNote(fields, ["not_applied"]);
+  // #1764: with forwarders set Technitium never falls back to recursion
+  // ('only'), so 'first' is not offered unless it is what is stored.
+  const forwardFirstLocked =
+    techUnsupported && opts?.forward_policy !== "first";
   // #3560: BIND9 9.20 will not load ``dnssec-validation yes`` without a
   // trust anchor, so the API refuses the change on a group that renders
   // BIND9 (an empty group counts). Offered only once an anchor exists; a
@@ -8585,8 +8837,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     rendersBind9 &&
     (opts?.trust_anchors?.length ?? 0) === 0 &&
     opts?.dnssec_validation !== "yes";
-  const techReason =
-    "Not supported by Technitium: this group has a Technitium server, which cannot apply it.";
+  const lockTitle = (field: string) =>
+    lock(field)
+      ? `Not applied by ${support[field].drivers.join(" / ")}: ${support[field].note}.`
+      : undefined;
 
   const [forwardersEnabled, setForwardersEnabled] = useState(false);
   const [forwarders, setForwarders] = useState("");
@@ -8956,6 +9210,17 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   const card = "rounded-md border p-4 space-y-3";
   const cardTitle = "text-sm font-medium flex items-center gap-2";
 
+  // #4562: a driver that applies no group option at all (Windows DNS, the
+  // hosted providers, agentless Technitium). A form whose every save is
+  // refused or ignored says less than this one line.
+  if (opts?.options_unmanaged_note) {
+    return (
+      <p className="max-w-xl rounded-md border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+        {opts.options_unmanaged_note}
+      </p>
+    );
+  }
+
   return (
     <div className="space-y-5 max-w-xl">
       <div className="flex items-center justify-between">
@@ -8999,6 +9264,22 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </p>
           <ul className="mt-1 list-disc pl-4">
             {opts?.technitium_warnings?.map((w) => (
+              <li key={w} className="break-words">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Stored values another driver here does not apply (#4562). */}
+      {(opts?.unapplied_warnings?.length ?? 0) > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">
+            Stored settings this group&apos;s servers do not apply:
+          </p>
+          <ul className="mt-1 list-disc pl-4">
+            {opts?.unapplied_warnings?.map((w) => (
               <li key={w} className="break-words">
                 {w}
               </li>
@@ -9150,6 +9431,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             )}
             <Field label="Forward policy">
               <select
+                disabled={lock("forward_policy")}
                 className={selCls}
                 value={forwardPolicy}
                 onChange={(e) => {
@@ -9159,9 +9441,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               >
                 <option
                   value="first"
-                  disabled={techLocked.forwardFirst}
+                  disabled={forwardFirstLocked}
                   title={
-                    techLocked.forwardFirst
+                    forwardFirstLocked
                       ? "Not supported by Technitium: with forwarders set it never falls back to recursion."
                       : undefined
                   }
@@ -9173,22 +9455,18 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 </option>
               </select>
             </Field>
-            {techUnsupported && (
-              <p className="text-xs text-muted-foreground">
-                This group has a Technitium server, which resolves only through
-                its forwarders and never falls back to recursion, so
-                &quot;only&quot; is what it does whichever is chosen here.
-              </p>
-            )}
+            {note("forwarders", "forward_policy")}
           </>
         )}
       </div>
 
       <div className={card}>
         <h4 className={cardTitle}>Recursion</h4>
+        {note("recursion_enabled", "allow_recursion")}
         <label className="flex items-center gap-2 cursor-pointer">
           <input
             type="checkbox"
+            disabled={lock("recursion_enabled")}
             checked={recursionEnabled}
             onChange={(e) => {
               setRecursionEnabled(e.target.checked);
@@ -9201,6 +9479,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         <Field label="allow-recursion (comma-separated CIDRs / ACL names)">
           <input
             className={inputCls}
+            disabled={lock("allow_recursion")}
             value={allowRecursion}
             onChange={(e) => {
               setAllowRecursion(e.target.value);
@@ -9221,8 +9500,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         <h4 className={cardTitle}>
           <Shield className="h-4 w-4 text-muted-foreground" /> DNSSEC Validation
         </h4>
+        {note("dnssec_validation")}
         <Field label="Validation mode">
           <select
+            disabled={lock("dnssec_validation")}
             className={selCls}
             value={dnssecValidation}
             onChange={(e) => {
@@ -9269,6 +9550,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </h4>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("rrl_enabled")}
               type="checkbox"
               checked={rrlEnabled}
               onChange={(e) => {
@@ -9285,11 +9567,13 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           the same client /24 — the primary defense against DNS amplification.
           Applies to every view on this server group.
         </p>
+        {note("rrl_enabled", "rrl_qps_scale", "rrl_log_only")}
         {rrlEnabled && (
           <>
             <div className="grid grid-cols-3 gap-3">
               <Field label="responses/sec (1–1000)">
                 <input
+                  disabled={lock("rrl_responses_per_second")}
                   type="number"
                   min={1}
                   max={1000}
@@ -9303,6 +9587,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="window sec (1–3600)">
                 <input
+                  disabled={lock("rrl_window")}
                   type="number"
                   min={1}
                   max={3600}
@@ -9316,6 +9601,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="slip (0–10)">
                 <input
+                  disabled={lock("rrl_slip")}
                   type="number"
                   min={0}
                   max={10}
@@ -9330,6 +9616,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </div>
             <Field label="qps-scale (optional — tighten limit under load)">
               <input
+                disabled={lock("rrl_qps_scale")}
                 type="number"
                 min={1}
                 className={inputCls}
@@ -9343,6 +9630,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </Field>
             <Field label="exempt-clients (comma/newline CIDRs or ACL names)">
               <input
+                disabled={lock("rrl_exempt_clients")}
                 className={inputCls}
                 value={rrlExempt}
                 onChange={(e) => {
@@ -9354,6 +9642,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </Field>
             <label className="flex items-center gap-2 cursor-pointer text-sm">
               <input
+                disabled={lock("rrl_log_only")}
                 type="checkbox"
                 checked={rrlLogOnly}
                 onChange={(e) => {
@@ -9367,18 +9656,18 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </>
         )}
         <div className="border-t pt-3 space-y-3">
-          {techUnsupported && (
-            <p className="text-xs text-muted-foreground">
-              Technitium has no minimal-responses, tcp-clients or
-              clients-per-query settings, so these are disabled for this group.
-            </p>
+          {note(
+            "minimal_responses",
+            "tcp_clients",
+            "clients_per_query",
+            "max_clients_per_query",
           )}
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
               type="checkbox"
               checked={minimalResponses}
-              disabled={techLocked.minimal}
-              title={techLocked.minimal ? techReason : undefined}
+              disabled={lock("minimal_responses")}
+              title={lockTitle("minimal_responses")}
               onChange={(e) => {
                 setMinimalResponses(e.target.checked);
                 setDirty(true);
@@ -9394,8 +9683,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={tcpClients}
-                disabled={techLocked.tcpClients}
-                title={techLocked.tcpClients ? techReason : undefined}
+                disabled={lock("tcp_clients")}
+                title={lockTitle("tcp_clients")}
                 onChange={(e) => {
                   setTcpClients(e.target.value);
                   setDirty(true);
@@ -9409,8 +9698,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={clientsPerQuery}
-                disabled={techLocked.clientsPerQuery}
-                title={techLocked.clientsPerQuery ? techReason : undefined}
+                disabled={lock("clients_per_query")}
+                title={lockTitle("clients_per_query")}
                 onChange={(e) => {
                   setClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -9424,8 +9713,8 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 min={1}
                 className={inputCls}
                 value={maxClientsPerQuery}
-                disabled={techLocked.maxClientsPerQuery}
-                title={techLocked.maxClientsPerQuery ? techReason : undefined}
+                disabled={lock("max_clients_per_query")}
+                title={lockTitle("max_clients_per_query")}
                 onChange={(e) => {
                   setMaxClientsPerQuery(e.target.value);
                   setDirty(true);
@@ -9447,9 +9736,11 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           upstream resolvers over TLS instead of plaintext port 53. Listeners
           are <strong>additive</strong> — plain DNS on :53 keeps working.
         </p>
+        {noteUnapplied("dot_enabled", "doh_enabled", "doq_enabled")}
 
         <Field label="TLS certificate (served by both listeners)">
           <select
+            disabled={lock("tls_certificate_id")}
             className={selCls}
             value={tlsCertificateId}
             onChange={(e) => {
@@ -9500,6 +9791,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           <span className="text-sm">DNS-over-TLS (DoT)</span>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("dot_enabled")}
               type="checkbox"
               checked={dotEnabled}
               onChange={(e) => {
@@ -9514,6 +9806,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         {dotEnabled && (
           <Field label="DoT port">
             <input
+              disabled={lock("dot_port")}
               type="number"
               min={1}
               max={65535}
@@ -9531,6 +9824,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           <span className="text-sm">DNS-over-HTTPS (DoH)</span>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("doh_enabled")}
               type="checkbox"
               checked={dohEnabled}
               onChange={(e) => {
@@ -9547,6 +9841,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             <div className="grid grid-cols-2 gap-3">
               <Field label="DoH port">
                 <input
+                  disabled={lock("doh_port")}
                   type="number"
                   min={1}
                   max={65535}
@@ -9560,6 +9855,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="URL path">
                 <input
+                  disabled={lock("doh_path")}
                   className={inputCls}
                   value={dohPath}
                   placeholder="/dns-query"
@@ -9590,6 +9886,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </div>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("doq_enabled")}
               type="checkbox"
               checked={doqEnabled}
               onChange={(e) => {
@@ -9605,6 +9902,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           <>
             <Field label="DoQ port">
               <input
+                disabled={lock("doq_port")}
                 type="number"
                 min={1}
                 max={65535}
@@ -9667,9 +9965,9 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                   <input
                     type="checkbox"
                     checked={forwardTlsVerify}
-                    disabled={techLocked.tlsVerify}
+                    disabled={lock("forward_tls_verify")}
                     title={
-                      techLocked.tlsVerify
+                      lock("forward_tls_verify")
                         ? "Not supported by Technitium: it always validates the upstream certificate."
                         : undefined
                     }
@@ -9694,6 +9992,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               techUnsupported ? (
                 <Field label="Upstream TLS hostname (required)">
                   <input
+                    disabled={lock("forward_tls_hostname")}
                     className={inputCls}
                     value={forwardTlsHostname}
                     placeholder="cloudflare-dns.com"
@@ -9730,6 +10029,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </h4>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("dnsdist_enabled")}
               type="checkbox"
               checked={dnsdistEnabled}
               onChange={(e) => {
@@ -9749,11 +10049,13 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           docker-compose only for now). pdns is unaffected; with the front off
           it's a plain pass-through. Point DNS clients at the front.
         </p>
+        {note("dnsdist_enabled")}
         {dnsdistEnabled && (
           <>
             <div className="grid grid-cols-2 gap-3">
               <Field label="Max QPS per client IP (blank = none)">
                 <input
+                  disabled={lock("dnsdist_max_qps_per_client")}
                   type="number"
                   min={1}
                   className={inputCls}
@@ -9767,6 +10069,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="Over-limit action">
                 <select
+                  disabled={lock("dnsdist_action")}
                   className={selCls}
                   value={dnsdistAction}
                   onChange={(e) => {
@@ -9784,6 +10087,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             <div className="grid grid-cols-2 gap-3">
               <Field label="Dynamic-block QPS (blank = off)">
                 <input
+                  disabled={lock("dnsdist_dynblock_qps")}
                   type="number"
                   min={1}
                   className={inputCls}
@@ -9797,6 +10101,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               </Field>
               <Field label="Dynamic-block duration (s)">
                 <input
+                  disabled={lock("dnsdist_dynblock_seconds")}
                   type="number"
                   min={1}
                   max={86400}
@@ -9817,6 +10122,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         <h4 className={cardTitle}>Notify</h4>
         <Field label="Notify mode">
           <select
+            disabled={lock("notify_enabled")}
             className={selCls}
             value={notifyEnabled}
             onChange={(e) => {
@@ -9834,12 +10140,24 @@ export function OptionsTab({ groupId }: { groupId: string }) {
               master-only — only send notifies from primary
             </option>
             <option value="no">no — disable zone change notifications</option>
+            {/* #4841: the API also stores primary-only; a stored value the
+                list lacks must show as itself, not as the first choice. */}
+            {!["yes", "explicit", "master-only", "no"].includes(
+              notifyEnabled,
+            ) && (
+              <option value={notifyEnabled}>
+                {notifyEnabled === "primary-only"
+                  ? "primary-only — only send notifies from primary"
+                  : notifyEnabled}
+              </option>
+            )}
           </select>
         </Field>
       </div>
 
       <div className={card}>
         <h4 className={cardTitle}>Query &amp; Transfer ACLs</h4>
+        {noteUnapplied("allow_query", "allow_transfer")}
         {techUnsupported && (
           <p className="text-xs text-muted-foreground">
             Technitium applies allow-query to each zone it serves as a network
@@ -9850,6 +10168,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         )}
         <Field label="allow-query (comma-separated CIDRs / ACL names)">
           <input
+            disabled={lock("allow_query")}
             className={inputCls}
             value={allowQuery}
             onChange={(e) => {
@@ -9861,6 +10180,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         </Field>
         <Field label="allow-transfer (comma-separated CIDRs / ACL names)">
           <input
+            disabled={lock("allow_transfer")}
             className={inputCls}
             value={allowTransfer}
             onChange={(e) => {
@@ -9879,6 +10199,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
           </h4>
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
+              disabled={lock("query_log_enabled")}
               type="checkbox"
               checked={queryLogEnabled}
               onChange={(e) => {
@@ -9892,11 +10213,12 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         </div>
         {!queryLogEnabled && (
           <p className="text-xs text-muted-foreground">
-            DNS query logs are disabled. Enable to record every query received
-            by BIND for debugging or audit purposes (high volume — large file
-            growth).
+            DNS query logs are disabled. Enable to record every query the DNS
+            server receives, for debugging or audit purposes (high volume —
+            large file growth).
           </p>
         )}
+        {note("query_log_enabled", "response_log_enabled")}
         {queryLogEnabled && (
           <>
             {/* Response logging (#914). Nested inside the query-log gate
@@ -9905,6 +10227,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 than accepting a toggle that produces nothing. */}
             <label className="flex cursor-pointer items-start gap-2 rounded border bg-muted/20 p-2 text-sm">
               <input
+                disabled={lock("response_log_enabled")}
                 type="checkbox"
                 checked={responseLogEnabled}
                 onChange={(e) => {
@@ -9927,6 +10250,7 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             </label>
             <Field label="Severity">
               <select
+                disabled={lock("query_log_severity")}
                 className={selCls}
                 value={queryLogSeverity}
                 onChange={(e) => {
@@ -9940,6 +10264,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 <option value="debug">
                   debug — very verbose; for troubleshooting only
                 </option>
+                {/* #4841: the API also stores dynamic and "debug N". */}
+                {!["info", "debug"].includes(queryLogSeverity) && (
+                  <option value={queryLogSeverity}>{queryLogSeverity}</option>
+                )}
               </select>
             </Field>
             <p className="text-xs text-muted-foreground">
@@ -10102,7 +10430,7 @@ export function RecordsTab({
       }
     }
     if (colFilters.source) {
-      const src = r.auto_generated ? "auto" : "user";
+      const src = recordSource(r);
       if (src !== colFilters.source) return false;
     }
     return true;
@@ -10118,7 +10446,7 @@ export function RecordsTab({
       if (key === "value") return row.value;
       if (key === "ttl") return row.ttl ?? -1;
       if (key === "view") return row.view_name ?? "";
-      if (key === "source") return row.auto_generated ? "auto" : "user";
+      if (key === "source") return recordSource(row);
       return "";
     },
   );
@@ -10204,6 +10532,7 @@ export function RecordsTab({
           <option value="">All</option>
           <option value="user">User</option>
           <option value="auto">Auto (IPAM/DHCP)</option>
+          <option value="pool">DNS pool</option>
         </select>
       );
     }
@@ -10387,7 +10716,14 @@ export function RecordsTab({
                       )}
                     </td>
                     <td className="px-4 py-2">
-                      {rec.auto_generated ? (
+                      {isPoolManagedRecord(rec) ? (
+                        <span
+                          className="inline-flex items-center rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-400"
+                          title="Managed by a DNS pool"
+                        >
+                          pool
+                        </span>
+                      ) : rec.auto_generated ? (
                         <span
                           className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
                           title="Auto-managed by IPAM or DHCP"
@@ -10402,37 +10738,79 @@ export function RecordsTab({
                     </td>
                     <td className="px-2 py-2 text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => setEditing(rec)}
-                          disabled={rec.auto_generated}
-                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
-                          title={
-                            rec.auto_generated
-                              ? "Auto-managed — edit the source IP/lease"
-                              : "Edit"
-                          }
-                          aria-label="Edit"
-                          {...permissionGate(canWriteRecords, NEEDS_DNS_WRITE)}
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        <button
-                          onClick={() => setConfirmDelete(rec)}
-                          disabled={rec.auto_generated}
-                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
-                          title={
-                            rec.auto_generated
-                              ? "Auto-managed — delete the source IP/lease"
-                              : "Delete"
-                          }
-                          aria-label="Delete"
-                          {...permissionGate(
+                        {(() => {
+                          // A disabled button takes no pointer events, so its
+                          // own title never shows (#4820): the reason also
+                          // rides a wrapping span that does.
+                          const locked =
+                            rec.auto_generated || isPoolManagedRecord(rec);
+                          const editGate = permissionGate(
+                            canWriteRecords,
+                            NEEDS_DNS_WRITE,
+                          );
+                          const delGate = permissionGate(
                             canDeleteRecords,
                             NEEDS_DNS_DELETE,
-                          )}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                          );
+                          const editTitle =
+                            editGate.title ??
+                            (isPoolManagedRecord(rec)
+                              ? POOL_MANAGED_REASON
+                              : rec.auto_generated
+                                ? "Auto-managed — edit the source IP/lease"
+                                : "Edit");
+                          const delTitle =
+                            delGate.title ??
+                            (isPoolManagedRecord(rec)
+                              ? POOL_MANAGED_REASON
+                              : rec.auto_generated
+                                ? "Auto-managed — delete the source IP/lease"
+                                : "Delete");
+                          return (
+                            <>
+                              <span
+                                data-testid="rec-edit-reason"
+                                title={
+                                  locked || editGate.disabled
+                                    ? editTitle
+                                    : undefined
+                                }
+                                className="inline-flex"
+                              >
+                                <button
+                                  onClick={() => setEditing(rec)}
+                                  disabled={locked}
+                                  className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
+                                  title={editTitle}
+                                  aria-label="Edit"
+                                  {...editGate}
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                              </span>
+                              <span
+                                data-testid="rec-delete-reason"
+                                title={
+                                  locked || delGate.disabled
+                                    ? delTitle
+                                    : undefined
+                                }
+                                className="inline-flex"
+                              >
+                                <button
+                                  onClick={() => setConfirmDelete(rec)}
+                                  disabled={locked}
+                                  className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
+                                  title={delTitle}
+                                  aria-label="Delete"
+                                  {...delGate}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </span>
+                            </>
+                          );
+                        })()}
                       </div>
                     </td>
                   </tr>
@@ -10612,7 +10990,11 @@ export function ZonesTab({
     };
   }
   function countZones(n: DnsTreeNode): number {
-    return (n.zone ? 1 : 0) + n.children.reduce((a, c) => a + countZones(c), 0);
+    return (
+      (n.zone ? 1 : 0) +
+      (n.twins?.length ?? 0) +
+      n.children.reduce((a, c) => a + countZones(c), 0)
+    );
   }
 
   const typeBadge: Record<string, string> = {
@@ -10701,122 +11083,133 @@ export function ZonesTab({
   function renderZoneRows(node: DnsTreeNode, depth: number): React.ReactNode[] {
     const rows: React.ReactNode[] = [];
     const indent = depth * 14;
-    if (node.zone) {
-      const z = node.zone;
-      const sel = selected.has(z.id);
-      rows.push(
-        <ContextMenu key={z.id}>
-          <ContextMenuTrigger asChild>
-            <tr
-              className={cn(
-                "border-b last:border-0 hover:bg-muted/30",
-                sel && "bg-primary/5",
-              )}
-            >
-              <td className="w-8 px-2 py-1">
-                <input
-                  type="checkbox"
-                  checked={sel}
-                  onChange={() => toggleOne(z.id)}
-                  onClick={(e) => e.stopPropagation()}
-                />
-              </td>
-              <td
-                className="py-1 pr-2 cursor-pointer"
-                onClick={() => onSelectZone(z)}
-              >
-                <span
-                  className="inline-flex items-center gap-1.5"
-                  style={{ paddingLeft: indent }}
-                >
-                  {swatchCls(z.color) ? (
-                    <span
-                      className={cn(
-                        "h-2 w-2 rounded-full flex-shrink-0",
-                        swatchCls(z.color)!,
-                      )}
-                    />
-                  ) : (
-                    <FileText className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-                  )}
-                  <span className="font-mono text-xs">
-                    {z.name.replace(/\.$/, "")}
-                  </span>
-                  <CustomerChip customerId={z.customer_id} />
-                </span>
-              </td>
-              <td className="py-1 pr-2">
-                <ZoneScopePill
-                  scope={z.name_scope}
-                  detail={z.name_scope_detail}
-                />
-              </td>
-              <td className="py-1">
-                <span
-                  className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${typeBadge[z.zone_type] ?? "bg-muted text-muted-foreground"}`}
-                >
-                  {z.zone_type}
-                </span>
-              </td>
-              <td className="py-1 tabular-nums text-xs text-muted-foreground">
-                {z.ttl}
-              </td>
-              <td className="py-1 text-xs">
-                {z.dnssec_enabled ? (
-                  <span className="inline-flex items-center gap-1 text-emerald-600">
-                    <Shield className="h-3 w-3" /> on
-                  </span>
-                ) : (
-                  <span className="text-muted-foreground/50">—</span>
+    const nodeZones = node.zone ? [node.zone, ...(node.twins ?? [])] : [];
+    if (nodeZones.length > 0) {
+      for (const z of nodeZones) {
+        const sel = selected.has(z.id);
+        rows.push(
+          <ContextMenu key={z.id}>
+            <ContextMenuTrigger asChild>
+              <tr
+                className={cn(
+                  "border-b last:border-0 hover:bg-muted/30",
+                  sel && "bg-primary/5",
                 )}
-              </td>
-              <td className="py-1 text-xs text-muted-foreground">
-                {z.last_pushed_at
-                  ? new Date(z.last_pushed_at).toLocaleString()
-                  : "—"}
-              </td>
-              <td className="py-1 pr-2 text-right">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSelectZone(z);
-                  }}
-                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-                  title="Open zone"
+              >
+                <td className="w-8 px-2 py-1">
+                  <input
+                    type="checkbox"
+                    checked={sel}
+                    onChange={() => toggleOne(z.id)}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </td>
+                <td
+                  className="py-1 pr-2 cursor-pointer"
+                  onClick={() => onSelectZone(z)}
                 >
-                  <Pencil className="h-3 w-3" />
-                </button>
-              </td>
-            </tr>
-          </ContextMenuTrigger>
-          <ContextMenuContent>
-            <ContextMenuLabel>{z.name.replace(/\.$/, "")}</ContextMenuLabel>
-            <ContextMenuSeparator />
-            <ContextMenuItem onSelect={() => onSelectZone(z)}>
-              Open Zone
-            </ContextMenuItem>
-            <ContextMenuItem
-              onSelect={() => copyToClipboard(z.name.replace(/\.$/, ""))}
-            >
-              Copy Name
-            </ContextMenuItem>
-            <ContextMenuItem
-              onSelect={async () => {
-                const { data, filename } = await dnsApi.exportZone(
-                  group.id,
-                  z.id,
-                );
-                const name =
-                  filename ??
-                  `${z.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
-                downloadBlob(data, name, "text/dns");
-              }}
-            >
-              Export Zone File
-            </ContextMenuItem>
-          </ContextMenuContent>
-        </ContextMenu>,
-      );
+                  <span
+                    className="inline-flex items-center gap-1.5"
+                    style={{ paddingLeft: indent }}
+                  >
+                    {swatchCls(z.color) ? (
+                      <span
+                        className={cn(
+                          "h-2 w-2 rounded-full flex-shrink-0",
+                          swatchCls(z.color)!,
+                        )}
+                      />
+                    ) : (
+                      <FileText className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                    )}
+                    <span className="font-mono text-xs">
+                      {z.name.replace(/\.$/, "")}
+                    </span>
+                    {node.twins && z.view_id && (
+                      <span
+                        className="rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
+                        data-testid="zone-view-chip"
+                      >
+                        view:{" "}
+                        {views.find((v) => v.id === z.view_id)?.name ?? "?"}
+                      </span>
+                    )}
+                    <CustomerChip customerId={z.customer_id} />
+                  </span>
+                </td>
+                <td className="py-1 pr-2">
+                  <ZoneScopePill
+                    scope={z.name_scope}
+                    detail={z.name_scope_detail}
+                  />
+                </td>
+                <td className="py-1">
+                  <span
+                    className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${typeBadge[z.zone_type] ?? "bg-muted text-muted-foreground"}`}
+                  >
+                    {z.zone_type}
+                  </span>
+                </td>
+                <td className="py-1 tabular-nums text-xs text-muted-foreground">
+                  {z.ttl}
+                </td>
+                <td className="py-1 text-xs">
+                  {z.dnssec_enabled ? (
+                    <span className="inline-flex items-center gap-1 text-emerald-600">
+                      <Shield className="h-3 w-3" /> on
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground/50">—</span>
+                  )}
+                </td>
+                <td className="py-1 text-xs text-muted-foreground">
+                  {z.last_pushed_at
+                    ? new Date(z.last_pushed_at).toLocaleString()
+                    : "—"}
+                </td>
+                <td className="py-1 pr-2 text-right">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelectZone(z);
+                    }}
+                    className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                    title="Open zone"
+                  >
+                    <Pencil className="h-3 w-3" />
+                  </button>
+                </td>
+              </tr>
+            </ContextMenuTrigger>
+            <ContextMenuContent>
+              <ContextMenuLabel>{z.name.replace(/\.$/, "")}</ContextMenuLabel>
+              <ContextMenuSeparator />
+              <ContextMenuItem onSelect={() => onSelectZone(z)}>
+                Open Zone
+              </ContextMenuItem>
+              <ContextMenuItem
+                onSelect={() => copyToClipboard(z.name.replace(/\.$/, ""))}
+              >
+                Copy Name
+              </ContextMenuItem>
+              <ContextMenuItem
+                onSelect={async () => {
+                  const { data, filename } = await dnsApi.exportZone(
+                    group.id,
+                    z.id,
+                  );
+                  const name =
+                    filename ??
+                    `${z.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
+                  downloadBlob(data, name, "text/dns");
+                }}
+              >
+                Export Zone File
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>,
+        );
+      }
     } else {
       const flag = groupFlag(node.domain);
       const open = filterActive || flag.open;
@@ -10897,7 +11290,10 @@ export function ZonesTab({
                 <Trash2 className="h-3 w-3" /> Delete {selected.size}
               </button>
               <button
-                onClick={() => setSelected(new Set())}
+                onClick={(e) => {
+                  handOffFocusOnRemove(e.currentTarget);
+                  setSelected(new Set());
+                }}
                 className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
               >
                 Clear
@@ -11192,13 +11588,27 @@ function BlocklistScopeFields({
     new Set(servers.filter((s) => s.driver !== "bind9").map((s) => s.driver)),
   );
   const nothingSelected = !wholeGroup && picked.size === 0;
+  // #4608 — only BIND9 (RPZ) and agent-managed Technitium render a blocklist
+  // (the backend's `blocklist` driver capability). A group with servers and
+  // none of those applies nothing, and the server refuses a NEW assignment to
+  // it, so the unchecked boxes are disabled (a stored one can be unchecked).
+  const inert =
+    servers.length > 0 &&
+    !servers.some((s) => s.driver === "bind9" || s.driver === "technitium");
 
   return (
     <fieldset className="space-y-3 rounded-md border p-3">
       <legend className="px-1 text-xs font-medium text-muted-foreground">
         Applies to
       </legend>
-      {nonBind.length > 0 && (
+      {inert && (
+        <div className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400">
+          This group runs {nonBind.join(" / ")}, which renders no blocklist, so
+          a blocklist here blocks nothing. Assign the list to a BIND9 group
+          instead.
+        </div>
+      )}
+      {nonBind.length > 0 && !inert && (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-700 dark:text-amber-400">
           This group also runs {nonBind.join(" / ")}, which
           {nonBind.length === 1 ? " does" : " do"} not render RPZ blocking.
@@ -11211,6 +11621,7 @@ function BlocklistScopeFields({
           type="checkbox"
           className="mt-0.5"
           checked={wholeGroup}
+          disabled={inert && !wholeGroup}
           onChange={(e) => setWholeGroup(e.target.checked)}
         />
         <span className="text-sm">
@@ -11245,6 +11656,7 @@ function BlocklistScopeFields({
                   type="checkbox"
                   className="mt-0.5"
                   checked={picked.has(v.id)}
+                  disabled={inert && !picked.has(v.id)}
                   onChange={() =>
                     setPicked((prev) => {
                       const next = new Set(prev);
@@ -11415,6 +11827,8 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     },
   });
 
+  // #4624 — why the last Apply (row or bulk) was refused, shown above the lists.
+  const [applyError, setApplyError] = useState<string | null>(null);
   const toggleAssignment = useMutation({
     mutationFn: async ({
       list,
@@ -11430,7 +11844,12 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           : { remove_server_group_ids: [group.id] },
       );
     },
+    onMutate: () => setApplyError(null),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
+    // #4624 — a refused assignment (a group that cannot apply a blocklist is
+    // a 422) says why; the list stays where it was.
+    onError: (e, { list }) =>
+      setApplyError(`${list.name}: ${formatApiError(e, "Update failed")}`),
   });
 
   const refreshMut = useMutation({
@@ -11459,17 +11878,39 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       const targets = lists.filter(
         (l) => ids.includes(l.id) && !l.applied_group_ids.includes(group.id),
       );
-      await Promise.allSettled(
+      const results = await Promise.allSettled(
         targets.map((l) =>
           dnsBlocklistApi.updateAssignments(l.id, {
             add_server_group_ids: [group.id],
           }),
         ),
       );
+      return { targets, results };
     },
-    onSuccess: () => {
+    onMutate: () => setApplyError(null),
+    onSuccess: ({ targets, results }) => {
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
-      setSelectedIds(new Set());
+      // #4624 — every result is read: a refused list (name + reason) is
+      // reported and stays selected; the lists that did apply are counted.
+      const refused = targets.flatMap((l, i) => {
+        const r = results[i];
+        return r.status === "rejected"
+          ? [`${l.name}: ${formatApiError(r.reason, "Update failed")}`]
+          : [];
+      });
+      const applied = targets.length - refused.length;
+      setSelectedIds(
+        new Set(
+          targets
+            .filter((_, i) => results[i].status === "rejected")
+            .map((l) => l.id),
+        ),
+      );
+      if (refused.length > 0) {
+        setApplyError(
+          `${applied} applied, ${refused.length} refused. ${refused.join("; ")}`,
+        );
+      }
     },
   });
   const bulkDetach = useMutation({
@@ -11611,6 +12052,14 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           ]),
         )}
       />
+      {applyError && (
+        <p
+          role="alert"
+          className="rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-700 dark:text-red-400"
+        >
+          {applyError}
+        </p>
+      )}
       {showCatalog && (
         <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
       )}
@@ -11626,7 +12075,10 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           </span>
           <div className="flex items-center gap-2">
             <button
-              onClick={() => setSelectedIds(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelectedIds(new Set());
+              }}
               className="rounded border px-2 py-1 hover:bg-muted/30"
             >
               Clear
@@ -11740,7 +12192,7 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   <div
                     key={l.id}
                     className={cn(
-                      "flex items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer",
+                      "flex flex-wrap items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer",
                       isSel && "ring-1 ring-primary/40 bg-primary/5",
                     )}
                     onClick={() => setSelected(l)}
@@ -11798,11 +12250,11 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground"
                         title={feedSkippedTitle(l)}
                       >
-                        {feedSkippedTotal(l)} rules skipped
+                        {countNoun(feedSkippedTotal(l), "rule")} skipped
                       </span>
                     )}
                     <span className="ml-auto text-xs text-muted-foreground">
-                      {l.entry_count} entries
+                      {countNoun(l.entry_count, "entry", "entries")}
                     </span>
                     <div
                       className="flex items-center gap-1"
@@ -11877,6 +12329,16 @@ export function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                         <Trash2 className="h-3 w-3" />
                       </button>
                     </div>
+                    {/* #4624 — applied here but a group it is applied to has
+                        no server that renders a blocklist. */}
+                    {l.unapplied_warning && appliesHere(l) && (
+                      <span
+                        role="note"
+                        className="basis-full text-xs text-amber-700 dark:text-amber-400"
+                      >
+                        {l.unapplied_warning}
+                      </span>
+                    )}
                   </div>
                 );
               })}
@@ -12569,8 +13031,9 @@ export function BlocklistDetail({
           {/* Each count waits for its own read: a refused, failed or
               unanswered one draws none (#3426). */}
           {[
-            page !== undefined && `${total} entries`,
-            exceptionsData !== undefined && `${exceptions.length} exceptions`,
+            page !== undefined && countNoun(total, "entry", "entries"),
+            exceptionsData !== undefined &&
+              countNoun(exceptions.length, "exception"),
           ]
             .filter(Boolean)
             .join(" · ")}
@@ -12609,6 +13072,12 @@ export function BlocklistDetail({
       {feedSkippedTotal(list) > 0 && (
         <p className="text-xs text-muted-foreground">
           {feedSkippedTitle(list)}
+        </p>
+      )}
+      {/* #4624 — applied, but to a group no server of which renders it. */}
+      {list.unapplied_warning && (
+        <p role="note" className="text-xs text-amber-700 dark:text-amber-400">
+          {list.unapplied_warning}
         </p>
       )}
 
@@ -12778,7 +13247,10 @@ export function BlocklistDetail({
                       )}
                       <button
                         className="text-muted-foreground hover:text-destructive"
-                        onClick={() => deleteEntry.mutate(e.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          deleteEntry.mutate(e.id);
+                        }}
                         title={
                           e.source === "manual"
                             ? "Remove entry"
@@ -12911,7 +13383,10 @@ export function BlocklistDetail({
                       </button>
                       <button
                         className="text-muted-foreground hover:text-destructive"
-                        onClick={() => deleteException.mutate(ex.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          deleteException.mutate(ex.id);
+                        }}
                         title="Remove exception"
                         aria-label="Remove exception"
                         {...permissionGate(
@@ -12953,10 +13428,14 @@ export function BlocklistDetail({
               bulkAdd.mutate();
             }}
           >
-            <p className="text-xs text-muted-foreground">
+            <label
+              htmlFor="dns-bulk-domains"
+              className="block text-xs text-muted-foreground"
+            >
               One domain per line. Duplicates and invalid entries are skipped.
-            </p>
+            </label>
             <textarea
+              id="dns-bulk-domains"
               className={`${inputCls} font-mono text-xs`}
               rows={12}
               value={bulkText}
@@ -13075,6 +13554,11 @@ function GroupDetailView({
   const tabs = allTabs.filter(
     (t) => !(t.id === "options" && technitiumApiGroup),
   );
+  // #4604 B6 — Sync with Servers reads zones back over a server API; a
+  // PowerDNS agent exposes none, so every zone answers "unsupported".
+  const powerdnsOnlyGroup =
+    (group.server_drivers ?? []).length > 0 &&
+    (group.server_drivers ?? []).every((d) => d === "powerdns");
 
   const typeBadge: Record<string, string> = {
     internal: "bg-blue-500/15 text-blue-600",
@@ -13125,8 +13609,12 @@ function GroupDetailView({
             <button
               className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
               onClick={runGroupSync}
-              disabled={syncing}
-              title="Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+              disabled={syncing || powerdnsOnlyGroup}
+              title={
+                powerdnsOnlyGroup
+                  ? "Not supported for PowerDNS groups: the PowerDNS driver cannot read zones back from the server, so every zone would be reported unsupported. SpatiumDDI pushes changes to PowerDNS automatically."
+                  : "Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+              }
               {...permissionGate(isSuperadmin, NEEDS_SUPERADMIN)}
             >
               <RefreshCw className={cn("h-3 w-3", syncing && "animate-spin")} />
@@ -13329,7 +13817,10 @@ export function SyncWithServersResultModal({
                   !!srv.error ||
                   (srv.result?.zones_pushed_to_server?.length ?? 0) > 0 ||
                   (srv.result?.zones_imported?.length ?? 0) > 0 ||
-                  (srv.result?.zones_push_to_server_errors?.length ?? 0) > 0
+                  (srv.result?.zones_push_to_server_errors?.length ?? 0) > 0 ||
+                  (srv.result?.items ?? []).some(
+                    (it) => (it.push_errors?.length ?? 0) > 0,
+                  )
                 }
               >
                 <summary className="cursor-pointer select-none border-b bg-muted/20 px-3 py-1.5 text-xs font-medium flex items-center justify-between">
@@ -13395,7 +13886,10 @@ export function SyncWithServersResultModal({
                         </div>
                       )}
                       {srv.result.zones_push_to_server_errors.length > 0 && (
-                        <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                        <div
+                          role="alert"
+                          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs"
+                        >
                           <div className="font-medium text-destructive">
                             Zone push errors
                           </div>
@@ -13406,6 +13900,30 @@ export function SyncWithServersResultModal({
                                   {e}
                                 </li>
                               ),
+                            )}
+                          </ul>
+                        </div>
+                      )}
+                      {srv.result.items.some(
+                        (it) => it.push_errors.length > 0,
+                      ) && (
+                        <div
+                          role="alert"
+                          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs"
+                        >
+                          <div className="font-medium text-destructive">
+                            Record push errors
+                          </div>
+                          <ul className="mt-1 ml-4 list-disc text-muted-foreground">
+                            {srv.result.items.flatMap((it) =>
+                              it.push_errors.map((e, i) => (
+                                <li
+                                  key={`${it.zone}-${i}`}
+                                  className="font-mono text-[11px] break-all"
+                                >
+                                  {it.zone}: {e}
+                                </li>
+                              )),
                             )}
                           </ul>
                         </div>
@@ -13632,6 +14150,13 @@ export function ZoneTreeRows({
                 <span className="font-mono truncate">
                   {node.zone.name.replace(/\.$/, "")}
                 </span>
+                {node.twins && node.zone.view_id && (
+                  <span className="text-[10px] opacity-70">
+                    view:{" "}
+                    {views.find((v) => v.id === node.zone!.view_id)?.name ??
+                      "?"}
+                  </span>
+                )}
                 {node.zone.dnssec_enabled && (
                   <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />
                 )}
@@ -13682,6 +14207,12 @@ export function ZoneTreeRows({
             <span className="font-mono truncate">
               {node.zone.name.replace(/\.$/, "")}
             </span>
+            {node.twins && node.zone.view_id && (
+              <span className="text-[10px] opacity-70">
+                view:{" "}
+                {views.find((v) => v.id === node.zone!.view_id)?.name ?? "?"}
+              </span>
+            )}
             {node.zone.dnssec_enabled && (
               <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />
             )}
@@ -13698,6 +14229,29 @@ export function ZoneTreeRows({
             </span>
           </div>
         )}
+        {/* Same name in other views of the group (#4843) */}
+        {node.twins?.map((t) => (
+          <button
+            key={t.id}
+            className={`flex w-full items-center gap-1.5 rounded py-1 pr-2 text-xs ${
+              selectedZoneId === t.id
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground"
+            }`}
+            style={{ paddingLeft: paddingLeft + (hasChildren ? 20 : 0) }}
+            onClick={() => onSelectZone(t)}
+          >
+            <FileText className="h-3 w-3 flex-shrink-0" />
+            <span className="font-mono truncate">
+              {t.name.replace(/\.$/, "")}
+            </span>
+            {t.view_id && (
+              <span className="text-[10px] opacity-70">
+                view: {views.find((v) => v.id === t.view_id)?.name ?? "?"}
+              </span>
+            )}
+          </button>
+        ))}
         {/* Children */}
         {hasChildren && expanded && (
           <div>
@@ -13746,6 +14300,7 @@ export function ZoneTreeRows({
           groupId={groupId}
           views={views}
           initialName={createZoneName}
+          initialViewId={ancestorViewId(createZoneName, zones)}
           onClose={() => setCreateZoneName(null)}
         />
       )}

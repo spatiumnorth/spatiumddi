@@ -257,3 +257,46 @@ async def test_move_into_technitium_allows_an_expressible_zone_list(
     )
     assert r.status_code == 200, r.text
     assert r.json()["technitium_acl_refusal"] is None
+
+
+# ── #4562 recursion on PowerDNS ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_powerdns_group_refuses_recursion_changes(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    group, _ = await _group(db_session, "powerdns")
+    await db_session.commit()
+    url = f"/api/v1/dns/groups/{group.id}/options"
+    # Stored default (recursion on) re-saves untouched.
+    r = await client.put(url, json={"recursion_enabled": True}, headers=headers)
+    assert r.status_code == 200, r.text
+    # A custom ACL is refused.
+    r = await client.put(url, json={"allow_recursion": ["0.0.0.0/0"]}, headers=headers)
+    assert r.status_code == 422, r.text
+    assert "allow_recursion" in str(r.json()["detail"])
+    # Off is allowed; turning it back on is refused. Forwarders stay accepted.
+    r = await client.put(
+        url, json={"recursion_enabled": False, "forwarders": ["1.1.1.1"]}, headers=headers
+    )
+    assert r.status_code == 200, r.text
+    r = await client.put(url, json={"recursion_enabled": True}, headers=headers)
+    assert r.status_code == 422, r.text
+    assert "recursion_enabled" in str(r.json()["detail"])
+
+
+@pytest.mark.asyncio
+async def test_bind9_group_still_accepts_recursion_acl(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    group, _ = await _group(db_session, "bind9")
+    await db_session.commit()
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/options",
+        json={"allow_recursion": ["any"]},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text

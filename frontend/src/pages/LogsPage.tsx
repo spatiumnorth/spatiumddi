@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -546,7 +547,10 @@ function EventLogTab({ sources }: { sources: LogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear since filter"
               className="rounded text-[11px] text-muted-foreground hover:text-foreground"
             >
@@ -887,7 +891,10 @@ function RefreshButton({
 function QueryErrorBanner({ query }: { query: { error: unknown } }) {
   const detail = formatApiError(query.error, String(query.error));
   return (
-    <div className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+    <div
+      role="alert"
+      className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive"
+    >
       <p className="font-medium">Query failed</p>
       <p className="mt-1 whitespace-pre-wrap break-words text-xs">{detail}</p>
     </div>
@@ -1370,7 +1377,10 @@ export function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear"
               className="rounded p-0.5 text-muted-foreground hover:text-foreground"
             >
@@ -1526,7 +1536,7 @@ function DNSQueryAnalyticsStrip({
         <span className="text-muted-foreground/70">
           {loading
             ? "computing…"
-            : `${total.toLocaleString()} queries in window`}
+            : `${total.toLocaleString()} ${total === 1 ? "query" : "queries"} in window`}
         </span>
       </div>
       <div className={cn("grid grid-cols-1 gap-3", cols)}>
@@ -1878,7 +1888,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear"
               className="rounded p-0.5 text-muted-foreground hover:text-foreground"
             >

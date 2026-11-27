@@ -497,6 +497,28 @@ describe("the list (#1961, #1962)", () => {
     );
   });
 
+  it("reads the list again each time the page opens (#4872)", async () => {
+    list.mockResolvedValue({
+      items: [entry(1)],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    const ui = (
+      <QueryClientProvider client={qc}>
+        <TrashPage />
+      </QueryClientProvider>
+    );
+    const first = render(ui);
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    first.unmount();
+    render(ui);
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+  });
+
   it("steps back when the page it is on empties", async () => {
     let total = 105;
     list.mockImplementation((p: { offset?: number }) =>
@@ -713,5 +735,24 @@ describe("the dialogs announce what happened (#3525)", () => {
     fireEvent.click(buttons[buttons.length - 1]);
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     expect(screen.getByRole("alert").textContent).toMatch(/Still referenced/);
+  });
+
+  it("says when Delete permanently is queued for approval", async () => {
+    list.mockResolvedValue({ items: [entry(1)], total: 1 });
+    permanentDelete.mockResolvedValue({
+      status: 202,
+      data: { change_request_id: "cr-1", status: "pending" },
+    });
+    renderPage();
+    fireEvent.click(await screen.findByText("Delete"));
+    const buttons = await screen.findAllByRole("button", {
+      name: "Delete permanently",
+    });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await screen.findByText(/Submitted for approval/);
+    expect(
+      screen.queryAllByRole("button", { name: "Delete permanently" }).length,
+    ).toBe(buttons.length - 1);
+    expect(screen.getByRole("button", { name: "Close" })).toBeTruthy();
   });
 });

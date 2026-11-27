@@ -1,3 +1,5 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
+import { countNoun } from "@/lib/count-noun";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -761,7 +763,10 @@ export function RespondersTab({ groupId }: { groupId: string }) {
         (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
         responders classify <span className="text-rose-600">rogue</span>, and
         fire the Rogue DHCP alert once that rule is enabled (Alerts → Rules; it
-        ships disabled) — acknowledge a known-but-external one to allowlist it.
+        ships disabled)
+        {!ackGate.disabled &&
+          " — acknowledge a known-but-external one to allowlist it"}
+        .
       </p>
       <div className="rounded-lg border overflow-auto">
         <table className="w-full text-sm">
@@ -815,7 +820,10 @@ export function RespondersTab({ groupId }: { groupId: string }) {
                 <td className="px-3 py-1.5 text-right">
                   {r.classification === "rogue" && (
                     <button
-                      onClick={() => ack.mutate(r.id)}
+                      onClick={() => {
+                        armRemovalFocus();
+                        ack.mutate(r.id);
+                      }}
                       disabled={ack.isPending}
                       className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                       {...ackGate}
@@ -938,7 +946,10 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
           RA sniffer (enable <code>DHCP_RA_SNIFFER_ENABLED=1</code> on the
           agent). Unknown routers classify{" "}
           <span className="text-rose-600">rogue</span> and fire the Rogue IPv6
-          router alert — acknowledge an expected one to allowlist it.
+          router alert
+          {!ackGate.disabled &&
+            " — acknowledge an expected one to allowlist it"}
+          .
         </p>
         <div className="rounded-lg border overflow-auto">
           <table className="w-full text-sm">
@@ -994,7 +1005,10 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
                   <td className="px-3 py-1.5 text-right">
                     {r.classification === "rogue" && (
                       <button
-                        onClick={() => ack.mutate(r.id)}
+                        onClick={() => {
+                          armRemovalFocus();
+                          ack.mutate(r.id);
+                        }}
                         disabled={ack.isPending}
                         className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                         {...ackGate}
@@ -1116,7 +1130,10 @@ function GroupServersList({
       )}
 
       {resumeMut.isError && (
-        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
           <span>
             Resume failed: {formatApiError(resumeMut.error, "request failed")}
           </span>
@@ -1514,12 +1531,12 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
             allScopes.length === 1 ? (
               "1 scope matches the tag filter."
             ) : (
-              `${allScopes.length} scopes match the tag filter.`
+              `${countNoun(allScopes.length, "scope")} match the tag filter.`
             )
           ) : unfilteredCount === 1 ? (
             `${allScopes.length} of 1 scope matches the tag filter.`
           ) : (
-            `${allScopes.length} of ${unfilteredCount} scopes match the tag filter.`
+            `${allScopes.length} of ${countNoun(unfilteredCount, "scope")} match the tag filter.`
           )}
         </p>
         <div className="flex items-center gap-2">
@@ -1782,7 +1799,7 @@ function PoolOccupancyCell({
   return (
     <div
       className="flex min-w-[9rem] items-center gap-2"
-      title={`${occ.assigned} of ${occ.total} addresses in use, ${occ.free} free`}
+      title={`${occ.assigned} of ${countNoun(occ.total, "address", "addresses")} in use, ${occ.free} free`}
     >
       <div className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
         <div
@@ -3146,7 +3163,9 @@ function ServerDetailView({
       ) {
         const scopeBits: string[] = [];
         if (result.scopes_imported)
-          scopeBits.push(`${result.scopes_imported} scopes imported`);
+          scopeBits.push(
+            `${countNoun(result.scopes_imported, "scope")} imported`,
+          );
         if (result.scopes_refreshed)
           scopeBits.push(`${result.scopes_refreshed} refreshed`);
         if (result.scopes_skipped_no_subnet)
@@ -3156,13 +3175,17 @@ function ServerDetailView({
         // Counts are changes, not totals: the scope reconciler diff-merges, so
         // an unchanged pool / reservation is not touched and not counted.
         if (result.pools_synced)
-          scopeBits.push(`${result.pools_synced} pools changed`);
+          scopeBits.push(`${countNoun(result.pools_synced, "pool")} changed`);
         if (result.pools_removed)
-          scopeBits.push(`${result.pools_removed} pools removed`);
+          scopeBits.push(`${countNoun(result.pools_removed, "pool")} removed`);
         if (result.statics_synced)
-          scopeBits.push(`${result.statics_synced} reservations changed`);
+          scopeBits.push(
+            `${countNoun(result.statics_synced, "reservation")} changed`,
+          );
         if (result.statics_removed)
-          scopeBits.push(`${result.statics_removed} reservations removed`);
+          scopeBits.push(
+            `${countNoun(result.statics_removed, "reservation")} removed`,
+          );
         // #1110 — shared with another Windows member that imports them.
         if (result.scopes_deferred)
           scopeBits.push(
@@ -3170,7 +3193,7 @@ function ServerDetailView({
           );
         parts.push(scopeBits.join(" / "));
       }
-      parts.push(`${result.server_leases} leases on wire`);
+      parts.push(`${countNoun(result.server_leases, "lease")} on wire`);
       if (result.imported) parts.push(`${result.imported} imported`);
       if (result.refreshed) parts.push(`${result.refreshed} refreshed`);
       if (result.ipam_created || result.ipam_refreshed)

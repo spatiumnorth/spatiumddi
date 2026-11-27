@@ -54,6 +54,7 @@ async def _pool(
     name: str,
     *,
     interval: int = 60,
+    timeout: int | None = None,
     enabled: bool = True,
     members: list[tuple[str, float | None, str, bool]],
 ) -> DNSPool:
@@ -67,6 +68,7 @@ async def _pool(
         ttl=30,
         enabled=enabled,
         hc_interval_seconds=interval,
+        **({} if timeout is None else {"hc_timeout_seconds": timeout}),
     )
     db.add(pool)
     await db.flush()
@@ -239,3 +241,29 @@ async def test_rule_is_registered_gated_and_seeded_enabled(db_session: AsyncSess
         .all()
     )
     assert len(rows) == 1 and rows[0].enabled is True
+
+
+@pytest.mark.asyncio
+async def test_long_timeout_is_part_of_one_cycle_4824(db_session: AsyncSession) -> None:
+    grp, zone = await _zone(db_session)
+    # interval 30 + timeout 60: a cycle runs ~120 s, so 104 s is not stale
+    # (mark 3 x 30 + 60 = 150 s); 160 s is.
+    await _pool(
+        db_session,
+        grp,
+        zone,
+        "ok104",
+        interval=30,
+        timeout=60,
+        members=[("192.0.2.1", 104, "healthy", True)],
+    )
+    await _pool(
+        db_session,
+        grp,
+        zone,
+        "bad160",
+        interval=30,
+        timeout=60,
+        members=[("192.0.2.2", 160, "healthy", True)],
+    )
+    assert set(await _fired(db_session)) == {"bad160"}

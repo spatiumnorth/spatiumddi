@@ -54,7 +54,10 @@ function passwordPolicyErrors(err: unknown): string[] {
 function PolicyErrorList({ errors }: { errors: string[] }) {
   if (errors.length === 0) return null;
   return (
-    <ul className="list-disc space-y-1 pl-5 text-xs text-destructive">
+    <ul
+      role="alert"
+      className="list-disc space-y-1 pl-5 text-xs text-destructive"
+    >
       {errors.map((e) => (
         <li key={e}>{e}</li>
       ))}

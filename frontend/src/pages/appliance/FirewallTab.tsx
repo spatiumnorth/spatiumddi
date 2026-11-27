@@ -6,6 +6,7 @@
 // tab itself is gated in AppliancePage on the appliance.firewall feature
 // module — #14's NavItem clause is satisfied by tab-level gating because the
 // firewall family lives under the always-visible /appliance parent.
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import {
   useEffect,
   useMemo,
@@ -55,6 +56,7 @@ import { useApplianceAdminGate } from "@/hooks/useApplianceAdmin";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused, pollUnlessRefused } from "@/lib/refusal";
 import { FormError } from "@/components/ui/form-error";
+import { countNoun } from "@/lib/count-noun";
 
 const ROLE_OPTIONS = [
   "dns-bind9",
@@ -368,8 +370,14 @@ export function FirewallLogsSection() {
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <label className="text-xs text-muted-foreground">Appliance</label>
+        <label
+          htmlFor="firewall-tab-appliance"
+          className="text-xs text-muted-foreground"
+        >
+          Appliance
+        </label>
         <select
+          id="firewall-tab-appliance"
           value={selected}
           onChange={(e) => setSelected(e.target.value)}
           className="rounded-md border bg-background px-2 py-1 text-sm"
@@ -703,7 +711,7 @@ function PoliciesSection() {
 
       <div className="flex items-center justify-between">
         <span className="text-xs text-muted-foreground">
-          {policies?.length ?? 0} policies
+          {countNoun(policies?.length ?? 0, "policy", "policies")}
         </span>
         <div className="flex gap-1.5">
           <button
@@ -1311,8 +1319,9 @@ function AliasesSection() {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-          <Tags className="h-3.5 w-3.5" /> {aliases?.length ?? 0} aliases —
-          named CIDR / port sets reusable across rules
+          <Tags className="h-3.5 w-3.5" />{" "}
+          {countNoun(aliases?.length ?? 0, "alias", "aliases")} — named CIDR /
+          port sets reusable across rules
         </span>
         <button
           type="button"
@@ -1350,7 +1359,10 @@ function AliasesSection() {
                     <button
                       type="button"
                       disabled={a.is_builtin}
-                      onClick={() => del.mutate(a.id)}
+                      onClick={() => {
+                        armRemovalFocus();
+                        del.mutate(a.id);
+                      }}
                       aria-label={`Delete alias ${a.name}`}
                       title="Delete alias"
                       className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
@@ -1576,7 +1588,9 @@ function EffectiveSection() {
             <span className="rounded bg-muted px-1.5 py-0.5 font-mono">
               {eff.hostname}
             </span>
-            <span className="text-muted-foreground">{totalRules} rules</span>
+            <span className="text-muted-foreground">
+              {countNoun(totalRules, "rule")}
+            </span>
             {eff.drift ? (
               <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-amber-600 dark:text-amber-400">
                 <AlertTriangle className="h-3 w-3" /> drift: rendered ≠ applied

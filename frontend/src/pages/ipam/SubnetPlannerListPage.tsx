@@ -273,10 +273,14 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
     <Modal title="New subnet plan" onClose={onClose} wide>
       <div className="space-y-3">
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="subnet-planner-list-name"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="subnet-planner-list-name"
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -284,10 +288,14 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
           />
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="subnet-planner-list-description"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <input
+            id="subnet-planner-list-description"
             type="text"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -295,10 +303,14 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
           />
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="subnet-planner-list-ip-space"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             IP Space
           </label>
           <select
+            id="subnet-planner-list-ip-space"
             value={spaceId}
             onChange={(e) => setSpaceId(e.target.value)}
             className="w-full rounded border bg-background px-2 py-1.5 text-sm"
@@ -312,7 +324,10 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
           </select>
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="subnet-planner-list-root"
+            className="mb-1 block text-xs font-medium text-muted-foreground"
+          >
             Root
           </label>
           <div className="mb-2 inline-flex overflow-hidden rounded border text-xs">
@@ -341,6 +356,7 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
           </div>
           {rootMode === "new" ? (
             <input
+              id="subnet-planner-list-root"
               type="text"
               value={rootCidr}
               onChange={(e) => setRootCidr(e.target.value)}
