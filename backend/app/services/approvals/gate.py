@@ -157,6 +157,11 @@ async def gate_or_execute(
 ) -> ChangeRequestPending | None:
     """Decide whether ``operation`` must be queued for second-person approval.
 
+    ``count`` is the number of rows the operation touches. Every covered op
+    is a single-target delete, so it defaults to 1 (#4909): a policy with
+    ``min_count`` 1 gates every such delete, while a higher threshold needs a
+    bulk op that passes a real count.
+
     Returns ``None`` to tell the caller to execute inline (today's behaviour);
     a :class:`ChangeRequestPending` to tell the caller to return 202.
     """
@@ -177,7 +182,7 @@ async def gate_or_execute(
     action, resource_type = operation.required_permission
 
     # 3. Strongest enabled matching policy, or None.
-    policy = await match_policy(db, resource_type, action, count)
+    policy = await match_policy(db, resource_type, action, 1 if count is None else count)
     if policy is None:
         _refuse_inline_non_superadmin(user, operation, args)
         return None

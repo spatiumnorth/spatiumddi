@@ -12174,17 +12174,12 @@ export interface ChangeRequestListParams {
   offset?: number;
 }
 
-// Threshold actions an approval policy can gate (mirror the backend
-// ``APPROVAL_POLICY_ACTIONS`` frozenset).
-export const APPROVAL_POLICY_ACTIONS = [
-  "delete",
-  "bulk_delete",
-  "bulk_edit",
-  "bulk_allocate",
-  "factory_reset",
-  "import_commit",
-] as const;
-export type ApprovalPolicyAction = (typeof APPROVAL_POLICY_ACTIONS)[number];
+// What the server can gate (#4910): the (action, resource_type) pairs a policy
+// may be saved for, read from the server, not kept here.
+export interface GateablePair {
+  action: string;
+  resource_type: string;
+}
 
 export interface ApprovalPolicy {
   id: string;
@@ -12277,6 +12272,10 @@ export const changeRequestsApi = {
       .then((r) => r.data),
   listPolicies: () =>
     api.get<ApprovalPolicy[]>("/change-requests/policies").then((r) => r.data),
+  gateablePairs: () =>
+    api
+      .get<GateablePair[]>("/change-requests/policies/gateable")
+      .then((r) => r.data),
   createPolicy: (body: ApprovalPolicyWrite) =>
     api
       .post<ApprovalPolicy>("/change-requests/policies", body)

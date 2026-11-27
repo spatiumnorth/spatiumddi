@@ -32,7 +32,7 @@ Neither file enumerates every transitive dependency. They cover components that
 are **bundled, shipped, or directly depended on** — the things an operator can
 point at in a running system, and the things a license auditor asks about. The
 full transitive set for the Python and npm layers lives in
-`backend/pyproject.toml` + `frontend/package-lock.json`; for the OS layer, ask
+`backend/requirements.txt` (the pinned Python set) + `frontend/package-lock.json`; for the OS layer, ask
 the package manager on a running appliance (see
 [Verifying a running system](#verifying-a-running-system)).
 
@@ -167,7 +167,8 @@ official upstream images instead.
 ## Control-plane backend (Python)
 
 Runs in the **API image**. Authoritative list, with versions:
-`backend/pyproject.toml`. The two API-docs bundles are not Python
+`backend/requirements.txt` (the pinned set the API image installs against, #3693);
+`backend/pyproject.toml` holds the direct requirements as ranges. The two API-docs bundles are not Python
 packages: they are vendored in `backend/app/static/api-docs/` and pinned in
 `versions.json`.
 
@@ -381,10 +382,13 @@ page's whois / traceroute report the missing binary). Dropped from the UBI `dhcp
 | [jemalloc](https://jemalloc.net/) | Alpine pkg | BSD-2-Clause | Allocator linked into `named` in the BIND9 agent image (#4192) |
 | [su-exec](https://github.com/ncopa/su-exec) / [gosu](https://github.com/tianon/gosu) | Alpine / Debian pkg | MIT / Apache 2.0 | Privilege drop at entrypoint |
 
-Alpine is pinned at **3.23, not 3.24**, and that pin is load-bearing: 3.24 ships
-Python 3.13 while the agent Dockerfiles install into 3.12 paths, which produces a
-`ModuleNotFoundError` crashloop rather than a build failure. Dependabot is
-configured to hold the pin.
+Alpine is pinned at **3.24** (#1037 moved it from 3.23). Alpine 3.24 ships
+Python 3.14, so every agent Dockerfile declares `ARG PYTHON_VERSION=3.14` and
+installs its agent into `/usr/local/lib/python${PYTHON_VERSION}/site-packages`;
+that `ARG` and the Alpine package set must move together, or the image
+crashloops with a `ModuleNotFoundError` rather than failing the build.
+Dependabot ignores Alpine minor and major updates, so the pin only moves by a
+deliberate edit.
 
 ## Build and test toolchain
 
