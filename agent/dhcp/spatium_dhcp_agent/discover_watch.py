@@ -143,6 +143,42 @@ class DiscoverWindow:
         }
 
 
+def _load_layers() -> None:
+    """Register scapy's Ethernet and DHCP layers.
+
+    ``AsyncSniffer`` fixes the link layer it decodes with when its socket is
+    opened, from the layers registered *at that moment*. ``scapy.sendrecv``
+    alone registers none, so a sniffer opened before something imports
+    ``scapy.layers.l2`` types every frame ``Raw`` ("Unable to guess type ...
+    Using Raw") -- and :func:`parse_discover`, which imports the DHCP layer
+    lazily, only does so after the first packet it can never read. Import them
+    before the socket opens.
+    """
+    import scapy.layers.dhcp  # noqa: F401, PLC0415
+    import scapy.layers.l2  # noqa: F401, PLC0415
+
+
+def sniff_interfaces(iface: str) -> list[str] | str | None:
+    """What to hand ``AsyncSniffer(iface=...)`` for the configured ``iface``.
+
+    ``"any"`` must not become ``iface=None``: scapy 2.8 then opens one socket
+    on every interface but types every frame it reads as ``Raw`` (the warning
+    is "Unable to guess type ... Using Raw"), so ``udp and dst port 67`` never
+    matches and the watch sees nothing -- silently, with the sniffer reported
+    as started. Naming the interfaces parses them as Ethernet. Loopback is
+    left out (no client DISCOVER arrives there). An interface that appears
+    after start is not watched until the agent restarts; ``None`` means the
+    host has no interface to name, and lets scapy pick its default.
+    """
+    if iface != "any":
+        return iface
+    try:
+        names = sorted(n for n in os.listdir("/sys/class/net") if n != "lo")
+    except OSError:
+        return None
+    return names or None
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return max(1, int(os.environ.get(name, "") or default))
@@ -205,12 +241,14 @@ class DiscoverWatchShipper:
     def _start_sniffer(self) -> bool:
         try:
             from scapy.sendrecv import AsyncSniffer  # type: ignore[import-not-found]
+
+            _load_layers()
         except ImportError as exc:
             log.warning("discover_watch_scapy_missing", error=str(exc))
             return False
         try:
             self._sniffer = AsyncSniffer(
-                iface=None if self.iface == "any" else self.iface,
+                iface=sniff_interfaces(self.iface),
                 filter="udp and dst port 67",
                 prn=self._on_packet,
                 store=False,
