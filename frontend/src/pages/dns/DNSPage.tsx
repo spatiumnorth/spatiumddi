@@ -1079,6 +1079,9 @@ function ImportZoneModal({
 interface DnsTreeNode {
   domain: string; // full domain name at this level, e.g. "test.com"
   zone?: DNSZone; // set if this node corresponds to a registered zone
+  // Further zones of the same name in other views of the group (split
+  // horizon, uq_dns_zone_group_view_name). Each gets its own row (#4843).
+  twins?: DNSZone[];
   children: DnsTreeNode[];
 }
 
@@ -1114,7 +1117,9 @@ function buildDnsTree(zones: DNSZone[]): DnsTreeNode[] {
       }
     }
 
-    getOrCreate(name).zone = z;
+    const node = getOrCreate(name);
+    if (node.zone) (node.twins ??= []).push(z);
+    else node.zone = z;
   }
 
   function sortNode(n: DnsTreeNode) {
@@ -10985,7 +10990,11 @@ export function ZonesTab({
     };
   }
   function countZones(n: DnsTreeNode): number {
-    return (n.zone ? 1 : 0) + n.children.reduce((a, c) => a + countZones(c), 0);
+    return (
+      (n.zone ? 1 : 0) +
+      (n.twins?.length ?? 0) +
+      n.children.reduce((a, c) => a + countZones(c), 0)
+    );
   }
 
   const typeBadge: Record<string, string> = {
@@ -11074,122 +11083,133 @@ export function ZonesTab({
   function renderZoneRows(node: DnsTreeNode, depth: number): React.ReactNode[] {
     const rows: React.ReactNode[] = [];
     const indent = depth * 14;
-    if (node.zone) {
-      const z = node.zone;
-      const sel = selected.has(z.id);
-      rows.push(
-        <ContextMenu key={z.id}>
-          <ContextMenuTrigger asChild>
-            <tr
-              className={cn(
-                "border-b last:border-0 hover:bg-muted/30",
-                sel && "bg-primary/5",
-              )}
-            >
-              <td className="w-8 px-2 py-1">
-                <input
-                  type="checkbox"
-                  checked={sel}
-                  onChange={() => toggleOne(z.id)}
-                  onClick={(e) => e.stopPropagation()}
-                />
-              </td>
-              <td
-                className="py-1 pr-2 cursor-pointer"
-                onClick={() => onSelectZone(z)}
-              >
-                <span
-                  className="inline-flex items-center gap-1.5"
-                  style={{ paddingLeft: indent }}
-                >
-                  {swatchCls(z.color) ? (
-                    <span
-                      className={cn(
-                        "h-2 w-2 rounded-full flex-shrink-0",
-                        swatchCls(z.color)!,
-                      )}
-                    />
-                  ) : (
-                    <FileText className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-                  )}
-                  <span className="font-mono text-xs">
-                    {z.name.replace(/\.$/, "")}
-                  </span>
-                  <CustomerChip customerId={z.customer_id} />
-                </span>
-              </td>
-              <td className="py-1 pr-2">
-                <ZoneScopePill
-                  scope={z.name_scope}
-                  detail={z.name_scope_detail}
-                />
-              </td>
-              <td className="py-1">
-                <span
-                  className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${typeBadge[z.zone_type] ?? "bg-muted text-muted-foreground"}`}
-                >
-                  {z.zone_type}
-                </span>
-              </td>
-              <td className="py-1 tabular-nums text-xs text-muted-foreground">
-                {z.ttl}
-              </td>
-              <td className="py-1 text-xs">
-                {z.dnssec_enabled ? (
-                  <span className="inline-flex items-center gap-1 text-emerald-600">
-                    <Shield className="h-3 w-3" /> on
-                  </span>
-                ) : (
-                  <span className="text-muted-foreground/50">—</span>
+    const nodeZones = node.zone ? [node.zone, ...(node.twins ?? [])] : [];
+    if (nodeZones.length > 0) {
+      for (const z of nodeZones) {
+        const sel = selected.has(z.id);
+        rows.push(
+          <ContextMenu key={z.id}>
+            <ContextMenuTrigger asChild>
+              <tr
+                className={cn(
+                  "border-b last:border-0 hover:bg-muted/30",
+                  sel && "bg-primary/5",
                 )}
-              </td>
-              <td className="py-1 text-xs text-muted-foreground">
-                {z.last_pushed_at
-                  ? new Date(z.last_pushed_at).toLocaleString()
-                  : "—"}
-              </td>
-              <td className="py-1 pr-2 text-right">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSelectZone(z);
-                  }}
-                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-                  title="Open zone"
+              >
+                <td className="w-8 px-2 py-1">
+                  <input
+                    type="checkbox"
+                    checked={sel}
+                    onChange={() => toggleOne(z.id)}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                </td>
+                <td
+                  className="py-1 pr-2 cursor-pointer"
+                  onClick={() => onSelectZone(z)}
                 >
-                  <Pencil className="h-3 w-3" />
-                </button>
-              </td>
-            </tr>
-          </ContextMenuTrigger>
-          <ContextMenuContent>
-            <ContextMenuLabel>{z.name.replace(/\.$/, "")}</ContextMenuLabel>
-            <ContextMenuSeparator />
-            <ContextMenuItem onSelect={() => onSelectZone(z)}>
-              Open Zone
-            </ContextMenuItem>
-            <ContextMenuItem
-              onSelect={() => copyToClipboard(z.name.replace(/\.$/, ""))}
-            >
-              Copy Name
-            </ContextMenuItem>
-            <ContextMenuItem
-              onSelect={async () => {
-                const { data, filename } = await dnsApi.exportZone(
-                  group.id,
-                  z.id,
-                );
-                const name =
-                  filename ??
-                  `${z.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
-                downloadBlob(data, name, "text/dns");
-              }}
-            >
-              Export Zone File
-            </ContextMenuItem>
-          </ContextMenuContent>
-        </ContextMenu>,
-      );
+                  <span
+                    className="inline-flex items-center gap-1.5"
+                    style={{ paddingLeft: indent }}
+                  >
+                    {swatchCls(z.color) ? (
+                      <span
+                        className={cn(
+                          "h-2 w-2 rounded-full flex-shrink-0",
+                          swatchCls(z.color)!,
+                        )}
+                      />
+                    ) : (
+                      <FileText className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                    )}
+                    <span className="font-mono text-xs">
+                      {z.name.replace(/\.$/, "")}
+                    </span>
+                    {node.twins && z.view_id && (
+                      <span
+                        className="rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground"
+                        data-testid="zone-view-chip"
+                      >
+                        view:{" "}
+                        {views.find((v) => v.id === z.view_id)?.name ?? "?"}
+                      </span>
+                    )}
+                    <CustomerChip customerId={z.customer_id} />
+                  </span>
+                </td>
+                <td className="py-1 pr-2">
+                  <ZoneScopePill
+                    scope={z.name_scope}
+                    detail={z.name_scope_detail}
+                  />
+                </td>
+                <td className="py-1">
+                  <span
+                    className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${typeBadge[z.zone_type] ?? "bg-muted text-muted-foreground"}`}
+                  >
+                    {z.zone_type}
+                  </span>
+                </td>
+                <td className="py-1 tabular-nums text-xs text-muted-foreground">
+                  {z.ttl}
+                </td>
+                <td className="py-1 text-xs">
+                  {z.dnssec_enabled ? (
+                    <span className="inline-flex items-center gap-1 text-emerald-600">
+                      <Shield className="h-3 w-3" /> on
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground/50">—</span>
+                  )}
+                </td>
+                <td className="py-1 text-xs text-muted-foreground">
+                  {z.last_pushed_at
+                    ? new Date(z.last_pushed_at).toLocaleString()
+                    : "—"}
+                </td>
+                <td className="py-1 pr-2 text-right">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelectZone(z);
+                    }}
+                    className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                    title="Open zone"
+                  >
+                    <Pencil className="h-3 w-3" />
+                  </button>
+                </td>
+              </tr>
+            </ContextMenuTrigger>
+            <ContextMenuContent>
+              <ContextMenuLabel>{z.name.replace(/\.$/, "")}</ContextMenuLabel>
+              <ContextMenuSeparator />
+              <ContextMenuItem onSelect={() => onSelectZone(z)}>
+                Open Zone
+              </ContextMenuItem>
+              <ContextMenuItem
+                onSelect={() => copyToClipboard(z.name.replace(/\.$/, ""))}
+              >
+                Copy Name
+              </ContextMenuItem>
+              <ContextMenuItem
+                onSelect={async () => {
+                  const { data, filename } = await dnsApi.exportZone(
+                    group.id,
+                    z.id,
+                  );
+                  const name =
+                    filename ??
+                    `${z.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
+                  downloadBlob(data, name, "text/dns");
+                }}
+              >
+                Export Zone File
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>,
+        );
+      }
     } else {
       const flag = groupFlag(node.domain);
       const open = filterActive || flag.open;
@@ -14103,6 +14123,13 @@ export function ZoneTreeRows({
                 <span className="font-mono truncate">
                   {node.zone.name.replace(/\.$/, "")}
                 </span>
+                {node.twins && node.zone.view_id && (
+                  <span className="text-[10px] opacity-70">
+                    view:{" "}
+                    {views.find((v) => v.id === node.zone!.view_id)?.name ??
+                      "?"}
+                  </span>
+                )}
                 {node.zone.dnssec_enabled && (
                   <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />
                 )}
@@ -14153,6 +14180,12 @@ export function ZoneTreeRows({
             <span className="font-mono truncate">
               {node.zone.name.replace(/\.$/, "")}
             </span>
+            {node.twins && node.zone.view_id && (
+              <span className="text-[10px] opacity-70">
+                view:{" "}
+                {views.find((v) => v.id === node.zone!.view_id)?.name ?? "?"}
+              </span>
+            )}
             {node.zone.dnssec_enabled && (
               <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />
             )}
@@ -14169,6 +14202,29 @@ export function ZoneTreeRows({
             </span>
           </div>
         )}
+        {/* Same name in other views of the group (#4843) */}
+        {node.twins?.map((t) => (
+          <button
+            key={t.id}
+            className={`flex w-full items-center gap-1.5 rounded py-1 pr-2 text-xs ${
+              selectedZoneId === t.id
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground"
+            }`}
+            style={{ paddingLeft: paddingLeft + (hasChildren ? 20 : 0) }}
+            onClick={() => onSelectZone(t)}
+          >
+            <FileText className="h-3 w-3 flex-shrink-0" />
+            <span className="font-mono truncate">
+              {t.name.replace(/\.$/, "")}
+            </span>
+            {t.view_id && (
+              <span className="text-[10px] opacity-70">
+                view: {views.find((v) => v.id === t.view_id)?.name ?? "?"}
+              </span>
+            )}
+          </button>
+        ))}
         {/* Children */}
         {hasChildren && expanded && (
           <div>

@@ -185,3 +185,25 @@ async def test_probe_returns_the_drivers_failure_message(
     assert await dhcp_health._probe_agentless(srv) == (False, down)
     monkeypatch.setattr(dhcp_health, "get_driver", lambda _n: _Drv((True, "reachable")))
     assert await dhcp_health._probe_agentless(srv) == (True, None)
+
+
+@pytest.mark.asyncio
+async def test_agentless_batch_probes_concurrently_4829(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dead hosts cost one connect bound in total, not one each (#4829)."""
+    import asyncio
+    import time
+
+    ids = [uuid.uuid4() for _ in range(3)]
+    seen: list[uuid.UUID] = []
+
+    async def fake_check(sid: uuid.UUID) -> None:
+        seen.append(sid)
+        if sid == ids[0]:
+            raise RuntimeError("boom")  # one failure must not stop the others
+        await asyncio.sleep(0.3)
+
+    monkeypatch.setattr(dhcp_health, "_check_health", fake_check)
+    t0 = time.monotonic()
+    await dhcp_health._check_many(ids)
+    assert time.monotonic() - t0 < 0.6  # serial would be >= 0.6
+    assert sorted(seen) == sorted(ids)
