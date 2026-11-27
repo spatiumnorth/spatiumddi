@@ -4,8 +4,11 @@ An *upgrade image* is the ``.raw.xz`` artifact an operator makes
 available for an appliance OS upgrade. ("Upgrade image" is the
 operator-facing name; "slot" stays the name of the lower-level A/B dd
 mechanism the bytes ultimately land on — see
-``services/appliance/slot.py``.) It arrives one of two ways:
+``services/appliance/slot.py``.) It arrives one of three ways:
 
+* **Removable media (air-gap, #4727).** The image + its ``.sha256`` on a
+  USB stick mounted through Fleet -> Removable storage, imported without a
+  browser upload (``services/appliance/upgrade_media.py``).
 * **Upload (air-gap).** Operators on disconnected networks can't reach
   ``https://github.com/spatiumnorth/spatiumddi/releases/...`` to feed the
   supervisor a ``desired_slot_image_url``. They download the ``.raw.xz``
@@ -28,6 +31,9 @@ Endpoints (all superadmin-gated unless noted):
   sidecar, so the connected-install picker has something to pick from.
 * ``POST /api/v1/appliance/upgrade-images/import-from-github`` —
   download + sha256-verify + store a release's upgrade image.
+* ``GET  /api/v1/appliance/upgrade-images/media`` +
+  ``POST .../import-from-media`` — list + import an image from a mounted
+  removable disk (USB stick), for sites with no network (#4727).
 * ``GET  /api/v1/appliance/upgrade-images/{id}`` — single row metadata.
 * ``GET  /api/v1/appliance/upgrade-images/{id}/raw.xz`` — stream the
   file back (token-auth — the host runner has no operator session).
@@ -50,6 +56,7 @@ operator-supplied ``filename`` is display-only.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import os
@@ -93,7 +100,7 @@ from app.models.audit import AuditLog
 from app.services.api_token_scopes import token_outbound
 from app.services.appliance import releases as releases_service
 from app.services.appliance import upgrade_image_catalog as catalog
-from app.services.appliance import upgrade_image_space
+from app.services.appliance import upgrade_image_space, upgrade_media
 from app.services.appliance.architecture import ApplianceArchitecture
 from app.services.appliance.upgrade_image_catalog import FleetArchitectures
 
@@ -1204,6 +1211,176 @@ async def import_upgrade_image_from_github(
         image_id=str(row.id),
         size_bytes=bytes_written,
         appliance_version=tag,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+class MediaImageRow(BaseModel):
+    mount: str
+    filename: str
+    size_bytes: int
+    appliance_version: str | None
+    architecture: str | None
+    sha256: str | None
+    # Empty when the image can be imported; otherwise why it cannot.
+    problems: list[str]
+
+
+class MediaImageList(BaseModel):
+    images: list[MediaImageRow]
+
+
+class ImportFromMediaRequest(BaseModel):
+    mount: str = Field(
+        ...,
+        min_length=1,
+        max_length=32,
+        description="The removable mount name, from ``GET /upgrade-images/media``.",
+    )
+    filename: str = Field(
+        ...,
+        min_length=1,
+        max_length=255,
+        description="The image's file name on that mount (a bare name, never a path).",
+    )
+
+
+@router.get(
+    "/upgrade-images/media",
+    response_model=MediaImageList,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="List upgrade images on mounted removable media (USB stick)",
+)
+async def list_upgrade_images_on_media(current_user: SuperAdmin) -> MediaImageList:
+    """Upgrade images found on the removable disks mounted on THIS node (#4727).
+
+    A removable disk is node-local, so this answers for the node serving the
+    request. Read-only: nothing is imported, mounted or written.
+    """
+    found = await asyncio.to_thread(upgrade_media.scan)
+    return MediaImageList(
+        images=[
+            MediaImageRow(
+                mount=i.mount,
+                filename=i.filename,
+                size_bytes=i.size_bytes,
+                appliance_version=i.appliance_version,
+                architecture=i.architecture,
+                sha256=i.sha256,
+                problems=i.problems,
+            )
+            for i in found
+        ]
+    )
+
+
+@router.post(
+    "/upgrade-images/import-from-media",
+    response_model=UpgradeImageRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Import an upgrade image from mounted removable media (USB stick)",
+)
+async def import_upgrade_image_from_media(
+    body: ImportFromMediaRequest,
+    current_user: SuperAdmin,
+    db: DB,
+) -> UpgradeImageRow:
+    """Verify + store an upgrade image read off a mounted removable disk (#4727).
+
+    The air-gap path with no browser upload: the same verified store as the
+    upload and GitHub import, so the size cap, the fleet-architecture gate,
+    the store headroom check and sha256 verification (against the release's
+    ``.sha256`` sidecar, which must be on the stick: slot images are not
+    signed, the sidecar is the only published integrity statement) all
+    apply. Nothing is fetched and nothing is written to the stick. A
+    multi-node cluster imports on one node; the image mirror distributes it.
+    """
+    try:
+        image = await asyncio.to_thread(upgrade_media.resolve, body.mount, body.filename)
+    except upgrade_media.MediaError as exc:
+        raise HTTPException(exc.status, exc.message) from exc
+    assert image.sha256 is not None and image.appliance_version is not None  # resolve() refuses
+    expected_sha = image.sha256
+
+    _refuse_unused_architecture(await catalog.fleet_architectures(db), image.architecture)
+
+    existing = (
+        await db.execute(
+            select(ApplianceUpgradeImage).where(ApplianceUpgradeImage.sha256 == expected_sha)
+        )
+    ).scalar_one_or_none()
+    if existing is not None and await _bytes_present_in_active_store(existing.id):
+        return _row_to_schema(existing)
+
+    try:
+        fd = await asyncio.to_thread(upgrade_media.open_image, image)
+    except upgrade_media.MediaError as exc:
+        raise HTTPException(exc.status, exc.message) from exc
+    try:
+        await _require_store_headroom(os.fstat(fd).st_size)
+
+        async def _media_iter() -> AsyncIterator[bytes]:
+            while True:
+                try:
+                    chunk = await asyncio.to_thread(os.read, fd, _CHUNK_BYTES)
+                except OSError as exc:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        f"Reading {image.filename} failed (was the stick removed?): "
+                        f"{exc.strerror or exc}",
+                    ) from exc
+                if not chunk:
+                    return
+                yield chunk
+
+        image_id = existing.id if existing is not None else uuid.uuid4()
+        bytes_written = await _store_verified_image(image_id, _media_iter(), expected_sha)
+    finally:
+        os.close(fd)
+
+    if existing is not None:
+        row = existing
+        action = "appliance.upgrade_image_bytes_restored"
+    else:
+        row = ApplianceUpgradeImage(
+            id=image_id,
+            filename=image.filename,
+            size_bytes=bytes_written,
+            sha256=expected_sha,
+            appliance_version=image.appliance_version,
+            architecture=image.architecture,
+            uploaded_by_user_id=current_user.id,
+            notes=f"Imported from removable media {image.mount}",
+        )
+        db.add(row)
+        action = "appliance.upgrade_image_imported"
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=action,
+            resource_type="appliance_upgrade_image",
+            resource_id=str(row.id),
+            resource_display=f"{row.filename} ({image.appliance_version})",
+            result="success",
+            new_value={
+                "size_bytes": bytes_written,
+                "sha256": expected_sha,
+                "appliance_version": image.appliance_version,
+                "source": "removable_media",
+                "mount": image.mount,
+            },
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_upgrade_image_imported",
+        image_id=str(row.id),
+        size_bytes=bytes_written,
+        appliance_version=image.appliance_version,
+        source="removable_media",
         user=current_user.username,
     )
     return _row_to_schema(row)

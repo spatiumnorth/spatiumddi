@@ -91,6 +91,7 @@ export function UpgradeImagesTable() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showUpload, setShowUpload] = useState(false);
+  const [showMedia, setShowMedia] = useState(false);
   // Rows queued for a delete confirmation (one row, or the bulk selection).
   const [deleteRows, setDeleteRows] = useState<ImageRow[] | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -402,6 +403,13 @@ export function UpgradeImagesTable() {
           >
             Upload image…
           </HeaderButton>
+          <HeaderButton
+            variant="secondary"
+            icon={Upload}
+            onClick={() => setShowMedia(true)}
+          >
+            From USB…
+          </HeaderButton>
         </div>
       </div>
 
@@ -552,6 +560,15 @@ export function UpgradeImagesTable() {
           running={running}
           onConfirm={(force) => runDeletes(deleteRows, force)}
           onClose={() => setDeleteRows(null)}
+        />
+      )}
+      {showMedia && (
+        <MediaImportModal
+          onClose={() => setShowMedia(false)}
+          onImported={() => {
+            invalidate();
+            setShowMedia(false);
+          }}
         />
       )}
       {showUpload && (
@@ -990,6 +1007,98 @@ function UploadImageModal({
             </span>
           )}
         </div>
+      </div>
+    </Modal>
+  );
+}
+
+// #4727 — import an image from a USB stick mounted on this node. The stick
+// is mounted through Removable storage on the appliance; the server only
+// lists regular files with a matching .sha256 and verifies it on import.
+function MediaImportModal({
+  onClose,
+  onImported,
+}: {
+  onClose: () => void;
+  onImported: () => void;
+}) {
+  const mediaQuery = useQuery({
+    queryKey: ["appliance", "upgrade-images", "media"],
+    queryFn: applianceUpgradeImagesApi.listMedia,
+  });
+  const importMedia = useMutation({
+    mutationFn: (m: { mount: string; filename: string }) =>
+      applianceUpgradeImagesApi.importFromMedia(m.mount, m.filename),
+    onSuccess: onImported,
+  });
+  const images = mediaQuery.data ?? [];
+
+  return (
+    <Modal title="Import upgrade image from USB" onClose={onClose} wide>
+      <div className="space-y-3 text-xs">
+        <p className="text-muted-foreground">
+          Copy the release&apos;s versioned <code>.raw.xz</code> and its{" "}
+          <code>.sha256</code> onto an ext4 or exFAT stick, plug it into this
+          node and mount it under Fleet, the appliance, Removable storage. Slot
+          images are not signed: the <code>.sha256</code> is checked, and an
+          image without one is refused.
+        </p>
+        {mediaQuery.isLoading && (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        )}
+        {mediaQuery.isError && (
+          <span role="alert" className="text-rose-700 dark:text-rose-300">
+            {formatApiError(mediaQuery.error)}
+          </span>
+        )}
+        {mediaQuery.isSuccess && images.length === 0 && (
+          <p>No upgrade images found on a mounted removable disk.</p>
+        )}
+        <ul className="space-y-2">
+          {images.map((i) => (
+            <li
+              key={`${i.mount}/${i.filename}`}
+              className="flex flex-wrap items-center gap-2 rounded-md border p-2"
+            >
+              <span className="min-w-0 break-all font-mono">
+                {i.mount}: {i.filename}
+              </span>
+              <span className="text-muted-foreground">
+                {i.appliance_version ?? "?"} · {i.architecture ?? "?"} ·{" "}
+                {(i.size_bytes / MIB).toFixed(0)} MiB
+              </span>
+              {i.problems.length > 0 ? (
+                <span role="alert" className="text-rose-700 dark:text-rose-300">
+                  {i.problems.join("; ")}
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() =>
+                    importMedia.mutate({
+                      mount: i.mount,
+                      filename: i.filename,
+                    })
+                  }
+                  disabled={importMedia.isPending}
+                  className="ml-auto inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {importMedia.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Upload className="h-3.5 w-3.5" />
+                  )}
+                  Import
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+        {importMedia.error && (
+          <span role="alert" className="text-rose-700 dark:text-rose-300">
+            {formatApiError(importMedia.error)}
+          </span>
+        )}
       </div>
     </Modal>
   );

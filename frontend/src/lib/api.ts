@@ -14429,7 +14429,31 @@ export interface AvailableUpgradeImages {
   fleet: FleetArchitectures;
 }
 
+// #4727 — an upgrade image on a mounted removable disk (USB stick).
+export interface MediaUpgradeImage {
+  mount: string;
+  filename: string;
+  size_bytes: number;
+  appliance_version: string | null;
+  architecture: string | null;
+  sha256: string | null;
+  // Empty when importable; otherwise why it cannot be.
+  problems: string[];
+}
+
 export const applianceUpgradeImagesApi = {
+  // Images on the removable disks mounted on the node serving the request.
+  listMedia: () =>
+    api
+      .get<{ images: MediaUpgradeImage[] }>("/appliance/upgrade-images/media")
+      .then((r) => r.data.images),
+  importFromMedia: (mount: string, filename: string) =>
+    api
+      .post<UpgradeImage>("/appliance/upgrade-images/import-from-media", {
+        mount,
+        filename,
+      })
+      .then((r) => r.data),
   list: () =>
     api
       .get<{ images: UpgradeImage[] }>("/appliance/upgrade-images")
