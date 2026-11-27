@@ -14,7 +14,7 @@ const NOT_A_REFUSAL =
   /last_|fingerbank|error_message|valueError|hostnameErr|(?<![\w.])errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"|run\.error/;
 
 const PLAIN_BOX =
-  /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>[a-z][a-z0-9]*)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
+  /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus|[bB]locked)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>[a-z][a-z0-9]*)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
 
 // A ternary form, `m.isError ? (<div key=".." className="..">..</div>) : null`,
 // with attributes (key) ahead of className (#4404).
@@ -32,7 +32,6 @@ function files(dir: string): string[] {
 }
 
 export function plainRefusalBoxes(source: string, ternary = false): string[] {
-  if (!source.includes("Modal") && !source.includes("fixed inset")) return [];
   const out: string[] = [];
   for (const m of [
     ...source.matchAll(PLAIN_BOX),
@@ -126,6 +125,39 @@ const STANDING_STATE: Record<string, { names: string[]; why: string }> = {
   },
 };
 
+// Refusal boxes in files that hold no dialog, found once the scan stopped
+// skipping them (#4965). Each is the same defect as the ones fixed, not yet
+// converted: an entry goes when its box gets a role, and the last test below
+// fails on a stale one. A NEW box in these files, or any other, fails the scan.
+const NOT_YET_ANNOUNCED: Record<string, string[]> = {
+  "components/AptSection.tsx": ["saveErr"],
+  "components/KubePodsPanel.tsx": ["error"],
+  "components/LLDPSection.tsx": ["saveErr"],
+  "components/NTPSection.tsx": ["saveErr"],
+  "components/ResolverSection.tsx": ["overrideNeedsServers", "saveErr"],
+  "components/SNMPSection.tsx": ["revealMutation.isError", "saveErr"],
+  "components/SyslogSection.tsx": ["saveErr"],
+  "components/TimezoneSection.tsx": ["save.error && !savedNote"],
+  "pages/ChangePasswordPage.tsx": ["error"],
+  "pages/DashboardPage.tsx": ["pdfError", "e.error_detail"],
+  "pages/ReportsPage.tsx": ["!withheld && !isLoading && isError"],
+  "pages/admin/AuditPage.tsx": ["exportPdfMut.isError"],
+  "pages/admin/DiagnosticsErrorsPage.tsx": ["listQ.isError", "detailQ.isError"],
+  "pages/appliance/LogsTab.tsx": ["run.isError"],
+  "pages/appliance/SetupWizardPage.tsx": ["finish.isError"],
+  "pages/dns/DriftView.tsx": ["failed.length > 0", "error"],
+  "pages/network/AsnDetailPage.tsx": [
+    "refreshMut.isError",
+    "refreshRpkiMut.isError",
+  ],
+  "pages/network/MulticastReachabilityTab.tsx": ["error"],
+  "pages/network/looking-glass/QueryTab.tsx": [
+    'submitted?.kind === "error"',
+    "queryQ.error",
+  ],
+  "pages/nmap/NmapScanForm.tsx": ["error"],
+};
+
 const found = new Map<string, string[]>();
 const exempted = new Map<string, string[]>();
 for (const f of files(SRC)) {
@@ -136,7 +168,10 @@ for (const f of files(SRC)) {
     ...plainErrorComponents(text),
     ...plainTintedBoxes(text, rel),
   ];
-  const skip = STANDING_STATE[rel]?.names ?? [];
+  const skip = [
+    ...(STANDING_STATE[rel]?.names ?? []),
+    ...(NOT_YET_ANNOUNCED[rel] ?? []),
+  ];
   const hits = all.filter((h) => !skip.includes(h));
   if (hits.length) found.set(rel, hits);
   const ex = all.filter((h) => skip.includes(h));
@@ -204,9 +239,27 @@ describe("dialog refusals are announced (#3821)", () => {
 
   it("every standing-state exemption still matches a box", () => {
     for (const [file, { names }] of Object.entries(STANDING_STATE)) {
-      expect(exempted.get(file)?.slice().sort(), file).toEqual(
+      const mine = exempted.get(file) ?? [];
+      expect(mine.filter((n) => names.includes(n)).sort(), file).toEqual(
         names.slice().sort(),
       );
     }
+  });
+
+  it("every not-yet-announced entry still matches a box", () => {
+    for (const [file, names] of Object.entries(NOT_YET_ANNOUNCED)) {
+      const mine = exempted.get(file) ?? [];
+      expect(mine.filter((n) => names.includes(n)).sort(), file).toEqual(
+        names.slice().sort(),
+      );
+    }
+  });
+
+  it("reads a file that holds no dialog (#4965)", () => {
+    const src = `function Card(){ return <div>{reveal.isError && (<div className="flex rounded-md border text-destructive"><span>{e}</span></div>)}{selectiveBlockedByPlainFormat && (<div className="text-xs text-destructive">no</div>)}</div>; }`;
+    expect(plainRefusalBoxes(src)).toEqual([
+      "reveal.isError",
+      "selectiveBlockedByPlainFormat",
+    ]);
   });
 });

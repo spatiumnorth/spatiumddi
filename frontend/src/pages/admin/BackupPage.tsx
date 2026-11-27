@@ -261,10 +261,10 @@ function CreateBackupCard() {
             {downloadMut.isPending ? "Building…" : "Build + download"}
           </button>
           {downloadMut.isError && (
-            <span className="text-xs text-destructive">
+            <FormError>
               {(downloadMut.error as Error)?.message ||
                 "Backup failed — see api logs."}
-            </span>
+            </FormError>
           )}
           {downloadMut.isSuccess && (
             <span className="text-xs text-emerald-600 dark:text-emerald-400">
@@ -452,7 +452,7 @@ function RestoreBackupCard() {
           </FormError>
         )}
         {selectiveBlockedByPlainFormat && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             Selective restore needs an archive whose database dump is in
             pg_dump&rsquo;s custom format.{" "}
             {dumpFormat === "plain" ? (
@@ -466,7 +466,7 @@ function RestoreBackupCard() {
             — switch to <em>Full restore</em>, or take a regular backup of the
             source install on a current build with <em>Exclude secrets</em>{" "}
             unticked.
-          </div>
+          </FormError>
         )}
 
         <Field label="Passphrase" required>
@@ -518,9 +518,9 @@ function RestoreBackupCard() {
             {restoreMut.isPending ? "Restoring…" : "Apply restore"}
           </button>
           {restoreMut.isError && (
-            <span className="text-xs text-destructive">
+            <FormError>
               {formatApiError(restoreMut.error, "Restore failed.")}
-            </span>
+            </FormError>
           )}
         </div>
 
