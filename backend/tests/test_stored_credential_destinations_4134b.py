@@ -49,6 +49,15 @@ CASES: dict[str, dict[str, Any]] = {
         test_path="/api/v1/proxmox/nodes/test",
         test_id="node_id",
     ),
+    "vsphere": dict(
+        module="integrations.vsphere",
+        path="/api/v1/vsphere/targets",
+        body={"host": "198.51.100.5", "username": "svc@vsphere.local", "password": "pw-old"},
+        secret="password",
+        move=("host", NEW_HOST),
+        test_path="/api/v1/vsphere/targets/test",
+        test_id="target_id",
+    ),
     "kubernetes": dict(
         module="integrations.kubernetes",
         path="/api/v1/kubernetes/clusters",

@@ -79,6 +79,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `looking_glass_collector` | BGP Looking Glass receive-only GoBGP collectors — register / CRUD + learned-route reads (#566) |
 | `bgp_lg_peer`     | BGP Looking Glass configured peer sessions within a collector (#566) |
 | `proxmox_node` | Proxmox VE integration targets (`/proxmox`) |
+| `vsphere_target` | VMware vSphere (vCenter) integration targets (`/vsphere`) |
 | `unifi_controller` | UniFi Network controllers (`/unifi`) |
 | `kubernetes_cluster` | Kubernetes cluster integrations (`/kubernetes`) |
 | `docker_host` | Docker host integrations (`/docker`) |

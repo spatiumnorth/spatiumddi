@@ -253,10 +253,11 @@ write surface, not a read-only pull mirror.
 - ✅ [**NetBox read-only import (one-shot)**](docs/SHIPPED.md#issue-36) (#36) — shipped `2026.06.28-1`: One-shot migration importer (not a continuous reconciler): live-pulls prefixes / addresses / VRFs /…
 - ✅ [**Cloud connectors — unified "Cloud" integration with per-provider picker (Azure / AWS / GCP)**](docs/SHIPPED.md#issue-37) (#37) — shipped `2026.06.04-1`: Part A: read-only infra mirror (cloud_endpoint + AWS/Azure/GCP connectors → IPBlock/Subnet/IPAddress…
 - ⬜ [**Load balancer family (F5 BIG-IP, HAProxy, nginx, KEMP, A10, Citrix ADC)**](https://github.com/spatiumnorth/spatiumddi/issues/38)
-- **VMware vCenter / ESXi.** Bigger enterprise audience, but
-  vCenter's SOAP-heavy + licensed API makes it a significantly
-  bigger dev effort than the tier 1 candidates. Revisit only if
-  a deployment specifically needs it.
+- 🟡 [**VMware vSphere (vCenter 7.0 U2+)**](https://github.com/spatiumnorth/spatiumddi/issues/4740) (#4740) — read-only mirror of
+  VM guest addresses (VMware Tools through the vSphere Automation REST API — no SOAP) and ESXi
+  hosts named by IP into IPAM, behind the default-off `integrations.vsphere` module. **Still
+  open:** creating subnets from guest prefix lengths, ESXi management addresses that are not the
+  inventory name, VM-level DNS.
 - **SNMP device polling** as an integration. Already tracked as
   its own line item above (IPAM ARP discovery); belongs with
   ping-sweep / ARP-scan, not the read-only integration shelf.

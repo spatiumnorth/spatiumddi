@@ -393,6 +393,12 @@ export const integrationsNav: NavEntry[] = [
     module: "integrations.tailscale",
   },
   { label: "UniFi", icon: Wifi, to: "/unifi", module: "integrations.unifi" },
+  {
+    label: "VMware vSphere",
+    icon: Boxes,
+    to: "/vsphere",
+    module: "integrations.vsphere",
+  },
 ];
 
 export const adminIdentityNav: NavEntry[] = [

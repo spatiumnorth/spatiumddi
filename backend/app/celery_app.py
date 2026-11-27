@@ -214,6 +214,7 @@ celery_app = SpatiumCelery(
         "app.tasks.meraki_sync",
         "app.tasks.tailscale_sync",
         "app.tasks.netbird_sync",
+        "app.tasks.vsphere_sync",
         "app.tasks.unifi_sync",
         "app.tasks.block_sync",
         "app.tasks.cloud_sync",
@@ -299,6 +300,7 @@ celery_app.conf.update(
         "app.tasks.block_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.netbird_sync.*": {"queue": "default"},
+        "app.tasks.vsphere_sync.*": {"queue": "default"},
         "app.tasks.unifi_sync.*": {"queue": "default"},
         "app.tasks.cloud_sync.*": {"queue": "default"},
         "app.tasks.snmp_poll.*": {"queue": "default"},
@@ -710,6 +712,12 @@ celery_app.conf.update(
         # Gated overall by the ``integrations.netbird`` module.
         "netbird-sync-sweep": {
             "task": "app.tasks.netbird_sync.sweep_netbird_instances",
+            "schedule": schedule(run_every=30.0),
+        },
+        # VMware vSphere (#4740) — same 30 s beat, per-vCenter interval gate.
+        # Gated overall by the ``integrations.vsphere`` module.
+        "vsphere-sync-sweep": {
+            "task": "app.tasks.vsphere_sync.sweep_vsphere_targets",
             "schedule": schedule(run_every=30.0),
         },
         # UniFi — same 30 s beat, per-controller interval gate.

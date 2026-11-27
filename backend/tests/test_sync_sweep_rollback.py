@@ -226,6 +226,7 @@ def _sweep_targets(space_id: uuid.UUID) -> dict[str, tuple]:
     from app.models.panos import PANOSFirewall  # noqa: PLC0415
     from app.models.tailscale import TailscaleTenant  # noqa: PLC0415
     from app.models.unifi import UnifiController  # noqa: PLC0415
+    from app.models.vsphere import VSphereTarget  # noqa: PLC0415
     from app.tasks import (  # noqa: PLC0415
         docker_sync,
         fortinet_sync,
@@ -236,6 +237,7 @@ def _sweep_targets(space_id: uuid.UUID) -> dict[str, tuple]:
         panos_sync,
         tailscale_sync,
         unifi_sync,
+        vsphere_sync,
     )
 
     def _name(prefix: str) -> str:
@@ -343,6 +345,14 @@ def _sweep_targets(space_id: uuid.UUID) -> dict[str, tuple]:
             "integration_meraki_enabled",
             lambda: MerakiOrg(name=_name("meraki"), ipam_space_id=space_id),
         ),
+        "vsphere": (
+            vsphere_sync,
+            "app.services.vsphere.reconcile.reconcile_target",
+            "integration_vsphere_enabled",
+            lambda: VSphereTarget(
+                name=_name("vc"), host=f"{_name('v')}.example.test", ipam_space_id=space_id
+            ),
+        ),
     }
 
 
@@ -358,6 +368,7 @@ _SWEEPS = [
     "fortinet",
     "panos",
     "meraki",
+    "vsphere",
 ]
 
 

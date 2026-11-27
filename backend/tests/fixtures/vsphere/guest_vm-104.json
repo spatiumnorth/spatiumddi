@@ -1,0 +1,7 @@
+[
+  {
+    "mac_address": "00:50:56:AA:BB:04",
+    "nic": "4000",
+    "ip": {"ip_addresses": [{"ip_address": "172.31.9.5", "prefix_length": 24, "state": "PREFERRED"}]}
+  }
+]

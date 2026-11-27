@@ -40,6 +40,7 @@ _RESOURCE_TYPES = {
     "fortinet": "fortinet_firewall",
     "panos": "panos_firewall",
     "meraki": "meraki_org",
+    "vsphere": "vsphere_target",
 }
 
 

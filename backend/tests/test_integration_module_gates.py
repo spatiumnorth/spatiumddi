@@ -57,6 +57,7 @@ _SWEEP_TASK: dict[str, str] = {
     "integrations.paloalto": "panos_sync",
     "integrations.fortinet": "fortinet_sync",
     "integrations.meraki": "meraki_sync",
+    "integrations.vsphere": "vsphere_sync",
 }
 
 _INTEGRATION_MODULES = sorted(m.id for m in fm_svc.MODULES if m.id.startswith("integrations."))

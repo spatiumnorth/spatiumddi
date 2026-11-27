@@ -50,6 +50,7 @@ from app.models.panos import PANOSFirewall
 from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
+from app.models.vsphere import VSphereTarget
 from app.services.feature_modules import get_enabled_modules
 from app.services.integration_credentials import (
     CREDENTIAL_PROBLEM_STATES,
@@ -166,6 +167,7 @@ _INTEGRATION_RESOURCE_TYPES = (
     "panos_firewall",
     "fortinet_firewall",
     "meraki_org",
+    "vsphere_target",
 )
 
 
@@ -351,6 +353,7 @@ _PANELS: tuple[tuple[str, str, str, Any, str], ...] = (
         "fortinet_firewall",
     ),
     ("meraki", "Cisco Meraki (MX)", "integrations.meraki", MerakiOrg, "meraki_org"),
+    ("vsphere", "VMware vSphere", "integrations.vsphere", VSphereTarget, "vsphere_target"),
 )
 
 

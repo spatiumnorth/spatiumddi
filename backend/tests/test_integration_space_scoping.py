@@ -41,6 +41,7 @@ from app.models.panos import PANOSFirewall
 from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
+from app.models.vsphere import VSphereTarget
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
 from app.services.ipam.integration_space_audit import (
     EVIDENCE_DHCP_RESERVATION_OTHER_SPACE,
@@ -166,6 +167,7 @@ def _targets(space_id: uuid.UUID) -> dict[str, Any]:
             api_key_encrypted=b"",
             ipam_space_id=space_id,
         ),
+        "vsphere": VSphereTarget(name=_n("vc"), host="vc.example.test", ipam_space_id=space_id),
     }
 
 
@@ -182,6 +184,7 @@ _CASES: dict[str, tuple[str, Callable[..., Awaitable[Any]]]] = {
     "cloud": ("cloud_endpoint_id", _module_runner("app.services.cloud.reconcile")),
     "opnsense": ("opnsense_router_id", _module_runner("app.services.opnsense.reconcile")),
     "paloalto": ("panos_firewall_id", _run_firewall),
+    "vsphere": ("vsphere_target_id", _module_runner("app.services.vsphere.reconcile")),
 }
 
 
@@ -1311,7 +1314,7 @@ def test_every_reconciler_reports_its_release_on_audit_log_and_result() -> None:
     files = [
         p for p in sorted(_APP.glob("services/*/reconcile.py")) if '.reconcile",' in p.read_text()
     ]
-    assert len(files) == 11, [p.parent.name for p in files]
+    assert len(files) == 12, [p.parent.name for p in files]
     missing = []
     for path in files:
         text = path.read_text()
@@ -1322,7 +1325,7 @@ def test_every_reconciler_reports_its_release_on_audit_log_and_result() -> None:
         if "refuse_sync_into_trashed_space(" not in text:
             missing.append(f"{path.relative_to(_APP)}: trashed-space check")
     tasks = _sync_task_files()
-    assert len(tasks) == 11, [p.name for p in tasks]
+    assert len(tasks) == 12, [p.name for p in tasks]
     for path in tasks:
         if '"released": summary.released.as_dict()' not in path.read_text():
             missing.append(f"{path.relative_to(_APP)}: task result")
@@ -1344,6 +1347,7 @@ def _trash_cases(space_id: uuid.UUID) -> dict[str, tuple[str, Any]]:
         "proxmox": ("app.services.proxmox.reconcile:reconcile_node", t["proxmox"]),
         "tailscale": ("app.services.tailscale.reconcile:reconcile_tenant", t["tailscale"]),
         "netbird": ("app.services.netbird.reconcile:reconcile_instance", t["netbird"]),
+        "vsphere": ("app.services.vsphere.reconcile:reconcile_target", t["vsphere"]),
         "cloud": ("app.services.cloud.reconcile:reconcile_endpoint", t["cloud"]),
         "opnsense": ("app.services.opnsense.reconcile:reconcile_router", t["opnsense"]),
         "paloalto": ("app.services.panos.reconcile:reconcile_firewall", t["paloalto"]),

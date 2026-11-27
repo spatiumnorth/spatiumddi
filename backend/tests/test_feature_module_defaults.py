@@ -100,6 +100,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "integrations.cloud": False,
     "integrations.opnsense": False,
     "integrations.netbird": False,
+    "integrations.vsphere": False,
     "integrations.paloalto": False,
     "integrations.fortinet": False,
     "integrations.meraki": False,

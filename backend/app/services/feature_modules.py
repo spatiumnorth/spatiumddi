@@ -614,6 +614,13 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of a Meraki organization's appliance VLANs → subnets, DHCP fixed-IP reservations → IPAM, org policy objects/groups → firewall objects, and 1:1 NAT / port-forward → NAT mappings (+ optional network clients). Optional per-client Blocked enforcement (move a client to a restrictive device policy via the Dashboard API — no on-prem deploy) is a separate, default-off master switch gated by the Active block sync module. Connect an org from the Meraki page once enabled.",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="integrations.vsphere",
+        label="VMware vSphere",
+        group="Integrations",
+        description="Read-only mirror of VMware vCenter VM guest addresses (through VMware Tools) and ESXi hosts into IPAM, over the vSphere Automation REST API (vCenter 7.0 U2 or later). Mirrors into subnets you already have; creates none. Connect a vCenter from the vSphere page once enabled.",
+        default_enabled=False,
+    ),
     # Appliance — the declarative fleet-firewall policy surface (#285
     # Phase 3). One of the few kept ON by #1069, and deliberately: on an
     # appliance a per-role nftables policy is ALREADY filtering traffic
@@ -801,6 +808,7 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.paloalto": "integration_panos_enabled",
     "integrations.fortinet": "integration_fortinet_enabled",
     "integrations.meraki": "integration_meraki_enabled",
+    "integrations.vsphere": "integration_vsphere_enabled",
 }
 
 # The reverse view: settings-API field name -> module id.

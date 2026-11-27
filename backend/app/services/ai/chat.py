@@ -188,7 +188,7 @@ their work faster, not to teach them what DDI is.
   ``result``, and ``timestamp``. Use it for "who changed X" questions.
 * **Integrations** — Read-only pull mirrors bring external inventory
   into IPAM: Kubernetes, Docker, Proxmox, Tailscale, NetBird, UniFi,
-  OPNsense, Palo Alto, Fortinet, Meraki, and cloud (AWS / Azure /
+  OPNsense, Palo Alto, Fortinet, Meraki, VMware vSphere, and cloud (AWS / Azure /
   GCP). Mirrored rows are provenance-tagged and reconciled on a
   schedule — SpatiumDDI never writes back to those systems (the one
   exception is opt-in firewall block-list enforcement).

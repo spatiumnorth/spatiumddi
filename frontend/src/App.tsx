@@ -37,6 +37,7 @@ import { MerakiPage } from "@/pages/meraki/MerakiPage";
 import { FirewallFeedsPage } from "@/pages/firewall_feeds/FirewallFeedsPage";
 import { CloudPage } from "@/pages/cloud/CloudPage";
 import { NetbirdPage } from "@/pages/netbird/NetbirdPage";
+import { VspherePage } from "@/pages/vsphere/VspherePage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { UnifiPage } from "@/pages/unifi/UnifiPage";
 import { UnifiControllerDetailPage } from "@/pages/unifi/UnifiControllerDetailPage";
@@ -238,6 +239,7 @@ export default function App() {
         <Route path="meraki" element={<MerakiPage />} />
         <Route path="cloud" element={<CloudPage />} />
         <Route path="netbird" element={<NetbirdPage />} />
+        <Route path="vsphere" element={<VspherePage />} />
         <Route path="tailscale" element={<TailscalePage />} />
         <Route path="unifi" element={<UnifiPage />} />
         <Route path="unifi/:id" element={<UnifiControllerDetailPage />} />

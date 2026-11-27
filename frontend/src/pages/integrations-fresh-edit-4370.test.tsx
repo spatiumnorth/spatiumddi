@@ -89,6 +89,11 @@ vi.mock("@/lib/api", async () => {
       updateTenant: upd,
     },
     cloudApi: { ...actual.cloudApi, listEndpoints: list, updateEndpoint: upd },
+    vsphereApi: {
+      ...actual.vsphereApi,
+      listTargets: list,
+      updateTarget: upd,
+    },
   };
 });
 
@@ -103,6 +108,7 @@ const { OpnsensePage } = await import("./opnsense/OpnsensePage");
 const { NetbirdPage } = await import("./netbird/NetbirdPage");
 const { TailscalePage } = await import("./tailscale/TailscalePage");
 const { CloudPage } = await import("./cloud/CloudPage");
+const { VspherePage } = await import("./vsphere/VspherePage");
 
 afterEach(() => {
   cleanup();
@@ -184,6 +190,10 @@ const BASE = {
   mirror_load_balancers: false,
   mirror_stopped_instances: false,
   public_space_id: null,
+  username: "svc@vsphere.local",
+  password_present: true,
+  mirror_hosts: true,
+  last_discovery: null,
 };
 const NEWER = {
   ...BASE,
@@ -205,6 +215,7 @@ const CASES: [string, () => React.ReactElement][] = [
   ["NetBird", () => <NetbirdPage />],
   ["Tailscale", () => <TailscalePage />],
   ["Cloud", () => <CloudPage />],
+  ["vSphere", () => <VspherePage />],
 ];
 
 function open(page: () => React.ReactElement) {

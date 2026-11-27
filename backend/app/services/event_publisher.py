@@ -110,6 +110,7 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     "kubernetes_cluster": "integration.kubernetes",
     "docker_host": "integration.docker",
     "proxmox_node": "integration.proxmox",
+    "vsphere_target": "integration.vsphere",
     "tailscale_tenant": "integration.tailscale",
     # Backup + restore (issue #117 Phase 3)
     "platform": "system",

@@ -351,6 +351,7 @@ SECTIONS: tuple[Section, ...] = (
             "proxmox_node",
             "tailscale_tenant",
             "unifi_controller",
+            "vsphere_target",
             "network_device",
             "network_interface",
             "network_arp_entry",

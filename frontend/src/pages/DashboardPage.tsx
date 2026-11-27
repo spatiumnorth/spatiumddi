@@ -62,6 +62,7 @@ import {
   merakiApi,
   cloudApi,
   netbirdApi,
+  vsphereApi,
   tailscaleApi,
   unifiApi,
   platformHealthApi,
@@ -90,6 +91,7 @@ import {
   type MerakiOrg,
   type CloudEndpoint,
   type NetbirdInstance,
+  type VSphereTarget,
   type TailscaleTenant,
   type UnifiController,
   type PlatformHealthResponse,
@@ -1684,6 +1686,7 @@ export function DashboardPage() {
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
   const netbirdEnabled = settings?.integration_netbird_enabled ?? false;
+  const vsphereEnabled = settings?.integration_vsphere_enabled ?? false;
   const { data: k8sClusters = [], error: k8sClustersError } = useQuery<
     KubernetesCluster[]
   >({
@@ -1712,6 +1715,15 @@ export function DashboardPage() {
       queryFn: netbirdApi.listInstances,
       enabled: netbirdEnabled,
     });
+
+  const { data: vsphereTargets = [], error: vsphereTargetsError } = useQuery<
+    VSphereTarget[]
+  >({
+    queryKey: ["vsphere-targets"],
+    queryFn: vsphereApi.listTargets,
+    enabled: vsphereEnabled,
+    refetchInterval: pollUnlessRefused(30_000),
+  });
 
   const { data: proxmoxNodes = [], error: proxmoxNodesError } = useQuery<
     ProxmoxNode[]
@@ -2943,7 +2955,8 @@ export function DashboardPage() {
             cloudEnabled ||
             tailscaleEnabled ||
             unifiEnabled ||
-            netbirdEnabled) && (
+            netbirdEnabled ||
+            vsphereEnabled) && (
             <div className="space-y-1.5">
               {ipamFilterActive && (
                 <p className="px-1 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -2974,6 +2987,8 @@ export function DashboardPage() {
                 unifiControllers={unifiControllers}
                 netbirdEnabled={netbirdEnabled}
                 netbirdInstances={netbirdInstances}
+                vsphereEnabled={vsphereEnabled}
+                vsphereTargets={vsphereTargets}
                 // A failed refetch over rows already read keeps the rows.
                 errors={{
                   k8s: k8sClusters.length ? null : k8sClustersError,
@@ -2995,6 +3010,7 @@ export function DashboardPage() {
                   meraki: merakiOrgs.length ? null : merakiOrgsError,
                   cloud: cloudEndpoints.length ? null : cloudEndpointsError,
                   unifi: unifiControllers.length ? null : unifiControllersError,
+                  vsphere: vsphereTargets.length ? null : vsphereTargetsError,
                 }}
               />
             </div>
@@ -3706,6 +3722,8 @@ function IntegrationsPanel({
   unifiControllers,
   netbirdEnabled,
   netbirdInstances,
+  vsphereEnabled,
+  vsphereTargets,
   errors = {},
 }: {
   kubernetesEnabled: boolean;
@@ -3730,6 +3748,8 @@ function IntegrationsPanel({
   unifiControllers: UnifiController[];
   netbirdEnabled: boolean;
   netbirdInstances: NetbirdInstance[];
+  vsphereEnabled: boolean;
+  vsphereTargets: VSphereTarget[];
   /** Each list read's error, by column: a refused list is not an empty one (#4855). */
   errors?: Record<string, unknown>;
 }) {
@@ -3744,6 +3764,7 @@ function IntegrationsPanel({
   const hasTailscale = tailscaleEnabled;
   const hasUnifi = unifiEnabled;
   const hasNetbird = netbirdEnabled;
+  const hasVsphere = vsphereEnabled;
   const cols = [
     hasK8s,
     hasDocker,
@@ -3756,6 +3777,7 @@ function IntegrationsPanel({
     hasTailscale,
     hasUnifi,
     hasNetbird,
+    hasVsphere,
   ].filter(Boolean).length;
   const totalTargets =
     clusters.length +
@@ -3768,7 +3790,8 @@ function IntegrationsPanel({
     cloudEndpoints.length +
     tailscaleTenants.length +
     unifiControllers.length +
-    netbirdInstances.length;
+    netbirdInstances.length +
+    vsphereTargets.length;
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">
@@ -3797,6 +3820,7 @@ function IntegrationsPanel({
           cols === 9 && "md:grid-cols-9 md:divide-x md:divide-y-0",
           cols === 10 && "md:grid-cols-10 md:divide-x md:divide-y-0",
           cols === 11 && "md:grid-cols-11 md:divide-x md:divide-y-0",
+          cols === 12 && "md:grid-cols-12 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -4301,6 +4325,47 @@ function IntegrationsPanel({
                         t.peer_count != null
                           ? `${t.peer_count} peer${t.peer_count === 1 ? "" : "s"}`
                           : "—"
+                      }
+                      lastSyncedAt={t.last_synced_at}
+                      lastSyncError={t.last_sync_error}
+                      intervalSeconds={t.sync_interval_seconds}
+                      enabled={t.enabled}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {hasVsphere && (
+          <div className="min-w-0">
+            <Link
+              to="/vsphere"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Boxes className="h-3 w-3" />
+              vSphere ({errors.vsphere ? "–" : vsphereTargets.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {vsphereTargets.length === 0 || errors.vsphere ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                <ListEmpty error={errors.vsphere} what="vCenters">
+                  No vCenters registered.
+                </ListEmpty>
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {vsphereTargets.map((t) => (
+                    <IntegrationRow
+                      key={t.id}
+                      to={`/vsphere`}
+                      name={t.name}
+                      subtitle={t.host}
+                      meta={
+                        t.vm_count != null ? countNoun(t.vm_count, "VM") : "—"
                       }
                       lastSyncedAt={t.last_synced_at}
                       lastSyncError={t.last_sync_error}

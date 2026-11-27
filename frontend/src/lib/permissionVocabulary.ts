@@ -94,5 +94,6 @@ export const GRANT_RESOURCE_TYPES = [
   "opnsense_router",
   "fortinet_firewall",
   "netbird_instance",
+  "vsphere_target",
   "firewall_feed",
 ] as const;

@@ -105,6 +105,7 @@ const ALLOWED: Record<string, Entry> = {
   "/src/pages/proxmox/ProxmoxPage.tsx": local(),
   "/src/pages/fortinet/FortinetPage.tsx": local(),
   "/src/pages/netbird/NetbirdPage.tsx": local(),
+  "/src/pages/vsphere/VspherePage.tsx": local(),
   "/src/pages/cloud/CloudPage.tsx": local(),
   "/src/pages/firewall_feeds/FirewallFeedsPage.tsx": local(),
   "/src/pages/meraki/MerakiPage.tsx": local(),

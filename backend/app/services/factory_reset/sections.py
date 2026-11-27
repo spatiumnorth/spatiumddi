@@ -312,6 +312,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "fortinet_firewall",
             "meraki_org",
             "netbird_instance",
+            "vsphere_target",
             "opnsense_router",
             "panos_firewall",
             "network_arp_entry",
