@@ -431,6 +431,77 @@ async def find_dns_servers(
     ]
 
 
+class FindDnsSecondaryHealthArgs(BaseModel):
+    zone_id: str | None = Field(default=None, description="Only this zone (UUID).")
+    server_id: str | None = Field(default=None, description="Only this DNS server (UUID).")
+    state: str | None = Field(
+        default=None,
+        description=(
+            "Only copies in this state: in_sync, lagging, stale, failing, "
+            "expiring, expired or never_transferred."
+        ),
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_dns_secondary_health",
+    honours_token_binding=True,
+    permission=("read", "dns_zone"),
+    description=(
+        "Per-secondary health of zones a DNS server receives by transfer: for "
+        "each secondary server and zone, the serial it holds, when it last "
+        "refreshed, when it is next due and when its copy expires, and a state "
+        "(in_sync / lagging / stale / failing / expiring / expired / "
+        "never_transferred). Answers 'is my secondary receiving this zone?' "
+        "and 'which secondary is about to stop answering?'. From what each "
+        "secondary's agent reports (BIND9 only); no row means the server has "
+        "not reported that zone. Read-only."
+    ),
+    args_model=FindDnsSecondaryHealthArgs,
+    category="dns",
+    module="core.dns",
+)
+async def find_dns_secondary_health(
+    db: AsyncSession, user: User, args: FindDnsSecondaryHealthArgs
+) -> list[dict[str, Any]]:
+    from app.services.dns.secondary_health import load_health  # noqa: PLC0415
+
+    try:
+        zone_id = uuid.UUID(args.zone_id) if args.zone_id else None
+        server_id = uuid.UUID(args.server_id) if args.server_id else None
+    except ValueError:
+        return []
+    rows = await load_health(db, zone_id=zone_id, server_id=server_id)
+    out: list[dict[str, Any]] = []
+    for h in rows:
+        if args.state and h.state != args.state:
+            continue
+        if not token_allows_zone(user, h.zone_id):
+            continue
+        out.append(
+            {
+                "server_id": str(h.server_id),
+                "server_name": h.server_name,
+                "zone_id": str(h.zone_id),
+                "zone_name": h.zone_name,
+                "state": h.state,
+                "detail": h.detail,
+                "serial": h.serial,
+                "lag_serials": h.lag_serials,
+                "last_refresh_at": h.last_refresh_at.isoformat() if h.last_refresh_at else None,
+                "next_refresh_at": h.next_refresh_at.isoformat() if h.next_refresh_at else None,
+                "expires_at": h.expires_at.isoformat() if h.expires_at else None,
+                "expires_in_seconds": h.expires_in_seconds,
+                "failed_attempts": h.failed_attempts,
+                "reported_at": h.reported_at.isoformat(),
+            }
+        )
+        if len(out) >= args.limit:
+            break
+    return out
+
+
 class GetDnsGroupMemoryEstimateArgs(BaseModel):
     group_id: str = Field(..., description="UUID of the DNS server group.")
 

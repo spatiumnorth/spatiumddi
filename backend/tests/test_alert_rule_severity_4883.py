@@ -28,6 +28,8 @@ _MATCHER_RULE_TYPES = {
     "dhcp_scope_uncoordinated": "_matching_dhcp_scope_uncoordinated_subjects",
     "dns_blocklist_feed_stale": "_matching_dns_blocklist_feed_stale_subjects",
     "dns_pool_health_stale": "_matching_dns_pool_health_stale_subjects",
+    "dns_secondary_transfer_failed": "_matching_dns_secondary_transfer_failed_subjects",
+    "dns_secondary_zone_stale": "_matching_dns_secondary_zone_stale_subjects",
     "agent_bundle_render_failed": "_matching_agent_bundle_render_failed_subjects",
     "appliance_heartbeat_stale": "_matching_appliance_heartbeat_stale_subjects",
     "postgres_instance_unhealthy": "_matching_postgres_instance_subjects",

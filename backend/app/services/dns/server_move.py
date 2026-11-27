@@ -52,6 +52,7 @@ from app.drivers.dns import get_driver
 from app.models.dns import (
     DNSIngestSnapshot,
     DNSRecordOp,
+    DNSSecondaryZoneState,
     DNSServer,
     DNSServerGroup,
     DNSServerOptions,
@@ -566,6 +567,10 @@ async def move_server_to_group(
             sa_delete(DNSServerZoneState).where(DNSServerZoneState.server_id == server.id)
         )
     ).rowcount or 0
+    # #4732 — and its secondary refresh / expiry state per zone, the same way.
+    await db.execute(
+        sa_delete(DNSSecondaryZoneState).where(DNSSecondaryZoneState.server_id == server.id)
+    )
     # #2654 — the server's last DDNS ingest report per zone describes the OLD
     # group's zones; compared against later, it would read as records the
     # writer withdrew.

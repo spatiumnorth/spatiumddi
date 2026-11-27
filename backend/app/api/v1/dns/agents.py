@@ -50,6 +50,7 @@ from app.models.dns import (
     DNSAgentBundle,
     DNSKey,
     DNSRecordOp,
+    DNSSecondaryZoneState,
     DNSServer,
     DNSServerGroup,
     DNSServerRuntimeState,
@@ -113,6 +114,7 @@ from app.services.dns.row_locks import (
     lock_server_key_share,
     lock_zone_state_rows,
 )
+from app.services.dns.secondary_health import SECONDARY_ZONE_TYPES
 from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
     group_view_names,
@@ -1749,6 +1751,108 @@ async def agent_zone_state(
         )
     await db.commit()
     return {"updated": len(serial_by_zone), "skipped": len(unknown) + len(ambiguous)}
+
+
+class SecondaryStateEntry(BaseModel):
+    """One secondary / stub zone's receiving-side state (#4732). Every field
+    but the name is optional: a zone that has not transferred has no serial
+    and no expiry, and that is reported as ``null``, not as a made-up value."""
+
+    zone_name: str = Field(min_length=1, max_length=512)
+    serial: int | None = Field(default=None, ge=0, le=2**32 - 1)
+    expires_at: datetime | None = None
+    next_refresh_at: datetime | None = None
+    last_loaded_at: datetime | None = None
+    soa_refresh: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    soa_retry: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    soa_expire: int | None = Field(default=None, ge=0, le=2**31 - 1)
+
+
+class SecondaryStateReport(BaseModel):
+    zones: list[SecondaryStateEntry] = Field(max_length=20000)
+
+
+@router.post("/secondary-state")
+async def agent_secondary_state(
+    body: SecondaryStateReport,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, int]:
+    """Agents POST, per secondary / stub zone they hold, when the copy
+    expires and is next due a refresh and the SOA timers it runs on (#4732).
+
+    A full snapshot each time; upserted by ``(server_id, zone_id)`` into
+    ``dns_secondary_zone_state``. Names are matched among the live zones of
+    the reporting server's group, as zone-state does; a name the group does
+    not hold, holds more than once (one zone per view), or holds as a zone
+    the server does not receive by transfer is skipped and counted.
+    """
+    server, _ = auth
+    now = datetime.now(UTC)
+    if not body.zones:
+        return {"updated": 0, "skipped": 0}
+
+    def _key(name: str) -> str:
+        return name.rstrip(".").lower()
+
+    # Waits only for a group move in progress, and returns the group as it is
+    # now (row_locks, step 3): a report must not land for the group the
+    # server has just left.
+    group_id = await lock_server_key_share(db, server.id)
+    if group_id is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    res = await db.execute(
+        select(DNSZone).where(
+            DNSZone.group_id == group_id,
+            DNSZone.deleted_at.is_(None),
+            func.lower(func.rtrim(DNSZone.name, ".")).in_({_key(e.zone_name) for e in body.zones}),
+        )
+    )
+    zones_by_key: dict[str, list[DNSZone]] = {}
+    for z in res.scalars().all():
+        zones_by_key.setdefault(_key(z.name), []).append(z)
+
+    entries: dict[uuid.UUID, SecondaryStateEntry] = {}
+    skipped = 0
+    for entry in body.zones:
+        matches = zones_by_key.get(_key(entry.zone_name), [])
+        if len(matches) != 1 or (matches[0].zone_type or "primary") not in SECONDARY_ZONE_TYPES:
+            skipped += 1
+            continue
+        entries[matches[0].id] = entry
+
+    existing = {
+        r.zone_id: r
+        for r in (
+            await db.execute(
+                select(DNSSecondaryZoneState)
+                .where(
+                    DNSSecondaryZoneState.server_id == server.id,
+                    DNSSecondaryZoneState.zone_id.in_(list(entries)),
+                )
+                .order_by(DNSSecondaryZoneState.id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    }
+    for zone_id, e in entries.items():
+        row = existing.get(zone_id)
+        if row is None:
+            row = DNSSecondaryZoneState(server_id=server.id, zone_id=zone_id)
+            db.add(row)
+        row.serial = e.serial
+        row.expires_at = e.expires_at
+        row.next_refresh_at = e.next_refresh_at
+        row.last_loaded_at = e.last_loaded_at
+        row.soa_refresh = e.soa_refresh
+        row.soa_retry = e.soa_retry
+        row.soa_expire = e.soa_expire
+        row.reported_at = now
+    await db.commit()
+    return {"updated": len(entries), "skipped": skipped}
 
 
 class DNSKeyReport(BaseModel):

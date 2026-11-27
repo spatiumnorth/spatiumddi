@@ -3610,3 +3610,43 @@ health-checked DNS round-robin.
   - Manual enable / disable per member, like a load-balancer pool
 - **Driver-agnostic** — members render as regular A/AAAA records via the normal record pipeline, so BIND9 + Windows DNS serve them unchanged
 - **Tradeoff (UI-warned)** — TTL races. DNS is cached client-side; a member dropping out doesn't take effect until TTL expires. This is not a real L4/L7 load balancer. Default TTL is 30 s with an inline pointer to the LB-mapping roadmap item.
+
+## 24. Secondary zone health (issue #4732)
+
+Drift (§12) and the zone-transfer log look at the primary. Nothing said whether
+a **secondary** received a zone and kept it current: one whose transfers fail
+keeps serving its old copy until the SOA expire timer runs out and then answers
+SERVFAIL.
+
+**What is reported.** A BIND9 agent reads each secondary / stub zone it holds
+from `rndc zonestatus` (the serial, `next refresh`, `expires`) and the SOA
+timers off the SOA it serves, and posts them every two minutes to
+`POST /api/v1/dns/agents/secondary-state`. They are stored per server and zone
+in `dns_secondary_zone_state`; every time column is NULL until reported, and
+NULL is "unknown", never "fine". Other drivers do not report yet.
+
+**What is derived.** `expires` is the last good refresh plus the SOA expire, so
+the control plane works the last successful refresh out from it, and a refresh
+is due one SOA refresh after that and retried every SOA retry. Missed attempts
+are therefore an **estimate** from the secondary's own timers; rndc names no
+failure reason, so none is shown. States: `in_sync`, `lagging` (behind the
+newest copy any server of the group holds), `stale`, `failing`, `expiring`,
+`expired`, `never_transferred`.
+
+**Where it shows.** Server detail, Zones tab, **Secondary health**;
+`GET /api/v1/dns/servers/{id}/secondary-health` and
+`GET /api/v1/dns/groups/{gid}/zones/{zid}/secondary-health`; and the
+`find_dns_secondary_health` Copilot tool.
+
+**Alerts**, both seeded **disabled** (Alerts, then enable). One event per
+secondary server and zone, so a single failing server is named:
+
+* `dns_secondary_transfer_failed`: an estimated N consecutive missed refreshes
+  (default 3), or an expired copy (critical).
+* `dns_secondary_zone_stale`: no successful refresh within N x the SOA refresh
+  (default 3), or the copy expires within the window (default 1 day, critical).
+
+A zone in the Trash, a paused server, a server in maintenance or being removed,
+and a report older than 30 minutes are never evaluated (a silent agent is
+`server_unreachable`'s). Restoring the zone resumes evaluation; purging it
+deletes its rows and closes its alerts.

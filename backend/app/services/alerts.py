@@ -581,6 +581,14 @@ RULE_TYPE_DNS_BLOCKLIST_FEED_STALE = "dns_blocklist_feed_stale"
 # leaves a dead member in the answer set with nothing else saying so.
 RULE_TYPE_DNS_POOL_HEALTH_STALE = "dns_pool_health_stale"
 
+# Issue #4732 — the receiving side of a zone transfer, per secondary server and
+# zone, from what the secondary's own agent reports. ``dns_secondary_transfer_failed``
+# fires once an estimated N consecutive refresh attempts have been missed;
+# ``dns_secondary_zone_stale`` when no refresh has worked within a multiple of
+# the SOA refresh, or the copy expires within the window. Both ship disabled.
+RULE_TYPE_DNS_SECONDARY_TRANSFER_FAILED = "dns_secondary_transfer_failed"
+RULE_TYPE_DNS_SECONDARY_ZONE_STALE = "dns_secondary_zone_stale"
+
 # Issue #4545 — a syslog forward target that opted into the DNS query log or
 # the DHCP activity log dropped entries because its collector could not keep up
 # (queue cap reached, or delivery kept failing). Subject = audit_forward_target.
@@ -799,6 +807,8 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET,
         RULE_TYPE_DNS_BLOCKLIST_FEED_STALE,
         RULE_TYPE_DNS_POOL_HEALTH_STALE,
+        RULE_TYPE_DNS_SECONDARY_TRANSFER_FAILED,
+        RULE_TYPE_DNS_SECONDARY_ZONE_STALE,
         RULE_TYPE_LOG_FORWARD_DROPPING,
         RULE_TYPE_DNSSEC_MULTI_SIGNER,
         RULE_TYPE_NODE_PRESSURE,
@@ -4779,6 +4789,88 @@ async def _matching_dns_pool_health_stale_subjects(
     return matches
 
 
+async def _matching_dns_secondary_transfer_failed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_secondary_transfer_failed`` — one event per secondary server and
+    zone whose refresh attempts have been missed ``threshold_percent`` times
+    in a row (default 3), or whose copy has expired (#4732).
+
+    The count is an estimate from the secondary's own timers (see
+    ``services.dns.secondary_health``), not one the daemon kept, and rndc
+    names no reason, so the message does not either. A zone in the Trash, a
+    paused or removing server, and a report older than half an hour are not
+    read. Auto-resolves when a refresh succeeds.
+    """
+    from app.services.dns import secondary_health as sh  # noqa: PLC0415
+
+    threshold = max(rule.threshold_percent or sh.DEFAULT_FAILURE_THRESHOLD, 1)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for h in await sh.load_health(db, now=now, live_only=True):
+        if h.state != "expired" and h.failed_attempts < threshold:
+            continue
+        if h.state == "expired":
+            sev = "critical"
+            what = "has expired and the server now answers SERVFAIL for it"
+        else:
+            sev = "warning"
+            what = f"has missed about {h.failed_attempts} refresh attempts in a row"
+        matches.append(
+            (
+                f"{h.server_id}:{h.zone_id}",
+                f"{h.zone_name} on {h.server_name}",
+                f"Secondary '{h.server_name}': zone '{h.zone_name}' {what}. "
+                f"It keeps serving its last copy until it expires.",
+                sev,
+            )
+        )
+    return matches
+
+
+async def _matching_dns_secondary_zone_stale_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime | None = None,
+) -> list[tuple[str, str, str, str | None]]:
+    """``dns_secondary_zone_stale`` — one event per secondary server and zone
+    with no successful refresh within ``threshold_percent`` times the SOA
+    refresh (default 3), or whose copy expires within ``threshold_days``
+    (default 1), or has not been transferred at all for that long (#4732).
+    """
+    from app.services.dns import secondary_health as sh  # noqa: PLC0415
+
+    multiple = max(rule.threshold_percent or sh.DEFAULT_STALE_MULTIPLE, 1)
+    days = max(rule.threshold_days or sh.DEFAULT_EXPIRY_DAYS, 1)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for h in await sh.load_health(
+        db,
+        now=now,
+        live_only=True,
+        stale_multiple=multiple,
+        expiry_window=timedelta(days=days),
+    ):
+        if h.state in ("expired", "expiring"):
+            sev = "critical"
+        elif h.state == "stale" or (
+            h.state in ("failing", "never_transferred")
+            and (h.refresh_age_seconds or 0) > multiple * (h.soa_refresh or 3600)
+        ):
+            sev = "warning"
+        else:
+            continue
+        matches.append(
+            (
+                f"{h.server_id}:{h.zone_id}",
+                f"{h.zone_name} on {h.server_name}",
+                f"Secondary '{h.server_name}': zone '{h.zone_name}' is out of date: {h.detail}.",
+                sev,
+            )
+        )
+    return matches
+
+
 def _daemon_degraded_source_text(reason: str) -> str:
     """The closing sentences of an ``agent_daemon_degraded`` message, worded by
     who actually reported (#2962). The agent's own report is the only case in
@@ -6912,6 +7004,59 @@ async def seed_dns_pool_health_stale_alert_rule() -> None:
         await session.commit()
 
 
+_DNS_SECONDARY_RULES: tuple[tuple[str, str, str, str], ...] = (
+    (
+        RULE_TYPE_DNS_SECONDARY_TRANSFER_FAILED,
+        "DNS secondary zone transfer failing",
+        "warning",
+        "Fires for each secondary server and zone whose refresh attempts have "
+        "failed several times in a row (estimated from the secondary's own SOA "
+        "timers), or whose copy has expired. A secondary keeps serving its old "
+        "copy until it expires and then answers SERVFAIL. Resolves when a "
+        "transfer succeeds.",
+    ),
+    (
+        RULE_TYPE_DNS_SECONDARY_ZONE_STALE,
+        "DNS secondary zone stale",
+        "warning",
+        "Fires for each secondary server and zone with no successful refresh "
+        "within a multiple of its SOA refresh interval, or whose copy expires "
+        "within the configured window. Resolves on the next successful transfer.",
+    ),
+)
+
+
+async def seed_dns_secondary_alert_rules() -> None:
+    """Seed the #4732 rules, DISABLED by default.
+
+    Neither reads anything on an install with no secondary zone, and each
+    needs a threshold the operator should choose for their estate, so the
+    operator opts in. Keyed on ``name``; one the operator renamed or enabled
+    is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        for rule_type, name, severity, description in _DNS_SECONDARY_RULES:
+            existing = await session.scalar(select(AlertRule).where(AlertRule.name == name))
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=name,
+                    description=description,
+                    rule_type=rule_type,
+                    severity=severity,
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+        await session.commit()
+
+
 async def seed_agent_daemon_degraded_alert_rule() -> None:
     """Seed the #1067 rule, ENABLED by default.
 
@@ -8406,6 +8551,8 @@ _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
     RULE_TYPE_DNS_BLOCKLIST_FEED_STALE: "core.dns",
     RULE_TYPE_DNS_POOL_HEALTH_STALE: "core.dns",
+    RULE_TYPE_DNS_SECONDARY_TRANSFER_FAILED: "core.dns",
+    RULE_TYPE_DNS_SECONDARY_ZONE_STALE: "core.dns",
     RULE_TYPE_VOICE_LEASE_COUNT_BELOW: "core.dhcp",
     RULE_TYPE_STALE_RESERVATION: "core.dhcp",
     RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE: "core.dhcp",
@@ -8727,6 +8874,15 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 stale_pools = await _matching_dns_pool_health_stale_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stale_pools]
                 subject_type = "dns_pool"
+            elif rule.rule_type == RULE_TYPE_DNS_SECONDARY_TRANSFER_FAILED:
+                xfer_failed = await _matching_dns_secondary_transfer_failed_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in xfer_failed]
+                # "<server id>:<zone id>": one subject per secondary and zone.
+                subject_type = "dns_secondary_zone"
+            elif rule.rule_type == RULE_TYPE_DNS_SECONDARY_ZONE_STALE:
+                zone_stale = await _matching_dns_secondary_zone_stale_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in zone_stale]
+                subject_type = "dns_secondary_zone"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]

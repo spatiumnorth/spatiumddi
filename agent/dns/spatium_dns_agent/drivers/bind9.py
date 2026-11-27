@@ -3185,6 +3185,31 @@ def _zonestatus_signed_serial(out: str) -> int | None:
     return None
 
 
+def _zonestatus_time(out: str, key: str) -> str | None:
+    """A timestamp line from ``rndc zonestatus`` as ISO-8601 UTC, or None.
+
+    named prints ``next refresh:`` / ``expires:`` / ``last loaded:`` as an
+    RFC 1123 date (``Thu, 12 Oct 2023 11:46:35 GMT``); a zone that has not
+    transferred yet has no ``expires:`` line at all, which stays None rather
+    than a made-up time (#4732).
+    """
+    from datetime import UTC  # noqa: PLC0415
+    from email.utils import parsedate_to_datetime  # noqa: PLC0415
+
+    for line in out.splitlines():
+        k, _, value = line.strip().partition(":")
+        if k != key or not value.strip():
+            continue
+        try:
+            parsed = parsedate_to_datetime(value.strip())
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).isoformat()
+    return None
+
+
 def _first_line(*texts: str | None, skip_warnings: bool = False) -> str:
     """The first non-blank line across ``texts``.
 
@@ -6633,6 +6658,43 @@ class Bind9Driver(DriverBase):
         keys += [k for k in getattr(self, "_rendered_secondaries", []) if k not in have]
         served = _parallel_map(lambda k: self._served_soa(k + ".")[2], keys)
         return {k: v for k, v in zip(keys, served) if v is not None}
+
+    def periodic_secondary_state(self) -> list[dict[str, Any]]:
+        """One entry per secondary / stub zone named holds a copy of (#4732):
+        the serial it serves, when its next refresh and its expiry are due
+        (``rndc zonestatus``), and the SOA timers it is running on (read off
+        the SOA it serves, since a secondary runs on the primary's, not the
+        control plane's).
+
+        ``expires`` is the last successful refresh plus the SOA expire, so the
+        control plane derives the time of the last transfer that worked from
+        it; a zone that never transferred has no ``expires`` and reports
+        ``null`` for it, never a guess. rndc names no failure reason, so
+        none is reported. A zone ``rndc`` cannot answer for is left out. The
+        reads run on the bounded apply pool.
+        """
+        if not shutil.which("rndc"):
+            return []
+        keys = list(getattr(self, "_rendered_secondaries", []))
+
+        def read(key: str) -> dict[str, Any] | None:
+            scopes = self._zone_rndc_scopes(key + ".")
+            rc, out, _err = _rndc_run(self._rndc_base(), "zonestatus", *scopes[0])
+            if rc != 0:
+                return None
+            soa = self._served_soa(key + ".")[0]
+            return {
+                "zone_name": key,
+                "serial": _zonestatus_serial(out),
+                "expires_at": _zonestatus_time(out, "expires"),
+                "next_refresh_at": _zonestatus_time(out, "next refresh"),
+                "last_loaded_at": _zonestatus_time(out, "last loaded"),
+                "soa_refresh": int(soa.refresh) if soa is not None else None,
+                "soa_retry": int(soa.retry) if soa is not None else None,
+                "soa_expire": int(soa.expire) if soa is not None else None,
+            }
+
+        return [r for r in _parallel_map(read, keys) if r is not None]
 
     def _apex_state(self, key: str) -> dict[str, Any] | None:
         """The apex inputs noted for zone ``key``: as the last op left them,

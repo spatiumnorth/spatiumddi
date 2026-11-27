@@ -603,6 +603,7 @@ backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_colu
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:66
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:67
 backend/alembic/versions/d7a3f2b9c1e4_platform_settings_reverse_dns.py:drop_column:68
+backend/alembic/versions/d7b3a9f15c42_dns_secondary_zone_state.py:drop_table:73
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:62
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:63
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:64

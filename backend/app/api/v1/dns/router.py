@@ -381,6 +381,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "GET /servers/{server_id}/rndc-status": _G,
     # a server's view of every zone in its group, and its queued record ops
     "GET /servers/{server_id}/zone-state": ("dns_group", "dns_zone"),
+    "GET /servers/{server_id}/secondary-health": ("dns_group", "dns_zone"),
     "GET /servers/{server_id}/pending-ops": ("dns_group", "dns_record"),
     "POST /servers/{server_id}/apply-record": _R,
     # options, forwarders, trust anchors, DNSSEC policies
@@ -439,6 +440,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "GET /groups/{group_id}/zones/export": ("dns_zone", "dns_record"),
     "GET /groups/{group_id}/zones/{zone_id}/export": ("dns_zone", "dns_record"),
     "GET /groups/{group_id}/zones/{zone_id}/drift": ("dns_zone", "dns_record", "dns_group"),
+    "GET /groups/{group_id}/zones/{zone_id}/secondary-health": ("dns_zone", "dns_group"),
     "GET /groups/{group_id}/zones/{zone_id}/delegation-preview": ("dns_zone", "dns_record"),
     "POST /groups/{group_id}/zones/{zone_id}/delegate-from-parent": ("dns_zone", "dns_record"),
     # records
@@ -6917,6 +6919,81 @@ async def get_server_zone_state(
             "not_reported": not_reported_count,
         },
     )
+
+
+class SecondaryHealthEntry(BaseModel):
+    """One secondary server's copy of one zone (#4732)."""
+
+    server_id: uuid.UUID
+    server_name: str
+    zone_id: uuid.UUID
+    zone_name: str
+    # in_sync | lagging | stale | failing | expiring | expired | never_transferred
+    state: str
+    detail: str
+    serial: int | None
+    lag_serials: int | None
+    last_refresh_at: datetime | None
+    next_refresh_at: datetime | None
+    expires_at: datetime | None
+    expires_in_seconds: int | None
+    failed_attempts: int
+    soa_refresh: int | None
+    reported_at: datetime
+
+
+class SecondaryHealthResponse(BaseModel):
+    items: list[SecondaryHealthEntry]
+    summary: dict[str, int]
+
+
+def _secondary_health_response(rows: list[Any]) -> SecondaryHealthResponse:
+    items = [
+        SecondaryHealthEntry(**{k: getattr(h, k) for k in SecondaryHealthEntry.model_fields})
+        for h in rows
+    ]
+    summary: dict[str, int] = {"total": len(items)}
+    for it in items:
+        summary[it.state] = summary.get(it.state, 0) + 1
+    return SecondaryHealthResponse(items=items, summary=summary)
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/secondary-health",
+    response_model=SecondaryHealthResponse,
+)
+async def get_zone_secondary_health(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
+) -> SecondaryHealthResponse:
+    """Per-secondary health of one zone: the serial each server holds, when it
+    last refreshed, when it expires, and whether it is in sync, lagging,
+    stale, failing or expiring (#4732). Read-only; from what each secondary's
+    agent reports. An empty list means no server has reported the zone."""
+    from app.services.dns.secondary_health import load_health  # noqa: PLC0415
+
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    return _secondary_health_response(await load_health(db, zone_id=zone.id))
+
+
+@router.get(
+    "/servers/{server_id}/secondary-health",
+    response_model=SecondaryHealthResponse,
+)
+async def get_server_secondary_health(
+    server_id: uuid.UUID, db: DB, current_user: CurrentUser
+) -> SecondaryHealthResponse:
+    """Health of every secondary zone this server holds (#4732)."""
+    from app.services.dns.secondary_health import load_health  # noqa: PLC0415
+
+    server = await db.get(DNSServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    rows = await load_health(db, server_id=server_id)
+    # GHSA-46mq-mpwf-xxwv: a dns_zone-scoped token sees only its bound zones.
+    token_zone_ids = _zone_token_id_filter(current_user)
+    if token_zone_ids is not None:
+        rows = [r for r in rows if r.zone_id in set(token_zone_ids)]
+    return _secondary_health_response(rows)
 
 
 class PendingOpEntry(BaseModel):
