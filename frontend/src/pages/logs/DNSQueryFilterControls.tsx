@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useState } from "react";
 import { Download, XCircle } from "lucide-react";
 import {
@@ -128,7 +129,8 @@ export function ExportControl({
       </button>
       {result?.truncated && (
         <span role="status" className="text-[11px] text-amber-600">
-          Export capped at {result.rowCap.toLocaleString()} rows (newest first)
+          Export capped at {result.rowCap.toLocaleString()}{" "}
+          {pluralize(result.rowCap, "row")} (newest first)
           — narrow the filter or time window for the rest.
         </span>
       )}
