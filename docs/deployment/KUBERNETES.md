@@ -78,6 +78,33 @@ that adds the Red Hat UBI 9 images and the certified values profile
 not tested and not supported. Report a problem on a supported version in
 [GitHub Issues](https://github.com/spatiumnorth/spatiumddi/issues).
 
+**Red Hat Ecosystem Catalog**
+
+SpatiumDDI is listed in the Red Hat Ecosystem Catalog as
+[Partner Validated for Red Hat OpenShift](https://catalog.redhat.com/en/software/container-stacks/detail/6af49e43879a2dda6c257559).
+Its four Red Hat Universal Base Image 9 images, the ones the certified values
+profile installs, are Red Hat certified:
+[spatiumddi-api](https://catalog.redhat.com/en/software/containers/spatiumnorth/spatiumddi-api/6afe3a343f920ff278cf212a),
+[spatiumddi-frontend](https://catalog.redhat.com/en/software/containers/spatiumnorth/spatiumddi-frontend/6afe3a3d071e4d6a9cc1d123),
+[dns-bind9](https://catalog.redhat.com/en/software/containers/spatiumnorth/dns-bind9/6afe3a562f24a256f824dc01)
+and
+[dhcp-kea](https://catalog.redhat.com/en/software/containers/spatiumnorth/dhcp-kea/6afe3a6f8bdde86e465f92ea).
+The images carry a `-ubi` tag suffix on GHCR (for example `1.0.1-ubi`). The
+Helm chart is a Red Hat certified chart from 1.0.1, published in the OpenShift
+Helm chart repository, so it can be installed from the OpenShift console's
+Helm catalog or with Helm:
+
+```bash
+helm repo add openshift-helm-charts https://charts.openshift.io/
+helm install spatiumddi openshift-helm-charts/spatiumnorth-spatiumddi \
+  --version 1.0.1 -n spatiumddi --create-namespace \
+  -f values-openshift-certified.yaml
+```
+
+Take `values-openshift-certified.yaml` from the chart
+(`helm show values` prints only the default values; `helm pull --untar` gives
+the whole chart) and add your own overrides after it.
+
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
 same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
@@ -172,19 +199,17 @@ ship radvd, for platforms where you grant it). `restricted-v3` (4.22+) also requ
 false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
 
-**Red Hat certification status.** The chart and images are **not yet** Red Hat
-certified. Partner Connect certification components exist for the four `-ubi`
-images, and when the repository secret `PYXIS_API_TOKEN` is set the release
-submits `preflight` results for each image and architecture against the published
-`ghcr.io/spatiumnorth/<image>:<version>-ubi` (the `submit-ubi-preflight` job; it is
-non-gating and skipped without the secret). Certification stays pending until Red
-Hat reviews and publishes them. What exists is everything short of it. Every image carries `name`,
-`vendor`, `version`, `release`, `summary`, `description`, `maintainer` and `url`
-labels (plus the `org.opencontainers.image.*` set) and the project `LICENSE` and
-`NOTICE` under `/licenses`; the chart has a `values.schema.json`,
-`charts.openshift.io/*` annotations in `Chart.yaml` and a `helm test` hook
-(`helm test <release>` checks the api and the frontend answer); and four of the
-images have Red Hat UBI 9 variants, described next.
+**Red Hat certification status.** From 1.0.1 the chart is a Red Hat certified
+Helm chart and the four `-ubi` images are Red Hat certified and published (see
+"Red Hat Ecosystem Catalog" above). The release submits `preflight` results for
+each `-ubi` image and architecture against the published
+`ghcr.io/spatiumnorth/<image>:<version>-ubi` (the `submit-ubi-preflight` job;
+non-gating, and skipped without the `PYXIS_API_TOKEN` repository secret). Every
+image carries `name`, `vendor`, `version`, `release`, `summary`, `description`,
+`maintainer` and `url` labels (plus the `org.opencontainers.image.*` set) and the
+project `LICENSE` and `NOTICE` under `/licenses`; the chart has a
+`values.schema.json`, `charts.openshift.io/*` annotations in `Chart.yaml` and a
+`helm test` hook (`helm test <release>` checks the api and the frontend answer).
 
 **UBI image variants and the certified profile (#3913).** The api, frontend,
 `dns-bind9` and `dhcp-kea` images are also published on `ubi9` as

@@ -32,6 +32,7 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
 <nav class="idx-jump" aria-label="Sections" markdown="0">
   <span class="idx-jump-label">Jump to</span>
   <a href="#start-here">Start here</a>
+  <a href="#platforms">Supported platforms</a>
   <a href="#architecture">Architecture &amp; design</a>
   <a href="#features">Feature specs</a>
   <a href="#deployment">Deployment</a>
@@ -72,6 +73,45 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
     Running containers you manage yourself? Start at
     <a href="deployment/DOCKER.html">Docker Compose</a> or
     <a href="deployment/KUBERNETES.html">Kubernetes</a> instead of step 1.
+  </p>
+</section>
+
+
+<section class="idx-section" id="platforms" markdown="0">
+  <header class="idx-section-head">
+    <span class="idx-section-icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg>
+    </span>
+    <div>
+      <h2>Supported platforms</h2>
+      <p>The same control plane and the same DNS and DHCP service containers on every platform, on amd64 and arm64.</p>
+    </div>
+  </header>
+  <div class="idx-grid idx-grid-platforms">
+    <a class="idx-card" href="deployment/APPLIANCE_INSTALL.html">
+      <span class="idx-card-title">OS appliance</span>
+      <span class="idx-card-desc">One ISO for x86-64 or arm64, on bare metal or a VM (Proxmox, VMware, Hyper-V, QEMU). Atomic A/B upgrades and a multi-node HA control plane, with no Docker or Kubernetes to run yourself</span>
+    </a>
+    <a class="idx-card" href="deployment/DOCKER.html">
+      <span class="idx-card-title">Docker Compose</span>
+      <span class="idx-card-desc">Docker Engine 25+ and Compose v2.20+ on one host, with optional DNS and DHCP service profiles</span>
+    </a>
+    <a class="idx-card" href="deployment/KUBERNETES.html">
+      <span class="idx-card-title">Kubernetes</span>
+      <span class="idx-card-desc">One Helm chart for Kubernetes 1.31+ (tested on 1.36 with Helm 4), with CloudNativePG and Redis Sentinel for HA</span>
+    </a>
+    <a class="idx-card" href="deployment/KUBERNETES.html#openshift">
+      <span class="idx-card-title">Red Hat OpenShift</span>
+      <span class="idx-card-tag">Red Hat Ecosystem Catalog · Partner Validated</span>
+      <span class="idx-card-desc">OpenShift 4.22 and 5.0 from SpatiumDDI 1.0.1: the same chart under OpenShift's default security context constraints, on Red Hat certified UBI 9 images</span>
+    </a>
+  </div>
+  <p class="idx-alt">
+    SpatiumDDI is listed in the Red Hat Ecosystem Catalog as
+    <a href="https://catalog.redhat.com/en/software/container-stacks/detail/6af49e43879a2dda6c257559">Partner Validated for Red Hat OpenShift</a>,
+    and its Helm chart and UBI 9 images are Red Hat certified.
+    Sizing for each platform is on <a href="deployment/SIZING.html">Sizing</a>.
   </p>
 </section>
 

@@ -931,6 +931,22 @@ kbd {
 .idx-card-desc code {
   font-size: 0.95em;
 }
+/* A platform card's catalog standing (the OpenShift card's Red Hat
+   Ecosystem Catalog listing): a quiet pill under the title, plain text, no
+   vendor logo (Red Hat's brand standards for technical partners). */
+.idx-card-tag {
+  align-self: flex-start;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--accent);
+}
+.idx-grid-platforms {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
 
 /* Start-here cards are a reading order, so they carry a step number and a
    little more presence than the reference cards below them. */
