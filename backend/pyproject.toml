@@ -10,11 +10,11 @@ name = "spatiumddi"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.162.6",
+    "fastapi>=0.165.0",
     "uvicorn[standard]>=0.32.0",
     # Below 2.1 until #1187: 2.1.0's new type annotations fail mypy in 23
     # files (#1186). The test suite itself passes on 2.1.
-    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "sqlalchemy[asyncio]>=2.0.58,<2.1",
     "asyncpg>=0.30.0",
     "alembic>=1.14.0",
     # Below 7 until re-measured (#3693): redis-py 7.4.1 / 8.1.0 cost ~10 % /
@@ -26,7 +26,7 @@ dependencies = [
     "celery[redis]>=5.4.0",
     "structlog>=24.4.0",
     "bcrypt>=4.0.0",
-    "python-multipart>=0.0.18",
+    "python-multipart>=0.0.34",
     "pydantic-settings>=2.16.3",
     "prometheus-client>=0.21.0",
     "joserfc>=1.0.0",
@@ -51,9 +51,9 @@ dependencies = [
     # every Add/Set/Remove-DhcpServerv4Failover* cmdlet has to do.
     "requests-credssp>=2.0.0",
     "pysnmp~=7.1",
-    "pyotp>=2.9.0",
-    "openai>=3.50.0",
-    "anthropic>=2.8.0",
+    "pyotp>=2.12.1",
+    "openai>=3.58.0",
+    "anthropic>=2.13.0",
     "reportlab>=4.2.0",
     "croniter>=3.0.0",
     # Scheduled Wake-on-LAN calendar gate (issue #586 Phase 2). ``icalendar``
@@ -61,7 +61,7 @@ dependencies = [
     # collections; ``python-dateutil`` (already present transitively via
     # botocore) expands RRULE/RDATE over a bounded horizon — pinned explicitly
     # so the recurrence path can't break on a transitive drop.
-    "icalendar>=6.0.0",
+    "icalendar>=7.3.2",
     "caldav>=1.3.0",
     "python-dateutil>=2.9.0",
     # IDNA2008 encoding for the shared DNS-name validators (issue #597) —
@@ -69,11 +69,11 @@ dependencies = [
     # form. Already present transitively (httpx / requests); pinned direct
     # because app.core.dns_names imports it.
     "idna>=3.20",
-    "boto3>=1.44.2",
+    "boto3>=1.44.10",
     "paramiko>=3.4.0",
     "azure-storage-blob>=12.20.0",
     "smbprotocol>=1.13.0",
-    "google-cloud-storage>=2.18.0",
+    "google-cloud-storage>=3.17.2",
     # Cloud integration (issue #37). AWS (infra mirror + Route 53 DNS) is
     # covered by the existing boto3. Azure + GCP infra + DNS need their
     # management SDKs; Cloudflare DNS uses plain REST via httpx (no SDK
@@ -86,7 +86,7 @@ dependencies = [
     "azure-mgmt-resource>=23.0.0",
     "google-cloud-compute>=1.58.0",
     "google-cloud-dns>=0.35.0",
-    "google-auth>=2.62.2",
+    "google-auth>=2.63.1",
     # docker SDK — only used on the SpatiumDDI OS appliance to send
     # SIGHUP to the frontend container when a new TLS cert is
     # activated (Phase 4b.2, issue #134). The cert deployer is gated
@@ -97,7 +97,7 @@ dependencies = [
     # HelmChartConfig.valuesContent string when bumping the image tag
     # post-rolling-upgrade. Pinned explicitly so the chart-bump path
     # doesn't break if a transitive consumer drops the dep.
-    "PyYAML>=6.0",
+    "PyYAML>=6.0.4",
 ]
 
 [project.optional-dependencies]
@@ -108,7 +108,7 @@ dev = [
     "pytest-xdist>=3.6.0",
     "pytest-split>=0.9.0",
     "httpx>=0.28.0",
-    "ruff>=0.17.5",
+    "ruff>=0.17.6",
     "black>=24.10.0",
     "mypy>=1.13.0",
     "types-croniter>=3.0.0",
