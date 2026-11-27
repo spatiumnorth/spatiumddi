@@ -303,6 +303,8 @@ backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_column:11
 backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_column:119
 backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_column:120
 backend/alembic/versions/b7e2c40a9d18_dns_encrypted_transports.py:drop_constraint_fk:112
+backend/alembic/versions/b7e2d94f1a63_ddi_mirror.py:drop_table:100
+backend/alembic/versions/b7e2d94f1a63_ddi_mirror.py:drop_table:98
 backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:drop_column:85
 backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:drop_column:86
 backend/alembic/versions/b7e2d9a5f314_dns_import_source.py:drop_column:88

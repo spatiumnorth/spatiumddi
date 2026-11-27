@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import { CutoverPage } from "./CutoverPage";
+import { DDIMirrorPage } from "./DDIMirrorPage";
 import { DHCPImportPage } from "./DHCPImportPage";
 import { DNSImportPage } from "./DNSImportPage";
 import { NetBoxImportPage } from "./NetBoxImportPage";
@@ -25,7 +26,7 @@ import { NetBoxImportPage } from "./NetBoxImportPage";
  * renders this shell with the matching initialTab, and the embedded page still
  * reads its router state.
  */
-export type ImportTab = "dhcp" | "dns" | "netbox" | "cutover";
+export type ImportTab = "dhcp" | "dns" | "netbox" | "cutover" | "ddi_mirror";
 
 const SECTIONS: {
   key: ImportTab;
@@ -56,6 +57,12 @@ const SECTIONS: {
     label: "Windows cutover",
     summary: "Guided migration off Windows DNS / DHCP",
     module: "migration.cutover",
+  },
+  {
+    key: "ddi_mirror",
+    label: "DDI mirror",
+    summary: "Read-only live mirror of an Infoblox estate (#4729)",
+    module: "migration.ddi_mirror",
   },
 ];
 
@@ -127,6 +134,8 @@ export function ImportPage({ initialTab }: { initialTab?: ImportTab }) {
           <NetBoxImportPage />
         ) : active?.key === "cutover" ? (
           <CutoverPage />
+        ) : active?.key === "ddi_mirror" ? (
+          <DDIMirrorPage />
         ) : null}
       </main>
     </div>

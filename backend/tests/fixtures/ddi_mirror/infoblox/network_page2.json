@@ -1,0 +1,15 @@
+{
+  "result": [
+    {
+      "_ref": "network/ZG5zLm5ldHdvcmskMTAuMy4wLjAvMjQvMA:10.3.0.0/24/default",
+      "network": "10.3.0.0/24",
+      "network_view": "default",
+      "comment": ""
+    },
+    {
+      "_ref": "network/bad1:oops/default",
+      "network": "not-a-cidr",
+      "network_view": "default"
+    }
+  ]
+}

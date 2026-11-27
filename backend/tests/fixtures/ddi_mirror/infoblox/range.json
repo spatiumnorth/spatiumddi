@@ -1,0 +1,15 @@
+{
+  "result": [
+    {
+      "_ref": "range/ZG5zLmRoY3BfcmFuZ2Uk:10.1.0.100/10.1.0.199/default",
+      "start_addr": "10.1.0.100",
+      "end_addr": "10.1.0.199",
+      "network": "10.1.0.0/24",
+      "network_view": "default",
+      "comment": "dynamic",
+      "name": "srv-pool",
+      "disable": false,
+      "server_association_type": "MEMBER"
+    }
+  ]
+}

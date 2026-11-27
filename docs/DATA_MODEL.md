@@ -392,6 +392,14 @@ The reconciler FKs live on the IPAM rows: e.g.
 `opnsense_router_id` (all `CASCADE`), with parallel columns on `IPBlock`
 and `Subnet` where the mirror creates structure.
 
+The commercial-DDI mirror (#4729) is the exception to that last paragraph: it
+mirrors into its own store, never into IPAM. `DDIMirrorTarget`
+(`ddi_mirror_target`: source URL, Fernet-encrypted password, interval, last sync
+state and per-run report) owns `DDIMirrorObject` rows (`ddi_mirror_object`: kind,
+the source's own object ref, name, view, value, comment, extra data) through a
+`CASCADE` FK, unique on `(target_id, kind, source_ref)`. No IPAM / DNS / DHCP
+table carries a column for it.
+
 The NetBox importer (`models` provenance columns, not a continuous
 mirror) and the cloud DNS drivers are documented in
 [MIGRATION.md](features/MIGRATION.md) and

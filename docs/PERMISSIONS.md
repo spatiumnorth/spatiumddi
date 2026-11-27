@@ -90,6 +90,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `fortinet_firewall` | Fortinet FortiGate firewalls (`/fortinet`) |
 | `netbird_instance` | NetBird management instances (`/netbird`) |
 | `firewall_feed` | Firewall block-list feeds (`/firewall-feeds`) |
+| `ddi_mirror_target` | Commercial DDI mirror sources — Infoblox live mirror + cutover rehearsal (`/migration/ddi-mirror`) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
 | `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
 | `manage_block_sync` | Active block sync / write-back enforcement (#601) — create/lift SpatiumDDI-owned IP/MAC blocks, arm per-target OPNsense/UniFi enforcement + write-scoped creds, reveal + reconcile. High blast-radius (pushes a real firewall/gateway block that can lock devices out); granted to `Network Editor`, not `Viewer`. Every push is audited and eligible for two-person approval (`admin:manage_block_sync`). |

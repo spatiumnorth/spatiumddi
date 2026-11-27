@@ -1,0 +1,14 @@
+{
+  "result": [
+    {
+      "_ref": "record:a/ZG5zLmJpbmRfYSQ:app.example.com/default",
+      "name": "app.example.com",
+      "view": "default",
+      "zone": "example.com",
+      "ipv4addr": "10.1.0.30",
+      "ttl": 300,
+      "comment": "",
+      "disable": false
+    }
+  ]
+}

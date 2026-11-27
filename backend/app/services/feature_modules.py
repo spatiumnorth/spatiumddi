@@ -485,6 +485,20 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Guided migration from Windows DNS / DHCP onto managed BIND9 / PowerDNS / Kea — parity verification, parallel-run shadow queries, per-zone and per-scope cutover with rollback, and the decommission checklist. Configuration → Import → Windows cutover; superadmin-only.",
         default_enabled=False,
     ),
+    # Commercial-DDI live mirror (#4729): a read-only, continuously refreshed
+    # copy of an Infoblox (BlueCat / EfficientIP later) estate to rehearse a
+    # cutover against while the old system still serves. One-shot migration
+    # tooling that calls out to the operator's own infrastructure with a stored
+    # credential, so default-OFF (#1069). Deliberately NOT an ``integrations.*``
+    # module: it mirrors into its own store, never into live IPAM, and so has
+    # no IP-space binding or Settings → Integrations flag.
+    ModuleSpec(
+        id="migration.ddi_mirror",
+        label="Commercial DDI mirror",
+        group="Tools",
+        description="Read-only live mirror of an Infoblox estate (networks, ranges, fixed addresses, host / A / PTR records, zones, views) into a separate store, with a cutover-rehearsal view showing what an import would create and what differs. Nothing is written to the source or to live IPAM / DNS / DHCP. Configuration → Import → DDI mirror; superadmin writes.",
+        default_enabled=False,
+    ),
     ModuleSpec(
         id="ipam.import.netbox",
         label="NetBox import",

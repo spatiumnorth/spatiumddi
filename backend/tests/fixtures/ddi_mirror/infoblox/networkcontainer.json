@@ -1,0 +1,15 @@
+{
+  "result": [
+    {
+      "_ref": "networkcontainer/ZG5zLm5ldHdvcmtfY29udGFpbmVyJDEwLjAuMC4wLzgvMA:10.0.0.0/8/default",
+      "network": "10.0.0.0/8",
+      "network_view": "default",
+      "comment": "Corporate supernet",
+      "extattrs": {
+        "Site": {
+          "value": "HQ"
+        }
+      }
+    }
+  ]
+}

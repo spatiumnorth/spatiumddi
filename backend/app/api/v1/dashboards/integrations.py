@@ -40,6 +40,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_any_permission, user_has_permission
 from app.models.audit import AuditLog
 from app.models.cloud import CloudEndpoint
+from app.models.ddi_mirror import DDIMirrorTarget
 from app.models.docker import DockerHost
 from app.models.fortinet import FortinetFirewall
 from app.models.kubernetes import KubernetesCluster
@@ -166,6 +167,7 @@ _INTEGRATION_RESOURCE_TYPES = (
     "panos_firewall",
     "fortinet_firewall",
     "meraki_org",
+    "ddi_mirror_target",
 )
 
 
@@ -351,6 +353,16 @@ _PANELS: tuple[tuple[str, str, str, Any, str], ...] = (
         "fortinet_firewall",
     ),
     ("meraki", "Cisco Meraki (MX)", "integrations.meraki", MerakiOrg, "meraki_org"),
+    # #4729 — the commercial-DDI mirror is migration tooling, so its module is
+    # ``migration.ddi_mirror`` rather than ``integrations.*``; it is still a
+    # read-only pull reconciler with per-target rows and belongs on this tab.
+    (
+        "ddi_mirror",
+        "Commercial DDI mirror",
+        "migration.ddi_mirror",
+        DDIMirrorTarget,
+        "ddi_mirror_target",
+    ),
 )
 
 

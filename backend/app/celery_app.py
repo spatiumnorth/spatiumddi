@@ -210,6 +210,7 @@ celery_app = SpatiumCelery(
         "app.tasks.proxmox_sync",
         "app.tasks.opnsense_sync",
         "app.tasks.panos_sync",
+        "app.tasks.ddi_mirror_sync",
         "app.tasks.fortinet_sync",
         "app.tasks.meraki_sync",
         "app.tasks.tailscale_sync",
@@ -294,6 +295,7 @@ celery_app.conf.update(
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.opnsense_sync.*": {"queue": "default"},
         "app.tasks.panos_sync.*": {"queue": "default"},
+        "app.tasks.ddi_mirror_sync.*": {"queue": "default"},
         "app.tasks.fortinet_sync.*": {"queue": "default"},
         "app.tasks.meraki_sync.*": {"queue": "default"},
         "app.tasks.block_sync.*": {"queue": "default"},
@@ -670,6 +672,13 @@ celery_app.conf.update(
         # the ``integrations.paloalto`` module.
         "panos-sync-sweep": {
             "task": "app.tasks.panos_sync.sweep_panos_firewalls",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Commercial-DDI live mirror (#4729) — same 30 s beat, per-target
+        # interval gate (default 15 min: it is bulk data). Gated overall by the
+        # ``migration.ddi_mirror`` module.
+        "ddi-mirror-sync-sweep": {
+            "task": "app.tasks.ddi_mirror_sync.sweep_ddi_mirror_targets",
             "schedule": schedule(run_every=30.0),
         },
         # Fortinet FortiGate (#606) — same 30 s beat, per-firewall interval

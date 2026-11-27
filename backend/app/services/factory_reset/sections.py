@@ -314,6 +314,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "netbird_instance",
             "opnsense_router",
             "panos_firewall",
+            "ddi_mirror_target",
             "network_arp_entry",
             "network_fdb_entry",
             "network_neighbour",
@@ -326,6 +327,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         cascade_dependents=(
             "address_set",
             "bacnet_device",
+            "ddi_mirror_object",
             "dhcp_phone_profile_scope",
             "dhcp_pool",
             "dhcp_scope",

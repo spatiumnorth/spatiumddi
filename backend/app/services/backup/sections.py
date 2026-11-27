@@ -359,6 +359,8 @@ SECTIONS: tuple[Section, ...] = (
             "router",
             "router_zone",
             "acme_account",
+            "ddi_mirror_target",
+            "ddi_mirror_object",
         ),
     ),
     Section(

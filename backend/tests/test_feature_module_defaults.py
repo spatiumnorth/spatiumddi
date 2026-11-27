@@ -84,6 +84,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "dhcp.import": True,
     # ── Tools ───────────────────────────────────────────────────────
     "migration.cutover": False,
+    "migration.ddi_mirror": False,
     # ── IPAM ────────────────────────────────────────────────────────
     "ipam.import.netbox": True,
     # #2100 — off on a FRESH install, but ``default_on_if_rows_in`` resolves

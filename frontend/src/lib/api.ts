@@ -11790,7 +11790,8 @@ export type IntegrationDashboardKind =
   | "paloalto"
   | "fortinet"
   | "meraki"
-  | "netbird";
+  | "netbird"
+  | "ddi_mirror";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;
@@ -15676,6 +15677,200 @@ export const opnsenseApi = {
   syncNow: (id: string) =>
     api
       .post<{ status: string; task_id: string }>(`/opnsense/routers/${id}/sync`)
+      .then((r) => r.data),
+};
+
+// ── Commercial-DDI live mirror (issue #4729) ───────────────────────
+
+export type DDIMirrorKind =
+  | "view"
+  | "container"
+  | "network"
+  | "range"
+  | "reservation"
+  | "zone"
+  | "host"
+  | "a"
+  | "ptr";
+
+export type DDIMirrorAction = "create" | "exists" | "differs";
+
+export interface DDIMirrorKindReport {
+  fetched: number;
+  created: number;
+  updated: number;
+  unchanged: number;
+  deleted: number;
+  unmapped: number;
+  complete: boolean;
+  error: string | null;
+}
+
+export interface DDIMirrorReport {
+  kinds: Record<string, DDIMirrorKindReport>;
+  unmapped_examples: string[];
+  unmapped_total: number;
+}
+
+export interface DDIMirrorTarget {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  vendor: string;
+  base_url: string;
+  api_version: string;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  username: string;
+  password_present: boolean;
+  network_view: string;
+  dns_view: string;
+  sync_interval_seconds: number;
+  page_size: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  last_sync_warning: string | null;
+  source_version: string | null;
+  object_count: number | null;
+  last_report: DDIMirrorReport | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DDIMirrorTargetCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  vendor?: string;
+  base_url: string;
+  api_version?: string;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  username: string;
+  password: string;
+  network_view?: string;
+  dns_view?: string;
+  sync_interval_seconds?: number;
+  page_size?: number;
+}
+
+export type DDIMirrorTargetUpdate = Partial<
+  Omit<DDIMirrorTargetCreate, "password">
+> & { password?: string };
+
+export interface DDIMirrorVendor {
+  vendor: string;
+  label: string;
+  supported: boolean;
+  kinds: string[];
+}
+
+export interface DDIMirrorTestResult {
+  ok: boolean;
+  message: string;
+  version: string | null;
+}
+
+export interface DDIMirrorObject {
+  id: string;
+  kind: DDIMirrorKind;
+  name: string;
+  view: string;
+  value: string;
+  comment: string;
+  source_ref: string;
+  data: Record<string, unknown>;
+  modified_at: string;
+}
+
+export interface DDIMirrorCounts {
+  total: number;
+  create: number;
+  exists: number;
+  differs: number;
+}
+
+export interface DDIMirrorRehearsalItem {
+  kind: DDIMirrorKind;
+  name: string;
+  value: string;
+  view: string;
+  action: DDIMirrorAction;
+  differences: string[];
+}
+
+export interface DDIMirrorRehearsal {
+  target_id: string;
+  synced_at: string | null;
+  totals: DDIMirrorCounts;
+  kinds: Record<string, DDIMirrorCounts>;
+  total_items: number;
+  items: DDIMirrorRehearsalItem[];
+}
+
+export const ddiMirrorApi = {
+  vendors: () =>
+    api
+      .get<DDIMirrorVendor[]>("/migration/ddi-mirror/vendors")
+      .then((r) => r.data),
+  list: () =>
+    api
+      .get<DDIMirrorTarget[]>("/migration/ddi-mirror/targets")
+      .then((r) => r.data),
+  create: (data: DDIMirrorTargetCreate) =>
+    api
+      .post<DDIMirrorTarget>("/migration/ddi-mirror/targets", data)
+      .then((r) => r.data),
+  update: (id: string, data: DDIMirrorTargetUpdate) =>
+    api
+      .put<DDIMirrorTarget>(`/migration/ddi-mirror/targets/${id}`, data)
+      .then((r) => r.data),
+  remove: (id: string) => api.delete(`/migration/ddi-mirror/targets/${id}`),
+  testConnection: (body: {
+    target_id?: string;
+    vendor?: string;
+    base_url?: string;
+    api_version?: string;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    username?: string;
+    password?: string;
+  }) =>
+    api
+      .post<DDIMirrorTestResult>("/migration/ddi-mirror/targets/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/migration/ddi-mirror/targets/${id}/sync`)
+      .then((r) => r.data),
+  objects: (
+    id: string,
+    params: { kind?: string; q?: string; limit?: number; offset?: number },
+  ) =>
+    api
+      .get<{
+        total: number;
+        items: DDIMirrorObject[];
+      }>(`/migration/ddi-mirror/targets/${id}/objects`, { params })
+      .then((r) => r.data),
+  rehearsal: (
+    id: string,
+    params: {
+      kind?: string;
+      action?: string;
+      limit?: number;
+      offset?: number;
+    },
+  ) =>
+    api
+      .get<DDIMirrorRehearsal>(
+        `/migration/ddi-mirror/targets/${id}/rehearsal`,
+        { params },
+      )
       .then((r) => r.data),
 };
 

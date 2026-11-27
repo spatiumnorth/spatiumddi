@@ -95,4 +95,5 @@ export const GRANT_RESOURCE_TYPES = [
   "fortinet_firewall",
   "netbird_instance",
   "firewall_feed",
+  "ddi_mirror_target",
 ] as const;

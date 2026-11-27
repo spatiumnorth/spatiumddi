@@ -1,0 +1,15 @@
+{
+  "result": [
+    {
+      "_ref": "fixedaddress/ZG5zLmZpeGVkX2FkZHJlc3Mk:10.1.0.10/default",
+      "ipv4addr": "10.1.0.10",
+      "mac": "00:50:56:AA:BB:CC",
+      "name": "printer1",
+      "network": "10.1.0.0/24",
+      "network_view": "default",
+      "comment": "",
+      "disable": false,
+      "match_client": "MAC_ADDRESS"
+    }
+  ]
+}

@@ -37,6 +37,7 @@ from app.models.cutover import (
     CutoverItem,
     CutoverPlan,
 )
+from app.models.ddi_mirror import DDIMirrorObject, DDIMirrorTarget
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPConfigOp,
@@ -291,6 +292,8 @@ __all__ = [
     "NetbirdInstance",
     "OPNsenseRouter",
     "PANOSFirewall",
+    "DDIMirrorObject",
+    "DDIMirrorTarget",
     "ProxmoxNode",
     "ReleaseSchemaHead",
     "SystemUpgradeRun",
