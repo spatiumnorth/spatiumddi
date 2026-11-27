@@ -163,7 +163,7 @@ import {
 import { FreshRowError } from "@/components/FreshRowError";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal, ModalTabs } from "@/components/ui/modal";
-import { ListReadError } from "@/components/ui/list-read-error";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused } from "@/lib/refusal";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { VrfPicker } from "@/components/ipam/vrf-picker";
@@ -3053,7 +3053,11 @@ export function CreateSubnetModal({
   );
 
   // Available subnets query (only active when in size mode and block + prefix are set)
-  const { data: availableNets = [], isFetching: searchingNets } = useQuery({
+  const {
+    data: availableNets = [],
+    isFetching: searchingNets,
+    error: availableNetsError,
+  } = useQuery({
     queryKey: ["available-subnets", blockId, prefixLen],
     queryFn: () => ipamApi.availableSubnets(blockId, parseInt(prefixLen)),
     enabled: subnetMode === "size" && !!blockId && !!prefixLen,
@@ -3272,7 +3276,12 @@ export function CreateSubnetModal({
               <p className="text-xs text-muted-foreground italic">Searching…</p>
             ) : availableNets.length === 0 ? (
               <p className="text-xs text-amber-600 italic">
-                No available /{prefixLen} subnets in this block.
+                <ListEmpty
+                  error={availableNetsError}
+                  what="the block's free subnets"
+                >
+                  No available /{prefixLen} subnets in this block.
+                </ListEmpty>
               </p>
             ) : (
               <div>
@@ -3869,7 +3878,11 @@ export function AddAddressModal({
   // allocation policy picks, and the response names the strategy that
   // did: a ``random`` pick is drawn again on commit, so its address is
   // not the one the dialog allocates and is not shown as such (#1307).
-  const { data: nextPreview, isFetching: previewFetching } = useQuery({
+  const {
+    data: nextPreview,
+    isFetching: previewFetching,
+    error: nextPreviewError,
+  } = useQuery({
     queryKey: ["next-ip-preview", subnetId],
     queryFn: () => ipamApi.previewNextIp(subnetId, "sequential"),
     enabled: mode === "next",
@@ -4179,8 +4192,10 @@ export function AddAddressModal({
               </>
             ) : (
               <span className="text-destructive">
-                No free IPs in this subnet (all in use or inside a dynamic
-                pool).
+                <ListEmpty error={nextPreviewError} what="the next free IP">
+                  No free IPs in this subnet (all in use or inside a dynamic
+                  pool).
+                </ListEmpty>
               </span>
             )}
           </div>
@@ -5694,7 +5709,11 @@ export function SubnetDetail({
     setShowAllAddressRows(false);
   }, [subnet.id]);
 
-  const { data: addresses, isLoading } = useQuery({
+  const {
+    data: addresses,
+    isLoading,
+    error: addressesError,
+  } = useQuery({
     queryKey: ["addresses", subnet.id],
     queryFn: () => ipamApi.listAddresses(subnet.id),
   });
@@ -6713,16 +6732,23 @@ export function SubnetDetail({
             <div className="flex flex-col items-center justify-center py-16 text-center">
               <Network className="mb-3 h-10 w-10 text-muted-foreground/30" />
               <p className="text-sm text-muted-foreground">
-                No IP addresses allocated yet.
+                <ListEmpty
+                  error={addressesError}
+                  what="this subnet's addresses"
+                >
+                  No IP addresses allocated yet.
+                </ListEmpty>
               </p>
-              <button
-                onClick={() => setShowAddModal(true)}
-                {...permissionGate(canAllocate, NEEDS_ADDRESS_WRITE)}
-                className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                Allocate first IP
-              </button>
+              {!addressesError && (
+                <button
+                  onClick={() => setShowAddModal(true)}
+                  {...permissionGate(canAllocate, NEEDS_ADDRESS_WRITE)}
+                  className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  Allocate first IP
+                </button>
+              )}
             </div>
           ) : (
             <>
@@ -8485,7 +8511,11 @@ export function OrphansModal({
   const qc = useQueryClient();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [purgeError, setPurgeError] = useState<string | null>(null);
-  const { data: addrs, isLoading } = useQuery({
+  const {
+    data: addrs,
+    isLoading,
+    error: addrsError,
+  } = useQuery({
     queryKey: ["addresses", subnetId],
     queryFn: () => ipamApi.listAddresses(subnetId),
   });
@@ -8533,7 +8563,9 @@ export function OrphansModal({
           </div>
         ) : orphans.length === 0 ? (
           <div className="rounded-md border bg-muted/30 py-6 text-center text-sm">
-            No orphans in this subnet.
+            <ListEmpty error={addrsError} what="this subnet's addresses">
+              No orphans in this subnet.
+            </ListEmpty>
           </div>
         ) : (
           <div className="rounded-md border">
