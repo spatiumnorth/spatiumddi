@@ -124,6 +124,14 @@ migrations, and the chart and appliance changes listed below.
 
 - **The OpenShift certified profile lets the chart create the DNS / DHCP agents' SecurityContextConstraints (#3913).** `values-openshift-certified.yaml` keeps `openshift.scc.create: true`, as the plain chart does; Red Hat confirmed that SCCs in a certified chart are acceptable. The control plane needs none (`restricted-v2`). For clusters whose admins manage SCCs, set `openshift.scc.create: false` and apply the ready-made manifests in the chart's `files/openshift/` and grant them to the agents' ServiceAccounts, as documented in the Kubernetes deployment guide; a CI check keeps those manifests identical to what the chart renders.
 
+- **Weekly check of the pinned nginx against nginx.org's list of
+  affected and fixed versions (#4816).** The image scan cannot see
+  nginx.org's own packages, so a new weekly job reads that list and
+  files one issue when the pin is in an affected range
+  (`make nginx-fixed-check`). `versions.json` now marks nginx, BIND,
+  Kea, PowerDNS and PostgreSQL as `network_facing`, and
+  `make versions-upstream` lists those first when they are behind.
+
 ### Fixed
 
 - A backup restore is now refused (409 `restore_refused_mixed_release`) while the appliance is booted into one release but the console serving it is another, the state an acknowledged schema rollback leaves, where restoring made the older worker and beat run on the newer schema and stopped DNS changes reaching the DNS servers. The api, worker and beat `wait-for-migrate` init containers also keep waiting while a restore is running (#4678).
