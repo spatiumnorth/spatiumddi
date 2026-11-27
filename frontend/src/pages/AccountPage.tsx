@@ -188,7 +188,10 @@ function MfaPanel() {
               </p>
             )}
             {reauthFailed && (
-              <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <p
+                role="alert"
+                className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+              >
                 Re-authentication did not complete, so nothing was changed. Try
                 again.
               </p>
