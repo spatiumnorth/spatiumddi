@@ -1130,7 +1130,10 @@ function GroupServersList({
       )}
 
       {resumeMut.isError && (
-        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
           <span>
             Resume failed: {formatApiError(resumeMut.error, "request failed")}
           </span>

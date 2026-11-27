@@ -43,7 +43,7 @@ class FindSshSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_ssh_settings",
-    permission="authenticated",
+    permission=("read", "settings"),
     description=(
         "Return the appliance SSH configuration: whether password "
         "authentication is enabled, whether root login is permitted, the sshd "
