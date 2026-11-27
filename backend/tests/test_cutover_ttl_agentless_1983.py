@@ -93,6 +93,7 @@ async def test_windows_rfc2136_keeps_all_three(
 ) -> None:
     from types import SimpleNamespace
 
+    import dns.message
     import dns.query
 
     from app.drivers.dns import windows
@@ -100,7 +101,9 @@ async def test_windows_rfc2136_keeps_all_three(
     changes = await _preflight_changes(db_session, monkeypatch, "windows_dns")
     sent: list[Any] = []
     monkeypatch.setattr(windows, "resolve_server_address", lambda *a, **k: ["192.0.2.53"])
-    monkeypatch.setattr(dns.query, "tcp", lambda msg, *a, **k: sent.append(msg))
+    monkeypatch.setattr(
+        dns.query, "tcp", lambda msg, *a, **k: (sent.append(msg), dns.message.make_response(msg))[1]
+    )
     server = SimpleNamespace(id="s1", host="dc1.example.com", api_port=53)
     for c in changes:
         await windows.WindowsDNSDriver().apply_record_change(server, c)

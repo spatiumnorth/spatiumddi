@@ -2160,6 +2160,41 @@ def _is_section_audited(field: str) -> bool:
     return field in _SECTION_AUDITED_FIELDS or field.startswith(_SECTION_AUDITED_PREFIXES)
 
 
+class SettingsPublicResponse(BaseModel):
+    """What ``GET /settings`` returns to a caller without ``read`` on
+    ``settings``: only the fields the console shell and the ordinary
+    (non-Settings) pages read. An explicit allow-list, so a field added to
+    ``SettingsResponse`` stays admin-only until it is listed here too."""
+
+    app_title: str
+    session_timeout_minutes: int
+    auto_logout_minutes: int
+    utilization_warn_threshold: int
+    utilization_critical_threshold: int
+    utilization_max_prefix_ipv4: int
+    utilization_max_prefix_ipv6: int
+    subnet_tree_default_expanded_depth: int
+    dns_default_ttl: int
+    dns_default_zone_type: str
+    dns_recursive_by_default: bool
+    dhcp_default_dns_servers: list[str]
+    dhcp_default_domain_name: str
+    dhcp_default_domain_search: list[str]
+    dhcp_default_ntp_servers: list[str]
+    dhcp_default_lease_time: int
+    integration_kubernetes_enabled: bool
+    integration_docker_enabled: bool
+    integration_proxmox_enabled: bool
+    integration_tailscale_enabled: bool
+    integration_unifi_enabled: bool
+    integration_cloud_enabled: bool
+    integration_opnsense_enabled: bool
+    integration_netbird_enabled: bool
+    integration_panos_enabled: bool
+    integration_fortinet_enabled: bool
+    integration_meraki_enabled: bool
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -2217,9 +2252,25 @@ async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResp
     )
 
 
-@router.get("", response_model=SettingsResponse)
-async def get_settings(current_user: CurrentUser, db: DB) -> SettingsResponse:
-    return await _settings_response(db, await _get_or_create(db))
+def _may_read_settings(user: Any) -> bool:
+    return user_has_permission(user, "read", "settings") or user_has_permission(
+        user, "write", "settings"
+    )
+
+
+@router.get("", response_model=SettingsResponse | SettingsPublicResponse)
+async def get_settings(
+    current_user: CurrentUser, db: DB
+) -> SettingsResponse | SettingsPublicResponse:
+    """The full settings for a caller holding ``read`` (or ``write``, which
+    the Settings page needs to edit) on ``settings``; every other signed-in
+    caller gets the reduced ``SettingsPublicResponse``."""
+    full = await _settings_response(db, await _get_or_create(db))
+    if _may_read_settings(current_user):
+        return full
+    return SettingsPublicResponse.model_validate(
+        full.model_dump(include=set(SettingsPublicResponse.model_fields))
+    )
 
 
 @router.get("/defaults")
@@ -3081,7 +3132,10 @@ async def update_settings(
 # ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
 
 
-@router.get("/resolver", response_model=ResolverSettingsResponse)
+@router.get(
+    "/resolver",
+    response_model=ResolverSettingsResponse,
+)
 async def get_resolver_settings(current_user: CurrentUser, db: DB) -> ResolverSettingsResponse:
     """Scoped read of just the appliance DNS-resolver config (issue #158).
 
@@ -3090,6 +3144,11 @@ async def get_resolver_settings(current_user: CurrentUser, db: DB) -> ResolverSe
     ``SettingsResponse`` too); this endpoint exists per the spec so the form
     can fetch just its own state.
     """
+    if not _may_read_settings(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'read' on 'settings'",
+        )
     settings = await _get_or_create(db)
     return ResolverSettingsResponse.model_validate(settings)
 

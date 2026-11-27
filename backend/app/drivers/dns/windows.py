@@ -49,7 +49,7 @@ from app.drivers._winrm import (
 from app.drivers._winrm import (
     run_ps as _winrm_run_ps,
 )
-from app.drivers.dns._axfr import resolve_server_address
+from app.drivers.dns._axfr import resolve_server_address, send_rfc2136_update
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -289,7 +289,6 @@ class WindowsDNSDriver(DNSDriver):
     async def _apply_record_change_rfc2136(self, server: Any, change: RecordChange) -> None:
         import dns.message  # noqa: PLC0415
         import dns.name  # noqa: PLC0415
-        import dns.query  # noqa: PLC0415
         import dns.rdatatype  # noqa: PLC0415
         import dns.tsigkeyring  # noqa: PLC0415
         import dns.update  # noqa: PLC0415
@@ -375,7 +374,13 @@ class WindowsDNSDriver(DNSDriver):
         # the AXFR path we take only the first address: this is a WRITE, and
         # retrying it against a second address risks applying it twice.
         addr = resolve_server_address(host, port, what=f"RFC 2136 update of {change.zone_name}")[0]
-        await asyncio.to_thread(dns.query.tcp, update, addr, port=port, timeout=10)
+        await asyncio.to_thread(
+            send_rfc2136_update,
+            update,
+            addr,
+            port,
+            what=f"RFC 2136 update of {change.zone_name}",
+        )
 
     async def _apply_record_change_winrm(self, server: Any, change: RecordChange) -> None:
         """Record create/update/delete via ``*-DnsServerResourceRecord``."""

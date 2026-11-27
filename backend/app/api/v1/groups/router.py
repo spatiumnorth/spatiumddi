@@ -263,9 +263,13 @@ async def _resolve_users(db: DB, user_ids: list[uuid.UUID]) -> list[User]:
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
-@router.get("", response_model=list[GroupResponse])
+@router.get(
+    "",
+    response_model=list[GroupResponse],
+    dependencies=[Depends(require_permission("read", "group"))],
+)
 async def list_groups(db: DB, _: CurrentUser) -> list[GroupResponse]:
-    """Listing groups is available to any authenticated user.
+    """List groups; needs `read` on `group`.
 
     The Auth Providers admin page and the Groups admin page both rely on this
     to populate pickers. Mutations require `admin` on `group`.
@@ -346,7 +350,11 @@ async def create_group(
     return _to_response(g)
 
 
-@router.get("/{group_id}", response_model=GroupResponse)
+@router.get(
+    "/{group_id}",
+    response_model=GroupResponse,
+    dependencies=[Depends(require_permission("read", "group"))],
+)
 async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> GroupResponse:
     g = await _load_group(db, group_id)
     return _to_response(g)

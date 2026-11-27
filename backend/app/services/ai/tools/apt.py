@@ -41,7 +41,7 @@ class FindAptSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_apt_settings",
-    permission="authenticated",
+    permission=("read", "settings"),
     description=(
         "Return the appliance APT configuration — whether SpatiumDDI "
         "manages apt (apt_managed), the configured repository sources "
