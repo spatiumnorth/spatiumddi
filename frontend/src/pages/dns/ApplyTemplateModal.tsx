@@ -12,6 +12,7 @@ import {
   type ZoneTemplate,
 } from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
+import { Field } from "@/components/ui/field";
 
 const STATUS_LABEL: Record<ApplyTemplateStatus, string> = {
   add: "Add",
@@ -163,13 +164,11 @@ export function ApplyTemplateModal({
                 )}
               </p>
               {selected.parameters.map((p) => (
-                <div key={p.key}>
-                  <label className="mb-0.5 block text-xs font-medium">
-                    {p.label}
-                    {p.required && (
-                      <span className="ml-1 text-destructive">*</span>
-                    )}
-                  </label>
+                <Field
+                  key={p.key}
+                  label={p.required ? `${p.label} *` : p.label}
+                  hint={p.hint}
+                >
                   <input
                     type="text"
                     value={params[p.key] ?? ""}
@@ -183,12 +182,7 @@ export function ApplyTemplateModal({
                     placeholder={p.placeholder ?? ""}
                     className="w-full rounded border bg-background px-2 py-1 text-xs"
                   />
-                  {p.hint && (
-                    <p className="mt-0.5 text-[11px] text-muted-foreground">
-                      {p.hint}
-                    </p>
-                  )}
-                </div>
+                </Field>
               ))}
 
               {preview && (
