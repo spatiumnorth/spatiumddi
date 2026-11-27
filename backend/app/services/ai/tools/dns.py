@@ -2014,3 +2014,98 @@ async def list_blocklist_templates(
             "not enforce them."
         ),
     }
+
+
+# ── find_scheduled_dns_changes (#4830) ────────────────────────────────
+
+
+class FindScheduledDnsChangesArgs(BaseModel):
+    zone_id: str | None = Field(default=None, description="Restrict to one zone (UUID).")
+    group_id: str | None = Field(default=None, description="Restrict to one server group (UUID).")
+    record_id: str | None = Field(
+        default=None, description="Only changes aimed at this record (UUID)."
+    )
+    state: str | None = Field(
+        default=None,
+        description="pending, running, executed, failed or cancelled. Omit for every state.",
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+    @field_validator("state")
+    @classmethod
+    def _v_state(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        from app.models.dns import SCHEDULED_CHANGE_STATES  # noqa: PLC0415
+
+        norm = v.strip().lower()
+        if norm not in SCHEDULED_CHANGE_STATES:
+            raise ValueError(f"state must be one of {list(SCHEDULED_CHANGE_STATES)}")
+        return norm
+
+
+@register_tool(
+    name="find_scheduled_dns_changes",
+    honours_token_binding=True,
+    permission=("read", "dns_record"),
+    description=(
+        "DNS record changes held until a set time: a record to be created "
+        "(activated), updated, or deleted (deactivated) at scheduled_at (UTC). "
+        "Each row carries the zone, the action, the record it targets, the "
+        "fields it will set, its state (pending / running / executed / failed / "
+        "cancelled), the outcome message, and who scheduled it. Use for 'what "
+        "DNS changes are queued for tonight?', 'did the scheduled cutover run?', "
+        "or 'why did that scheduled change fail?'. Changes whose zone or record "
+        "is in the Trash are cancelled and listed as such. Read-only; scheduling "
+        "and cancelling are done in the DNS zone view or the REST API."
+    ),
+    args_model=FindScheduledDnsChangesArgs,
+    category="dns",
+    module="core.dns",
+)
+async def find_scheduled_dns_changes(
+    db: AsyncSession, user: User, args: FindScheduledDnsChangesArgs
+) -> list[dict[str, Any]]:
+    from app.models.dns import DNSScheduledChange  # noqa: PLC0415
+
+    # Joined to the zone, which the soft-delete filter hides while it is in the
+    # Trash, so a trashed zone's changes never list.
+    stmt = select(DNSScheduledChange, DNSZone.name.label("zone_name")).join(
+        DNSZone, DNSZone.id == DNSScheduledChange.zone_id
+    )
+    if args.zone_id:
+        stmt = stmt.where(DNSScheduledChange.zone_id == args.zone_id)
+    if args.group_id:
+        stmt = stmt.where(DNSZone.group_id == args.group_id)
+    if args.record_id:
+        stmt = stmt.where(DNSScheduledChange.record_id == args.record_id)
+    if args.state:
+        stmt = stmt.where(DNSScheduledChange.state == args.state)
+    zone_ids = token_zone_ids(user)
+    if zone_ids is not None:
+        stmt = stmt.where(DNSScheduledChange.zone_id.in_(zone_ids))
+    stmt = stmt.order_by(DNSScheduledChange.scheduled_at.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "id": str(r.DNSScheduledChange.id),
+            "zone_id": str(r.DNSScheduledChange.zone_id),
+            "zone_name": r.zone_name,
+            "record_id": (
+                str(r.DNSScheduledChange.record_id) if r.DNSScheduledChange.record_id else None
+            ),
+            "action": r.DNSScheduledChange.action,
+            "record": r.DNSScheduledChange.record_label,
+            "fields": r.DNSScheduledChange.payload,
+            "scheduled_at": r.DNSScheduledChange.scheduled_at.isoformat(),
+            "state": r.DNSScheduledChange.state,
+            "result_message": r.DNSScheduledChange.result_message,
+            "created_by": r.DNSScheduledChange.created_by_display,
+            "finished_at": (
+                r.DNSScheduledChange.finished_at.isoformat()
+                if r.DNSScheduledChange.finished_at
+                else None
+            ),
+        }
+        for r in rows
+    ]

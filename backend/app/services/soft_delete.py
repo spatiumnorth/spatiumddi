@@ -368,6 +368,14 @@ async def apply_soft_delete(
         # on the parent's audit row.
         if result.rowcount is not None and result.rowcount >= 0:
             child.count = int(result.rowcount)
+    # #4830 — a record change scheduled against a zone or record that is now in
+    # the Trash must not run, and a restore must not re-arm it.
+    zone_ids = [r.obj.id for r in batch.rows if r.resource_type == "dns_zone"]
+    record_ids = [r.obj.id for r in batch.rows if r.resource_type == "dns_record"]
+    if zone_ids or record_ids:
+        from app.services.dns.scheduled_changes import cancel_for_trash  # noqa: PLC0415
+
+        await cancel_for_trash(db, zone_ids=zone_ids, record_ids=record_ids, user_id=user_id)
     return now
 
 

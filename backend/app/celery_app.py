@@ -174,6 +174,7 @@ celery_app = SpatiumCelery(
         "app.tasks.dns",
         "app.tasks.blocklist_refresh_sweep",
         "app.tasks.dns_pull",
+        "app.tasks.dns_scheduled_changes",
         "app.tasks.looking_glass",
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
@@ -262,6 +263,7 @@ celery_app.conf.update(
         "app.tasks.dns.*": {"queue": "dns"},
         "app.tasks.blocklist_refresh_sweep.*": {"queue": "dns"},
         "app.tasks.dns_pull.*": {"queue": "dns"},
+        "app.tasks.dns_scheduled_changes.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
         "app.tasks.dhcp_mac_blocks.*": {"queue": "dhcp"},
@@ -359,6 +361,12 @@ celery_app.conf.update(
         "dns-agent-stale-sweep": {
             "task": "app.tasks.dns.agent_stale_sweep",
             "schedule": schedule(run_every=60.0),
+        },
+        # Every 30 s, run the DNS record changes an operator scheduled for a
+        # set time (#4830).
+        "dns-scheduled-changes": {
+            "task": "app.tasks.dns_scheduled_changes.run_due",
+            "schedule": schedule(run_every=30.0),
         },
         # Every 60 s, replay agentless DNS record ops a transient provider
         # error rescheduled (#1538) — agentless servers have no agent

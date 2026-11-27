@@ -164,6 +164,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         tables=(
             "dns_record",
             "dns_record_op",
+            "dns_scheduled_change",
             "dns_pool_member",
             "dns_pool",
             "dns_blocklist_view_assoc",
@@ -334,6 +335,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "dns_pool_member",
             "dns_ingest_snapshot",
             "dns_record",
+            "dns_scheduled_change",
             "dns_server_zone_state",
             "dns_zone",
             "dns_zone_update_acl",

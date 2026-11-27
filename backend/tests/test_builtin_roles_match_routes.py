@@ -186,6 +186,13 @@ OPEN_DNS_DHCP_WRITES: frozenset[tuple[str, str]] = frozenset(
     }
     | {
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/records/bulk-delete"),
+        # #4830 — record changes held until a set time.
+        ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/scheduled-changes"),
+        ("PUT", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/scheduled-changes/{{change_id}}"),
+        (
+            "POST",
+            f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/scheduled-changes/{{change_id}}/cancel",
+        ),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/delegate-from-parent"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/preview"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/spreadsheet/preview"),

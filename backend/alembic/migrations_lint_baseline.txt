@@ -586,6 +586,7 @@ backend/alembic/versions/d5b2e8a14c93_dhcpv6_prefix_delegation_duid.py:drop_colu
 backend/alembic/versions/d5b2e8a14c93_dhcpv6_prefix_delegation_duid.py:drop_column:34
 backend/alembic/versions/d5b2e8a14c93_dhcpv6_prefix_delegation_duid.py:drop_column:35
 backend/alembic/versions/d5b2e8a14c93_dhcpv6_prefix_delegation_duid.py:drop_column:36
+backend/alembic/versions/d5b2f8a1c3e7_dns_scheduled_change.py:drop_table:78
 backend/alembic/versions/d5b8a3f12e64_dhcp_pxe_profiles.py:drop_column:136
 backend/alembic/versions/d5b8a3f12e64_dhcp_pxe_profiles.py:drop_table:140
 backend/alembic/versions/d5b8a3f12e64_dhcp_pxe_profiles.py:drop_table:141

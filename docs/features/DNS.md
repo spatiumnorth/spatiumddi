@@ -1006,6 +1006,47 @@ that already exist — made before this check, or by an import or the IPAM sync,
 which do not refuse — keep serving whichever copy is deleted. The wire never
 carries the same RR twice.
 
+### Scheduled record changes (#4830)
+
+A record create, update or delete can be held until a set time, to activate a
+record at a cutover, deactivate it afterwards, or change a value at 02:00.
+There is no "disabled" record state: activating is a scheduled **create**,
+deactivating a scheduled **delete** (the record goes to the Trash, so a
+restore is one click), updating a scheduled **update** that names only the
+fields to change.
+
+- **API**: `POST/GET /dns/groups/{g}/zones/{z}/scheduled-changes`, `GET`/`PUT`
+  `…/{id}`, `POST …/{id}/cancel`. `scheduled_at` needs a UTC offset (`Z` is
+  fine) and is stored and returned in UTC; a time in the past, or more than 366
+  days ahead, is a 422. The list filters on `state`, `action` and `record_id`.
+  The record's content is validated when it is scheduled (type, value, driver
+  rules), so a bad payload fails now and not at 02:00.
+- **Execution**: a beat task (every 30 s, gated on `core.dns`) claims each due
+  change with one conditional `UPDATE`, so with several control-plane nodes
+  exactly one runs it, then replays it through the same handlers a live edit
+  uses, **as the user who scheduled it**. The record-op queue (RFC 2136 or the
+  driver's API) and the record's own audit row are therefore the ordinary ones;
+  the scheduler adds an audit row on `schedule`, `update`, `scheduled_cancel`
+  and `scheduled_execute`. The scheduling user's permission is checked again at
+  run time (deactivated or demoted: the change fails, it does not run).
+- **States**: `pending` (editable, cancellable), `running`, `executed`,
+  `failed` (the row says why: a twin appeared, the provider refused, the
+  permission is gone), `cancelled`. A worker that dies mid-change leaves it
+  `running`; after 15 minutes it is settled as `failed` rather than replayed,
+  because whether the write landed is unknown.
+- **Conflicts**: an update or delete remembers the record's fields when it was
+  scheduled; if the record was edited since, the change fails instead of
+  overwriting that edit. Re-saving the change's content re-bases it.
+- **Trash**: moving a zone, or a record, to the Trash cancels its pending changes
+  (the reason is on the row), and a restore does **not** re-arm them; schedule
+  again. A trashed zone's changes are hidden from the API and the Copilot with
+  the zone.
+- **Copilot**: `find_scheduled_dns_changes` (read, default-on). Scheduling and
+  cancelling stay REST-only for now; there is no `propose_*` twin.
+- **Not covered**: the zone and record views in the UI do not show scheduled
+  changes yet, and a scheduled change does not go through the approvals
+  workflow (#62).
+
 ---
 
 ## 6. Incremental DNS Updates (No Restarts)

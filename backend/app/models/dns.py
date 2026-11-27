@@ -630,6 +630,70 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 DNS_RECORD_OP_SEQ = Sequence("dns_record_op_seq_seq", metadata=Base.metadata)
 
 
+# Lifecycle of a ``DNSScheduledChange`` (#4830). ``pending`` is the only state a
+# change can be edited or cancelled from; ``running`` is the claim a worker
+# holds while it applies the change; the other three are terminal.
+SCHEDULED_CHANGE_STATES = ("pending", "running", "executed", "failed", "cancelled")
+SCHEDULED_CHANGE_ACTIONS = ("create", "update", "delete")
+
+
+class DNSScheduledChange(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A record create / update / delete held until ``scheduled_at`` (#4830).
+
+    Activating a record at a set time is a scheduled ``create``, deactivating
+    one a scheduled ``delete``; an ``update`` changes the fields named in
+    ``payload``. Nothing is written to ``dns_record`` until the change runs:
+    the executor (``app.services.dns.scheduled_changes``) replays it through
+    the same record handlers an operator's request goes through, so every
+    driver rule, the record-op queue and the audit row apply unchanged.
+    """
+
+    __tablename__ = "dns_scheduled_change"
+    __table_args__ = (
+        # The due sweep reads pending rows by time.
+        Index("ix_dns_scheduled_change_state_due", "state", "scheduled_at"),
+    )
+
+    # Gone with the zone; a trashed zone cancels its pending changes instead
+    # (``cancel_for_trashed``), so a restore never re-arms one.
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # The record an update / delete targets; set on a create once it has run.
+    # NULL after the record is purged (an update / delete then fails).
+    record_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_record.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action: Mapped[str] = mapped_column(String(10), nullable=False)
+    # create: the full record fields; update: only the fields to change;
+    # delete: empty.
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # "name type" of the target, frozen when scheduled so the row still reads
+    # after the record is renamed or purged.
+    record_label: Mapped[str] = mapped_column(String(600), nullable=False, default="")
+    # Hash of the target's fields when an update / delete was scheduled; the
+    # change refuses to run over a record that has changed since.
+    base_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="pending", server_default="pending"
+    )
+    # Why it failed or was cancelled; the outcome note of an executed change.
+    result_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    created_by_display: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+
 class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     """Per-record mutation queued for an agent to apply via RFC 2136."""
 

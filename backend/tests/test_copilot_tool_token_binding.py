@@ -46,6 +46,7 @@ AUDITED_TOKEN_BINDING_TOOLS = frozenset(
         "find_zone_dnssec_info",
         "find_dns_zone_drift",
         "find_zone_update_acls",
+        "find_scheduled_dns_changes",
         # IPAM — list filtered by the bound subnets, or by-id gated on them.
         "list_ip_spaces",
         "list_ip_blocks",
