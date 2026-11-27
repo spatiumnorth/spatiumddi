@@ -509,7 +509,12 @@ def _implicit_soft_delete_froms(select: Any, table_names: frozenset[str]) -> lis
     return out
 
 
-def _filter_implicit_froms(statement: Any, selects: list[Any], soft_tables: set[str]) -> Any:
+def _filter_implicit_froms(
+    statement: Any,
+    selects: list[Any],
+    soft_tables: set[str],
+    predicate: Any = None,
+) -> Any:
     """Add ``<from>.deleted_at IS NULL`` to every SELECT in ``statement``
     that reaches a soft-deletable table only through its WHERE clause.
 
@@ -517,6 +522,11 @@ def _filter_implicit_froms(statement: Any, selects: list[Any], soft_tables: set[
     SELECT needs it. Otherwise rebuilds the tree once with
     ``replacement_traverse``, rewriting innermost SELECTs first so a
     filtered subquery nested inside another filtered one keeps its filter.
+
+    ``predicate(from_obj)`` builds the clause added per FROM (default:
+    ``deleted_at IS NULL``); the tenant filter (``app.services.tenancy``,
+    #4263) reuses this walk with its own predicate and may return ``None`` for
+    a table it does not scope.
     """
     from sqlalchemy.sql import visitors
 
@@ -543,7 +553,15 @@ def _filter_implicit_froms(statement: Any, selects: list[Any], soft_tables: set[
 
         new = visitors.replacement_traverse(el, {}, replace)
         if key in needs:
-            new = new.where(*[f.c.deleted_at.is_(None) for f in needs[key]])
+            preds = [
+                p
+                for p in (
+                    predicate(f) if predicate else f.c.deleted_at.is_(None) for f in needs[key]
+                )
+                if p is not None
+            ]
+            if preds:
+                new = new.where(*preds)
         done[key] = new
         return new
 
@@ -562,6 +580,27 @@ def _audit_chain_hash(session: Session, _flush_context: Any, _instances: Any) ->
     from app.services.audit_chain import compute_audit_hashes
 
     compute_audit_hashes(session)
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _filter_tenant_scope(execute_state: Any) -> None:
+    """Narrow IPAM SELECTs to the request's tenant scope (#4263). A session
+    with no scope (every non-tenant caller, every Celery task) does nothing."""
+    if execute_state.session.info.get("tenant_scope") is None:
+        return
+    from app.services.tenancy import on_orm_execute
+
+    on_orm_execute(execute_state)
+
+
+@event.listens_for(Session, "before_flush")
+def _guard_tenant_writes(session: Session, flush_context: Any, instances: Any) -> None:
+    """Refuse a flush that writes outside the session's tenant scope (#4263)."""
+    if session.info.get("tenant_scope") is None:
+        return
+    from app.services.tenancy import on_before_flush
+
+    on_before_flush(session, flush_context, instances)
 
 
 @event.listens_for(Session, "do_orm_execute")

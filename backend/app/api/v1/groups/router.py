@@ -26,6 +26,7 @@ from app.api.stepup import require_stepup_if_granting_superadmin
 from app.core.permissions import caller_can_grant, refuse_and_audit, require_permission
 from app.models.audit import AuditLog
 from app.models.auth import Group, Role, User
+from app.models.tenant import Tenant
 from app.services.superadmin_grant import SuperadminModel, leaves_no_active_superadmin
 from app.services.time_bound_grants import load_active_grants_for_groups
 
@@ -39,6 +40,7 @@ router = APIRouter()
 class GroupResponse(BaseModel):
     id: uuid.UUID
     name: str
+    tenant_id: uuid.UUID | None = None
     description: str
     auth_source: str
     external_dn: str | None = None
@@ -48,6 +50,9 @@ class GroupResponse(BaseModel):
 
 class GroupCreate(BaseModel):
     name: str
+    # Binds the group to a tenant (#4263): its members become tenant users.
+    # Superadmin only, because unbinding widens access to the whole install.
+    tenant_id: uuid.UUID | None = None
     description: str = ""
     auth_source: str = "local"
     external_dn: str | None = None
@@ -76,6 +81,7 @@ class GroupCreate(BaseModel):
 
 class GroupUpdate(BaseModel):
     name: str | None = None
+    tenant_id: uuid.UUID | None = None
     description: str | None = None
     external_dn: str | None = None
     role_ids: list[uuid.UUID] | None = None
@@ -102,12 +108,43 @@ def _to_response(g: Group) -> GroupResponse:
     return GroupResponse(
         id=g.id,
         name=g.name,
+        tenant_id=g.tenant_id,
         description=g.description,
         auth_source=g.auth_source,
         external_dn=g.external_dn,
         role_ids=[r.id for r in g.roles],
         user_ids=[u.id for u in g.users],
     )
+
+
+def _has_wildcard_role(roles: Sequence[Role]) -> bool:
+    return any(
+        p.get("action") == "*" and p.get("resource_type") == "*"
+        for r in roles
+        for p in (r.permissions or [])
+    )
+
+
+async def _check_tenant_binding(
+    db: DB, current_user: User, tenant_id: uuid.UUID | None, roles: Sequence[Role]
+) -> None:
+    """A group's tenant is set by a superadmin only, names a real tenant, and
+    never sits with a ``*`` / ``*`` role: that role makes its holder an
+    effective superadmin, which is not confined to any tenant (#4263)."""
+    from app.api.deps import ensure_superadmin
+
+    ensure_superadmin(current_user)
+    if tenant_id is None:
+        return
+    if await db.get(Tenant, tenant_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Tenant not found"
+        )
+    if _has_wildcard_role(roles):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A group bound to a tenant cannot carry a superadmin (* / *) role",
+        )
 
 
 async def _load_group(db: DB, group_id: uuid.UUID) -> Group:
@@ -292,13 +329,19 @@ async def list_groups(db: DB, _: CurrentUser) -> list[GroupResponse]:
 async def create_group(
     body: GroupCreate, request: Request, current_user: CurrentUser, db: DB
 ) -> GroupResponse:
-    existing = await db.scalar(select(Group).where(Group.name == body.name))
+    existing = await db.scalar(
+        select(Group).where(
+            Group.name == body.name, Group.tenant_id.is_not_distinct_from(body.tenant_id)
+        )
+    )
     if existing is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Group name already in use"
         )
 
     roles = await _resolve_roles(db, body.role_ids)
+    if body.tenant_id is not None:
+        await _check_tenant_binding(db, current_user, body.tenant_id, roles)
     # Every role here is newly attached, and every member newly added, so the
     # one ceiling covers both: members of a new group hold only its roles.
     await _enforce_ceiling(
@@ -334,6 +377,7 @@ async def create_group(
     g = Group(
         id=new_group_id,
         name=body.name,
+        tenant_id=body.tenant_id,
         description=body.description,
         auth_source=body.auth_source,
         external_dn=body.external_dn,
@@ -374,8 +418,27 @@ async def update_group(
 ) -> GroupResponse:
     g = await _load_group(db, group_id)
 
-    if body.name is not None and body.name != g.name:
-        dup = await db.scalar(select(Group).where(Group.name == body.name, Group.id != g.id))
+    tenant_changes = "tenant_id" in body.model_fields_set and body.tenant_id != g.tenant_id
+    final_tenant = body.tenant_id if "tenant_id" in body.model_fields_set else g.tenant_id
+    if tenant_changes or (final_tenant is not None and body.role_ids is not None):
+        final_roles = (
+            await _resolve_roles(db, body.role_ids) if body.role_ids is not None else list(g.roles)
+        )
+        if tenant_changes:
+            await _check_tenant_binding(db, current_user, final_tenant, final_roles)
+        elif _has_wildcard_role(final_roles):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A group bound to a tenant cannot carry a superadmin (* / *) role",
+            )
+    if (body.name is not None and body.name != g.name) or tenant_changes:
+        dup = await db.scalar(
+            select(Group).where(
+                Group.name == (body.name if body.name is not None else g.name),
+                Group.id != g.id,
+                Group.tenant_id.is_not_distinct_from(final_tenant),
+            )
+        )
         if dup is not None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="Group name already in use"
@@ -459,6 +522,7 @@ async def update_group(
         (body.name is None or body.name == g.name)
         and (body.description is None or body.description == g.description)
         and (body.external_dn is None or body.external_dn == g.external_dn)
+        and not tenant_changes
         and (new_roles is None or {r.id for r in new_roles} == current_role_ids)
         and (new_users is None or {u.id for u in new_users} == current_member_ids)
     )
@@ -469,6 +533,8 @@ async def update_group(
         g.description = body.description
     if body.external_dn is not None:
         g.external_dn = body.external_dn
+    if tenant_changes:
+        g.tenant_id = body.tenant_id
     if new_roles is not None:
         g.roles = new_roles
     if new_users is not None:

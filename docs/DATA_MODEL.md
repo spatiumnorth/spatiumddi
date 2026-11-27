@@ -139,7 +139,7 @@ The core hierarchy is a strict containment tree:
 
 | Model | Table | Key FKs |
 |---|---|---|
-| `IPSpace` | `ip_space` | optional `vrf_id`, `asn_id`, `customer_id`, `dhcp_server_group_id` (all `SET NULL`) |
+| `IPSpace` | `ip_space` | optional `vrf_id`, `asn_id`, `customer_id`, `dhcp_server_group_id` (all `SET NULL`); optional `tenant_id` → `tenant` (`RESTRICT`, #4263) |
 | `IPBlock` | `ip_block` | `space_id` (`CASCADE`), `parent_block_id` → self (`CASCADE`), optional `vrf_id` / `asn_id` / `customer_id` / `site_id` / `ipam_template_id` |
 | `Subnet` | `subnet` | `space_id` (`RESTRICT`), `block_id` (`RESTRICT`), `router_zone_id` / `vlan_ref_id` (`SET NULL`) |
 | `IPAddress` | `ip_address` | `subnet_id` (`CASCADE`); optional `dns_zone_id` / `dns_record_id` (`SET NULL`), `nmap_scan_id` |
@@ -147,6 +147,9 @@ The core hierarchy is a strict containment tree:
 Notes:
 
 - `IPSpace.is_default` flags a single "simplified deployment" space.
+- `IPSpace.tenant_id` is the multi-tenancy boundary (#4263): blocks, subnets and
+  addresses belong to the tenant of their space. Space names are unique per tenant
+  (two partial unique indexes), install-wide among spaces with no tenant.
 - Block ↔ subnet overlap is enforced at the application layer using the
   PostgreSQL `cidr &&` operator (see IPAM.md); `IPAddress` is unique per
   `(subnet_id, address)`.
@@ -347,8 +350,9 @@ Permission grammar: [PERMISSIONS.md](PERMISSIONS.md).
 
 | Model | Table | Notes |
 |---|---|---|
+| `Tenant` | `tenant` | multi-tenancy boundary (#4263): unique case-insensitive `name`, optional `customer_id` (`SET NULL`); referenced `RESTRICT` by `ip_space.tenant_id`, `group.tenant_id` and `api_token.tenant_id` |
 | `User` | `user` | unique `username` / `email`; nullable `hashed_password` (external-auth users) |
-| `Group` | `group` | membership container |
+| `Group` | `group` | membership container; optional `tenant_id` binds its members to a tenant (#4263); name unique per tenant |
 | `Role` | `role` | `is_builtin` flag; `permissions` JSONB (`{action, resource_type, resource_id?}`) |
 | `APIToken` | `api_token` | hashed token; `scope`, `allowed_paths`, coarse `scopes`; `user_id` (`CASCADE`), `created_by_user_id` (`RESTRICT`) |
 | `UserSession` | `user_session` | active session rows |

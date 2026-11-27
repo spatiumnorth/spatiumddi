@@ -46,6 +46,7 @@ import {
 import { askAI } from "@/components/copilot/askAI";
 import { useAiAvailable } from "@/components/copilot/useAiAvailable";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { useTenantUser } from "@/hooks/useTenantUser";
 import { useSessionState } from "@/lib/useSessionState";
 import { useOverlayLayer } from "@/components/ui/use-draggable-modal";
 import {
@@ -300,6 +301,7 @@ export function GlobalSearch() {
   const uid = useId();
   const navigate = useNavigate();
   const { enabled: moduleEnabled } = useFeatureModules();
+  const tenantUser = useTenantUser();
 
   const [recents, setRecents] = useSessionState<string[]>(RECENTS_KEY, []);
 
@@ -343,7 +345,9 @@ export function GlobalSearch() {
   // shouldn't answer with a link to the Alerts page.
   const commands = useMemo(() => {
     if (!debouncedQuery || scope !== "all") return [];
-    return ALL_NAV_DESTINATIONS.filter((d) => navEntryVisible(d, moduleEnabled))
+    return ALL_NAV_DESTINATIONS.filter((d) =>
+      navEntryVisible(d, moduleEnabled, tenantUser),
+    )
       .map((d) => ({ dest: d, score: commandScore(debouncedQuery, d) }))
       .filter((c) => c.score > 0)
       .sort(
@@ -351,7 +355,7 @@ export function GlobalSearch() {
       )
       .slice(0, MAX_COMMANDS)
       .map((c) => c.dest);
-  }, [debouncedQuery, scope, moduleEnabled]);
+  }, [debouncedQuery, scope, moduleEnabled, tenantUser]);
 
   const aiAvailable = useAiAvailable();
   const askAIVisible = aiAvailable && debouncedQuery.length > 0;

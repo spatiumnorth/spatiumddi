@@ -331,6 +331,8 @@ export type DdnsHostnamePolicy =
 export interface IPSpace {
   id: string;
   name: string;
+  /** Owning tenant (#4263); null for an install-wide space. */
+  tenant_id?: string | null;
   description: string;
   is_default: boolean;
   tags: Record<string, unknown>;
@@ -4725,6 +4727,8 @@ export interface AuthProviderTestResult {
 export interface InternalGroup {
   id: string;
   name: string;
+  /** Tenant the group is bound to (#4263); its members are tenant users. */
+  tenant_id?: string | null;
   description: string;
   auth_source: string;
   external_dn?: string | null;
@@ -4734,6 +4738,7 @@ export interface InternalGroup {
 
 export interface InternalGroupCreate extends StepUp {
   name: string;
+  tenant_id?: string | null;
   description?: string;
   auth_source?: string;
   external_dn?: string | null;
@@ -4743,6 +4748,7 @@ export interface InternalGroupCreate extends StepUp {
 
 export interface InternalGroupUpdate extends StepUp {
   name?: string;
+  tenant_id?: string | null;
   description?: string;
   external_dn?: string | null;
   role_ids?: string[];
@@ -10723,6 +10729,8 @@ export const authApi = {
         is_superadmin: boolean;
         force_password_change: boolean;
         auth_source: string;
+        /** True for a tenant user (#4263): the console shows the IPAM surface only. */
+        is_tenant_user?: boolean;
       }>("/auth/me")
       .then((r) => r.data),
 
@@ -22334,4 +22342,44 @@ export const otApi = {
     api
       .post<OTDeviceImportCommitResponse>("/ot/devices/import/commit", data)
       .then((r) => r.data),
+};
+
+// ── Tenants (#4263) ─────────────────────────────────────────────────────────
+
+export interface Tenant {
+  id: string;
+  name: string;
+  description: string;
+  customer_id: string | null;
+  space_count: number;
+  group_count: number;
+  token_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface TenantWrite {
+  name?: string;
+  description?: string;
+  customer_id?: string | null;
+}
+
+export const tenantsApi = {
+  list: () => api.get<Tenant[]>("/tenants").then((r) => r.data),
+  get: (id: string) => api.get<Tenant>(`/tenants/${id}`).then((r) => r.data),
+  create: (body: TenantWrite & { name: string }) =>
+    api.post<Tenant>("/tenants", body).then((r) => r.data),
+  update: (id: string, body: TenantWrite) =>
+    api.put<Tenant>(`/tenants/${id}`, body).then((r) => r.data),
+  remove: (id: string) => api.delete(`/tenants/${id}`),
+  spaces: (id: string) =>
+    api
+      .get<{ id: string; name: string }[]>(`/tenants/${id}/spaces`)
+      .then((r) => r.data),
+  assignSpaces: (id: string, spaceIds: string[]) =>
+    api
+      .post<Tenant>(`/tenants/${id}/spaces`, { space_ids: spaceIds })
+      .then((r) => r.data),
+  unassignSpace: (id: string, spaceId: string) =>
+    api.delete(`/tenants/${id}/spaces/${spaceId}`),
 };

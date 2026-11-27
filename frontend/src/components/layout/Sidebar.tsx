@@ -17,6 +17,7 @@ import {
 import { cn } from "@/lib/utils";
 import { safeExternalHref } from "@/lib/safeUrl";
 import { changeRequestsApi, versionApi } from "@/lib/api";
+import { useTenantUser } from "@/hooks/useTenantUser";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { pollUnlessRefused } from "@/lib/refusal";
@@ -324,11 +325,14 @@ export function Sidebar({
   // Loading / error state defaults to "everything visible" so the
   // sidebar never blinks empty on a slow network.
   const { enabled: moduleEnabled } = useFeatureModules();
+  // #4263 — a tenant user is confined to their tenant's IP spaces; every page
+  // outside IPAM reads data the API refuses them, so their navigation is IPAM only.
+  const tenantUser = useTenantUser();
   // Shared with the command palette (``lib/navigation.ts``) so a
   // module-gated page is hidden identically in both places.
   const filterByModule = <T extends { module?: string; anyModule?: string[] }>(
     items: T[],
-  ): T[] => filterNav(items, moduleEnabled);
+  ): T[] => filterNav(items, moduleEnabled, tenantUser);
 
   // Pending approval-queue count → the Change Requests nav badge. Only
   // polls when the (default-off) governance.approvals module is on, so a
@@ -415,174 +419,16 @@ export function Sidebar({
 
         {/* Nav */}
         <nav className="flex-1 overflow-y-auto p-2 space-y-4">
-          <NavSection
-            label="Core"
-            storageKey="sidebar-section-core-open"
-            collapsed={effectiveCollapsed}
-          >
-            {mainNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-            {/* #1068 — both sub-groups go through the module filter and
-             *  their heading is suppressed when nothing survives it. The
-             *  DNS group carried module tags that nothing applied, so with
-             *  core.dns off you got a "DNS" heading over a lone Domains
-             *  row: not a missing feature, just a stray label that reads
-             *  like the menu has been reshuffled. */}
-            {(() => {
-              const ipamItems = filterByModule(coreIpamNav);
-              const dnsItems = filterByModule(dnsSectionNav);
-              return (
-                <>
-                  {ipamItems.length > 0 && (
-                    <SubNavLabel label="IPAM" collapsed={effectiveCollapsed} />
-                  )}
-                  {ipamItems.map((item) => (
-                    <NavItem
-                      key={item.to}
-                      {...item}
-                      collapsed={effectiveCollapsed}
-                      onNavigate={mobileOpen ? onMobileClose : undefined}
-                    />
-                  ))}
-                  {dnsItems.length > 0 && (
-                    <SubNavLabel label="DNS" collapsed={effectiveCollapsed} />
-                  )}
-                  {dnsItems.map((item) => (
-                    <NavItem
-                      key={item.to}
-                      {...item}
-                      collapsed={effectiveCollapsed}
-                      onNavigate={mobileOpen ? onMobileClose : undefined}
-                    />
-                  ))}
-                </>
-              );
-            })()}
-          </NavSection>
-
-          <NavSection
-            label="Operations"
-            storageKey="sidebar-section-operations-open"
-            collapsed={effectiveCollapsed}
-            showDivider
-          >
-            {operationsNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-          </NavSection>
-
-          {(() => {
-            const visibleLogical = filterByModule(networkLogicalNav);
-            const visibleInfra = filterByModule(networkInfrastructureNav);
-            // Hide the whole Network section if everything inside is
-            // disabled — otherwise we'd render an empty header.
-            if (visibleLogical.length + visibleInfra.length === 0) return null;
-            return (
-              <NavSection
-                label="Network"
-                storageKey="sidebar-section-network-open"
-                collapsed={effectiveCollapsed}
-                showDivider
-              >
-                {visibleLogical.length > 0 && (
-                  <>
-                    <SubNavLabel
-                      label="Logical"
-                      collapsed={effectiveCollapsed}
-                    />
-                    {visibleLogical.map((item) => (
-                      <NavItem
-                        key={item.to}
-                        {...item}
-                        collapsed={effectiveCollapsed}
-                        onNavigate={mobileOpen ? onMobileClose : undefined}
-                      />
-                    ))}
-                  </>
-                )}
-                {visibleInfra.length > 0 && (
-                  <>
-                    <SubNavLabel
-                      label="Infrastructure"
-                      collapsed={effectiveCollapsed}
-                    />
-                    {visibleInfra.map((item) => (
-                      <NavItem
-                        key={item.to}
-                        {...item}
-                        collapsed={effectiveCollapsed}
-                        onNavigate={mobileOpen ? onMobileClose : undefined}
-                      />
-                    ))}
-                  </>
-                )}
-              </NavSection>
-            );
-          })()}
-
-          {(() => {
-            const visibleTools = filterByModule(toolsNav);
-            if (visibleTools.length === 0) return null;
-            return (
-              <NavSection
-                label="Tools"
-                storageKey="sidebar-section-tools-open"
-                collapsed={effectiveCollapsed}
-                showDivider
-              >
-                {visibleTools.map((item) => (
-                  <NavItem
-                    key={item.to}
-                    {...item}
-                    collapsed={effectiveCollapsed}
-                    onNavigate={mobileOpen ? onMobileClose : undefined}
-                  />
-                ))}
-              </NavSection>
-            );
-          })()}
-
-          {(() => {
-            const visibleReports = filterByModule(reportsNav);
-            if (visibleReports.length === 0) return null;
-            return (
-              <NavSection
-                label="Reports"
-                storageKey="sidebar-section-reports-open"
-                collapsed={effectiveCollapsed}
-                showDivider
-              >
-                {visibleReports.map((item) => (
-                  <NavItem
-                    key={item.to}
-                    {...item}
-                    collapsed={effectiveCollapsed}
-                    onNavigate={mobileOpen ? onMobileClose : undefined}
-                  />
-                ))}
-              </NavSection>
-            );
-          })()}
-
-          {visibleIntegrations.length > 0 && (
+          {tenantUser ? (
             <NavSection
-              label="Integrations"
-              storageKey="sidebar-section-integrations-open"
+              label="IPAM"
+              storageKey="sidebar-section-core-open"
               collapsed={effectiveCollapsed}
-              showDivider
             >
-              {visibleIntegrations.map((item) => (
+              {[
+                ...filterByModule(baseMainNav),
+                ...filterByModule(coreIpamNav),
+              ].map((item) => (
                 <NavItem
                   key={item.to}
                   {...item}
@@ -591,68 +437,261 @@ export function Sidebar({
                 />
               ))}
             </NavSection>
-          )}
+          ) : (
+            <>
+              <NavSection
+                label="Core"
+                storageKey="sidebar-section-core-open"
+                collapsed={effectiveCollapsed}
+              >
+                {mainNav.map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+                {/* #1068 — both sub-groups go through the module filter and
+                 *  their heading is suppressed when nothing survives it. The
+                 *  DNS group carried module tags that nothing applied, so with
+                 *  core.dns off you got a "DNS" heading over a lone Domains
+                 *  row: not a missing feature, just a stray label that reads
+                 *  like the menu has been reshuffled. */}
+                {(() => {
+                  const ipamItems = filterByModule(coreIpamNav);
+                  const dnsItems = filterByModule(dnsSectionNav);
+                  return (
+                    <>
+                      {ipamItems.length > 0 && (
+                        <SubNavLabel
+                          label="IPAM"
+                          collapsed={effectiveCollapsed}
+                        />
+                      )}
+                      {ipamItems.map((item) => (
+                        <NavItem
+                          key={item.to}
+                          {...item}
+                          collapsed={effectiveCollapsed}
+                          onNavigate={mobileOpen ? onMobileClose : undefined}
+                        />
+                      ))}
+                      {dnsItems.length > 0 && (
+                        <SubNavLabel
+                          label="DNS"
+                          collapsed={effectiveCollapsed}
+                        />
+                      )}
+                      {dnsItems.map((item) => (
+                        <NavItem
+                          key={item.to}
+                          {...item}
+                          collapsed={effectiveCollapsed}
+                          onNavigate={mobileOpen ? onMobileClose : undefined}
+                        />
+                      ))}
+                    </>
+                  );
+                })()}
+              </NavSection>
 
-          <NavSection
-            label="Administration"
-            storageKey="sidebar-section-admin-open"
-            collapsed={effectiveCollapsed}
-            showDivider
-          >
-            <SubNavLabel label="Identity" collapsed={effectiveCollapsed} />
-            {adminIdentityNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
+              <NavSection
+                label="Operations"
+                storageKey="sidebar-section-operations-open"
                 collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-            <SubNavLabel label="Configuration" collapsed={effectiveCollapsed} />
-            {filterByModule(adminConfigurationNav).map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
+                showDivider
+              >
+                {operationsNav.map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+              </NavSection>
+
+              {(() => {
+                const visibleLogical = filterByModule(networkLogicalNav);
+                const visibleInfra = filterByModule(networkInfrastructureNav);
+                // Hide the whole Network section if everything inside is
+                // disabled — otherwise we'd render an empty header.
+                if (visibleLogical.length + visibleInfra.length === 0)
+                  return null;
+                return (
+                  <NavSection
+                    label="Network"
+                    storageKey="sidebar-section-network-open"
+                    collapsed={effectiveCollapsed}
+                    showDivider
+                  >
+                    {visibleLogical.length > 0 && (
+                      <>
+                        <SubNavLabel
+                          label="Logical"
+                          collapsed={effectiveCollapsed}
+                        />
+                        {visibleLogical.map((item) => (
+                          <NavItem
+                            key={item.to}
+                            {...item}
+                            collapsed={effectiveCollapsed}
+                            onNavigate={mobileOpen ? onMobileClose : undefined}
+                          />
+                        ))}
+                      </>
+                    )}
+                    {visibleInfra.length > 0 && (
+                      <>
+                        <SubNavLabel
+                          label="Infrastructure"
+                          collapsed={effectiveCollapsed}
+                        />
+                        {visibleInfra.map((item) => (
+                          <NavItem
+                            key={item.to}
+                            {...item}
+                            collapsed={effectiveCollapsed}
+                            onNavigate={mobileOpen ? onMobileClose : undefined}
+                          />
+                        ))}
+                      </>
+                    )}
+                  </NavSection>
+                );
+              })()}
+
+              {(() => {
+                const visibleTools = filterByModule(toolsNav);
+                if (visibleTools.length === 0) return null;
+                return (
+                  <NavSection
+                    label="Tools"
+                    storageKey="sidebar-section-tools-open"
+                    collapsed={effectiveCollapsed}
+                    showDivider
+                  >
+                    {visibleTools.map((item) => (
+                      <NavItem
+                        key={item.to}
+                        {...item}
+                        collapsed={effectiveCollapsed}
+                        onNavigate={mobileOpen ? onMobileClose : undefined}
+                      />
+                    ))}
+                  </NavSection>
+                );
+              })()}
+
+              {(() => {
+                const visibleReports = filterByModule(reportsNav);
+                if (visibleReports.length === 0) return null;
+                return (
+                  <NavSection
+                    label="Reports"
+                    storageKey="sidebar-section-reports-open"
+                    collapsed={effectiveCollapsed}
+                    showDivider
+                  >
+                    {visibleReports.map((item) => (
+                      <NavItem
+                        key={item.to}
+                        {...item}
+                        collapsed={effectiveCollapsed}
+                        onNavigate={mobileOpen ? onMobileClose : undefined}
+                      />
+                    ))}
+                  </NavSection>
+                );
+              })()}
+
+              {visibleIntegrations.length > 0 && (
+                <NavSection
+                  label="Integrations"
+                  storageKey="sidebar-section-integrations-open"
+                  collapsed={effectiveCollapsed}
+                  showDivider
+                >
+                  {visibleIntegrations.map((item) => (
+                    <NavItem
+                      key={item.to}
+                      {...item}
+                      collapsed={effectiveCollapsed}
+                      onNavigate={mobileOpen ? onMobileClose : undefined}
+                    />
+                  ))}
+                </NavSection>
+              )}
+
+              <NavSection
+                label="Administration"
+                storageKey="sidebar-section-admin-open"
                 collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-            <SubNavLabel label="Notifications" collapsed={effectiveCollapsed} />
-            {filterByModule(adminNotificationsNav).map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                badge={
-                  item.to === "/admin/change-requests"
-                    ? pendingChangeCount
-                    : undefined
-                }
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-            <SubNavLabel
-              label="Insights & Audit"
-              collapsed={effectiveCollapsed}
-            />
-            {filterByModule(adminInsightsNav).map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-            <SubNavLabel label="Reference" collapsed={effectiveCollapsed} />
-            {adminReferenceNav.map((item) => (
-              <NavExternalItem
-                key={item.href}
-                {...item}
-                collapsed={effectiveCollapsed}
-              />
-            ))}
-            <div className="my-1 border-t border-sidebar-border/60" />
-          </NavSection>
+                showDivider
+              >
+                <SubNavLabel label="Identity" collapsed={effectiveCollapsed} />
+                {filterByModule(adminIdentityNav).map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+                <SubNavLabel
+                  label="Configuration"
+                  collapsed={effectiveCollapsed}
+                />
+                {filterByModule(adminConfigurationNav).map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+                <SubNavLabel
+                  label="Notifications"
+                  collapsed={effectiveCollapsed}
+                />
+                {filterByModule(adminNotificationsNav).map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    badge={
+                      item.to === "/admin/change-requests"
+                        ? pendingChangeCount
+                        : undefined
+                    }
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+                <SubNavLabel
+                  label="Insights & Audit"
+                  collapsed={effectiveCollapsed}
+                />
+                {filterByModule(adminInsightsNav).map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+                <SubNavLabel label="Reference" collapsed={effectiveCollapsed} />
+                {adminReferenceNav.map((item) => (
+                  <NavExternalItem
+                    key={item.href}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                  />
+                ))}
+                <div className="my-1 border-t border-sidebar-border/60" />
+              </NavSection>
+            </>
+          )}
         </nav>
 
         {/* Footer (#2895 — compacted). The three destinations an operator
@@ -681,21 +720,25 @@ export function Sidebar({
             (docker/k8s control plane + appliance agents) is a real
             deployment shape.
           */}
-          <NavItem
-            label="Appliance"
-            icon={Wrench}
-            to="/appliance"
-            collapsed={effectiveCollapsed}
-            onNavigate={mobileOpen ? onMobileClose : undefined}
-          />
+          {!tenantUser && (
+            <>
+              <NavItem
+                label="Appliance"
+                icon={Wrench}
+                to="/appliance"
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
 
-          <NavItem
-            label="Features & Integrations"
-            icon={ToggleLeft}
-            to="/admin/features"
-            collapsed={effectiveCollapsed}
-            onNavigate={mobileOpen ? onMobileClose : undefined}
-          />
+              <NavItem
+                label="Features & Integrations"
+                icon={ToggleLeft}
+                to="/admin/features"
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            </>
+          )}
 
           <NavItem
             label="Settings"

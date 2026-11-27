@@ -89,6 +89,8 @@ import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
 import { DomainsPage } from "@/pages/admin/DomainsPage";
 import { DomainDetailPage } from "@/pages/admin/DomainDetailPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
+import { useTenantUserState } from "@/hooks/useTenantUser";
+import { TenantsPage } from "@/pages/admin/TenantsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
 import { CompliancePage } from "@/pages/admin/CompliancePage";
 import { ConformityPage } from "@/pages/admin/ConformityPage";
@@ -140,6 +142,14 @@ function LegacyDeviceRoute() {
   return <Navigate to={`/network/devices/${id}${search}${hash}`} replace />;
 }
 
+// A tenant user (#4263) has no dashboard: its panels read install-wide data the
+// API refuses them, so they land on IPAM.
+function HomeRedirect() {
+  const { tenantUser, ready } = useTenantUserState();
+  if (!ready) return null;
+  return <Navigate to={tenantUser ? "/ipam" : "/dashboard"} replace />;
+}
+
 export default function App() {
   // Issue #888 — keep the browser tab on the operator's configured title.
   useBrandDocumentTitle();
@@ -157,7 +167,7 @@ export default function App() {
           </ProtectedRoute>
         }
       >
-        <Route index element={<Navigate to="/dashboard" replace />} />
+        <Route index element={<HomeRedirect />} />
         {/* #2895 — signed-in only: the version, the libraries and the
             third-party tools are not for someone probing from outside. */}
         <Route path="about" element={<AboutPage />} />
@@ -243,6 +253,7 @@ export default function App() {
         <Route path="unifi/:id" element={<UnifiControllerDetailPage />} />
         <Route path="admin/users" element={<UsersPage />} />
         <Route path="admin/groups" element={<GroupsPage />} />
+        <Route path="admin/tenants" element={<TenantsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
         {/* Configuration → Import hub (#36): one shell with a left sub-nav.

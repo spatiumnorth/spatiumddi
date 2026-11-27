@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends
 
+from app.api.tenant_binding import mark_router_tenant_aware
 from app.api.token_path_scope import include_token_scoped
 from app.api.v1.about import router as about_router
 from app.api.v1.acme import router as acme_router
@@ -57,6 +58,7 @@ from app.api.v1.groups.router import router as groups_router
 from app.api.v1.groups.time_bound_grants import router as time_bound_grants_router
 from app.api.v1.ipam.integration_space_audit import router as integration_space_audit_router
 from app.api.v1.ipam.router import router as ipam_router
+from app.api.v1.ipam.tenant_policy import TENANT_REFUSED_IPAM_ENDPOINTS
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
 from app.api.v1.looking_glass.agents import router as looking_glass_agents_router
@@ -91,6 +93,7 @@ from app.api.v1.settings.router import router as settings_router
 from app.api.v1.system import router as system_router
 from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
+from app.api.v1.tenants import router as tenants_router
 from app.api.v1.tls_certs import router as tls_certs_router
 from app.api.v1.tools import router as tools_router
 from app.api.v1.unifi import router as unifi_router
@@ -152,6 +155,9 @@ api_v1_router.include_router(
     dependencies=[Depends(require_module("network.asn"))],
 )
 api_v1_router.include_router(audit_router, prefix="/audit", tags=["audit"])
+# Every /auth route is the caller's own sign-in / MFA / password surface, so a
+# tenant user (#4263) may use all of them.
+mark_router_tenant_aware(auth_router)
 api_v1_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 api_v1_router.include_router(
     auth_providers_router, prefix="/auth-providers", tags=["auth-providers"]
@@ -214,6 +220,12 @@ api_v1_router.include_router(
 )
 api_v1_router.include_router(custom_fields_router, prefix="/custom-fields", tags=["custom-fields"])
 api_v1_router.include_router(dashboards_router, prefix="/dashboards", tags=["dashboards"])
+api_v1_router.include_router(
+    tenants_router,
+    prefix="/tenants",
+    tags=["tenants"],
+    dependencies=[Depends(require_module("ipam.tenants"))],
+)
 api_v1_router.include_router(
     customers_router,
     prefix="/customers",
@@ -371,6 +383,11 @@ api_v1_router.include_router(groups_router, prefix="/groups", tags=["groups"])
 # resource-bound token is refused on it. Mounted before the IPAM router so no
 # parameterised IPAM path can shadow the literal one.
 api_v1_router.include_router(integration_space_audit_router, prefix="/ipam", tags=["ipam"])
+# Multi-tenancy phase 1 (#4263): the IPAM routes serve tenant users because the
+# session filter (``app.services.tenancy``) narrows every IPAM read to the
+# tenant. The routes below are refused because they reach DNS / DHCP / shared
+# objects, or read leases and zones the filter does not cover.
+mark_router_tenant_aware(ipam_router, exclude=TENANT_REFUSED_IPAM_ENDPOINTS)
 include_token_scoped(
     api_v1_router,
     ipam_router,

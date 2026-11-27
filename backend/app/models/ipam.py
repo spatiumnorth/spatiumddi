@@ -135,15 +135,35 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         # see it and the INSERT 500'd on the constraint (#491). Scoping
         # uniqueness to live rows matches the soft-delete semantics — same
         # pattern as uq_dhcp_scope_group_subnet (b67286f).
+        #
+        # Multi-tenancy (#4263): a name is unique install-wide among spaces
+        # without a tenant (exactly as before) and unique per tenant among
+        # spaces with one, so two customers may both own "Corporate".
         Index(
             "ix_ip_space_name",
             "name",
             unique=True,
-            postgresql_where=sa_text("deleted_at IS NULL"),
+            postgresql_where=sa_text("deleted_at IS NULL AND tenant_id IS NULL"),
+        ),
+        Index(
+            "ix_ip_space_tenant_name",
+            "tenant_id",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL AND tenant_id IS NOT NULL"),
         ),
     )
 
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The tenant boundary (#4263). NULL = an ordinary install-wide space that
+    # only non-tenant users see. Blocks, subnets and addresses inherit it from
+    # their space. RESTRICT: a tenant that still owns a space cannot be deleted.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenant.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

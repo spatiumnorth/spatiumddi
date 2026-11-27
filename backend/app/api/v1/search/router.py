@@ -11,6 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 
 from app.api.deps import DB, CurrentUser
+from app.api.tenant_binding import tenant_aware
 from app.api.token_binding import honours_token_binding
 from app.services.search import execute, visible_providers
 from app.services.search.schemas import SearchResponse, SearchResult, SearchTypeInfo
@@ -22,6 +23,7 @@ router = APIRouter()
 
 @router.get("/types", response_model=list[SearchTypeInfo])
 @honours_token_binding
+@tenant_aware
 async def searchable_types(current_user: CurrentUser, db: DB) -> list[SearchTypeInfo]:
     """Types this caller may search, for building scope filters.
 
@@ -37,6 +39,7 @@ async def searchable_types(current_user: CurrentUser, db: DB) -> list[SearchType
 
 @router.get("", response_model=SearchResponse)
 @honours_token_binding
+@tenant_aware
 async def global_search(
     current_user: CurrentUser,
     db: DB,

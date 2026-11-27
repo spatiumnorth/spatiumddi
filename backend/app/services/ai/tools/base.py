@@ -130,6 +130,12 @@ def _carries_token_binding(user: User) -> bool:
     return bool(_token_grants_for(user))
 
 
+def _is_tenant_user(user: User) -> bool:
+    from app.services.tenancy import is_tenant_user  # noqa: PLC0415
+
+    return is_tenant_user(user)
+
+
 def tool_callable_by(user: User, tool: Tool) -> bool:
     """Whether ``user`` may call ``tool`` — the one decision both
     ``tools/list`` and dispatch use.
@@ -149,6 +155,11 @@ def tool_callable_by(user: User, tool: Tool) -> bool:
     if tool.permission is None or not tool_permission_allows(user, tool.permission):
         return False
     if not tool.honours_token_binding and _carries_token_binding(user):
+        return False
+    # A tenant user (#4263) may only call a tool that declares it reads IPAM
+    # rows alone, which the session's tenant filter then narrows. Any other
+    # tool reads install-wide tables, so it is not offered, not trusted.
+    if not tool.tenant_aware and _is_tenant_user(user):
         return False
     return True
 
@@ -217,6 +228,12 @@ class Tool:
     # :func:`tool_callable_by`. Leave False unless every row the tool can
     # return is filtered by, or gated on, the token's bound instances.
     honours_token_binding: bool = False
+    # Whether a tenant user (#4263) may call the tool: every row it can return
+    # comes from the IPAM tables the session's tenant filter narrows
+    # (``app.services.tenancy``), or none comes from the install. Leave False
+    # for anything that reads DNS, DHCP, network, audit or settings data;
+    # ``tests/test_copilot_tool_tenant_4263.py`` pins the audited list.
+    tenant_aware: bool = False
     # True for a tool that makes SpatiumDDI send traffic outward: a probe
     # (ping / traceroute / port / TLS / DNS query), a live pull from a
     # managed server (AXFR, WinRM, a vendor / cloud API, a backup
@@ -349,6 +366,14 @@ class ToolRegistry:
 
             if await consume_budget(str(user.id), tool.rate_limit):
                 return rate_limit_refusal(name, tool.rate_limit)
+        # Whatever entry path brought the call (REST, MCP, the in-app chat, a
+        # background session), a tenant user's rows are narrowed to the tenant:
+        # the scope is set here rather than trusted to have been set earlier.
+        from app.services.tenancy import set_session_scope, tenant_scope_for  # noqa: PLC0415
+
+        scope = tenant_scope_for(user)
+        if scope is not None:
+            set_session_scope(db, scope)
         return await tool.executor(db, user, args)
 
 
@@ -418,6 +443,7 @@ def register_tool(
     permission: ToolPermission,
     rate_limit: str | None = None,
     honours_token_binding: bool = False,
+    tenant_aware: bool = False,
     outbound: bool = False,
     outbound_scope: str | None = None,
 ) -> Callable[[ToolExecutor], ToolExecutor]:
@@ -466,6 +492,7 @@ def register_tool(
                 permission=permission,
                 rate_limit=rate_limit,
                 honours_token_binding=honours_token_binding,
+                tenant_aware=tenant_aware,
                 outbound=outbound,
                 outbound_scope=outbound_scope,
             )

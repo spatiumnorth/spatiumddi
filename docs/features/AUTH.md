@@ -967,6 +967,34 @@ both `expires_in_days` (UX-friendly) and `expires_at` (ISO timestamp,
 for automation). Expired tokens 401 with a distinct detail message
 so clients can detect "refresh me" vs "reconfigure me".
 
+## Tenants and tenant users (#4263)
+
+A managed-service provider runs one console for several customers. A **tenant** is the
+boundary: it owns IP spaces, and each customer's users sign in to the same console and
+work only in their own.
+
+1. **Settings → Features → Tenants** turns on the management page (it is also on
+   wherever a tenant already exists). Administration → Tenants then creates tenants and
+   puts IP spaces into them. A space belongs to at most one tenant and takes its blocks,
+   subnets and addresses with it, so moving a block between spaces moves its tenant too.
+2. **Bind a group.** In Administration → Groups, pick the group's tenant (superadmin
+   only). Its members become tenant users, and the roles the group carries apply *inside*
+   the tenant: an `IPAM Editor` edits that tenant's IPAM and sees nothing else. A group
+   with a `*` / `*` role cannot be bound.
+3. **Pin a token** (optional): an API token created with a `tenant_id` sees that tenant
+   only; for a tenant user it can only narrow, never widen.
+
+Group names, like IP space names, are unique per tenant, so two customers can both have
+an `Admins` group and a `Corporate` space. Names outside any tenant stay unique install
+wide.
+
+A tenant user sees the IPAM surface (and the console hides navigation they have no use
+for); every route that has not been made tenant-aware answers `403`. See
+[PERMISSIONS.md](../PERMISSIONS.md#tenant-users-4263) for how tenant and role combine and
+what is deliberately out of scope in phase 1: DNS zones and records, DHCP scopes and leases,
+audit history, alerts, dashboards and reports per tenant, a Tenant Admin role, per-tenant
+quotas and webhooks, and rules for server groups shared between tenants.
+
 ## Open items
 
 - **SCIM provisioning** — not planned for Phase 1.

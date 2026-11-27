@@ -16,6 +16,7 @@ import {
   type InternalGroup,
   type InternalGroupCreate,
   type InternalGroupUpdate,
+  tenantsApi,
 } from "@/lib/api";
 import { apiErrorStatus } from "@/lib/refusal";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -25,6 +26,7 @@ import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
 import { TimeBoundGrantsPanel } from "./TimeBoundGrantsPanel";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { useModuleOn } from "@/hooks/useModuleOn";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -166,6 +168,18 @@ function GroupForm({
   const [description, setDescription] = useState(group?.description ?? "");
   const [roleIds, setRoleIds] = useState<string[]>(group?.role_ids ?? []);
   const [userIds, setUserIds] = useState<string[]>(group?.user_ids ?? []);
+  // #4263 — binding a group to a tenant is a superadmin act, and the tenant
+  // list needs the Tenants module; anyone else is shown neither the field nor
+  // a way to unbind (the stored tenant rides along untouched).
+  const tenantsOn = useModuleOn("ipam.tenants");
+  const { isSuperadmin } = usePermissions();
+  const canBindTenant = tenantsOn && isSuperadmin;
+  const tenants = useQuery({
+    queryKey: ["tenants"],
+    queryFn: () => tenantsApi.list(),
+    enabled: canBindTenant,
+  });
+  const [tenantId, setTenantId] = useState<string>(group?.tenant_id ?? "");
   const [error, setError] = useState<string | null>(null);
   // #1412 — shown once the server says this change makes someone a
   // superadmin; the dialog cannot work that out itself.
@@ -181,6 +195,7 @@ function GroupForm({
           description,
           role_ids: roleIds,
           user_ids: userIds,
+          ...(canBindTenant && tenantId ? { tenant_id: tenantId } : {}),
         } as InternalGroupCreate);
       }
       // Only what changed; an untouched Save sends nothing (#4452).
@@ -190,8 +205,18 @@ function GroupForm({
           description: group.description,
           role_ids: group.role_ids,
           user_ids: group.user_ids,
+          tenant_id: group.tenant_id ?? null,
         },
-        { name, description, role_ids: roleIds, user_ids: userIds },
+        {
+          name,
+          description,
+          role_ids: roleIds,
+          user_ids: userIds,
+          // Not bindable by this caller: send the stored value, so no diff.
+          tenant_id: canBindTenant
+            ? tenantId || null
+            : (group.tenant_id ?? null),
+        },
       ) as InternalGroupUpdate;
       if (Object.keys(diff).length === 0 && !needsStepUp) return null;
       return groupsApi.update(group.id, {
@@ -237,6 +262,26 @@ function GroupForm({
             />
           </Field>
         </div>
+
+        {canBindTenant && (
+          <Field
+            label="Tenant"
+            hint="Members of a group bound to a tenant work only inside that tenant's IP spaces."
+          >
+            <select
+              className={inputCls}
+              value={tenantId}
+              onChange={(e) => setTenantId(e.target.value)}
+            >
+              <option value="">— None (whole install) —</option>
+              {(tenants.data ?? []).map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        )}
 
         <div className="grid grid-cols-2 gap-4">
           <div>

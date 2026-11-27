@@ -65,6 +65,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     ssh,
     support_bundle,
     syslog,
+    tenants,
     tls_certs,
     upgrades,
     vendor,
