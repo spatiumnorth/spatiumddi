@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from email.utils import format_datetime
+from types import SimpleNamespace
 from typing import Any
 
 import structlog
@@ -30,6 +31,7 @@ from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.responses import ZipResponse
+from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
 from app.services.api_token_scopes import token_outbound
@@ -67,6 +69,7 @@ from app.services.backup.targets import (
     safe_filename,
     secret_field_names,
 )
+from app.services.backup.targets.base import BackupDestination
 from app.services.backup.targets.secrets_config import ENC_PREFIX, REDACTED_SENTINEL
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
@@ -488,6 +491,94 @@ async def create_target(
     return _to_response(row)
 
 
+# Config keys that decide where the stored credentials are sent.
+_DESTINATION_KEYS = ("host", "port", "server", "url", "endpoint_url")
+
+
+def _text(config: dict[str, Any], key: str, default: str) -> str:
+    value = config.get(key)
+    return (value if isinstance(value, str) and value.strip() else default).strip().lower()
+
+
+def _transport_level(kind: str, config: dict[str, Any]) -> int:
+    """How well the destination protects a credential in transit, higher is
+    better. Defaults match the drivers' own (an unset setting reads the same
+    here as when a backup runs)."""
+    if kind == "ftp":
+        if _text(config, "mode", "ftp") not in {"ftps_explicit", "ftps_implicit"}:
+            return 0  # plain FTP
+        return 2 if _text(config, "verify_tls", "true") != "false" else 1
+    if kind in {"https_put", "webdav"}:
+        return 1 if _text(config, "verify_tls", "true") != "false" else 0
+    if kind == "scp":
+        return 0 if _text(config, "host_key_check", "known_hosts") == "insecure_skip" else 1
+    return 1
+
+
+# Settings that decide who the credential is trusted to reach, per kind; one
+# edited to a different value counts as a change of destination, as a new
+# host does, even when it is not weaker on its face (a replaced known_hosts).
+_TRUST_KEYS = {"scp": ("known_hosts",)}
+
+
+def _weakened_transport_keys(
+    kind: str, stored: dict[str, Any], incoming: dict[str, Any]
+) -> list[str]:
+    """Transport settings this edit changes in a way that is weaker for the
+    stored credential (FTPS to FTP, TLS verification off, host-key checking
+    off), or re-points at other trusted keys."""
+    merged = {**stored, **incoming}
+    if _transport_level(kind, merged) >= _transport_level(kind, stored):
+        changed: list[str] = []
+    else:
+        changed = [
+            k
+            for k in ("mode", "verify_tls", "host_key_check")
+            if k in incoming and str(incoming[k] or "") != str(stored.get(k) or "")
+        ]
+    for k in _TRUST_KEYS.get(kind, ()):
+        if k in incoming and str(incoming[k] or "") != str(stored.get(k) or ""):
+            changed.append(k)
+    return changed
+
+
+def _require_secrets_with_new_destination(
+    driver: BackupDestination, stored: dict[str, Any], incoming: dict[str, Any]
+) -> None:
+    """422 when an edit moves the destination, or weakens how the credential
+    travels to it, but keeps a stored credential.
+
+    The console leaves a stored secret blank on Edit, so an edit of only the
+    host would otherwise carry the credential to the new host unasked; the
+    same goes for FTPS to plain FTP, TLS verification off, or host-key
+    checking off.
+    """
+    secrets = secret_field_names(driver)
+    weakened = _weakened_transport_keys(driver.kind, stored, incoming)
+    keys = (*_DESTINATION_KEYS, *weakened)
+    supplied: dict[str, Any] = {k: incoming[k] for k in keys if k in incoming}
+    for name in secrets:
+        if name not in incoming:
+            continue
+        value = incoming[name]
+        if value is None:
+            supplied[name] = ""  # an explicit null takes the stored secret away
+        elif (
+            isinstance(value, str)
+            and value
+            and value != REDACTED_SENTINEL
+            and not value.startswith(ENC_PREFIX)
+        ):
+            supplied[name] = value
+    require_secret_with_destination_change(
+        SimpleNamespace(**{k: stored.get(k) for k in keys}),
+        supplied,
+        destination=keys,
+        secrets={name: stored.get(name) for name in secrets},
+        transport=weakened,
+    )
+
+
 @router.patch("/{target_id}", response_model=BackupTargetResponse)
 async def update_target(
     target_id: uuid.UUID,
@@ -573,6 +664,7 @@ async def update_target(
             )
         except DestinationConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _require_secrets_with_new_destination(driver, row.config or {}, payload["config"])
         # #989 item 3 — same derivation as create. No-op unless the path
         # moved under the removable root and no node was set by hand.
         from app.services.appliance.removable import stamp_node_name  # noqa: PLC0415
@@ -618,12 +710,6 @@ async def update_target(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             row.drill_cron = payload["drill_cron"]
 
-    if payload.get("drill_enabled") and not (payload.get("drill_cron") or row.drill_cron):
-        raise HTTPException(
-            status_code=422,
-            detail="drill_enabled requires drill_cron — set a drill schedule first",
-        )
-
     if "passphrase" in payload and payload["passphrase"] is not None:
         row.passphrase_encrypted = encrypt_str(payload["passphrase"])
 
@@ -645,6 +731,20 @@ async def update_target(
                 continue
             setattr(row, key, payload[key])
 
+    # Judge the state the edit leaves behind, not the payload (#4450):
+    # blanking the cron of an already-enabled drill sends no drill_enabled,
+    # and would otherwise store an enabled drill no sweep can ever fire. An
+    # edit touching neither field is left alone so a legacy row saves.
+    if (
+        ("drill_enabled" in payload or "drill_cron" in payload)
+        and row.drill_enabled
+        and not row.drill_cron
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="drill_enabled requires drill_cron — set a drill schedule first",
+        )
+
     # Audit only what this edit changed (#3697): the console's Save sends
     # the whole form, so a payload key is not evidence of a change. Config
     # secrets are compared by their stored (wrapped) form, and only the key
@@ -662,7 +762,7 @@ async def update_target(
         secret_names = set(secret_field_names(driver))
         for key in sorted(set(before_config) | set(after_config)):
             a, b = before_config.get(key), after_config.get(key)
-            if (a or None) == (b or None):
+            if _reads_as(a) == _reads_as(b):
                 continue
             if key in secret_names and a and b and a != b:
                 # Re-wrapping an unchanged secret yields fresh ciphertext;
@@ -713,6 +813,17 @@ async def update_target(
     await db.commit()
     await db.refresh(row)
     return _to_response(row)
+
+
+def _reads_as(value: Any) -> str | None:
+    """A config value as it reads, for the audit diff (#3947): unset is
+    None, and a number reads as its text, so ``21`` and ``"21"`` are one
+    setting."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
 
 
 @router.delete("/{target_id}", status_code=204)
@@ -1194,6 +1305,12 @@ async def restore_from_archive(
     back the install on a hunch.
     """
     _archive_name(body.filename)
+    # #4678 — same refusal as POST /backup/restore.
+    from app.services.upgrades.schema_rollback import (  # noqa: PLC0415
+        assert_restore_allowed_for_release,
+    )
+
+    assert_restore_allowed_for_release()
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
@@ -1300,6 +1417,7 @@ async def restore_from_archive(
                     "allow_newer_schema": body.allow_newer_schema,
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "adopted_appliances": outcome.adopted_appliances,
                 },
             )
         )

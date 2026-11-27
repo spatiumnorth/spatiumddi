@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
@@ -13,10 +14,13 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -124,6 +128,7 @@ function DomainEditorModal({
   existing: Domain | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [name, setName] = useState(existing?.name ?? "");
   const [expectedNs, setExpectedNs] = useState(
@@ -167,7 +172,11 @@ function DomainEditorModal({
           customer_id: customerId,
           registrar_provider_id: registrarProviderId,
         };
-        return domainsApi.update(existing.id, body);
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4379), so a field another client set since is kept.
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return domainsApi.update(existing.id, changed);
       }
       const body: DomainCreate = {
         name,
@@ -226,31 +235,35 @@ function DomainEditorModal({
           </p>
         </div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Customer
-            </label>
-            <CustomerPicker
-              className={inputCls}
-              value={customerId}
-              onChange={setCustomerId}
-            />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
-              Registrar (Provider)
-            </label>
-            <ProviderPicker
-              className={inputCls}
-              value={registrarProviderId}
-              onChange={setRegistrarProviderId}
-              kind="registrar"
-            />
-            <p className="text-[11px] text-muted-foreground/80">
-              FK successor to the freeform registrar text. Pick a Provider of
-              kind "registrar".
-            </p>
-          </div>
+          {own.customer && (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">
+                Customer
+              </label>
+              <CustomerPicker
+                className={inputCls}
+                value={customerId}
+                onChange={setCustomerId}
+              />
+            </div>
+          )}
+          {own.provider && (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">
+                Registrar (Provider)
+              </label>
+              <ProviderPicker
+                className={inputCls}
+                value={registrarProviderId}
+                onChange={setRegistrarProviderId}
+                kind="registrar"
+              />
+              <p className="text-[11px] text-muted-foreground/80">
+                FK successor to the freeform registrar text. Pick a Provider of
+                kind "registrar".
+              </p>
+            </div>
+          )}
         </div>
         <div className="space-y-1">
           <label className="text-xs font-medium text-muted-foreground">
@@ -272,7 +285,9 @@ function DomainEditorModal({
             onChange={(e) => setCfRaw(e.target.value)}
           />
         </div>
-        {error && <p className="text-xs text-red-600">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-red-600">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"
@@ -580,8 +595,10 @@ export function DomainsPage() {
                         setSearch("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New domain" to add the first one.`}
                     >
-                      No domains yet — click "New domain" to add the first one.
+                      No domains yet.
                     </ListEmpty>
                   </td>
                 </tr>
@@ -618,10 +635,19 @@ export function DomainsPage() {
         />
       )}
       {editing && (
-        <DomainEditorModal
-          existing={editing}
+        <FreshEdit
+          row={editing}
+          load={() => domainsApi.get(editing.id)}
+          title="Edit Domain"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <DomainEditorModal
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );

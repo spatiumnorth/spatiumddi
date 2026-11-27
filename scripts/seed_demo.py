@@ -3,6 +3,9 @@
 Usage (with the compose stack running):
     python3 scripts/seed_demo.py http://localhost:8000 admin admin
 
+Add ``--insecure`` (or set SEED_INSECURE=1) against a self-signed
+control plane such as a default appliance or Compose certificate.
+
 Creates a representative slice of every first-class entity that's
 shipped to date so screenshots look populated and the AI Copilot's
 dynamic context block has real numbers to summarise. Sections:
@@ -55,14 +58,19 @@ and ships disabled so the worker never attempts delivery.
 
 from __future__ import annotations
 
+import os
 import random
 import sys
 
 import httpx
 
 
-def login(base: str, user: str, pw: str) -> str:
-    r = httpx.post(f"{base}/api/v1/auth/login", json={"username": user, "password": pw})
+def login(base: str, user: str, pw: str, verify: bool = True) -> str:
+    r = httpx.post(
+        f"{base}/api/v1/auth/login",
+        json={"username": user, "password": pw},
+        verify=verify,
+    )
     r.raise_for_status()
     return r.json()["access_token"]
 
@@ -79,9 +87,12 @@ class Api:
     that silently seeded nothing (#1465).
     """
 
-    def __init__(self, base: str, token: str):
+    def __init__(self, base: str, token: str, verify: bool = True):
         self.c = httpx.Client(
-            base_url=base, headers={"Authorization": f"Bearer {token}"}, timeout=30.0
+            base_url=base,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30.0,
+            verify=verify,
         )
         self.failures: list[str] = []
 
@@ -104,6 +115,14 @@ class Api:
 def find(items, key, val):
     if not items:
         return None
+    if key == "name" and isinstance(val, str):
+        # Zone names come back fully qualified ("corp.example.com."); compare
+        # without the trailing dot so a lookup by bare name still matches.
+        want = val.rstrip(".")
+        return next(
+            (i for i in items if isinstance(i.get(key), str) and i[key].rstrip(".") == want),
+            None,
+        )
     return next((i for i in items if i.get(key) == val), None)
 
 
@@ -149,6 +168,10 @@ def seed_dns(a: Api) -> tuple[str | None, str | None, str | None]:
     rz = find(zones, "name", "10.in-addr.arpa")
     fz_id = fz["id"] if fz else None
     rz_id = rz["id"] if rz else None
+    if not fz_id:
+        # Never skip silently: every demo ``dig`` depends on these records.
+        print("  ! forward zone corp.example.com not found; DNS records not seeded")
+        a.failures.append("DNS forward zone corp.example.com not found")
 
     if fz_id:
         for rec in [
@@ -164,8 +187,11 @@ def seed_dns(a: Api) -> tuple[str | None, str | None, str | None]:
             {
                 "name": "_sip._tcp",
                 "record_type": "SRV",
-                "value": "10 10 5060 voip.corp.example.com.",
+                "value": "voip.corp.example.com.",
                 "ttl": 3600,
+                "priority": 10,
+                "weight": 10,
+                "port": 5060,
             },
             {
                 "name": "office",
@@ -220,7 +246,6 @@ def seed_dhcp_scope(a: Api, group_id: str | None, subnets: list[dict]) -> str | 
             "name": "Servers DHCP",
             "lease_time": 86400,
             "enabled": True,
-            "ddns_enabled": True,
         },
     )
     scope_id = scope["id"] if scope and scope.get("id") else None
@@ -406,14 +431,14 @@ def seed_spaces_blocks_subnets(
         "/api/v1/ipam/blocks",
         json={
             "space_id": space_id,
-            "name": "DMZ 192.168.0.0/16",
-            "network": "192.168.0.0/16",
+            "name": "DMZ 172.20.0.0/16",
+            "network": "172.20.0.0/16",
             "description": "DMZ and lab",
         },
     )
     blocks = a.call("GET", f"/api/v1/ipam/blocks?space_id={space_id}") or []
     hq = find(blocks, "name", "HQ 10.0.0.0/8")
-    dmz = find(blocks, "name", "DMZ 192.168.0.0/16")
+    dmz = find(blocks, "name", "DMZ 172.20.0.0/16")
     if not hq or not dmz:
         print("! block creation failed")
         return space_id, []
@@ -424,8 +449,8 @@ def seed_spaces_blocks_subnets(
         (hq["id"], "Voice-VLAN", "10.1.1.0/24", "VoIP phones", 11),
         (hq["id"], "Servers", "10.10.10.0/24", "Production servers", 20),
         (hq["id"], "Wireless-Staff", "10.20.0.0/22", "Corporate WiFi", 30),
-        (dmz["id"], "DMZ-Public", "192.168.1.0/24", "Public-facing hosts", 100),
-        (dmz["id"], "Lab", "192.168.99.0/24", "Test/lab network", 200),
+        (dmz["id"], "DMZ-Public", "172.20.1.0/24", "Public-facing hosts", 100),
+        (dmz["id"], "Lab", "172.20.99.0/24", "Test/lab network", 200),
     ]
     for block_id, name, net, desc, vlan_id in subnet_specs:
         a.call(
@@ -439,6 +464,7 @@ def seed_spaces_blocks_subnets(
                 "description": desc,
                 "gateway": net.rsplit(".", 1)[0] + ".1",
                 "vlan_id": vlan_id,
+                "domain_name": ("lab.corp.example.com" if name == "Lab" else "corp.example.com"),
             },
         )
 
@@ -525,7 +551,7 @@ def seed_network_devices(a: Api, space_id: str | None):
         {
             "name": "dmz-sw1",
             "hostname": "dmz-sw1.corp.example.com",
-            "ip_address": "192.168.1.2",
+            "ip_address": "172.20.1.2",
             "device_type": "switch",
             "description": "DMZ switch — Arista 7050SX",
             "snmp_version": "v2c",
@@ -574,7 +600,7 @@ def seed_legacy_vlans(a: Api):
             "name": "dmz-sw1",
             "description": "DMZ switch",
             "location": "Server room B",
-            "management_ip": "192.168.1.1",
+            "management_ip": "172.20.1.1",
             "vendor": "Arista",
             "model": "7050SX",
         },
@@ -952,9 +978,7 @@ def seed_multicast(
         group_id = existing["id"] if existing else None
 
     if not group_id:
-        print(
-            "  · multicast group unavailable (module disabled?); skipping ports + membership"
-        )
+        print("  · multicast group unavailable (module disabled?); skipping ports + membership")
         return
 
     # RTP + RTCP port pair on the group.
@@ -974,15 +998,9 @@ def seed_multicast(
     servers = find(subnets, "name", "Servers")
     addr_id = None
     if servers:
-        addresses = (
-            a.call("GET", f"/api/v1/ipam/subnets/{servers['id']}/addresses") or []
-        )
+        addresses = a.call("GET", f"/api/v1/ipam/subnets/{servers['id']}/addresses") or []
         allocated = next(
-            (
-                ip
-                for ip in addresses
-                if ip.get("status") == "allocated" and ip.get("id")
-            ),
+            (ip for ip in addresses if ip.get("status") == "allocated" and ip.get("id")),
             None,
         )
         if allocated is None and addresses:
@@ -1257,9 +1275,7 @@ def seed_services(
 
     attaches: list[dict] = []
     if vrfs.get("default"):
-        attaches.append(
-            {"resource_kind": "vrf", "resource_id": vrfs["default"], "role": "core"}
-        )
+        attaches.append({"resource_kind": "vrf", "resource_id": vrfs["default"], "role": "core"})
     for site_name in ("HQ Datacenter", "Branch — Austin"):
         if sites.get(site_name):
             attaches.append(
@@ -1279,9 +1295,7 @@ def seed_services(
         )
     servers = find(subnets, "name", "Servers")
     if servers:
-        attaches.append(
-            {"resource_kind": "subnet", "resource_id": servers["id"], "role": "lan"}
-        )
+        attaches.append({"resource_kind": "subnet", "resource_id": servers["id"], "role": "lan"})
     for body in attaches:
         a.call("POST", f"/api/v1/services/{service_id}/resources", json=body)
 
@@ -1424,9 +1438,22 @@ def seed_dns_subresources(
         json={
             "name": "internal",
             "description": "Internal split-horizon view",
-            "match_clients": ["10.0.0.0/8", "192.168.0.0/16"],
+            "match_clients": ["10.0.0.0/8", "172.20.0.0/16"],
             "recursion": True,
             "order": 0,
+        },
+    )
+    # Catch-all view so zones answer from any network (an internal-only view
+    # REFUSEs every other client); also a split-horizon example.
+    a.call(
+        "POST",
+        f"/api/v1/dns/groups/{dns_group_id}/views",
+        json={
+            "name": "external",
+            "description": "Catch-all view for every other client (no recursion)",
+            "match_clients": ["any"],
+            "recursion": False,
+            "order": 100,
         },
     )
 
@@ -1439,7 +1466,7 @@ def seed_dns_subresources(
             "description": "RFC1918 trusted ranges",
             "entries": [
                 {"value": "10.0.0.0/8", "negate": False, "order": 0},
-                {"value": "192.168.0.0/16", "negate": False, "order": 1},
+                {"value": "172.20.0.0/16", "negate": False, "order": 1},
             ],
         },
     )
@@ -1666,12 +1693,9 @@ def seed_rbac_sample(a: Api):
 
     # Time-bound grant — NOT idempotent (no unique constraint), so list-then-
     # skip on a stable (action, resource_type) key to avoid pile-up on re-run.
-    existing_grants = (
-        a.call("GET", f"/api/v1/groups/time-bound-grants?group_id={group_id}") or []
-    )
+    existing_grants = a.call("GET", f"/api/v1/groups/time-bound-grants?group_id={group_id}") or []
     already = any(
-        g.get("action") == "write" and g.get("resource_type") == "dhcp"
-        for g in existing_grants
+        g.get("action") == "write" and g.get("resource_type") == "dhcp" for g in existing_grants
     )
     if already:
         print("  · time-bound grant already present; skipping")
@@ -1798,6 +1822,8 @@ DEMO_MODULES = (
     "network.overlay",
     "network.multicast",
     "compliance.conformity",
+    "network.domains",
+    "ipam.nat",
 )
 
 
@@ -1815,9 +1841,15 @@ def enable_demo_modules(a: "Api") -> None:
     print(f"  enabled {len(DEMO_MODULES)} module(s) so their demo data is reachable")
 
 
-def main(base: str, user: str, pw: str):
-    token = login(base, user, pw)
-    a = Api(base, token)
+def main(base: str, user: str, pw: str, verify: bool = True):
+    try:
+        token = login(base, user, pw, verify)
+    except httpx.HTTPError as e:
+        print(f"✗ Login failed: {e}")
+        if isinstance(e, httpx.ConnectError) and "CERTIFICATE" in str(e).upper():
+            print("  (self-signed certificate? re-run with --insecure)")
+        sys.exit(1)
+    a = Api(base, token, verify)
 
     enable_demo_modules(a)
 
@@ -1889,7 +1921,9 @@ def main(base: str, user: str, pw: str):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("Usage: python3 scripts/seed_demo.py <base_url> <username> <password>")
+    args = [x for x in sys.argv[1:] if x != "--insecure"]
+    insecure = len(args) != len(sys.argv) - 1 or bool(os.environ.get("SEED_INSECURE"))
+    if len(args) != 3:
+        print("Usage: python3 scripts/seed_demo.py [--insecure] <base_url> <username> <password>")
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    main(args[0], args[1], args[2], verify=not insecure)

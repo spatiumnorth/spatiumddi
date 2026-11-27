@@ -31,6 +31,7 @@ import {
   type IPBlock,
   type IPSpace,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 const INPUT_CLS =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-60";
@@ -216,9 +217,9 @@ export function MoveBlockModal({
               {previewMut.isPending ? "Calculating…" : "Preview move"}
             </button>
             {previewError && (
-              <p className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <FormError className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
                 {previewError}
-              </p>
+              </FormError>
             )}
           </div>
 
@@ -234,6 +235,10 @@ export function MoveBlockModal({
                   {preview.descendant_subnets_count === 1 ? "" : "s"},{" "}
                   {preview.descendant_ip_addresses_total} IP address
                   {preview.descendant_ip_addresses_total === 1 ? "" : "es"}.
+                  {(preview.descendant_blocks_trashed ?? 0) > 0 &&
+                    ` ${preview.descendant_blocks_trashed} more block${
+                      preview.descendant_blocks_trashed === 1 ? "" : "s"
+                    } in the Trash move with it.`}
                 </span>
               </div>
               {preview.reparent_chain_block_ids.length > 0 && (
@@ -311,9 +316,9 @@ export function MoveBlockModal({
           )}
 
           {commitError && (
-            <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2">
               {commitError}
-            </p>
+            </FormError>
           )}
         </div>
 

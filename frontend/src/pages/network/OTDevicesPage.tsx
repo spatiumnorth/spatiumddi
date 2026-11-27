@@ -1,4 +1,7 @@
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
+import { Field } from "@/components/ui/field";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Factory, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -32,6 +35,7 @@ import { Pager } from "@/components/ui/pager";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // OT / industrial device registry + Purdue zoning (issue #542, part of
 // #543). Read-only identification: nothing here probes, scans, reads a
@@ -123,6 +127,7 @@ export function OTDevicesPage() {
       qc.invalidateQueries({ queryKey: ["ot-zones"] });
       setDeleteDevice(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["ot-devices"] }),
   });
 
   const deleteZoneMut = useMutation({
@@ -131,6 +136,7 @@ export function OTDevicesPage() {
       qc.invalidateQueries({ queryKey: ["ot-zones"] });
       setDeleteZone(null);
     },
+    onError: () => qc.invalidateQueries({ queryKey: ["ot-zones"] }),
   });
 
   return (
@@ -306,9 +312,10 @@ export function OTDevicesPage() {
                       setSubnetFilter("");
                       setPage(1);
                     }}
+                    gate={{ disabled: !canWrite }}
+                    hint="Attach one to an existing IPAM address to start documenting the plant."
                   >
-                    No OT descriptors recorded. Attach one to an existing IPAM
-                    address to start documenting the plant.
+                    No OT descriptors recorded.
                   </ListEmpty>
                 )}
               </div>
@@ -540,55 +547,113 @@ export function OTDevicesPage() {
         </section>
       </div>
 
-      {deviceModal && (
+      {deviceModal && deviceModal.mode === "create" && (
         <DeviceModal
-          mode={deviceModal.mode}
-          device={deviceModal.mode === "edit" ? deviceModal.device : null}
+          mode="create"
+          device={null}
           onClose={() => setDeviceModal(null)}
         />
       )}
-      {zoneModal && (
+      {deviceModal && deviceModal.mode === "edit" && (
+        <FreshEdit
+          row={deviceModal.device}
+          load={() => otApi.getDevice(deviceModal.device.id)}
+          title="Edit OT descriptor"
+          onClose={() => setDeviceModal(null)}
+        >
+          {(fresh) => (
+            <DeviceModal
+              mode="edit"
+              device={fresh}
+              onClose={() => setDeviceModal(null)}
+            />
+          )}
+        </FreshEdit>
+      )}
+      {zoneModal && zoneModal.mode === "create" && (
         <ZoneModal
-          mode={zoneModal.mode}
-          zone={zoneModal.mode === "edit" ? zoneModal.zone : null}
+          mode="create"
+          zone={null}
           onClose={() => setZoneModal(null)}
         />
+      )}
+      {zoneModal && zoneModal.mode === "edit" && (
+        <FreshEdit
+          row={zoneModal.zone}
+          load={() => otApi.getZone(zoneModal.zone.id)}
+          title="Edit Purdue zone"
+          onClose={() => setZoneModal(null)}
+        >
+          {(fresh) => (
+            <ZoneModal
+              mode="edit"
+              zone={fresh}
+              onClose={() => setZoneModal(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={deleteDevice !== null}
         title="Delete OT descriptor"
         message={
           <>
-            Delete the OT descriptor for{" "}
-            <span className="font-mono">{deleteDevice?.address}</span>? This
-            says &ldquo;no longer an OT device&rdquo;, not &ldquo;this address
-            is free&rdquo; — the IPAM row itself is untouched.
+            <>
+              Delete the OT descriptor for{" "}
+              <span className="font-mono">{deleteDevice?.address}</span>? This
+              says &ldquo;no longer an OT device&rdquo;, not &ldquo;this address
+              is free&rdquo; — the IPAM row itself is untouched.
+            </>
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteDeviceMut.isPending}
+        error={
+          deleteDeviceMut.isError
+            ? formatApiError(
+                deleteDeviceMut.error,
+                "Failed to delete OT descriptor",
+              )
+            : null
+        }
         onConfirm={() =>
           deleteDevice && deleteDeviceMut.mutate(deleteDevice.id)
         }
-        onClose={() => setDeleteDevice(null)}
+        onClose={() => {
+          setDeleteDevice(null);
+          deleteDeviceMut.reset();
+        }}
       />
       <ConfirmModal
         open={deleteZone !== null}
         title="Delete Purdue zone"
         message={
           <>
-            Un-zone{" "}
-            <span className="font-mono">{deleteZone?.subnet_network}</span>?
-            Devices inside keep their own declared levels; they simply stop
-            having a zone to be compared against.
+            <>
+              Un-zone{" "}
+              <span className="font-mono">{deleteZone?.subnet_network}</span>?
+              Devices inside keep their own declared levels; they simply stop
+              having a zone to be compared against.
+            </>
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={deleteZoneMut.isPending}
+        error={
+          deleteZoneMut.isError
+            ? formatApiError(
+                deleteZoneMut.error,
+                "Failed to delete Purdue zone",
+              )
+            : null
+        }
         onConfirm={() => deleteZone && deleteZoneMut.mutate(deleteZone.id)}
-        onClose={() => setDeleteZone(null)}
+        onClose={() => {
+          setDeleteZone(null);
+          deleteZoneMut.reset();
+        }}
       />
     </div>
   );
@@ -654,7 +719,10 @@ function DeviceModal({
         notes,
       };
       if (mode === "edit" && device) {
-        const body: OTDeviceUpdate = shared;
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const body = changedFields(device, shared as OTDeviceUpdate);
+        if (Object.keys(body).length === 0) return Promise.resolve(device);
         return otApi.updateDevice(device.id, body);
       }
       const body: OTDeviceCreate = {
@@ -820,7 +888,9 @@ function DeviceModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -873,12 +943,16 @@ function ZoneModal({
   const mut = useMutation({
     mutationFn: () => {
       if (mode === "edit" && zone) {
-        const body: OTZoneUpdate = {
+        const full: OTZoneUpdate = {
           purdue_level: purdue as PurdueLevel,
           cell_area: cellArea,
           name,
           description,
         };
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const body = changedFields(zone, full);
+        if (Object.keys(body).length === 0) return Promise.resolve(zone);
         return otApi.updateZone(zone.id, body);
       }
       const body: OTZoneCreate = {
@@ -984,7 +1058,9 @@ function ZoneModal({
           />
         </Field>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -1016,20 +1092,3 @@ const inputCls =
 
 const filterCls =
   "rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}

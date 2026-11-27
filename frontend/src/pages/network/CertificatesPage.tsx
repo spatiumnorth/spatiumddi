@@ -1,4 +1,6 @@
 import { useState, type ReactNode } from "react";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { Pencil, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
@@ -25,6 +27,7 @@ import {
   tlsStateCls,
 } from "@/lib/tls-cert-state";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -252,7 +255,13 @@ function CertTargetEditorModal({
         interval_hours: parsedInterval,
         enabled,
       };
-      if (existing) return tlsCertsApi.update(existing.id, body);
+      if (existing) {
+        // Only what the operator changed against the row read when the
+        // dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return tlsCertsApi.update(existing.id, changed);
+      }
       return tlsCertsApi.create(body as TLSCertTargetCreate);
     },
     onSuccess: (saved) => {
@@ -360,7 +369,9 @@ function CertTargetEditorModal({
         </div>
       </div>
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -667,14 +678,18 @@ function CertDetailModal({
                   Querying crt.sh…
                 </p>
               ) : ctQuery.isError ? (
-                <p className="px-3 py-2 text-xs text-destructive">
+                <p role="alert" className="px-3 py-2 text-xs text-destructive">
                   CT-log lookup failed.
+                </p>
+              ) : ctQuery.data?.error ? (
+                // The API answers a crt.sh failure with 200 + `error`, so the
+                // isError branch above never sees it: announce it here (#4480).
+                <p role="alert" className="px-3 py-2 text-xs text-destructive">
+                  crt.sh: {ctQuery.data.error}
                 </p>
               ) : (ctQuery.data?.entries.length ?? 0) === 0 ? (
                 <p className="px-3 py-2 text-xs text-muted-foreground">
-                  {ctQuery.data?.error
-                    ? `crt.sh: ${ctQuery.data.error}`
-                    : "No CT-log entries found for this host."}
+                  No CT-log entries found for this host.
                 </p>
               ) : (
                 <table className="w-full text-[11px]">
@@ -815,9 +830,16 @@ export function CertificatesPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => tlsCertsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["tls-certs"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete TLS cert target"));
+      qc.invalidateQueries({ queryKey: ["tls-certs"] });
+    },
   });
 
   if (ready && !moduleOn) {
@@ -832,6 +854,11 @@ export function CertificatesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="flex items-center gap-2 text-xl font-semibold">
@@ -946,8 +973,10 @@ export function CertificatesPage() {
                         setStateFilter("");
                         setSourceFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New target" to add one.`}
                     >
-                      No targets yet — click "New target" to add one.
+                      No targets yet.
                     </ListEmpty>
                   </td>
                 </tr>
@@ -1078,10 +1107,19 @@ export function CertificatesPage() {
           />
         )}
         {editing && (
-          <CertTargetEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => tlsCertsApi.get(editing.id)}
+            title="Edit certificate target"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CertTargetEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

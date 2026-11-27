@@ -1,4 +1,5 @@
 import { ListReadError } from "@/components/ui/list-read-error";
+import { ServerDeleteAgentNote } from "@/pages/serverDeleteAgentNote";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { humanTime } from "../network/_shared";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -63,6 +64,7 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
 import { DaemonStateChip } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryCell } from "@/components/AgentMemoryCell";
 import { SpoolChip } from "@/components/SpoolChip";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
@@ -759,7 +761,10 @@ export function RespondersTab({ groupId }: { groupId: string }) {
         (enable <code>DHCP_ROGUE_PROBE_ENABLED=1</code> on the agent). Unknown
         responders classify <span className="text-rose-600">rogue</span>, and
         fire the Rogue DHCP alert once that rule is enabled (Alerts → Rules; it
-        ships disabled) — acknowledge a known-but-external one to allowlist it.
+        ships disabled)
+        {!ackGate.disabled &&
+          " — acknowledge a known-but-external one to allowlist it"}
+        .
       </p>
       <div className="rounded-lg border overflow-auto">
         <table className="w-full text-sm">
@@ -936,7 +941,10 @@ function RouterAdvertisementsTab({ groupId }: { groupId: string }) {
           RA sniffer (enable <code>DHCP_RA_SNIFFER_ENABLED=1</code> on the
           agent). Unknown routers classify{" "}
           <span className="text-rose-600">rogue</span> and fire the Rogue IPv6
-          router alert — acknowledge an expected one to allowlist it.
+          router alert
+          {!ackGate.disabled &&
+            " — acknowledge an expected one to allowlist it"}
+          .
         </p>
         <div className="rounded-lg border overflow-auto">
           <table className="w-full text-sm">
@@ -1148,7 +1156,9 @@ function GroupServersList({
 
       {servers.length === 0 ? (
         <p className="text-sm text-muted-foreground italic">
-          No servers. Add one manually or start a Kea agent container.
+          No servers.
+          {!superadminGate.disabled &&
+            " Add one manually or start a Kea agent container."}
         </p>
       ) : (
         <div className="space-y-2">
@@ -1253,6 +1263,7 @@ function GroupServersList({
                   </div>
                 </div>
                 <div className="flex items-center gap-1 flex-shrink-0">
+                  <AgentMemoryCell server={s} className="mr-2" />
                   {s.maintenance_mode ? (
                     <button
                       type="button"
@@ -1525,6 +1536,7 @@ export function ServerScopesTab({ groupId }: { groupId: string }) {
               if (e.target.value) setCreateForSubnet(e.target.value);
               e.target.value = "";
             }}
+            aria-label="Serve leases on subnet"
             title="Pick the IPAM subnet you want this DHCP server to serve leases from."
             {...dhcpGate("write", "dhcp_scope")}
           >
@@ -2513,7 +2525,7 @@ export function OptionTemplatesTab({ groupId }: { groupId: string }) {
   );
 }
 
-function LeasesTab({ server }: { server: DHCPServer }) {
+export function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
   const [deviceClass, setDeviceClass] = useState<string>("");
@@ -2659,13 +2671,18 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               <th className="px-3 py-2 text-left font-medium">State</th>
               <th className="px-3 py-2 text-left font-medium">Expires</th>
               <th className="px-3 py-2 text-left font-medium">Last Seen</th>
+              {isSuperadmin && (
+                <th className="px-3 py-2 text-right font-medium">
+                  <span className="sr-only">Actions</span>
+                </th>
+              )}
             </tr>
           </thead>
           <tbody className={zebraBodyCls}>
             {leases.length === 0 && (
               <tr>
                 <td
-                  colSpan={7}
+                  colSpan={isSuperadmin ? 8 : 7}
                   className="p-6 text-center text-sm text-muted-foreground"
                 >
                   {isFetching ? "Loading…" : "No leases."}
@@ -2753,6 +2770,22 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                         ? new Date(l.last_seen_at).toLocaleString()
                         : "—"}
                     </td>
+                    {isSuperadmin && (
+                      <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                        {/* The keyboard path to Delete lease (#3912): the
+                            right-click menu has no Tab stop to open it
+                            from. */}
+                        <button
+                          type="button"
+                          onClick={() => setDel(l)}
+                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                          aria-label={`Delete lease ${l.ip_address}`}
+                          title="Delete lease"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 </ContextMenuTrigger>
                 <ContextMenuContent>
@@ -3717,6 +3750,9 @@ export function DHCPPage() {
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      // Logs offers and validates a pick against this list (#4234).
+      qc.invalidateQueries({ queryKey: ["logs-agent-sources"] });
+      qc.invalidateQueries({ queryKey: ["logs-sources"] });
       if (selection?.type === "server" && selection.server.id === id)
         setSelection(null);
       setDelServer(null);
@@ -3846,7 +3882,12 @@ export function DHCPPage() {
       {delServer && (
         <DeleteConfirmModal
           title="Delete DHCP Server"
-          description={deleteServerDescription(delServer.name)}
+          description={
+            <>
+              {deleteServerDescription(delServer.name)}
+              <ServerDeleteAgentNote />
+            </>
+          }
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
           onClose={() => {
             setDelServer(null);

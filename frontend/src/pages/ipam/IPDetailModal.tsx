@@ -38,6 +38,7 @@ import {
   formatApiError,
   formatDialogError,
 } from "@/lib/api";
+import { customFieldDisplay } from "@/lib/customFieldValues";
 import { cn } from "@/lib/utils";
 import { isDefaultGatewayHostname } from "@/lib/gatewayDns";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
@@ -55,6 +56,7 @@ import { useModuleOn } from "@/hooks/useModuleOn";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -528,7 +530,7 @@ export function IPDetailModal({
               isDefaultGatewayHostname(addr.hostname) &&
               (hasForwardZone ?? !!addr.forward_zone_id) && (
                 <div className="sm:col-span-2">
-                  <GatewayHostnameNote />
+                  <GatewayHostnameNote canEdit={canEdit} />
                 </div>
               )}
           </div>
@@ -617,9 +619,7 @@ export function IPDetailModal({
                         <td className="px-2 py-1 break-words">
                           {v === null || v === undefined || v === ""
                             ? dash(null)
-                            : typeof v === "object"
-                              ? JSON.stringify(v)
-                              : String(v)}
+                            : customFieldDisplay(v)}
                         </td>
                       </tr>
                     ))}
@@ -1413,9 +1413,9 @@ function DeviceProfileSection({
       </div>
 
       {error && (
-        <div className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
+        <FormError className="mb-2 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-1 text-[11px] text-destructive">
           {error}
-        </div>
+        </FormError>
       )}
 
       {/* Passive layer — DHCP fingerprint via fingerbank. */}

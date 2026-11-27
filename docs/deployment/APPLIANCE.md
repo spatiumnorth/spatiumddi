@@ -289,6 +289,34 @@ and would strand an appliance whose STATE says one thing and whose `/etc`
 overlay says another. STATE stays the single source of truth; the adopt-back
 changes what STATE says rather than who owns the file.
 
+### Reinstall with Keep /var when the address changed (#4591)
+
+"Keep /var and STATE" keeps k3s's datastore, whose etcd member is registered
+under the node's old address. On new hardware, a new VM or a new NIC, DHCP
+usually gives the node another address, and k3s refuses its own member
+(`this server is not a member of the etcd cluster. Found [...]`).
+
+`spatium-etcd-peer-reset` (a `k3s.service` `ExecStartPre`) handles the
+single-node case: when k3s's refusal lists exactly one member, that member is
+this node, and the node is not a joined member, it runs `k3s server
+--cluster-reset` once, as the snapshot restore does, and k3s then starts on
+the new address with the data intact. It logs to the console and to
+`/var/log/spatiumddi/etcd-peer-reset.log`. The first start still fails once
+before the reset (about 15 minutes after boot), then k3s restarts itself;
+`spatiumddi-firstboot` waits for that, up to 25 more minutes, so it completes
+on that boot.
+
+It is detected from k3s's own message because the member list cannot be read
+offline (the db is a bbolt file, no `etcdutl` ships). A control plane with more
+than one etcd member is never reset, since that would orphan the others: a
+member whose address changed there needs its peer address updated or a rejoin
+(Fleet, Replace). The reason is printed on the console and shown in the
+health verdict ("etcd member address changed"); nothing is done automatically.
+It is recognised from the node address `spatiumddi-firstboot` records at each
+good boot (`/var/lib/spatiumddi/etcd-peer-addr`), since an HA member never logs
+k3s's refusal. Pin the address
+(static IP or a DHCP reservation) to avoid all of this.
+
 ### Interface MTU (#1017)
 
 `network_mtu` in `spatium-config.yaml` sets the MTU on the connection
@@ -401,7 +429,7 @@ separate profiles that STATE does not model.
 k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves
 `*.svc.cluster.local` through it: the api pod finds Postgres and Redis that
 way, the frontend nginx finds the api, and on a multi-node control plane a
-member's supervisor heartbeats the in-cluster api Service name. Nothing on
+member's supervisor heartbeats the node-local api Service name. Nothing on
 the appliance talks to it from the LAN — it is not a DNS server operators put
 zones on, and it is unrelated to the BIND9 / Kea role containers.
 
@@ -508,7 +536,7 @@ single-node appliance restarting cluster DNS is a footgun.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
 5. Operator browses to `https://<appliance-ip>/`. Until the api is serving, the frontend nginx answers every page with the **"SpatiumDDI is initialising"** page (`frontend/public/_starting.html`, auto-refreshing every 5 s) instead of the SPA shell — `location /` gates on an `auth_request` probe of the api Service, so a cold boot reads as "still coming up" rather than a wall of failed XHRs (#767).
-6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
+6. Operator accepts the self-signed cert **once** and signs in. On a first node whose installer collected a web UI password (below) that is `admin` with that password; otherwise it is `admin / admin`, followed by a forced change to a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
 7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
@@ -700,7 +728,7 @@ state on its heartbeat:
 
   | HelmChartConfig | Supervisor-owned keys (source) |
   |---|---|
-  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
+  | `spatium-control` | `api` / `frontend` / `worker`: `replicas`, `podAntiAffinity`, `tolerations` (committed control-plane size); `api.service.trafficDistribution` (`PreferSameNode` at every size, #1805); `api.service.nodeLocal` (`true` at every size, #3645); `api.resources.limits.memory`, `worker.resources.limits.memory`, `worker.concurrency` (node RAM); `api.resources.limits.cpu`, `postgresql.resources.limits.cpu` (node CPU count, #2240); `frontend.controlPlaneVIP`, `frontend.loadBalancerSourceRanges` (MetalLB settings, Web UI source CIDRs); `slotImageMirror.enabled`; `postgresql.cnpg.instances`, `postgresql.cnpg.parameters.shared_buffers`, `postgresql.cnpg.parameters.max_connections` (connection budget, #2156), `postgresql.resources.requests.memory` + `.limits.memory` (size, node RAM, and the connection budget of the control-plane size, #2156); `api.databasePool.size` / `.maxOverflow` (control-plane size, #2156); `redis.kind`, `redis.sentinel.replicas` |
   | `spatium-metallb` | `metallb.enabled`, `metallb.ipPool.addresses`, `metallb.frrk8s.enabled`, `metallb.bgp.enabled` / `.peers` / `.advertisements` (Network & Host → MetalLB) |
   | `spatiumddi-appliance` | `dns.useMetalLBVIP`, `dns.vip`, `dhcpKea.relayVIP` (MetalLB → Advanced) |
 
@@ -819,19 +847,55 @@ agent). Dismissal requires a deliberate checkbox and is remembered
 client-side.
 
 **Heartbeat targets.** A supervisor that is itself a control-plane
-cluster member heartbeats the **in-cluster api Service**
-(`spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000`) rather
-than the seed node's IP it was installed/promoted against — so losing any
-single node never strands a member's control plane, and kube-proxy
-load-balances heartbeats across the ready api pods. Off-cluster DNS/DHCP
+cluster member heartbeats the **node-local api Service**
+(`spatium-control-spatiumddi-api-local.spatium.svc.cluster.local:8000`, #3645:
+only ever the api pod on its own node) rather than the seed node's IP it was
+installed/promoted against. With no ready api pod on its node it falls back to
+its configured `CONTROL_PLANE_URL` over https (pinned certificate), so losing
+a node's api pod never strands a member's control plane and no plain http
+crosses the node LAN. The seed has no `CONTROL_PLANE_URL` (firstboot writes it
+empty on a control-plane install), so it falls back to the cluster-wide api
+Service, as before #3645: a path through another node's api pod beats none.
+Off-cluster DNS/DHCP
 agents have no in-cluster DNS to resolve that name, so they keep using
 their configured `CONTROL_PLANE_URL` — which should be the **VIP** on an
 HA cluster (see `_effective_control_plane_url` in the supervisor's
 `heartbeat.py`).
 
+**Node-local api traffic (#3645).** Pod-to-pod traffic between nodes is flannel
+`host-gw`: routed over the node LAN, not tunnelled or encrypted, and the api
+speaks plain http. So the two callers that carry credentials keep that hop on
+their own node: firstboot and the seed supervisor set `api.service.nodeLocal`,
+which renders a second Service, `spatium-control-spatiumddi-api-local`, with
+`internalTrafficPolicy: Local`. It answers only from an api pod on the caller's
+node. A member's supervisor uses it; the original `-api` Service is unchanged,
+for the frontend nginx, the worker, the role agents and the probes, and an
+older supervisor keeps using it.
+
+The requirement is **a ready api pod on every control-plane node** (the
+appliance already runs one per node: `replicas` equals the control-plane size,
+with required anti-affinity). A node whose api pod is down (crashed, rolling,
+or not yet scheduled after a node join) has no local endpoint, and its
+supervisor does not wait:
+the Service drops traffic rather than refusing it, so the node-local attempt has
+a 4 s connect timeout, and after the first failed attempt the same heartbeat is
+re-sent to its `CONTROL_PLANE_URL` over https against the pinned certificate
+(`cp_tls`; the seed uses the cluster Service). It tries the local Service again
+once 60 s have passed, on its next heartbeat, and goes back to it when that
+lands. Plain http is therefore only ever node-local, except for the seed's
+fallback. The frontend's `/api` proxy is deliberately not on the
+node-local Service: the node-local path has no fallback there, so it would turn
+an api pod rolling on a node into a UI outage on that node. It keeps the
+cluster Service (`PreferSameNode`, #1805, so it uses the local pod while one is
+ready). Not covered yet, and tracked in #4019: the frontend's fallback window,
+the role agents, the worker and beat still reach the api over the
+cluster-wide Service, and the Postgres and Redis traffic is unencrypted too.
+On a network where the node LAN is not trusted, put a WireGuard-capable CNI
+under the cluster instead of relying on this alone.
+
 ### Guided etcd restore (Phase 9b)
 
-`/appliance → Fleet → Control plane` carries an **etcd snapshots**
+`/appliance → Cluster → etcd snapshots` carries an **etcd snapshots**
 disaster-recovery card. The seed reports its local
 `k3s etcd-snapshot list` on every heartbeat — read from the
 `ETCDSnapshotFile` CRs over the kubeapi (no host `k3s` binary needed),
@@ -1428,7 +1492,7 @@ of that floor *can* be source-scoped, but only by the separate `ssh_lockdown`
 setting ([#1009](https://github.com/spatiumnorth/spatiumddi/issues/1009)) — a
 deliberate act with its own guards, never a consequence of a firewall rule.
 
-**Fleet → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
+**Appliance → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
 five sections: **Policies** (fleet/role/appliance list + rule editor, with the
 **Enforcement** + **Web-UI-access** cards nested compactly at the top rather
 than as full-width bars), **Aliases** (named CIDR/port sets), **Preview
@@ -1466,6 +1530,8 @@ genuinely dangerous patterns (nft-injection chars, unbalanced braces, a `drop`
 on 22); everything else is advisory (`nft -c -f` on the host is the final
 authority), and the lint runs delta-only so pre-existing values are
 grandfathered.
+
+**SNMP and `firewall_extra` (#3819).** UDP 161 is accepted only from the sources in `snmp_allowed_sources` (Fleet → Services → SNMP). `firewall_extra` lands in the same input chain, whose policy is drop, and the SNMP rule only ever accepts. So a `firewall_extra` rule that accepts UDP 161 **adds** its sources to the allowed list rather than being narrowed by it. If you scope SNMP to a list, remove any older custom accept for port 161. IPv6 sources work: snmpd listens on all IPv6 addresses (`udp6:161`) whenever the list holds an IPv6 prefix or is empty, and stays on `::1` for an IPv4-only list (#3813).
 
 **Compliance + Copilot.** The `no_lanwide_control_plane_ports` conformity check
 (platform-kind, PCI-DSS 1.2.1 / HIPAA segmentation) fails only on a *confirmed*
@@ -1582,7 +1648,7 @@ The fix:
   - **Frontend / core** (was `control-only`): control plane only.
   - **Application**: supervisor only; pairs against a remote control plane.
 - **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
-- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate.
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. Every request the supervisor makes with the cert carries an Ed25519 signature over the method, the path and query string, a SHA-256 of the body, a nonce and a timestamp (±300 s), and the control plane accepts each signature once (recorded in Redis; if Redis is unreachable the check is skipped with a warning rather than stopping the fleet's heartbeats). Supervisors older than #3631 sign only the method, path and timestamp; that form is accepted while `APPLIANCE_LEGACY_SIGNATURE_ALLOWED` is true (the default) and logged per appliance as `appliance_cert_auth_legacy_signature`, so set it to `false` once those lines stop. Every heartbeat answer carries `X-Appliance-Signature-Versions: 2`; a supervisor that gets an answer without it (an older control plane, e.g. between a node's slot upgrade and the application roll) signs the older form until one carries it, and never falls back again in that process once it has. The heartbeat still accepts the session token as a fallback when the cert does not validate. Registration is signed too: the request carries the registering key's Ed25519 signature over a fresh timestamp and nonce, and re-registering an existing appliance (which returns a new session token) needs it. A supervisor that has reported it signs registrations is refused when it sends one unsigned. `APPLIANCE_UNSIGNED_REGISTER_ALLOWED` (separate from `APPLIANCE_LEGACY_SIGNATURE_ALLOWED`, which covers heartbeats only) decides the rest: with `legacy` (the default in 1.0.1) an unsigned re-registration is accepted only for an appliance whose last reported supervisor version is older than 1.0.1 (or was never reported), is recorded in the audit log as `appliance.supervisor_register_unsigned` and counts against the registration attempt budget; with `never` it is always refused. The default becomes `never` in 1.1.0. A refused supervisor is told to upgrade, or to have its Fleet row deleted and be paired again. On a multi-node control plane the supervisor-to-api hop inside the cluster is plain HTTP (it is not given TLS in this release); the join token is the only secret answered on it, and is sealed to a one-off key, but the request bodies a supervisor sends (heartbeat state, kubeconfig, join token it reports) are not encrypted on that hop.
 - **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS; udp/67-68, plus udp/547 for DHCPv6, for DHCP; the Kea HA listener, scoped to the other HA members, when the DHCP group is an HA pair; tcp/179 for Looking Glass) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
 - **Baked-in container images**. Every container image needed for any install role is baked in at release time as `/var/lib/rancher/k3s/agent/images/*.tar.zst`, which k3s imports into its containerd store at start; no boot ever reaches out to ghcr.io. Air-gapped installs are first-class.
 - **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
@@ -2344,6 +2410,33 @@ trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
 >   time, so correcting the hostname from the last screen before a wipe
 >   meant pressing Back past four screens and OK through them again.
 >   Picking a row jumps straight to it; `Install` is the last thing.
+>   A jump re-runs the screens whose answers depend on the one you
+>   changed (#4546): a different role brings back the sizing check, the
+>   k3s ranges and the control-plane URL and pairing code; a different
+>   network re-checks the k3s ranges against it; a different disk
+>   re-asks the partition-layout acknowledgement; a new hostname
+>   re-checks the password against it. There are rows for the k3s ranges
+>   (First node) and the control-plane URL and code (Additional node),
+>   and `Install` is refused, and the screen that fixes it opened, while
+>   an Additional node has no URL or code or the k3s ranges overlap the
+>   LAN. Review lists the DNS servers of a static network.
+> - **Static network and control-plane URL are checked.** A static
+>   address that is the network or broadcast address of its subnet,
+>   loopback, multicast or unspecified, a gateway equal to the address,
+>   and an empty DNS list (unless you confirm "No DNS") are refused; a
+>   dotted netmask such as `255.255.255.0` is accepted and converted.
+>   The control-plane URL must be `http://` or `https://` with a host and
+>   no spaces or quotes (the preseed parser applies the same rule), and
+>   plain `http://` needs an explicit choice because the pairing code
+>   would cross the network unencrypted.
+> - **Keep /var and STATE reads what it keeps.** The previous
+>   `spatium-config.yaml` and exported answers on STATE become the
+>   defaults of the hostname, admin account, timezone and network
+>   screens, and the role and k3s ranges are fixed to the values the kept
+>   data was built with (k3s stops on a mismatch), with a notice on the
+>   screen and on Review. If STATE cannot be read, Review says nothing
+>   was checked. The partition-layout screen then says the two OS slots
+>   are replaced rather than that everything is erased.
 > - **The answers are exported** to
 >   `/var/lib/spatium-state/spatium-preseed.yaml` in the #549 format, so
 >   an identical reinstall or a fleet clone is one file away. Secrets are
@@ -2687,6 +2780,18 @@ one whole disk. Prefer a stable `/dev/disk/by-id/…` or `by-path/…` id
 (a bare `sda` can renumber). A supplied-but-unresolvable disk drops to
 the interactive picker rather than guessing.
 
+**Other disks carrying SpatiumDDI labels (#4547).** The installed
+system mounts `/var`, STATE and the ESP by filesystem label (`var`,
+`state`, `ESP`), so a second attached disk with the same labels (an old
+system disk, a former mirror member, another test install) can be
+mounted instead of the installed one. Before the wipe the installer
+scans every disk it is not about to write and stops if one carries
+those labels. Interactively you can cancel (detach the disk) or clear
+the labels on the other disk after typing `CLEAR`; only the filesystem
+labels are blanked. A headless install halts unless the preseed carries
+`clear_foreign_labels: true`. Mounting by filesystem UUID instead is not
+done yet; existing installs keep their label-based fstab.
+
 **Lint a preseed offline (#581).**
 `spatium-install --check-preseed <preseed.yaml>` dry-runs the answer
 file **without installing anything** — it is unprivileged, read-only,
@@ -2788,7 +2893,24 @@ LG_AGENT_KEY, BOOTSTRAP_PAIRING_CODE) on first run, writes the
 bootstrap HelmChart manifest into
 `/var/lib/rancher/k3s/server/manifests/`, and polls
 `http://127.0.0.1:8000/health/live`. Default web-UI login is
-`admin / admin` with `force_password_change=True`.
+`admin / admin` with `force_password_change=True`, unless the install
+set a web UI password (next section).
+
+**Web UI admin password (#4548).** On a first node the installer asks, right after the OS
+password, whether to use that password for the web UI's `admin` account too (default yes) or to
+enter a separate one, under the same checks. Only a bcrypt hash is kept: the installer hashes it
+with `python3-bcrypt`, writes it 0600 to `/var/lib/spatium-state/web-admin-password-hash`,
+`spatiumddi-firstboot` puts it in the `spatium-control-app-keys` Secret as
+`initial-admin-password-hash`, and the chart passes it to the api as `INITIAL_ADMIN_PASSWORD_HASH`.
+The api uses it only when it creates the very first user, with no forced password change, so nobody
+has to be first to the UI. A headless install supplies `web_admin_password_hash` (a bcrypt hash;
+there is no plaintext key) and `spatium-install --check-preseed` reports which login the file
+produces. Without it, and on an install from before this option, the web UI starts on
+`admin / admin` as before. An additional node has no web UI, so the option is not asked there and
+its console banner (`/etc/issue`) omits the web UI lines. The hash never enters the install log,
+the trace log, the exported answers file or a support bundle. Docker Compose and plain Helm installs
+keep `admin / admin` with a forced change, but the same `INITIAL_ADMIN_PASSWORD_HASH` variable works
+there too (Compose `environment:`, Helm `api.env`).
 
 `LG_AGENT_KEY` (the Looking Glass collector's agent key, #576) is
 generated on control-plane roles only. Because it is the first agent
@@ -2853,8 +2975,12 @@ covers how to get off 2026.10.02-1 on each deployment shape (#3915).
 The normal [slot upgrade](#5b-phase-8-atomic-ab-image-upgrades-slot-upgrade)
 works: it was verified from 2026.10.02-1 to 1.0.0-rc.2 on real release
 images (#1181). It went through in under 10 minutes, with DNS down for
-about 4 minutes during the reboot. A second, shorter DNS and DHCP
-interruption of a few seconds can follow about 3 minutes after boot
+about 4 minutes during the reboot. Upgrading from a release that
+predates #3919's fix, a second, shorter DNS and DHCP interruption of a few
+seconds can follow about 3 minutes after boot; a release that carries it
+moves the role pods onto its own image during the boot, so they restart
+once, and the upgrade unpacks the new role images while the old slot is still
+running, so the first container start after the reboot is not slowed by it
 (#3919).
 
 ### Multi-node cluster, from 2026.10.02-1
@@ -3258,9 +3384,14 @@ schema revision with the one that release was built with:
 When the older release cannot run on the database, the request is
 refused with a 409 whose `detail.code` is `schema_rollback_unsafe`,
 naming both revisions. The Fleet UI shows that as a confirmation. To go
-ahead anyway, resend with `acknowledge_schema_rollback: true`. Only do
-that if you will restore a copy of the database from before the
-upgrade. Data-plane appliances are never checked, because their release
+ahead anyway, resend with `acknowledge_schema_rollback: true`. That is
+**not** a way back to the older release: restoring a pre-upgrade backup
+afterwards is refused (below), because the older release's worker and
+beat would pass their migration wait while the restore is replaying and
+stay up on a schema they do not match, and no DNS change would reach the
+DNS servers again (#4678). The supported way back is to boot the newer
+release again and restore there; the restore migrates the old archive up
+to that release. Data-plane appliances are never checked, because their release
 does not touch the database. Pointing a node at the slot it already
 runs, which commits a trial boot, is not checked either.
 
@@ -3278,6 +3409,18 @@ A release in neither, such as an older nightly, is reported as `unknown`, and th
 switch goes ahead: refusing on "don't know" would block every rollback
 on an install that never recorded anything.
 
+**Restoring while the host and the console are different releases.**
+After an acknowledged rollback the host is booted into the older slot,
+but the newer release's api keeps serving. `POST /api/v1/backup/restore`
+and `POST /api/v1/backup/targets/{id}/archives/restore` answer 409 with
+`detail.code` `restore_refused_mixed_release` in that state, and no
+acknowledgement lifts it. Boot the serving release again from the console
+(`spatium-upgrade-slot set-next-boot` and a reboot), then restore. A
+restore also holds an install-wide lock for its whole replay and migrate;
+the `wait-for-migrate` init container of api, worker and beat keeps
+waiting while it is held, even if the schema already reads their head.
+Pods of a release older than 1.0.1 do not have that check.
+
 **What is not covered.** The trial-boot auto-revert (step 8 above)
 happens on the host with no operator involved, so nothing can refuse
 it. No database snapshot is taken before an upgrade yet, so there is
@@ -3294,6 +3437,33 @@ Compose / Helm redeploy of it leaves the control plane down with only
 so a reinstall during the rollback can mint a new `SECRET_KEY` and
 leave every credential encrypted at rest unreadable. If you must go
 back, restore the pre-upgrade backup together with the older release.
+
+**Restoring a backup onto a fresh install (#4677).** This is the way back
+when an appliance is lost and rebuilt, or when you reinstall the older
+release and restore the pre-upgrade backup. The steps:
+
+1. Install the release the backup was taken on, or a newer one (a newer
+   schema than the install knows is refused), and sign in with the install's
+   own admin.
+2. Backup → Restore from file or destination → Full restore, with the
+   passphrase and `RESTORE-FROM-BACKUP`. Keep "Exclude secrets" archives out
+   of this path: they carry no credentials, so nobody can sign in after one.
+3. Sign in with the **backup's** accounts; the install's own admin is gone.
+
+A restore replaces the appliance registry and the internal CA with the
+archive's. Since #4677 the restore keeps the rows of the appliances that
+are alive in this install before the replay (certificate, roles, state),
+puts the install's CA back when the archive's differs, and drops an
+archive row for the same hostname, so the supervisor on this node keeps
+heartbeating and its DNS and DHCP roles keep serving. The restore result
+names what was kept, and the audit entry `backup_restored` carries
+`adopted_appliances`. Group assignments are matched by group name; a node
+whose group the archive lacks has no group until you assign one. Archive
+appliances that exist no more stay in the Fleet list with no heartbeat:
+delete them there. One that does still exist, on another node, has a
+certificate from the archive's CA, so re-key it or pair it again.
+Releases before this fix revoke the appliance about 30 seconds after the
+restore, and nothing in the console brings it back.
 
 **Where SECRET_KEY lives (#1448).** From the release after 2026.10.02-1,
 firstboot keeps `SECRET_KEY` in `spatium-control-app-keys` in the
@@ -3344,8 +3514,34 @@ No api is needed: firstboot commits the slot as the durable default once
 k3s's `/readyz` answers and every baked image is in containerd, as for an
 upgrade (step 7 above), and the database is left as it is. If that boot
 fails, the next reboot falls back to the older slot, as any trial boot
-does. The only other way out is to restore a pre-upgrade copy of the
-database by hand.
+does. The way back to the older release itself is the reinstall and
+restore below.
+
+### The way back from 1.0.1 to 1.0.0 (#4658)
+
+Upgrading from 1.0.0 to 1.0.1 is supported. **Going back to 1.0.0 in
+place is not supported.**
+
+- **Not a slot rollback.** A slot rollback leaves the database on
+  1.0.1's schema, and a restore after an acknowledged rollback is
+  refused (above).
+- **Not a reinstall plus restore either.** Reinstalling 1.0.0 from its
+  ISO and restoring the pre-upgrade backup there brings the archive's
+  data back, but 1.0.0 does not carry the appliance identity fix
+  (#4680): about 30 seconds after the restore the supervisor is refused
+  as unknown and revoked, DNS and DHCP stop serving on that node, and
+  nothing in the console brings it back. This is the same behaviour
+  "Restoring a backup onto a fresh install" above describes for
+  releases before that fix.
+
+Before you upgrade, still take a Full backup from Backup, with a
+passphrase you will still know, and copy the archive off the appliance.
+Do not use "Exclude secrets": an archive without credentials leaves
+nobody able to sign in after a restore. The archive is your record of
+the data as it was before the upgrade.
+
+If 1.0.1 misbehaves after the upgrade, stay on 1.0.1 and report it
+rather than going back to 1.0.0.
 
 ### 5c. Phase 8f fleet upgrade orchestration
 
@@ -3757,7 +3953,15 @@ so a first-time operator never gets stuck looking for the upload.
    gives up (finishing only the node it is on) 8 minutes after its last
    renewal, before the Lease could lapse for anyone else. If a drive
    exits with the run still `running`, a beat sweep re-drives it once
-   the Lease has been free on two sweeps a minute apart (#1713). If the drive itself died, the Lease lapses after its
+   the Lease has been free on two sweeps a minute apart (#1713). After the shared-tag
+   hand-off the hop chain refreshes a 45 s heartbeat; if it stops (the worker holding
+   the hop was killed) the sweep re-drives the run on its second sighting, about
+   two minutes after the last hop when beat keeps running. The shared-tag flip
+   also recreates beat, and a restarted beat runs one sweep as it starts, so on
+   a rolling upgrade expect the re-drive within a few minutes (about five
+   measured on a three-node roll) rather than two. Otherwise (a hand-off from a
+   build without the heartbeat, or Redis unreadable) the sweep waits out the
+   15-minute grace (#3851). If the drive itself died, the Lease lapses after its
    10-minute duration; a superadmin can free it sooner with
    **Force release** beside the Lease pill (`POST
    /api/v1/upgrades/lease/force-release`). That is refused while the
@@ -3907,7 +4111,7 @@ from a snapshot taken before the upgrade** — and the order and the
 vantage both matter.
 
 **The Fleet UI path only works while the control plane still serves.**
-Fleet → Control plane → etcd snapshots drives the restore through the
+Appliance → Cluster → etcd snapshots drives the restore through the
 api pod → the seed's heartbeat → a host trigger file, so every hop
 needs the very cluster you are recovering to be up. Use it while things
 still work: on a partial rollout, or when you have decided to abandon
@@ -4148,7 +4352,15 @@ the operator installing a CA anywhere:
    control plane serves signed by the appliance CA (whose certificate the
    supervisor received on approval), and re-pins only if the new certificate
    is on it. Otherwise it keeps the old pin and logs
-   `supervisor.tls.certificate_not_vouched`.
+   `supervisor.tls.certificate_not_vouched`. A member on the node-local http
+   path does not wait for that failure: every ~5 minutes it reads the same
+   list over the in-cluster path (trust is the CA signature, not the
+   transport), which also carries the vouched certificates' PEM, and replaces
+   its pin when the list names a certificate it does not hold
+   (`supervisor.tls.pin_refreshed`). A read that fails (its own api is
+   down) stays pending: it is retried with backoff and as soon as the
+   node-local path returns, and is dropped with
+   `supervisor.tls.pin_refresh_satisfied_by_repin` if a repin got there first.
 3. **Once approved, the first-contact pin is checked.** When the CA arrives,
    the supervisor checks that the certificate it pinned at first contact is on
    the CA's list, and logs `supervisor.tls.pin_not_vouched` if not.

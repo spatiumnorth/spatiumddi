@@ -13,6 +13,7 @@ from spatium_supervisor.register import (
     RegisterCodeRejected,
     RegisterDisabled,
     RegisterFatal,
+    RegisterProofRefused,
     RegisterThrottled,
     register,
 )
@@ -229,3 +230,84 @@ def test_register_503_honours_a_capped_retry_after(
     )
     register(**_kwargs(tmp_path, lambda _req: next(responses)))
     assert slept == [register_mod._MAX_RETRY_AFTER_S, 0]
+
+
+def test_register_request_carries_a_verifiable_key_signature(tmp_path: Path) -> None:
+    import base64
+    import json
+
+    from spatium_supervisor.cert_auth import register_proof_payload
+
+    identity, _ = load_or_generate(tmp_path)
+    seen: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(req.read()))
+        return httpx.Response(
+            200,
+            json={
+                "appliance_id": "11111111-2222-3333-4444-555555555555",
+                "state": "pending_approval",
+                "public_key_fingerprint": identity.fingerprint,
+                "session_token": "t",
+            },
+        )
+
+    kwargs = dict(
+        control_plane_url="https://ddi.example.com",
+        pairing_code="12345678",
+        identity=identity,
+        hostname="h",
+        supervisor_version="1",
+        client=_client_for(handler),
+    )
+    register(**kwargs)
+    register(**kwargs)
+    first, second = seen
+    identity.public_key.verify(
+        base64.b64decode(first["proof_signature"]),
+        register_proof_payload(identity.fingerprint, first["proof_timestamp"], first["proof_nonce"]),
+    )
+    assert first["proof_nonce"] != second["proof_nonce"]
+
+
+# ── #4433: a refused registration proof is not a dead pairing code ──────────
+
+
+@pytest.mark.parametrize("reason", ["clock_skew", "bad_signature", "replayed"])
+def test_register_403_with_a_proof_reason_header_keeps_the_code(
+    tmp_path: Path, reason: str
+) -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"X-Register-Refusal": reason}, json={"detail": "x"})
+
+    with pytest.raises(RegisterProofRefused) as exc:
+        register(**_kwargs(tmp_path, handler))
+    assert exc.value.reason == reason
+    assert not isinstance(exc.value, RegisterFatal)
+
+
+def test_register_403_proof_reason_is_read_from_the_body_too(tmp_path: Path) -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"detail": {"reason": "clock_skew", "message": "m"}})
+
+    with pytest.raises(RegisterProofRefused, match="clock"):
+        register(**_kwargs(tmp_path, handler))
+
+
+def test_register_403_with_an_unknown_reason_is_still_a_rejected_code(tmp_path: Path) -> None:
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"X-Register-Refusal": "other"}, json={})
+
+    with pytest.raises(RegisterCodeRejected):
+        register(**_kwargs(tmp_path, handler))
+
+
+def test_register_bare_403_from_a_1_0_0_control_plane_is_a_rejected_code(tmp_path: Path) -> None:
+    """A 1.0.0 control plane never refuses a proof; its 403 is the code."""
+
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"detail": "Registration refused."})
+
+    with pytest.raises(RegisterCodeRejected):
+        register(**_kwargs(tmp_path, handler))

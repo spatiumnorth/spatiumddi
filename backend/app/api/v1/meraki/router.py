@@ -24,6 +24,11 @@ from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
+from app.core.stored_secret_guard import (
+    release_block_sync_credentials,
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace, Subnet
@@ -311,17 +316,34 @@ async def update_org(org_pk: uuid.UUID, body: OrgUpdate, db: DB, user: SuperAdmi
         raise HTTPException(status_code=404, detail="Meraki org not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        o,
+        changes,
+        destination=["base_url"],
+        secrets={"api_key": o.api_key_encrypted},
+        blank_keeps=("api_key",),
+    )
     new_ipam = changes.get("ipam_space_id", o.ipam_space_id)
     new_dns = changes.get("dns_group_id", o.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
         await _validate_bindings(db, new_ipam, new_dns)
 
+    block_sync_cleared = release_block_sync_credentials(
+        o,
+        changes,
+        destination=["base_url"],
+        credentials={"block_sync_api_key_encrypted": b""},
+        label="base_url",
+    )
     for k, v in changes.items():
         if k == "api_key":
             if v:
                 o.api_key_encrypted = encrypt_str(v)
         else:
             setattr(o, k, v)
+
+    if block_sync_cleared:
+        changes["block_sync_credentials_cleared"] = True
 
     _audit(
         db,
@@ -502,6 +524,12 @@ async def test_connection(
         stored = await db.get(MerakiOrg, body.org_id_pk)
         if stored is None:
             raise HTTPException(status_code=404, detail="Meraki org not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"base_url": body.base_url, "api_key": body.api_key},
+            destination=("base_url",),
+            secrets={"api_key": stored.api_key_encrypted},
+        )
         base_url = body.base_url or stored.base_url
         org_id = org_id or stored.org_id
         if not api_key and stored.api_key_encrypted:

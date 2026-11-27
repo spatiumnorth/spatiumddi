@@ -203,6 +203,37 @@ Three channels:
 **Why not WebSocket / SSE?**
 - We considered it. Long-poll is simpler, survives hostile proxies, does not need sticky-session affinity on a multi-replica API. We can upgrade to SSE in a later phase without changing the agent contract (long-poll remains a compatible fallback).
 
+### Blocklist entries in the bundle — packed runs (#4040)
+
+A blocklist's `entries` list used to hold one JSON object per entry (~108
+bytes each): 69 MB for AdGuard + OISD + Hagezi, which the agent parsed whole
+and kept twice on disk (`current.json`, `previous.json`). An agent that sends
+`packed-blocklists` in its `X-Spatium-Agent-Features` header (register and
+every heartbeat, recorded as `dns_server.agent_renders_packed_blocklists`) is
+sent each run of **consecutive** entries that share every field but the
+domain as one element:
+
+```json
+{"packed": {"action": "block", "block_mode": "nxdomain", "target": null,
+            "is_wildcard": true},
+ "count": 100000, "domains_gz": "<base64 of gzip of the domains, one per line>"}
+```
+
+Runs are never regrouped, because the renderer keeps the first writer of an
+owner name (#878) and a reordered list would render a different zone. An
+entry a run cannot carry (a `target`, a newline in the name, a run under 32)
+stays an object, in place; a run is cut at 100,000 domains. The agent expands
+runs a line at a time (`blocklist_entries.iter_entries`), and the zone it
+writes is byte-identical to the per-entry one: `rpz_sha256`, and the SOA serial
+derived from it, are computed over the per-entry form in both shapes, so a
+server whose agent starts reading packed entries keeps its zone files. The
+bundle ETag is over the bundle as sent, so it differs between the two shapes
+and moves with every entry in either. An agent that has not advertised the
+feature (an older release, or one rolled back, which re-renders the bundle on
+its next heartbeat) is sent the per-entry shape. The cache holds the packed
+bundle as received, so a restart with the control plane down renders from it
+alone. Measured on three catalogue lists: 69 MB down to the figures in the PR.
+
 ### Stored bundles — rendered once, served as bytes (#1111)
 
 The bundle the long-poll hands out is **not assembled in the request**. It
@@ -455,6 +486,40 @@ ops/
 
 **Offline operation**: if the control plane is unreachable on boot, the agent loads `config/current.json`, renders configs if not already rendered, starts the daemon, and continues serving DNS. It enters a retry loop and resumes sync when the control plane returns. No query path ever depends on control-plane reachability.
 
+### BIND9 memory: jemalloc (#4192)
+
+Alpine's `named` is built without jemalloc and runs on musl's malloc, which
+keeps freed pages. With split-horizon every view loads its own copy of each
+RPZ (BIND refuses an RPZ defined by `in-view`), so removing a view or
+reloading a large list left the memory resident until the container
+restarted. The `dns-bind9` image links `libjemalloc` into `named` and ships
+`/etc/malloc.conf` as `background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`,
+so freed pages return to the OS about a second later. Measured with two
+views each loading a 300k-entry RPZ: removing one view took RSS from 439 MB
+to 274 MB (stock image: 439 MB stays).
+
+`MALLOC_CONF` and `LD_PRELOAD` do nothing here: `named` carries a file
+capability for port 53, and a binary with one ignores both. Set
+`SPATIUM_MALLOC_CONF` to replace the options instead. The entrypoint can
+only apply it when the container starts as root; under a random uid
+(OpenShift restricted SCC) it logs that it was ignored and the image default
+stays.
+
+### PowerDNS: emptying the server (`PDNS_ALLOW_EMPTY_RETIRE`, #4564)
+
+The PowerDNS agent deletes the zones a bundle drops. When one confirmed
+apply would delete **every** zone the agent manages, it deletes none: it
+logs `powerdns_zone_retire_held_all`, reports a warning on the server row
+(`holding deletion of all N managed zones; the bundle carries none`) and
+leaves its ledger unchanged. This covers an explicit empty zone list as
+well as a bundle that carries none of the managed zones. Normal removal
+resumes by itself once a later bundle carries at least one zone, and
+removing part of the zones is never held. A server managing a single zone
+that the bundle drops counts as "all", so that zone is held too.
+
+To really empty the server, set `PDNS_ALLOW_EMPTY_RETIRE=1` in the PowerDNS
+agent's environment (`1`, `true`, `yes` or `on`). Default: unset.
+
 ### Last-known-good revert (issue #882)
 
 Offline operation covers a *missing* control plane. It does not cover a
@@ -510,6 +575,14 @@ exits during its first start is reported as such instead of as started.
 On restart the agent checks the quarantine before re-applying `current.json`:
 a container that crash-loops must not re-break itself with the bundle that
 broke it.
+
+**Resolver cache ceiling (#4185).** The agent writes `max-cache-size` into
+`options {}`, which BIND applies to each recursive view's own cache. Precedence:
+the server group's `max_cache_size` (carried in the bundle's `options`), then
+the `NAMED_MAX_CACHE_SIZE` env var, then a quarter of the container's memory
+limit split across the recursive views. `unlimited` and `0` are refused by the
+API and ignored by the agent (`bind9_max_cache_size_ignored`). See
+`docs/features/DNS.md` section 8.0 for sizing guidance.
 
 **A bundle the daemon dies on is not re-applied blindly either (#2019).**
 The quarantine only hears of failures the agent survives. A bundle too big
@@ -719,6 +792,12 @@ heartbeat body is strict and an agent can be upgraded before its control plane.
 - `soa-timers`: the BIND9 driver writes each zone's own refresh / retry /
   expire / minimum into its SOA. Agents before #1171 send no header and write
   `3600 600 86400 300` for every zone.
+- `served-serials` (#3940): the BIND9 driver reports a secondary / stub zone's
+  serial as named serves it, and nothing for a zone named holds no copy of,
+  instead of the bundle's 0. Stored as `dns_server.agent_reports_served_serials`.
+  The control plane reads a secondary at a non-zero serial as in sync and 0
+  as not synced for every BIND9 agent: an older agent's start-up report also
+  reads each zone from named, and its 0 means "not reported".
 - Register and heartbeat store it as `dns_server.agent_renders_soa_timers`.
   A group's bundles carry each zone's own timers only while every BIND9 server
   of the group (run by an agent, enabled, approved) says `soa-timers`
@@ -968,7 +1047,7 @@ codebase and the same `spatium-dns-entrypoint`, and exposes the same
 The `dns-technitium` image follows the same agent/entrypoint shape too,
 but has no config file for the agent to render at all — Technitium is
 configured entirely over its own HTTP API (the agent calls
-`http://127.0.0.1:5380`; the daemon listens on every interface, see the note
+`http://127.0.0.1:5380`; the daemon listens on loopback only, see the note
 below), so
 `render()`/`validate()`/`swap_and_reload()` collapse into "stash the
 desired zone/record state as JSON, then reconcile it against the live
@@ -976,7 +1055,7 @@ API." The agent provisions a permanent API bearer token on first-ever
 boot (via `DNS_SERVER_ADMIN_PASSWORD` + `/api/user/createToken`) the same
 way the PowerDNS driver provisions its local API key.
 
-**Technitium console reachability (#1776).** The daemon's web console and API listen on `0.0.0.0` / `[::]:5380` over plaintext HTTP, not on loopback ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776); the bind change is planned for 1.1.0). The agent itself calls it over `127.0.0.1`. Who can reach it from outside depends on the deployment: on the default appliance path it is not reachable from the LAN or from pods; in Docker Compose, the umbrella chart and DNS-VIP mode every other container or pod on the same network can reach it; and in the host-network standalone compose it is reachable from the LAN. The `admin` account carries a random 192-bit password generated at first boot (there is no `admin`/`admin` window). For the host-network standalone compose, add a host firewall rule that drops inbound TCP 5380 from anything but the host itself.
+**Technitium console reachability (#1776).** The daemon's web console and API listen on loopback only (`127.0.0.1:5380`, plaintext HTTP), so nothing outside the container, pod or host can reach them ([#1776](https://github.com/spatiumnorth/spatiumddi/issues/1776)). A fresh `/etc/dns` takes the bind from `DNS_SERVER_WEB_SERVICE_LOCAL_ADDRESSES=127.0.0.1`, which the agent sets on every daemon start; Technitium reads that variable only when `webservice.config` does not exist yet, so on an existing `/etc/dns` the agent sends `settings/set webServiceLocalAddresses=127.0.0.1` once (it restarts the web service) after reading `settings/get`, and does nothing once pinned. Loopback is IPv4 only on purpose: Kestrel fails to start on `::1` where IPv6 is disabled in the container. The `admin` account still carries a random 192-bit password generated at first boot. To reach the console for debugging, run `curl` inside the container with `docker exec` / `kubectl exec`; `kubectl port-forward` does not work, as it connects to the pod IP rather than loopback. An operator who sets a different bind in the console will see it reset on the next structural apply.
 
 
 ### Volumes

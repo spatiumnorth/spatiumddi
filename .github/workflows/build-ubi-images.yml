@@ -1,0 +1,193 @@
+name: Build UBI Images
+
+# The Red Hat UBI 9 variants of the api, frontend, BIND9 and Kea images (#3913),
+# built on a PR that touches them and weekly (Red Hat rebuilds its base images
+# and a CVE fixed there should show up here, not at the next release).
+#
+# What it proves per image, on linux/amd64: it builds, the entrypoint's tools
+# start under the OpenShift-style random uid in group 0, Trivy + trivy-gate.sh
+# find nothing installable, and Red Hat's `preflight check container` passes
+# (check only; a submission needs a Partner Connect token and is not CI's).
+# release.yml builds and gates both architectures before it publishes the
+# `-ubi` tags; this is the PR-time lane, like build-dns-images.yml.
+#
+# build-arm64 (#4638) builds each image natively on an arm64 runner and runs
+# the same smoke test, so an arm64-only break (a library ubi-minimal lacks on
+# aarch64, a separately signed aarch64 RPM) fails the PR rather than the
+# release tag, which is where 1.0.1-soak.1 first met them. Trivy and Red Hat
+# preflight stay on the amd64 job.
+#
+# Read-only: it builds and scans, it never publishes.
+on:
+  pull_request:
+    paths:
+      - ".github/images-ubi.json"
+      - "backend/Dockerfile.ubi"
+      - "frontend/Dockerfile.ubi"
+      - "frontend/ubi/**"
+      - "agent/dns/images/bind9/**"
+      - "agent/dhcp/images/kea/**"
+      - ".github/workflows/build-ubi-images.yml"
+      - ".github/actions/install-trivy/**"
+      - ".github/actions/preflight-check/**"
+      - ".github/scripts/trivy-gate.sh"
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.image }} (UBI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: spatiumddi-api
+            context: ./backend
+            file: ./backend/Dockerfile.ubi
+            target: runtime
+            smoke: >-
+              docker run --rm --user 123456:0 -e SECRET_KEY="$(openssl rand -hex 32)" "$IMG" python -c "import app.main"
+              && docker run --rm --user 123456:0 "$IMG" pg_dump --version
+          - image: spatiumddi-frontend
+            context: .
+            file: ./frontend/Dockerfile.ubi
+            target: ""
+            smoke: docker run --rm --user 123456:0 -e FRONTEND_HTTP_PORT=8080 "$IMG" nginx -t
+          - image: dns-bind9
+            context: .
+            file: ./agent/dns/images/bind9/Dockerfile.ubi
+            target: ""
+            smoke: docker run --rm --user 123456:0 --entrypoint named "$IMG" -V
+          - image: dhcp-kea
+            context: .
+            file: ./agent/dhcp/images/kea/Dockerfile.ubi
+            target: ""
+            smoke: docker run --rm --user 123456:0 --entrypoint kea-dhcp4 "$IMG" -V
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Bust the package layer once a week, like the other image lanes: the
+      # ``type=gha`` cache keys a layer on its RUN text, so a scan of a cached
+      # ``microdnf upgrade`` layer describes whenever it was first written.
+      - name: Compute package snapshot key
+        id: snap
+        run: echo "snapshot=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Build (amd64, loaded locally)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi
+          build-args: |
+            RPM_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
+            APP_VERSION=pr-scan
+          cache-from: type=gha,scope=ubi-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=ubi-${{ matrix.image }}
+
+      # The tools the entrypoint needs start under an OpenShift-style random uid in
+      # group 0 (the restricted SCC), not as the image's own user.
+      - name: Smoke test as a random uid in group 0
+        env:
+          IMG: ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi
+        run: ${{ matrix.smoke }}
+
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          skip-setup-trivy: true
+          image-ref: ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi
+          format: json
+          output: trivy-report.json
+          severity: HIGH,CRITICAL
+          # The verdict belongs to the gate step below.
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Gate on the scan
+        run: >-
+          .github/scripts/trivy-gate.sh
+          "trivy-report.json"
+          "ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi"
+
+      - name: Preflight (Red Hat container certification checks, check only)
+        uses: ./.github/actions/preflight-check
+        with:
+          image: ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi
+          name: ${{ matrix.image }}
+          tag: pr-scan-ubi-${{ github.run_id }}
+
+  build-arm64:
+    name: ${{ matrix.image }} (UBI, arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: spatiumddi-api
+            context: ./backend
+            file: ./backend/Dockerfile.ubi
+            target: runtime
+            smoke: >-
+              docker run --rm --user 123456:0 -e SECRET_KEY="$(openssl rand -hex 32)" "$IMG" python -c "import app.main"
+              && docker run --rm --user 123456:0 "$IMG" pg_dump --version
+          - image: spatiumddi-frontend
+            context: .
+            file: ./frontend/Dockerfile.ubi
+            target: ""
+            smoke: docker run --rm --user 123456:0 -e FRONTEND_HTTP_PORT=8080 "$IMG" nginx -t
+          - image: dns-bind9
+            context: .
+            file: ./agent/dns/images/bind9/Dockerfile.ubi
+            target: ""
+            smoke: docker run --rm --user 123456:0 --entrypoint named "$IMG" -V
+          - image: dhcp-kea
+            context: .
+            file: ./agent/dhcp/images/kea/Dockerfile.ubi
+            target: ""
+            smoke: docker run --rm --user 123456:0 --entrypoint kea-dhcp4 "$IMG" -V
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Compute package snapshot key
+        id: snap
+        run: echo "snapshot=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Build (arm64, native, loaded locally)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/arm64
+          push: false
+          load: true
+          tags: ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi-arm64
+          build-args: |
+            RPM_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
+            APP_VERSION=pr-scan
+          cache-from: type=gha,scope=ubi-arm64-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=ubi-arm64-${{ matrix.image }}
+
+      - name: Smoke test as a random uid in group 0
+        env:
+          IMG: ghcr.io/spatiumnorth/${{ matrix.image }}:pr-scan-ubi-arm64
+        run: ${{ matrix.smoke }}

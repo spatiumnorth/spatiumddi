@@ -28,6 +28,10 @@ from app.core.demo_mode import forbid_in_demo_mode
 from app.core.exc_text import describe_exc
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import (
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.docker import DockerHost
@@ -374,6 +378,13 @@ async def update_host(
         raise HTTPException(status_code=404, detail="Host not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        h,
+        changes,
+        destination=["connection_type", "endpoint"],
+        secrets={"client_key_pem": h.client_key_encrypted},
+        blank_keeps=("client_key_pem",),
+    )
     new_ipam = changes.get("ipam_space_id", h.ipam_space_id)
     new_dns = changes.get("dns_group_id", h.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
@@ -457,6 +468,16 @@ async def test_connection(
         stored = await db.get(DockerHost, body.host_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="Host not found")
+        require_secret_for_changed_connection(
+            stored,
+            {
+                "connection_type": body.connection_type,
+                "endpoint": body.endpoint,
+                "client_key_pem": body.client_key_pem,
+            },
+            destination=("connection_type", "endpoint"),
+            secrets={"client_key_pem": stored.client_key_encrypted},
+        )
         connection_type = connection_type or stored.connection_type
         endpoint = endpoint or stored.endpoint
         ca_bundle_pem = ca_bundle_pem if ca_bundle_pem is not None else stored.ca_bundle_pem

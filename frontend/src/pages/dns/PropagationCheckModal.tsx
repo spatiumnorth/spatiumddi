@@ -15,6 +15,7 @@ import {
   type PropagationCheckResult,
   type PropagationResolverResult,
 } from "@/lib/api";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Multi-resolver propagation check — fires the same DNS query against
@@ -180,7 +181,9 @@ function ResultsTable({
                     ))}
                   </div>
                 ) : r.error ? (
-                  <span className="text-destructive/80">{r.error}</span>
+                  <span role="alert" className="text-destructive/80">
+                    {r.error}
+                  </span>
                 ) : (
                   <span className="text-muted-foreground">—</span>
                 )}
@@ -190,9 +193,9 @@ function ResultsTable({
         </tbody>
       </table>
       {errorMessage && (
-        <div className="border-t bg-destructive/5 px-2 py-1.5 text-xs text-destructive">
+        <FormError className="border-t bg-destructive/5 px-2 py-1.5 text-xs text-destructive">
           The check failed: {errorMessage}
-        </div>
+        </FormError>
       )}
       {result && (
         <div className="border-t bg-muted/20 px-2 py-1.5 text-[11px] text-muted-foreground">

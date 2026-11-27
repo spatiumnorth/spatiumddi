@@ -1,3 +1,7 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -39,6 +43,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // One-shot snippet operators can paste into a root shell on any PVE
@@ -360,7 +365,16 @@ export function ProxmoxPage() {
       </div>
 
       {showCreate && <NodeModal onClose={() => setShowCreate(false)} />}
-      {edit && <NodeModal node={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["proxmox-nodes"]]}
+          title="Edit Proxmox Endpoint"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => <NodeModal node={fresh} onClose={() => setEdit(null)} />}
+        </FreshEdit>
+      )}
       {discover && (
         <DiscoveryModal node={discover} onClose={() => setDiscover(null)} />
       )}
@@ -749,6 +763,13 @@ function NodeModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [tokenId, setTokenId] = useState(node?.token_id ?? "");
   const [tokenSecret, setTokenSecret] = useState("");
+  // #4135 — a moved address needs the stored secret entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    node && { host: node.host, port: node.port },
+    () => setTokenSecret(""),
+  );
+  const mustEnter = reask.asks(node?.token_secret_present);
   const [spaceId, setSpaceId] = useState(node?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(node?.dns_group_id ?? "");
   const [mirrorVms, setMirrorVms] = useState(node?.mirror_vms ?? true);
@@ -810,7 +831,12 @@ function NodeModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (tokenSecret) update.token_secret = tokenSecret;
-        return proxmoxApi.updateNode(node!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(node!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(node!);
+        return proxmoxApi.updateNode(node!.id, body);
       }
       const create: ProxmoxNodeCreate = {
         name,
@@ -953,18 +979,20 @@ function NodeModal({
               required
             />
           </Field>
-          <Field label="Token Secret">
+          <Field label="Token Secret" hint={mustEnter ? reask.hint : undefined}>
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={tokenSecret}
               onChange={(e) => setTokenSecret(e.target.value)}
               placeholder={
-                editing && node?.token_secret_present
-                  ? "••• stored — enter to replace"
-                  : "UUID printed by pveum"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && node?.token_secret_present
+                    ? "••• stored — enter to replace"
+                    : "UUID printed by pveum"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -1131,7 +1159,9 @@ function NodeModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -1143,7 +1173,7 @@ function NodeModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !tokenSecret.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -1247,26 +1277,6 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {

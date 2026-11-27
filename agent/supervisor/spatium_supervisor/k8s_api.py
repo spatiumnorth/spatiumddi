@@ -2054,6 +2054,10 @@ _CONTROL_PLANE_FAST_EVICT = [
 #: api pod makes it inert. firstboot renders the same value, or the first
 #: heartbeat of every install would add a helm revision (#1005).
 _NODE_LOCAL_API = "PreferSameNode"
+#: #3645 — ``api.service.nodeLocal``: the second, ``internalTrafficPolicy:
+#: Local`` api Service the frontend's /api proxy and the members' supervisors
+#: use, so their plain-http hop never crosses the node LAN. Written with
+#: ``trafficDistribution`` (and rendered by firstboot, #1005).
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -2870,7 +2874,7 @@ def apply_control_plane_overrides(
             # #2156 — the pool per api pod shrinks as pods are added, so the
             # connections Postgres' limit is sized for are all it can be sent.
             | {"databasePool": api_db_pool(cp_size)}
-            | {"service": {"trafficDistribution": _NODE_LOCAL_API}},
+            | {"service": {"trafficDistribution": _NODE_LOCAL_API, "nodeLocal": True}},
             "frontend": dict(scaled)
             | {
                 "controlPlaneVIP": vip,

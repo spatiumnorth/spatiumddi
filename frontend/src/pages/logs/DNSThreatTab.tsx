@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseQueryResult,
+} from "@tanstack/react-query";
 import {
   AlertTriangle,
   ChevronDown,
@@ -16,6 +21,7 @@ import {
 
 import { Modal } from "@/components/ui/modal";
 import { cn } from "@/lib/utils";
+import { useSessionState } from "@/lib/useSessionState";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import {
   authApi,
@@ -23,6 +29,9 @@ import {
   formatApiError,
   type DNSClientWindow,
   type DNSTunnelSignal,
+  type RPZHitRow,
+  type RPZOffender,
+  type RPZSummary,
 } from "@/lib/api";
 
 const NEEDS_MUTE = "Requires write permission on servers";
@@ -164,6 +173,55 @@ function SignalBar({ signal }: { signal: DNSTunnelSignal }) {
   );
 }
 
+type SubTab = "threat" | "rpz" | "recent";
+const SUB_TABS: readonly { id: SubTab; label: string }[] = [
+  { id: "threat", label: "Threat log" },
+  { id: "rpz", label: "RPZ hits" },
+  { id: "recent", label: "Recent blocked" },
+];
+
+function SubTabButton({
+  id,
+  label,
+  active,
+  count,
+  onSelect,
+  onKey,
+}: {
+  id: SubTab;
+  label: string;
+  active: boolean;
+  count: number | undefined;
+  onSelect: () => void;
+  onKey: (e: React.KeyboardEvent<HTMLButtonElement>) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      id={`dns-threat-tab-${id}`}
+      aria-selected={active}
+      aria-controls={`dns-threat-panel-${id}`}
+      tabIndex={active ? 0 : -1}
+      onClick={onSelect}
+      onKeyDown={onKey}
+      className={cn(
+        "flex items-center gap-1.5 border-b-2 px-3 pb-2 pt-1.5 text-xs font-medium transition-colors",
+        active
+          ? "border-primary text-foreground"
+          : "border-transparent text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {label}
+      {count !== undefined && (
+        <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] tabular-nums">
+          {count}
+        </span>
+      )}
+    </button>
+  );
+}
+
 export function DNSThreatTab() {
   const [hours, setHours] = useState(24);
   const [minScore, setMinScore] = useState(20);
@@ -181,6 +239,14 @@ export function DNSThreatTab() {
   const [detection, setDetection] = useState<Detection>("tunnel");
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [muting, setMuting] = useState<string | null>(null);
+  // Which of the three tables is showing (#4172). Session-scoped, like the
+  // main Logs tab selection.
+  const [sub, setSub] = useSessionState<SubTab>(
+    "logs-dns-threat-sub",
+    "threat",
+  );
+  // Clicking an RPZ client narrows the recent-blocked list (#914).
+  const [focusClient, setFocusClient] = useState<string | null>(null);
   const qc = useQueryClient();
   // #2531 — the mute routes take ``write`` on ``server`` (muting silences a
   // critical alert); offer the controls only to a caller the server accepts.
@@ -230,6 +296,26 @@ export function DNSThreatTab() {
     retry: false,
   });
 
+  // RPZ queries live here (not in the panel) so the sub-tab row can show
+  // each table's row count without a second round of requests (#4172).
+  const rpzSummaryQ = useQuery({
+    queryKey: ["dns-threat-rpz-summary", hours],
+    queryFn: () => dnsThreatApi.rpzSummary({ hours }),
+  });
+  const rpzClientsQ = useQuery({
+    queryKey: ["dns-threat-rpz-clients", hours],
+    queryFn: () => dnsThreatApi.rpzClients({ hours, limit: 20 }),
+  });
+  const rpzHitsQ = useQuery({
+    queryKey: ["dns-threat-rpz-hits", hours, focusClient],
+    queryFn: () =>
+      dnsThreatApi.rpzHits({
+        hours,
+        limit: 100,
+        ...(focusClient ? { client_ip: focusClient } : {}),
+      }),
+  });
+
   // A 404 here means the feature module is off, not that something
   // broke — the router include is module-gated.
   const moduleOff =
@@ -238,6 +324,30 @@ export function DNSThreatTab() {
 
   const rows = q.data ?? [];
   const summary = summaryQ.data;
+
+  // Counts come from data already fetched. A count is left out (undefined)
+  // while its query is unresolved, and for the RPZ tables when the pipeline
+  // has never run: "no data yet" is not "zero".
+  const rpzLive = rpzSummaryQ.data?.has_data === true;
+  const subCounts: Record<SubTab, number | undefined> = {
+    threat: q.data ? q.data.length : undefined,
+    rpz: rpzLive && rpzClientsQ.data ? rpzClientsQ.data.length : undefined,
+    recent: rpzLive && rpzHitsQ.data ? rpzHitsQ.data.length : undefined,
+  };
+  // WAI-ARIA tabs: arrow keys move focus and selection, Home / End jump.
+  const onSubKey = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    const i = SUB_TABS.findIndex((t) => t.id === sub);
+    let n = i;
+    if (e.key === "ArrowRight") n = (i + 1) % SUB_TABS.length;
+    else if (e.key === "ArrowLeft")
+      n = (i - 1 + SUB_TABS.length) % SUB_TABS.length;
+    else if (e.key === "Home") n = 0;
+    else if (e.key === "End") n = SUB_TABS.length - 1;
+    else return;
+    e.preventDefault();
+    setSub(SUB_TABS[n].id);
+    document.getElementById(`dns-threat-tab-${SUB_TABS[n].id}`)?.focus();
+  };
 
   if (moduleOff) {
     return (
@@ -283,18 +393,6 @@ export function DNSThreatTab() {
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-end gap-3 rounded-lg border bg-card px-4 py-3">
         <div>
-          <label className="mb-1 block text-xs font-medium">Detection</label>
-          <select
-            value={detection}
-            onChange={(e) => setDetection(e.target.value as Detection)}
-            className="rounded-md border bg-background px-2 py-1.5 text-sm"
-          >
-            <option value="tunnel">Tunneling (name content)</option>
-            <option value="beacon">Beaconing (timing)</option>
-            <option value="dga">DGA (name plausibility)</option>
-          </select>
-        </div>
-        <div>
           <label className="mb-1 block text-xs font-medium">Window</label>
           <select
             value={hours}
@@ -307,150 +405,196 @@ export function DNSThreatTab() {
             <option value={168}>Last 7 days</option>
           </select>
         </div>
-        <div>
-          <label className="mb-1 block text-xs font-medium">
-            Minimum score
-          </label>
-          <select
-            value={minScore}
-            onChange={(e) => setMinScore(Number(e.target.value))}
-            className="rounded-md border bg-background px-2 py-1.5 text-sm"
-          >
-            <option value={0}>Everything (noisy)</option>
-            <option value={20}>20 — worth a look</option>
-            <option value={40}>40 — suspicious</option>
-            <option value={60}>60 — likely tunnel</option>
-          </select>
-        </div>
-        <button
-          type="button"
-          onClick={() => setShowMutes((v) => !v)}
-          className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
-        >
-          <BellOff className="h-4 w-4" />
-          Muted clients
-        </button>
-        <label className="flex items-center gap-1.5 text-xs">
-          <input
-            type="checkbox"
-            checked={showAllowlisted}
-            onChange={(e) => setShowAllowlisted(e.target.checked)}
-          />
-          Show cleared (allowlisted)
-        </label>
         <button
           type="button"
           onClick={() => {
             void q.refetch();
             void summaryQ.refetch();
+            void rpzSummaryQ.refetch();
+            void rpzClientsQ.refetch();
+            void rpzHitsQ.refetch();
           }}
           className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
         >
           <RefreshCw className="h-4 w-4" />
           Refresh
         </button>
-
-        {summary && (
-          <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
-            {summary.has_data ? (
-              <>
-                <ShieldCheck className="h-4 w-4" />
-                {summary.windows_scored} windows · {summary.clients_seen}{" "}
-                clients scored
-              </>
-            ) : (
-              <>
-                <AlertTriangle className="h-4 w-4 text-amber-500" />
-                No windows scored yet
-              </>
-            )}
-          </div>
-        )}
       </div>
 
-      {q.isLoading ? (
-        <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-6 text-sm text-muted-foreground">
-          <Loader2 className="h-4 w-4 animate-spin" />
-          Scoring&hellip;
-        </div>
-      ) : rows.length === 0 ? (
-        <div className="rounded-lg border bg-card p-6">
-          <div className="flex items-start gap-3">
-            {summary?.has_data ? (
-              <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
-            ) : (
-              <ShieldQuestion className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
-            )}
+      <div
+        role="tablist"
+        aria-label="DNS threat views"
+        className="flex gap-1 border-b"
+      >
+        {SUB_TABS.map((t) => (
+          <SubTabButton
+            key={t.id}
+            id={t.id}
+            label={t.label}
+            active={sub === t.id}
+            count={subCounts[t.id]}
+            onSelect={() => setSub(t.id)}
+            onKey={onSubKey}
+          />
+        ))}
+      </div>
+
+      {sub === "threat" && (
+        <div
+          role="tabpanel"
+          id="dns-threat-panel-threat"
+          aria-labelledby="dns-threat-tab-threat"
+          className="flex flex-col gap-4"
+        >
+          <div className="flex flex-wrap items-end gap-3 rounded-lg border bg-card px-4 py-3">
             <div>
-              <h3 className="text-sm font-semibold">
-                {summary?.has_data
-                  ? "Nothing scoring above the threshold"
-                  : "No data to score yet"}
-              </h3>
-              <p className="mt-1 max-w-2xl text-xs text-muted-foreground">
-                {summary?.has_data ? (
+              <label className="mb-1 block text-xs font-medium">
+                Detection
+              </label>
+              <select
+                value={detection}
+                onChange={(e) => setDetection(e.target.value as Detection)}
+                className="rounded-md border bg-background px-2 py-1.5 text-sm"
+              >
+                <option value="tunnel">Tunneling (name content)</option>
+                <option value="beacon">Beaconing (timing)</option>
+                <option value="dga">DGA (name plausibility)</option>
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium">
+                Minimum score
+              </label>
+              <select
+                value={minScore}
+                onChange={(e) => setMinScore(Number(e.target.value))}
+                className="rounded-md border bg-background px-2 py-1.5 text-sm"
+              >
+                <option value={0}>Everything (noisy)</option>
+                <option value={20}>20 — worth a look</option>
+                <option value={40}>40 — suspicious</option>
+                <option value={60}>60 — likely tunnel</option>
+              </select>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowMutes((v) => !v)}
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              <BellOff className="h-4 w-4" />
+              Muted clients
+            </button>
+            <label className="flex items-center gap-1.5 text-xs">
+              <input
+                type="checkbox"
+                checked={showAllowlisted}
+                onChange={(e) => setShowAllowlisted(e.target.checked)}
+              />
+              Show cleared (allowlisted)
+            </label>
+            {summary && (
+              <div className="ml-auto flex items-center gap-2 text-xs text-muted-foreground">
+                {summary.has_data ? (
                   <>
-                    {summary.clients_seen} client(s) were scored over this
-                    window and none crossed {minScore}. Lower the minimum score
-                    to see the full picture.
+                    <ShieldCheck className="h-4 w-4" />
+                    {summary.windows_scored} windows · {summary.clients_seen}{" "}
+                    clients scored
                   </>
                 ) : (
                   <>
-                    The rollup has scored nothing in this period, which is{" "}
-                    <strong>not the same as an all-clear</strong>. Check that a
-                    DNS server group has query logging enabled — without it
-                    there are no queries to analyse.
+                    <AlertTriangle className="h-4 w-4 text-amber-500" />
+                    No windows scored yet
                   </>
                 )}
-              </p>
-            </div>
+              </div>
+            )}
           </div>
-        </div>
-      ) : (
-        <div className="overflow-x-auto rounded-lg border bg-card">
-          <table className="w-full min-w-[820px] text-sm">
-            <thead>
-              <tr className="border-b text-left text-xs text-muted-foreground">
-                <th className="px-4 py-2 font-medium">Score</th>
-                <th className="px-4 py-2 font-medium">Client</th>
-                <th className="px-4 py-2 font-medium">Window</th>
-                <th className="px-4 py-2 font-medium">Queries</th>
-                <th className="px-4 py-2 font-medium">Concentrated on</th>
-                <th className="px-4 py-2" />
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((w) => (
-                <Row
-                  key={w.id}
-                  w={w}
-                  open={expanded.has(w.id)}
-                  onToggle={() =>
-                    setExpanded((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(w.id)) next.delete(w.id);
-                      else next.add(w.id);
-                      return next;
-                    })
-                  }
-                  onInspect={() => setInspecting(w.client_ip)}
-                  detection={detection}
-                  onMute={() => setMuting(w.client_ip)}
-                  onUnmute={() => unmute.mutate(w.client_ip)}
-                  canMute={canMute}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
 
-      {showMutes && (
-        <MutedClientsPanel
-          onUnmute={(ip) => unmute.mutate(ip)}
-          error={unmute.error}
-          canMute={canMute}
-        />
+          {q.isLoading ? (
+            <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-6 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Scoring&hellip;
+            </div>
+          ) : rows.length === 0 ? (
+            <div className="rounded-lg border bg-card p-6">
+              <div className="flex items-start gap-3">
+                {summary?.has_data ? (
+                  <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                ) : (
+                  <ShieldQuestion className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+                )}
+                <div>
+                  <h3 className="text-sm font-semibold">
+                    {summary?.has_data
+                      ? "Nothing scoring above the threshold"
+                      : "No data to score yet"}
+                  </h3>
+                  <p className="mt-1 max-w-2xl text-xs text-muted-foreground">
+                    {summary?.has_data ? (
+                      <>
+                        {summary.clients_seen} client(s) were scored over this
+                        window and none crossed {minScore}. Lower the minimum
+                        score to see the full picture.
+                      </>
+                    ) : (
+                      <>
+                        The rollup has scored nothing in this period, which is{" "}
+                        <strong>not the same as an all-clear</strong>. Check
+                        that a DNS server group has query logging enabled —
+                        without it there are no queries to analyse.
+                      </>
+                    )}
+                  </p>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="overflow-x-auto rounded-lg border bg-card">
+              <table className="w-full min-w-[820px] text-sm">
+                <thead>
+                  <tr className="border-b text-left text-xs text-muted-foreground">
+                    <th className="px-4 py-2 font-medium">Score</th>
+                    <th className="px-4 py-2 font-medium">Client</th>
+                    <th className="px-4 py-2 font-medium">Window</th>
+                    <th className="px-4 py-2 font-medium">Queries</th>
+                    <th className="px-4 py-2 font-medium">Concentrated on</th>
+                    <th className="px-4 py-2" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((w) => (
+                    <Row
+                      key={w.id}
+                      w={w}
+                      open={expanded.has(w.id)}
+                      onToggle={() =>
+                        setExpanded((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(w.id)) next.delete(w.id);
+                          else next.add(w.id);
+                          return next;
+                        })
+                      }
+                      onInspect={() => setInspecting(w.client_ip)}
+                      detection={detection}
+                      onMute={() => setMuting(w.client_ip)}
+                      onUnmute={() => unmute.mutate(w.client_ip)}
+                      canMute={canMute}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {showMutes && (
+            <MutedClientsPanel
+              onUnmute={(ip) => unmute.mutate(ip)}
+              error={unmute.error}
+              canMute={canMute}
+            />
+          )}
+        </div>
       )}
 
       {muting && (
@@ -470,25 +614,33 @@ export function DNSThreatTab() {
         />
       )}
 
-      {/* Blocklist attribution. Rendered as its own section rather than a
-          fourth detection mode because it is ground truth, not a score:
-          named matched a policy and logged it, so there is nothing to
-          threshold and nothing to rank by confidence.
-
-          Carries the same card treatment as every sibling above — the
-          root is a bare `flex flex-col gap-4`, so the horizontal inset
-          comes from each child's own `px-4`, not from the container. A
-          bare <section> here rendered flush against the left edge and
-          visibly out of line with the rest of the tab. */}
-      {!moduleOff && (
-        <section className="rounded-lg border bg-card px-4 py-3">
-          <h3 className="mb-1 text-sm font-semibold">Blocklist hits (RPZ)</h3>
+      {/* Blocklist attribution. Its own sub-tabs rather than a fourth
+          detection mode because it is ground truth, not a score: named
+          matched a policy and logged it, so there is nothing to threshold
+          and nothing to rank by confidence. */}
+      {sub !== "threat" && (
+        <section
+          role="tabpanel"
+          id={`dns-threat-panel-${sub}`}
+          aria-labelledby={`dns-threat-tab-${sub}`}
+          className="rounded-lg border bg-card px-4 py-3"
+        >
+          <h3 className="mb-1 text-sm font-semibold">
+            {sub === "rpz" ? "Blocklist hits (RPZ)" : "Recent blocked lookups"}
+          </h3>
           <p className="mb-3 text-xs text-muted-foreground">
             Which machines keep reaching for domains the blocklists block.
-            Unlike the scores above this is not a heuristic — every row is a
-            policy that actually fired.
+            Unlike the scores on the Threat log tab this is not a heuristic
+            &mdash; every row is a policy that actually fired.
           </p>
-          <RPZPanel hours={hours} />
+          <RPZPanel
+            view={sub}
+            summary={rpzSummaryQ}
+            clients={rpzClientsQ}
+            hits={rpzHitsQ}
+            focusClient={focusClient}
+            setFocusClient={setFocusClient}
+          />
         </section>
       )}
     </div>
@@ -1043,29 +1195,21 @@ function MutedClientsPanel({
  * an explicit ALLOW (a blocklist exception firing), and folding it in
  * would make a correctly-tuned allowlist read as an infection.
  */
-function RPZPanel({ hours }: { hours: number }) {
-  const summary = useQuery({
-    queryKey: ["dns-threat-rpz-summary", hours],
-    queryFn: () => dnsThreatApi.rpzSummary({ hours }),
-  });
-  const clients = useQuery({
-    queryKey: ["dns-threat-rpz-clients", hours],
-    queryFn: () => dnsThreatApi.rpzClients({ hours, limit: 20 }),
-  });
-  // Clicking a client narrows the per-hit list below (#914). The rollup
-  // says a host has 412 blocked lookups; closing out "the user says this
-  // site does not work" needs the names themselves.
-  const [focusClient, setFocusClient] = useState<string | null>(null);
-  const hits = useQuery({
-    queryKey: ["dns-threat-rpz-hits", hours, focusClient],
-    queryFn: () =>
-      dnsThreatApi.rpzHits({
-        hours,
-        limit: 100,
-        ...(focusClient ? { client_ip: focusClient } : {}),
-      }),
-  });
-
+function RPZPanel({
+  view,
+  summary,
+  clients,
+  hits,
+  focusClient,
+  setFocusClient,
+}: {
+  view: "rpz" | "recent";
+  summary: UseQueryResult<RPZSummary>;
+  clients: UseQueryResult<RPZOffender[]>;
+  hits: UseQueryResult<RPZHitRow[]>;
+  focusClient: string | null;
+  setFocusClient: (ip: string | null) => void;
+}) {
   if (summary.isLoading) {
     return (
       <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
@@ -1108,142 +1252,161 @@ function RPZPanel({ hours }: { hours: number }) {
         />
       </div>
 
-      <div>
-        <h4 className="mb-1 text-xs font-semibold">
-          Clients reaching for blocked domains
-        </h4>
-        <p className="mb-2 text-xs text-muted-foreground">
-          A single blocked lookup is an ad on a web page. Hundreds from one host
-          is a machine with something running on it — which is the question the
-          blocklists could always answer and never did.
-        </p>
-        {rows.length === 0 ? (
-          <p className="py-3 text-sm text-muted-foreground">
-            Nothing was blocked in this window.
+      {view === "rpz" && (
+        <div>
+          <h4 className="mb-1 text-xs font-semibold">
+            Clients reaching for blocked domains
+          </h4>
+          <p className="mb-2 text-xs text-muted-foreground">
+            A single blocked lookup is an ad on a web page. Hundreds from one
+            host is a machine with something running on it — which is the
+            question the blocklists could always answer and never did.
           </p>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[40rem] text-sm">
-              <thead className="border-b text-left text-xs text-muted-foreground">
-                <tr>
-                  <th className="py-1.5 pr-3 font-medium">Client</th>
-                  <th className="py-1.5 pr-3 font-medium">Blocked</th>
-                  <th className="py-1.5 pr-3 font-medium">Names</th>
-                  <th className="py-1.5 pr-3 font-medium">Most blocked</th>
-                  <th className="py-1.5 font-medium">Last seen</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => (
-                  <tr
-                    key={r.client_ip}
-                    onClick={() =>
-                      setFocusClient(
-                        focusClient === r.client_ip ? null : r.client_ip,
-                      )
-                    }
-                    className={cn(
-                      "cursor-pointer border-b last:border-0 hover:bg-muted/40",
-                      focusClient === r.client_ip && "bg-muted/60",
-                    )}
-                    title="Show this client's individual blocked lookups"
-                  >
-                    <td className="py-1.5 pr-3 font-mono text-xs">
-                      <span className="inline-flex items-center gap-1.5">
-                        {r.noisy && (
-                          <Ban className="h-3.5 w-3.5 text-rose-500" />
-                        )}
-                        {r.client_ip}
-                      </span>
-                    </td>
-                    <td
-                      className={`py-1.5 pr-3 font-mono ${
-                        r.noisy ? "font-semibold text-rose-600" : ""
-                      }`}
-                    >
-                      {r.hits.toLocaleString()}
-                    </td>
-                    <td className="py-1.5 pr-3 font-mono text-xs">
-                      {r.distinct_names}
-                    </td>
-                    <td className="py-1.5 pr-3 font-mono text-xs break-all">
-                      {r.top_qname ?? "—"}
-                    </td>
-                    <td className="py-1.5 text-xs text-muted-foreground">
-                      {new Date(r.last_seen).toLocaleString()}
-                    </td>
+          {rows.length === 0 ? (
+            <p className="py-3 text-sm text-muted-foreground">
+              Nothing was blocked in this window.
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[40rem] text-sm">
+                <thead className="border-b text-left text-xs text-muted-foreground">
+                  <tr>
+                    <th className="py-1.5 pr-3 font-medium">Client</th>
+                    <th className="py-1.5 pr-3 font-medium">Blocked</th>
+                    <th className="py-1.5 pr-3 font-medium">Names</th>
+                    <th className="py-1.5 pr-3 font-medium">Most blocked</th>
+                    <th className="py-1.5 font-medium">Last seen</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      <div>
-        <div className="mb-1 flex flex-wrap items-center gap-2">
-          <h4 className="text-xs font-semibold">Recent blocked lookups</h4>
-          {focusClient && (
-            <button
-              type="button"
-              onClick={() => setFocusClient(null)}
-              className="rounded-md border px-2 py-0.5 text-[11px] hover:bg-accent"
-            >
-              {focusClient} &times;
-            </button>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr
+                      key={r.client_ip}
+                      onClick={() =>
+                        setFocusClient(
+                          focusClient === r.client_ip ? null : r.client_ip,
+                        )
+                      }
+                      className={cn(
+                        "cursor-pointer border-b last:border-0 hover:bg-muted/40",
+                        focusClient === r.client_ip && "bg-muted/60",
+                      )}
+                      title="Show this client's individual blocked lookups"
+                    >
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        <span className="inline-flex items-center gap-1.5">
+                          {r.noisy && (
+                            <Ban className="h-3.5 w-3.5 text-rose-500" />
+                          )}
+                          {r.client_ip}
+                        </span>
+                      </td>
+                      <td
+                        className={`py-1.5 pr-3 font-mono ${
+                          r.noisy ? "font-semibold text-rose-600" : ""
+                        }`}
+                      >
+                        {r.hits.toLocaleString()}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {r.distinct_names}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs break-all">
+                        {r.top_qname ?? "—"}
+                      </td>
+                      <td className="py-1.5 text-xs text-muted-foreground">
+                        {new Date(r.last_seen).toLocaleString()}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
-        <p className="mb-2 text-xs text-muted-foreground">
-          The individual hits, newest first — what the counts above cannot tell
-          you. Click a client to narrow. PASSTHRU rows are excluded: an
-          exception firing is an explicit allow, not a block.
-        </p>
-        {hits.isLoading ? (
-          <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Loading&hellip;
+      )}
+
+      {view === "recent" && (
+        <div>
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            <h4 className="text-xs font-semibold">Recent blocked lookups</h4>
+            {focusClient && (
+              <button
+                type="button"
+                onClick={() => setFocusClient(null)}
+                className="rounded-md border px-2 py-0.5 text-[11px] hover:bg-accent"
+              >
+                {focusClient} &times;
+              </button>
+            )}
           </div>
-        ) : (hits.data ?? []).length === 0 ? (
-          <p className="py-3 text-sm text-muted-foreground">
-            No blocked lookups in this window.
+          <p className="mb-2 text-xs text-muted-foreground">
+            The individual hits, newest first — what the counts above cannot
+            tell you. Click a client to narrow. PASSTHRU rows are excluded: an
+            exception firing is an explicit allow, not a block.
           </p>
-        ) : (
-          <div className="max-h-96 overflow-auto">
-            <table className="w-full min-w-[40rem] text-sm">
-              <thead className="sticky top-0 border-b bg-card text-left text-xs text-muted-foreground">
-                <tr>
-                  <th className="py-1.5 pr-3 font-medium">Time</th>
-                  <th className="py-1.5 pr-3 font-medium">Client</th>
-                  <th className="py-1.5 pr-3 font-medium">Name</th>
-                  <th className="py-1.5 pr-3 font-medium">Policy</th>
-                  <th className="py-1.5 font-medium">Feed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(hits.data ?? []).map((h) => (
-                  <tr key={h.id} className="border-b last:border-0">
-                    <td className="py-1.5 pr-3 text-xs text-muted-foreground whitespace-nowrap">
-                      {new Date(h.ts).toLocaleString()}
-                    </td>
-                    <td className="py-1.5 pr-3 font-mono text-xs">
-                      {h.client_ip ?? "—"}
-                    </td>
-                    <td className="py-1.5 pr-3 font-mono text-xs break-all">
-                      {h.qname ?? "—"}
-                    </td>
-                    <td className="py-1.5 pr-3 font-mono text-xs">
-                      {h.trigger} {h.policy}
-                    </td>
-                    <td className="py-1.5 font-mono text-xs break-all text-muted-foreground">
-                      {h.rpz_zone ?? "—"}
-                    </td>
+          {hits.isLoading ? (
+            <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading&hellip;
+            </div>
+          ) : (hits.data ?? []).length === 0 ? (
+            <p className="py-3 text-sm text-muted-foreground">
+              No blocked lookups in this window.
+            </p>
+          ) : (
+            <div className="max-h-96 overflow-auto">
+              <table className="w-full min-w-[40rem] text-sm">
+                <thead className="sticky top-0 border-b bg-card text-left text-xs text-muted-foreground">
+                  <tr>
+                    <th className="py-1.5 pr-3 font-medium">Time</th>
+                    <th className="py-1.5 pr-3 font-medium">Server</th>
+                    <th className="py-1.5 pr-3 font-medium">Client</th>
+                    <th className="py-1.5 pr-3 font-medium">Name</th>
+                    <th className="py-1.5 pr-3 font-medium">Policy</th>
+                    <th className="py-1.5 font-medium">Feed</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+                </thead>
+                <tbody>
+                  {(hits.data ?? []).map((h) => (
+                    <tr key={h.id} className="border-b last:border-0">
+                      <td className="py-1.5 pr-3 text-xs text-muted-foreground whitespace-nowrap">
+                        {new Date(h.ts).toLocaleString()}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {h.server_name ? (
+                          <span title={h.server_name}>
+                            {h.server_name}
+                            {h.server_id == null && (
+                              <span className="ml-1 font-sans text-muted-foreground">
+                                (deleted)
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {h.client_ip ?? "—"}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs break-all">
+                        {h.qname ?? "—"}
+                      </td>
+                      <td className="py-1.5 pr-3 font-mono text-xs">
+                        {h.trigger} {h.policy}
+                      </td>
+                      <td className="py-1.5 font-mono text-xs break-all text-muted-foreground">
+                        {h.rpz_zone ?? "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

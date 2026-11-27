@@ -4,6 +4,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatApiError, ipamApi, type IPSpace } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
+import { useFieldControl } from "@/components/ui/field";
+import { FormError } from "@/components/ui/form-error";
 
 // Dropdown + "+ New" shortcut used inside the integration-endpoint modals
 // (Proxmox / Kubernetes / Docker). Operators coming from a fresh install
@@ -25,22 +27,28 @@ export function IPSpacePicker({
   onChange: (id: string) => void;
   required?: boolean;
 }) {
-  const { data: spaces = [] } = useQuery<IPSpace[]>({
+  const { data: spaces = [], isPending } = useQuery<IPSpace[]>({
     queryKey: ["spaces"],
     queryFn: () => ipamApi.listSpaces(),
   });
   const [showCreate, setShowCreate] = useState(false);
+  const fieldControl = useFieldControl();
 
   return (
     <>
       <div className="flex items-center gap-1">
         <select
+          {...fieldControl}
           className={selectCls}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           required={required}
         >
           <option value="">— select —</option>
+          {/* A stored value stays selected until the list arrives. Without
+              this option the select reads "" and a required form refuses to
+              submit (#4419). */}
+          {isPending && value && <option value={value}>Loading…</option>}
           {spaces.map((s) => (
             <option key={s.id} value={s.id}>
               {s.name}
@@ -151,9 +159,9 @@ function QuickCreateSpaceModal({
           page.
         </p>
         {error && (
-          <p className="rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+          <FormError className="rounded border border-destructive/50 bg-destructive/10 px-2 py-1 text-xs text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2 pt-2">
           <button

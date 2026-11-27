@@ -27,7 +27,7 @@ describe("blocklistPayload", () => {
     blockMode: "nxdomain",
     sinkholeIp: "10.0.0.1",
     updateHours: 24,
-    feedWildcard: true,
+    feedWildcard: "by_syntax" as const,
     enabled: true,
   };
 

@@ -34,6 +34,11 @@ from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import (
+    release_block_sync_credentials,
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPAddress, IPSpace, Subnet
@@ -716,6 +721,13 @@ async def update_controller(
         raise HTTPException(status_code=404, detail="UniFi controller not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        c,
+        changes,
+        destination=["mode", "host", "port", "cloud_host_id"],
+        secrets={"api_key": c.api_key_encrypted, "password": c.password_encrypted},
+        blank_keeps=("api_key", "password"),
+    )
     new_ipam = changes.get("ipam_space_id", c.ipam_space_id)
     new_dns = changes.get("dns_group_id", c.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
@@ -745,6 +757,17 @@ async def update_controller(
         api_key=api_key_value,
     )
 
+    block_sync_cleared = release_block_sync_credentials(
+        c,
+        changes,
+        destination=["mode", "host", "port", "cloud_host_id"],
+        credentials={
+            "block_sync_api_key_encrypted": b"",
+            "block_sync_username_encrypted": b"",
+            "block_sync_password_encrypted": b"",
+        },
+        label="host",
+    )
     for k, v in changes.items():
         if k == "api_key":
             if v:
@@ -757,6 +780,9 @@ async def update_controller(
                 c.password_encrypted = encrypt_str(v)
         else:
             setattr(c, k, v)
+
+    if block_sync_cleared:
+        changes["block_sync_credentials_cleared"] = True
 
     _audit(
         db,
@@ -862,6 +888,19 @@ async def test_connection(
         stored = await db.get(UnifiController, body.controller_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="UniFi controller not found")
+        require_secret_for_changed_connection(
+            stored,
+            {
+                "mode": body.mode,
+                "host": body.host,
+                "port": body.port,
+                "cloud_host_id": body.cloud_host_id,
+                "api_key": body.api_key,
+                "password": body.password,
+            },
+            destination=("mode", "host", "port", "cloud_host_id"),
+            secrets={"api_key": stored.api_key_encrypted, "password": stored.password_encrypted},
+        )
         mode = mode or stored.mode
         host = host or stored.host
         port = body.port or stored.port

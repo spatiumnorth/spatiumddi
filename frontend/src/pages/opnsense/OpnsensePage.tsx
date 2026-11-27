@@ -1,4 +1,8 @@
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -33,6 +37,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Steps an operator follows in the OPNsense web UI to mint a read-only
@@ -365,7 +370,18 @@ export function OpnsensePage() {
       </div>
 
       {showCreate && <RouterModal onClose={() => setShowCreate(false)} />}
-      {edit && <RouterModal router={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["opnsense-routers"]]}
+          title="Edit OPNsense Firewall"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <RouterModal router={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {del && (
         <DeleteRouterModal
           router={del}
@@ -420,6 +436,13 @@ function RouterModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [apiKey, setApiKey] = useState(router?.api_key ?? "");
   const [apiSecret, setApiSecret] = useState("");
+  // #4135 — a moved address needs the stored secret entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    router && { host: router.host, port: router.port },
+    () => setApiSecret(""),
+  );
+  const mustEnter = reask.asks(router?.api_secret_present);
   const [spaceId, setSpaceId] = useState(router?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(router?.dns_group_id ?? "");
   const [mirrorDhcpLeases, setMirrorDhcpLeases] = useState(
@@ -477,7 +500,12 @@ function RouterModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiSecret) update.api_secret = apiSecret;
-        return opnsenseApi.updateRouter(router!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(router!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(router!);
+        return opnsenseApi.updateRouter(router!.id, body);
       }
       const create: OPNsenseRouterCreate = {
         name,
@@ -616,18 +644,23 @@ function RouterModal({
               required
             />
           </Field>
-          <Field label="API Secret" hint="The 'secret' line from apikey.txt.">
+          <Field
+            label="API Secret"
+            hint={mustEnter ? reask.hint : "The 'secret' line from apikey.txt."}
+          >
             <input
               type="password"
               className={`${inputCls} font-mono text-[11px]`}
               value={apiSecret}
               onChange={(e) => setApiSecret(e.target.value)}
               placeholder={
-                editing && router?.api_secret_present
-                  ? "••• stored — enter to replace"
-                  : "API secret"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && router?.api_secret_present
+                    ? "••• stored — enter to replace"
+                    : "API secret"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -769,7 +802,9 @@ function RouterModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -781,7 +816,7 @@ function RouterModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            disabled={saveMut.isPending || (mustEnter && !apiSecret.trim())}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -829,9 +864,9 @@ function DeleteRouterModal({
           <span>I understand.</span>
         </label>
         {error && (
-          <p className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <FormError className="break-words rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
             {error}
-          </p>
+          </FormError>
         )}
         <div className="flex justify-end gap-2">
           <button
@@ -894,26 +929,6 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {

@@ -102,8 +102,8 @@ VALUES: dict[str, Any] = {
             "enabled": True,
         }
     ],
-    "apt_gpg_keys": [],
-    "apt_auth": [],
+    "apt_gpg_keys": [{"key_id": "k1", "armoured_text": "gpg-armour-secret-3995"}],
+    "apt_auth": [{"machine": "m.lan", "login": "bob", "password": "mirror-pw-secret-3995"}],
     "apt_proxy_http": "http://proxy.example.test:3128",
     "apt_proxy_https": "http://proxy.example.test:3128",
     "apt_unattended_origins": ["origin=Debian"],
@@ -120,6 +120,8 @@ SECRETS = [
     "community-secret-3640",
     "authpass-secret-3640",
     "privpass-secret-3640",
+    "gpg-armour-secret-3995",
+    "mirror-pw-secret-3995",
 ]
 
 # field -> reason, for a field that legitimately writes no platform_settings
@@ -191,6 +193,8 @@ async def test_every_settings_field_is_audited(
     if field == "ssh_lockdown":
         body["ssh_allowed_source_networks"] = ["192.0.2.0/24"]
         body["ssh_lockdown_force"] = True
+    if field == "ssh_authorized_keys":
+        body[field] = [{"name": "k", "public_key": _ed25519_key()}]
     if field == "ssh_password_auth_enabled":
         body["ssh_authorized_keys"] = [{"name": "k", "public_key": _ed25519_key()}]
     before = {r.id for r in await _audit_rows(db_session)}
@@ -250,3 +254,103 @@ async def test_secret_rotation_is_recorded_without_the_value(
     assert rows[-1].old_value == {"snmp_community": "<set>"} or rows[0].old_value == {
         "snmp_community": "<set>"
     }
+
+
+@pytest.mark.asyncio
+async def test_branding_row_names_the_changed_field_and_old_value_3847(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.put("/api/v1/settings", headers=headers, json={"app_title": "Acme DDI"})
+    assert r.status_code == 200, r.text
+    rows = [r for r in await _audit_rows(db_session) if r.resource_id == "branding"]
+    assert len(rows) == 1
+    assert rows[0].changed_fields == ["app_title"]
+    assert rows[0].old_value == {"app_title": "SpatiumDDI"}
+    assert rows[0].new_value == {"app_title": "Acme DDI"}
+
+
+@pytest.mark.asyncio
+async def test_branding_save_that_changes_nothing_writes_no_row_3847(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.put("/api/v1/settings", headers=headers, json={"app_title": "SpatiumDDI"})
+    assert r.status_code == 200, r.text
+    rows = [r for r in await _audit_rows(db_session) if r.resource_id == "branding"]
+    assert rows == []
+
+
+def _png(tag: bytes) -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + tag * 16
+
+
+async def _put_logo(client: AsyncClient, headers: dict[str, str], data: bytes) -> Any:
+    return await client.put(
+        "/api/v1/settings/branding/logo",
+        headers=headers,
+        files={"file": ("logo.png", data, "image/png")},
+    )
+
+
+def _logo_rows(rows: list[AuditLog]) -> list[AuditLog]:
+    return [r for r in rows if r.resource_id == "branding_logo"]
+
+
+@pytest.mark.asyncio
+async def test_logo_upload_names_replaced_logo_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    import hashlib
+
+    headers = await _superadmin(db_session)
+    a, b = _png(b"A"), _png(b"B")
+    assert (await _put_logo(client, headers, a)).status_code == 200
+    assert (await _put_logo(client, headers, b)).status_code == 200
+    rows = _logo_rows(await _audit_rows(db_session))
+    assert len(rows) == 2
+    first = next(r for r in rows if r.old_value is None)
+    second = next(r for r in rows if r.old_value is not None)
+    assert first.new_value == {"sha256": hashlib.sha256(a).hexdigest(), "byte_size": len(a)}
+    assert second.old_value == {"sha256": hashlib.sha256(a).hexdigest(), "byte_size": len(a)}
+    assert second.new_value == {"sha256": hashlib.sha256(b).hexdigest(), "byte_size": len(b)}
+
+
+@pytest.mark.asyncio
+async def test_logo_reupload_of_stored_bytes_writes_no_row_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    a = _png(b"A")
+    first = await _put_logo(client, headers, a)
+    assert first.status_code == 200
+    again = await _put_logo(client, headers, a)
+    assert again.status_code == 200
+    assert again.json() == first.json()
+    assert len(_logo_rows(await _audit_rows(db_session))) == 1
+
+
+@pytest.mark.asyncio
+async def test_logo_delete_names_removed_logo_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    import hashlib
+
+    headers = await _superadmin(db_session)
+    a = _png(b"A")
+    assert (await _put_logo(client, headers, a)).status_code == 200
+    r = await client.delete("/api/v1/settings/branding/logo", headers=headers)
+    assert r.status_code == 204
+    deletes = [x for x in _logo_rows(await _audit_rows(db_session)) if x.action == "delete"]
+    assert len(deletes) == 1
+    assert deletes[0].old_value == {"sha256": hashlib.sha256(a).hexdigest(), "byte_size": len(a)}
+
+
+@pytest.mark.asyncio
+async def test_logo_delete_with_none_stored_writes_no_row_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.delete("/api/v1/settings/branding/logo", headers=headers)
+    assert r.status_code == 204
+    assert _logo_rows(await _audit_rows(db_session)) == []

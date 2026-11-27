@@ -3,12 +3,14 @@
 import contextlib
 import contextvars
 import hashlib
+import heapq
 import ipaddress
 import itertools
 import re
+import secrets
 import string
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, NamedTuple, cast
 
@@ -118,6 +120,8 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.custom_field_rules import (
     enforce_required_custom_fields,
     inherited_block_custom_fields,
+    is_empty_value,
+    validate_custom_field_values,
 )
 from app.services.ipam.gateway_rules import gateway_problem
 from app.services.ipam.host_name import current_fqdn, fqdn_matches
@@ -206,6 +210,7 @@ _SUBNET_INSTANCE_ROUTES = (
             "GET /subnets/{subnet_id}/addresses",
             "GET /subnets/{subnet_id}/aliases",
             "GET /subnets/{subnet_id}/domains",
+            "GET /subnets/{subnet_id}/effective-ddns",
             "GET /subnets/{subnet_id}/effective-dhcp",
             "GET /subnets/{subnet_id}/effective-dns",
             "GET /subnets/{subnet_id}/effective-fields",
@@ -646,6 +651,7 @@ async def _assert_no_block_overlap(
     network: str,
     parent_block_id: uuid.UUID | None,
     exclude_id: uuid.UUID | None = None,
+    for_restore: bool = False,
 ) -> list[uuid.UUID]:
     """Validate the new/updated block against its siblings.
 
@@ -659,7 +665,8 @@ async def _assert_no_block_overlap(
 
     Raises 409 on: exact duplicate, strict subset of a sibling
     (operator should set ``parent_block_id`` to that sibling
-    instead), or any partial overlap.
+    instead), or any partial overlap. ``for_restore`` words the strict-subset
+    refusal for the Trash's Restore, which takes no parent (#4228).
     """
     # deleted_at IS NULL: raw SQL bypasses the ORM soft-delete filter, so a
     # trashed block must free its CIDR for recreate/reparent (#490).
@@ -697,6 +704,16 @@ async def _assert_no_block_overlap(
             reparent.append(sibling_id)
             continue
         if new_net.subnet_of(sibling_net):  # type: ignore[arg-type]
+            if for_restore:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Block {network} cannot be restored at the top level: its range is "
+                        f"now inside live block {sibling_net}, and a restore does not "
+                        f"re-parent a block. Move, resize or delete block {sibling_net} "
+                        "first, then restore this one."
+                    ),
+                )
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -1406,8 +1423,10 @@ async def _enforce_zone_token_scope(
 # Subnet fields that point the subnet at ANOTHER resource. A caller who writes
 # the subnet only through a grant scoped to it (#2438) may not change them:
 # the grant names this subnet, not the customer, site, VLAN, DHCP server group
-# or DNS servers it would be attached to. (DNS zones are checked separately by
-# ``_assert_scoped_zones``, which also lets the subnet's own zones through.)
+# or DNS servers it would be attached to. The inherit switches count too:
+# flipping one re-points the subnet at the parent's servers and zones.
+# (DNS zones are checked separately by ``_assert_scoped_zones``, which also
+# lets the subnet's own zones through.)
 _SUBNET_BINDING_FIELDS = (
     "block_id",
     "customer_id",
@@ -1416,6 +1435,9 @@ _SUBNET_BINDING_FIELDS = (
     "dhcp_server_group_id",
     "dns_group_ids",
     "ddns_domain_override",
+    "dns_inherit_settings",
+    "dhcp_inherit_settings",
+    "ddns_inherit_settings",
 )
 
 
@@ -1836,6 +1858,63 @@ class _NextIPPick(NamedTuple):
     strategy: str
 
 
+# Most candidates the delegate walk looks at before it gives up (#4279). Bounds
+# the work done under the subnet lock when the caller's ranges are huge and
+# nearly all of them are taken or inside a dynamic pool.
+_MAX_DELEGATE_CANDIDATES: int = 1_000_000
+
+
+def _host_bounds(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> tuple[int, int]:
+    """First and last host of ``net``, as ``net.hosts()`` yields them."""
+    first = int(net.network_address)
+    last = int(net.broadcast_address)
+    if net.prefixlen < net.max_prefixlen:
+        first += 1
+        if isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
+            last -= 1
+    return first, last
+
+
+def _delegate_candidates(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    allowed: WritableSetRanges,
+) -> Iterator[int]:
+    """Yield, in ascending order, the hosts of ``net`` the caller's
+    address-set ranges cover (#4279): what ``net.hosts()`` offers, narrowed to
+    ``allowed`` without walking the rest of the subnet."""
+    first, last = _host_bounds(net)
+
+    def spans() -> Iterator[int]:
+        for lo, hi in allowed.intervals:
+            yield from range(max(lo, first), min(hi, last) + 1)
+
+    yield from heapq.merge(spans(), sorted(h for h in allowed.hosts if first <= h <= last))
+
+
+def _random_delegate_candidate(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    allowed: WritableSetRanges,
+) -> int | None:
+    """One uniformly drawn host inside the caller's ranges, or ``None`` when
+    they hold no host of ``net`` (#4279)."""
+    first, last = _host_bounds(net)
+    spans = [
+        (max(lo, first), min(hi, last))
+        for lo, hi in allowed.intervals
+        if max(lo, first) <= min(hi, last)
+    ]
+    spans += [(h, h) for h in allowed.hosts if first <= h <= last]
+    total = sum(hi - lo + 1 for lo, hi in spans)
+    if total == 0:
+        return None
+    pick = secrets.randbelow(total)
+    for lo, hi in spans:
+        if pick <= hi - lo:
+            return lo + pick
+        pick -= hi - lo + 1
+    return None  # pragma: no cover - pick < total always lands in a span
+
+
 async def _pick_next_available_ip(
     db: AsyncSession,
     subnet: Subnet,
@@ -1856,7 +1935,10 @@ async def _pick_next_available_ip(
     pass their resolved ranges here so the picker never hands out an address
     the per-IP gate would then 403 (and reports "no available IP" only when no
     free host inside *their* ranges exists). ``None`` = unconstrained (the
-    subnet-write-holder path).
+    subnet-write-holder path). A constrained pick draws (``random``) or walks
+    (everything else) inside the ranges themselves, not the whole subnet, so a
+    small set in a /64, or one past the subnet's first 65,536 hosts, is found
+    (#4279).
 
     For IPv6 the ``strategy`` argument is honoured but also falls back
     to ``Subnet.ipv6_allocation_policy`` when the caller doesn't know
@@ -1888,6 +1970,50 @@ async def _pick_next_available_ip(
         """#8: when the caller is address-set-delegated, the candidate must
         fall inside their writable ranges. ``None`` = unconstrained."""
         return allowed_ranges is None or allowed_ranges.contains(ip_int)
+
+    # ── Address-set delegate (#4279) ──────────────────────────────────
+    # A caller confined to its sets' ranges draws or walks INSIDE them. The
+    # whole-subnet walks below cap at 65,536 hosts and the v6 random draw
+    # tries 32 addresses of the whole subnet, so a set that is a small part
+    # of a /64 (or sits past the first 65,536 hosts) was answered "none free"
+    # while it held free hosts.
+    if allowed_ranges is not None:
+        is_v6 = isinstance(net, ipaddress.IPv6Network)
+        effective = strategy
+        if (
+            is_v6
+            and effective == "sequential"
+            and subnet.ipv6_allocation_policy in ("random", "eui64")
+        ):
+            effective = subnet.ipv6_allocation_policy
+        if effective == "eui64" and isinstance(net, ipaddress.IPv6Network):
+            candidate = _eui64_from_mac(net, mac_address or "")
+            if candidate is not None and str(candidate) not in used and _allowed(int(candidate)):
+                return _NextIPPick(candidate, "eui64")
+            effective = "random"
+        if not is_v6 and effective != "random":
+            effective = "sequential"
+        make = ipaddress.IPv6Address if is_v6 else ipaddress.IPv4Address
+
+        def _free(ip_int: int) -> bool:
+            return not (
+                str(make(ip_int)) in used
+                or (dynamic_ranges and _ip_int_in_dynamic_pool(ip_int, dynamic_ranges))
+            )
+
+        if effective == "random":
+            for _ in range(32):
+                drawn = _random_delegate_candidate(net, allowed_ranges)
+                if drawn is None:
+                    break
+                if _free(drawn):
+                    return _NextIPPick(make(drawn), "random")
+        for ip_int in itertools.islice(
+            _delegate_candidates(net, allowed_ranges), _MAX_DELEGATE_CANDIDATES
+        ):
+            if _free(ip_int):
+                return _NextIPPick(make(ip_int), effective)
+        return _NextIPPick(None, effective)
 
     # ── IPv6 ──────────────────────────────────────────────────────────
     if isinstance(net, ipaddress.IPv6Network):
@@ -1931,8 +2057,6 @@ async def _pick_next_available_ip(
         # At /64 the birthday collision probability is astronomical;
         # the loop exists to be correct under degenerate cases (tiny v6
         # subnets) rather than because we expect it to iterate.
-        import secrets  # noqa: PLC0415
-
         host_bits = net.max_prefixlen - net.prefixlen
         if host_bits <= 0:
             return _NextIPPick(None, "random")  # /128 — network IS the address
@@ -2064,7 +2188,7 @@ async def _enqueue_dns_op(
     when the batched op comes back ``failed`` (#1536)."""
     from app.drivers.dns import is_agentless
     from app.services.dns.record_ops import enqueue_record_op, resolve_primary_server
-    from app.services.dns.serial import bump_zone_serial
+    from app.services.dns.serial import bump_zone_serial_once
 
     if op == "delete" and _never_publishable(name, rtype, value):
         # Only where the primary could never have taken the name: a Windows
@@ -2084,7 +2208,7 @@ async def _enqueue_dns_op(
             )
             return None
 
-    target_serial = bump_zone_serial(zone)
+    target_serial = bump_zone_serial_once(zone)
     record: dict[str, Any] = {"name": name, "type": rtype, "value": value, "ttl": ttl}
     if record_id is not None:
         # #1230 — names the row being retracted, so a delete drops exactly it
@@ -3863,6 +3987,44 @@ async def _sync_dns_record(
     return True
 
 
+def _free_networks(
+    block_network: str, child_networks: list[str]
+) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Every free CIDR inside ``block_network``, sorted by address, uncapped.
+
+    One sweep over the children sorted by address (O(n log n + output)): merge
+    the occupied intervals, then split each gap into its maximal aligned CIDRs.
+    The earlier repeated ``address_exclude`` was O(children x pieces), which
+    for a few thousand children in a /8 or an IPv6 /16 ran for minutes. Same
+    set and order of ranges as that algorithm (pinned by a fuzz test).
+    """
+    block = ipaddress.ip_network(block_network, strict=False)
+    lo = int(block.network_address)
+    hi = int(block.broadcast_address)
+    version = block.version
+    spans: list[tuple[int, int]] = []
+    for raw in child_networks:
+        child = ipaddress.ip_network(raw, strict=False)
+        if child.version != version:
+            continue
+        c_lo, c_hi = int(child.network_address), int(child.broadcast_address)
+        if c_hi < lo or c_lo > hi:
+            continue
+        spans.append((max(c_lo, lo), min(c_hi, hi)))
+    spans.sort()
+
+    addr = ipaddress.IPv4Address if version == 4 else ipaddress.IPv6Address
+    out: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    cursor = lo  # first address not yet known to be occupied
+    for s_lo, s_hi in spans:
+        if s_lo > cursor:
+            out.extend(ipaddress.summarize_address_range(addr(cursor), addr(s_lo - 1)))
+        cursor = max(cursor, s_hi + 1)
+    if cursor <= hi:
+        out.extend(ipaddress.summarize_address_range(addr(cursor), addr(hi)))
+    return out
+
+
 def _compute_free_cidrs(
     block_network: str,
     child_networks: list[str],
@@ -3880,31 +4042,7 @@ def _compute_free_cidrs(
     correct for arbitrary combinations of child sizes and does not
     require them to be aligned.
     """
-    block = ipaddress.ip_network(block_network, strict=False)
-
-    # Start with a single working set containing the block itself.
-    working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [block]
-
-    # Sort children by prefixlen desc so smaller ones excluded first is fine —
-    # address_exclude handles either ordering. We just iterate.
-    for raw in child_networks:
-        child = ipaddress.ip_network(raw, strict=False)
-        next_working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
-        for net in working:
-            if child == net:
-                # fully consumed
-                continue
-            if child.subnet_of(net):  # type: ignore[arg-type]
-                next_working.extend(net.address_exclude(child))  # type: ignore[arg-type]
-            elif net.subnet_of(child):  # type: ignore[arg-type]
-                # net is fully covered by child → drop
-                continue
-            else:
-                next_working.append(net)
-        working = next_working
-
-    # Sort by network address and build result
-    working.sort(key=lambda n: int(n.network_address))
+    working = _free_networks(block_network, child_networks)
     out: list[dict[str, Any]] = []
     for net in working[:max_results]:
         out.append(
@@ -5671,6 +5809,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 detail=f"{body.network} is not contained within parent block {parent.network}",
             )
 
+    await validate_custom_field_values(db, "ip_block", body.custom_fields)
     # A Required custom field needs a value (#2478), after any template
     # pre-fill above, counting what the parent chain already carries.
     await enforce_required_custom_fields(
@@ -5837,6 +5976,9 @@ async def update_block(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the block already holds.
     if body.custom_fields is not None:
+        await validate_custom_field_values(
+            db, "ip_block", body.custom_fields, stored=block.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "ip_block",
@@ -6064,15 +6206,21 @@ async def get_available_subnets(
     )
     existing += [ipaddress.ip_network(str(n), strict=False) for (n,) in child_blocks.all()]
 
+    # Walk the block's FREE ranges (maximal CIDRs, few) rather than every
+    # candidate of this size, which for an IPv6 /48 at /64 is 65,536 and for a
+    # /32 at /64 is 2^32. A candidate is free iff it sits inside one free
+    # range, so each range of prefix <= prefix_len yields its subnets lazily
+    # and the walk ends as soon as ``limit`` are found (#3849).
     available: list[str] = []
-    scanned = 0
-    max_scan = limit * 200  # cap iterations to avoid runaway loops on large sparse blocks
-    for candidate in block_net.subnets(new_prefix=prefix_len):
-        if len(available) >= limit or scanned >= max_scan:
-            break
-        scanned += 1
-        if not any(candidate.overlaps(ex) for ex in existing):
+    for free_net in _free_networks(str(block.network), [str(n) for n in existing]):
+        if free_net.prefixlen > prefix_len:
+            continue
+        for candidate in itertools.islice(
+            free_net.subnets(new_prefix=prefix_len), limit - len(available)
+        ):
             available.append(str(candidate))
+        if len(available) >= limit:
+            break
 
     return available
 
@@ -6084,11 +6232,22 @@ class FreeCidrRange(BaseModel):
     size: int = Field(description=_COUNT_DESC)
     size_exact: str = Field(description=_EXACT_DESC)
     prefix_len: int
+    more_after: int = Field(
+        0,
+        description=(
+            "Only ever non-zero on the LAST range of a capped answer: how many further "
+            "free ranges (higher addresses) were left out. Everything after this range "
+            "up to the end of the block is the omitted part (#3848)."
+        ),
+    )
 
 
 @router.get("/blocks/{block_id}/free-space", response_model=list[FreeCidrRange])
 async def get_block_free_space(
-    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+    block_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    limit: int = Query(200, ge=1, le=10000, description="Most free ranges to return"),
 ) -> list[FreeCidrRange]:
     """Return free CIDR ranges inside this block.
 
@@ -6106,18 +6265,23 @@ async def get_block_free_space(
     )
     child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
     occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
-    ranges = _compute_free_cidrs(str(block.network), occupied)
-    return [
+    all_free = _free_networks(str(block.network), occupied)
+    out = [
         FreeCidrRange(
-            network=r["network"],
-            first=r["first"],
-            last=r["last"],
-            size=_int64_count(r["size"]),
-            size_exact=str(r["size"]),
-            prefix_len=r["prefix_len"],
+            network=str(n),
+            first=str(n.network_address),
+            last=str(n.broadcast_address),
+            size=_int64_count(n.num_addresses),
+            size_exact=str(n.num_addresses),
+            prefix_len=n.prefixlen,
         )
-        for r in ranges
+        for n in all_free[:limit]
     ]
+    # A capped answer says so on its last range instead of reading as the
+    # whole block (#3848).
+    if out and len(all_free) > len(out):
+        out[-1].more_after = len(all_free) - len(out)
+    return out
 
 
 class PlanRequestItem(BaseModel):
@@ -6165,8 +6329,8 @@ async def plan_block_allocation(
     """Pack requested subnet sizes into the block's free space.
 
     Largest-first heuristic — sorts requests by ascending prefix_len (= largest
-    network first) and best-fits each into the smallest free range that can hold
-    it. Returns the planned allocations plus anything that couldn't fit. This is
+    network first) and places each first-fit by address, in the lowest-addressed
+    free range that can hold it. Returns the planned allocations plus anything that couldn't fit. This is
     a preview only; nothing is written.
     """
     _refuse_container_scan_for_bound_token(current_user)
@@ -6787,6 +6951,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         # Override to enforce consistency
         body.vlan_id = vlan_obj.vlan_id
 
+    await validate_custom_field_values(db, "subnet", body.custom_fields)
     # A Required custom field needs a value (#2478), after any template
     # pre-fill above, counting what the block chain already carries.
     await enforce_required_custom_fields(
@@ -7869,6 +8034,24 @@ async def update_subnet(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=scoped_grant_refusal(field, "subnet"),
                 )
+        # The switches are judged on the value the update will STORE, not only
+        # on the body: ``ddns_enabled: true`` and a primary ``dns_zone_id``
+        # clear DDNS / DNS inheritance further down, whatever the body says
+        # about the switch itself.
+        for field, flips in (
+            ("dns_inherit_settings", bool(body.dns_zone_id)),
+            ("ddns_inherit_settings", body.ddns_enabled is True),
+        ):
+            stored = getattr(subnet, field)
+            if field in body.model_fields_set and getattr(body, field) is not None:
+                stored = getattr(body, field)
+            if flips:
+                stored = False
+            if stored != getattr(subnet, field):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=scoped_grant_refusal(field, "subnet"),
+                )
         await _assert_scoped_zones(
             db,
             current_user,
@@ -7961,6 +8144,9 @@ async def update_subnet(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the subnet already holds.
     if body.custom_fields is not None:
+        await validate_custom_field_values(
+            db, "subnet", body.custom_fields, stored=subnet.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "subnet",
@@ -8608,6 +8794,8 @@ class BlockMovePreviewResponse(BaseModel):
     target_space_id: str
     target_parent_id: str | None
     descendant_blocks_count: int
+    # Child blocks in the Trash: they move too, but are not in the count above.
+    descendant_blocks_trashed: int = 0
     descendant_subnets_count: int
     descendant_ip_addresses_total: int
     reparent_chain_block_ids: list[str]
@@ -8667,13 +8855,25 @@ async def move_block_preview(
         plan = await preview_move(db, block, body.target_space_id, body.target_parent_id)
     except BlockMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    # The Trash is left out of the count (#3922), as Resize's preview does
+    # (#3710); the commit still moves those blocks, so they are reported apart.
+    live_descendants = 0
+    if plan.descendant_block_ids:
+        live_descendants = (
+            await db.execute(
+                select(func.count())
+                .select_from(IPBlock)
+                .where(IPBlock.id.in_([uuid.UUID(b) for b in plan.descendant_block_ids]))
+            )
+        ).scalar_one()
     return BlockMovePreviewResponse(
         block_id=plan.block_id,
         block_network=plan.block_network,
         source_space_id=plan.source_space_id,
         target_space_id=plan.target_space_id,
         target_parent_id=plan.target_parent_id,
-        descendant_blocks_count=len(plan.descendant_block_ids),
+        descendant_blocks_count=live_descendants,
+        descendant_blocks_trashed=len(plan.descendant_block_ids) - live_descendants,
         descendant_subnets_count=len(plan.descendant_subnet_ids),
         descendant_ip_addresses_total=plan.descendant_ip_count,
         reparent_chain_block_ids=plan.reparent_chain_block_ids,
@@ -10445,6 +10645,7 @@ async def create_address(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
 
     # Multicast subnets don't allocate per-IP endpoint rows. Use the
     # multicast group registry under ``/multicast/groups`` instead —
@@ -10659,7 +10860,7 @@ async def search_addresses(
 
     data_stmt = (
         _scoped(select(IPAddress, Subnet.network, Subnet.name, Subnet.space_id, IPSpace.name))
-        .order_by(*_address_order_by(sort, order))
+        .order_by(*_address_order_by(sort, order), IPAddress.id)
         .offset(offset)
         .limit(limit)
     )
@@ -10987,6 +11188,9 @@ async def update_address(
     # ``reserved_until`` by sending an explicit null. ``dns_zone_id`` /
     # ``force`` are routing fields, not row attrs.
     changes = body.model_dump(exclude_unset=True, exclude={"dns_zone_id", "force"})
+    await validate_custom_field_values(
+        db, "ip_address", changes.get("custom_fields"), stored=ip.custom_fields
+    )
     changes_for_audit = body.model_dump(
         mode="json", exclude_unset=True, exclude={"dns_zone_id", "force"}
     )
@@ -12206,6 +12410,7 @@ async def bulk_allocate_commit(
             },
         )
 
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     created_addrs: list[str] = []
     # Every allocated IP lands in the same subnet → same zone(s); batch the
@@ -12395,6 +12600,7 @@ async def allocate_next_ip(
     subnet_id: uuid.UUID, body: NextIPRequest, current_user: CurrentUser, db: DB
 ) -> IPAddress:
     """Atomically allocate the next available IP in the subnet."""
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
     # Lock the subnet row to serialise concurrent allocations. `of=Subnet`
     # restricts the FOR UPDATE to the base table; Subnet has joined-eager
     # relationships (vlan, etc.) and Postgres rejects FOR UPDATE on the
@@ -12787,11 +12993,24 @@ async def remove_subnet_domain(
 _BULK_ALLOWED_STATUSES = {"active", "deprecated", "reserved", "quarantine"}
 
 
+def _merge_dict_patch(existing: dict[str, Any] | None, patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``patch`` into ``existing`` per key; a ``None`` value removes the key."""
+    merged = dict(existing or {})
+    for k, v in patch.items():
+        if v is None:
+            merged.pop(k, None)
+        else:
+            merged[k] = v
+    return merged
+
+
 class SubnetBulkChanges(BaseModel):
     name: str | None = None
     description: str | None = None
     status: str | None = None
     vlan_id: int | None = None
+    # Merged into the existing dicts per key (set a key to null to remove it),
+    # like the address bulk edit (#4304).
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
 
@@ -12822,6 +13041,11 @@ async def bulk_edit_subnets(
 ) -> SubnetBulkEditResponse:
     """Apply the same set of changes to multiple subnets atomically.
 
+    ``name`` / ``description`` / ``status`` / ``vlan_id`` replace the existing
+    value. ``tags`` and ``custom_fields`` are **merged** into each subnet's
+    existing dict per key; a key set to ``null`` is removed (same as the
+    address bulk edit). Before #4304 they replaced the whole dict.
+
     All mutations happen in a single transaction; one audit row per
     successfully-updated subnet shares a `batch_id` in `new_value`.
     """
@@ -12844,6 +13068,8 @@ async def bulk_edit_subnets(
     for sid in body.subnet_ids:
         _enforce_subnet_token_scope(current_user, sid)
 
+    await validate_custom_field_values(db, "subnet", changes.get("custom_fields"))
+
     batch_id = uuid.uuid4()
     updated = 0
     not_found: list[uuid.UUID] = []
@@ -12856,6 +13082,8 @@ async def bulk_edit_subnets(
 
         old = {k: getattr(subnet, k, None) for k in changes.keys()}
         for field, value in changes.items():
+            if field in ("tags", "custom_fields"):
+                value = _merge_dict_patch(getattr(subnet, field, None), value)
             setattr(subnet, field, value)
 
         db.add(
@@ -12941,6 +13169,11 @@ async def get_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if is_empty_value(v):
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 
@@ -13006,6 +13239,11 @@ async def get_block_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if is_empty_value(v):
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 
@@ -13365,6 +13603,10 @@ class IPAddressBulkEditResponse(BaseModel):
     # With ``dns_zone_id: ""``: the updated addresses whose DNS records were
     # removed. An updated address absent from it had none to remove (#2172).
     dns_cleared: list[uuid.UUID] = []
+    # Why a row in ``skipped`` was skipped, keyed by id (#3905), as the bulk
+    # delete does (#1714): a delegate must not be told its grant's gap is a
+    # "system row".
+    skipped_reasons: dict[str, str] = {}
 
 
 @router.post("/addresses/bulk-edit", response_model=IPAddressBulkEditResponse)
@@ -13409,6 +13651,7 @@ async def bulk_edit_addresses(
     found_ids = {ip.id for ip in rows}
     not_found = [i for i in body.ip_ids if i not in found_ids]
     updated = 0
+    skipped_reasons: dict[str, str] = {}
     skipped: list[uuid.UUID] = []
     # Subnets whose utilization must be recomputed after the batch (#509).
     touched_subnets: set[uuid.UUID] = set()
@@ -13421,6 +13664,7 @@ async def bulk_edit_addresses(
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
+    await validate_custom_field_values(db, "ip_address", cf_patch)
     # Per-field opt-in: the change set carries ONLY the fields the
     # client explicitly set. ``role`` and ``reserved_until`` flow
     # through as scalars; an empty string on ``role`` clears.
@@ -13465,17 +13709,22 @@ async def bulk_edit_addresses(
         for ip in rows:
             if ip.status in ("network", "broadcast", "orphan"):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = (
+                    "System row (network, broadcast or orphan); not editable."
+                )
                 continue
             # Skip dynamic-lease mirrors — DHCP server owns their state and any
             # edit here would be overwritten on the next pull. The UI already
             # blocks these from being selected; this is defence-in-depth.
             if ip.auto_from_lease:
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = "DHCP lease mirror; the DHCP server owns it."
                 continue
             # Resource-scoped token (#374): a subnet-scoped token can't bulk-edit
             # IPs outside its bound subnet.
             if not token_scope_allows(current_user, "subnet", ip.subnet_id):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = "Outside the subnet this API token is scoped to."
                 continue
             # GHSA-875w — nor move an IP into a zone the token holds no grant
             # on (the IP's own subnet zones and its current zone pass).
@@ -13503,6 +13752,7 @@ async def bulk_edit_addresses(
                     )
                 except HTTPException:
                     skipped.append(ip.id)
+                    skipped_reasons[str(ip.id)] = "Names a DNS zone this token or user may not use."
                     continue
             # Address-set write delegation (#103): skip IPs the caller has no
             # write permission on (subnet-wide nor any covering address set).
@@ -13514,6 +13764,9 @@ async def bulk_edit_addresses(
                 set_ranges,
             ):
                 skipped.append(ip.id)
+                skipped_reasons[str(ip.id)] = (
+                    "Not in an address set you can edit, and no write permission on its subnet."
+                )
                 continue
 
             old: dict[str, Any] = {}
@@ -13534,21 +13787,11 @@ async def bulk_edit_addresses(
                 touched_subnets.add(ip.subnet_id)
 
             if tags_patch is not None:
-                merged = dict(ip.tags or {})
-                for k, v in tags_patch.items():
-                    if v is None:
-                        merged.pop(k, None)
-                    else:
-                        merged[k] = v
+                merged = _merge_dict_patch(ip.tags, tags_patch)
                 old["tags"] = ip.tags or {}
                 ip.tags = merged
             if cf_patch is not None:
-                merged_cf = dict(ip.custom_fields or {})
-                for k, v in cf_patch.items():
-                    if v is None:
-                        merged_cf.pop(k, None)
-                    else:
-                        merged_cf[k] = v
+                merged_cf = _merge_dict_patch(ip.custom_fields, cf_patch)
                 old["custom_fields"] = ip.custom_fields or {}
                 ip.custom_fields = merged_cf
 
@@ -13628,6 +13871,7 @@ async def bulk_edit_addresses(
         updated_count=updated,
         not_found=not_found,
         skipped=skipped,
+        skipped_reasons=skipped_reasons,
         dns_cleared=dns_cleared,
     )
 

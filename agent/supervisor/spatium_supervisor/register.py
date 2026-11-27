@@ -13,6 +13,8 @@ Failure modes:
   cached pairing code from env so we don't crash-loop on a dead
   code. Wave A2's behaviour is "log loud + idle"; Wave B+'s console
   dashboard will surface a recover-from-failed-pair affordance.
+* Registration proof refused (403 + ``X-Register-Refusal``, #4433) for clock
+  skew or a bad signature → keep the code, retry with backoff.
 * Attempt budget spent (429, #1356) → stop this round and let the main
   loop try again on its next tick. Retrying every couple of seconds
   cannot succeed before the window passes, and each retry is another
@@ -33,6 +35,7 @@ from dataclasses import dataclass
 import httpx
 import structlog
 
+from .cert_auth import register_proof_fields
 from .identity import Identity
 
 log = structlog.get_logger()
@@ -63,6 +66,36 @@ class RegisterCodeRejected(RegisterFatal):
     address's registration attempts (#1356), so a box stuck on a dead code
     would keep its address throttled and lock out every other appliance
     pairing from behind the same NAT."""
+
+
+class RegisterProofRefused(Exception):
+    """Control plane returned 403 with a proof-refusal reason (#4433): the
+    registration proof was out of the allowed clock skew, not signed by our
+    key, or replayed. Says nothing about the pairing code, so the caller keeps
+    it and retries later with backoff. ``reason`` is the control plane's
+    machine-readable reason (``clock_skew``, ``bad_signature``, ``replayed``)."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+# Reasons the control plane names (header ``X-Register-Refusal``, body
+# ``detail.reason``) for a refused proof. A 1.0.0 control plane never refuses a
+# proof and answers a bare 403, which stays "code rejected".
+PROOF_REFUSAL_REASONS = frozenset({"clock_skew", "bad_signature", "replayed"})
+PROOF_REFUSAL_HEADER = "X-Register-Refusal"
+
+
+def _proof_refusal_reason(resp: httpx.Response) -> str | None:
+    reason = resp.headers.get(PROOF_REFUSAL_HEADER)
+    if reason is None:
+        try:
+            detail = resp.json().get("detail")
+            reason = detail.get("reason") if isinstance(detail, dict) else None
+        except (ValueError, AttributeError):
+            reason = None
+    return reason if reason in PROOF_REFUSAL_REASONS else None
 
 
 class RegisterDisabled(Exception):
@@ -129,7 +162,9 @@ def register(
     last_error: str | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            resp = client.post(url, json=payload, timeout=10.0)
+            # Signed afresh per attempt: the control plane accepts each once.
+            signed = {**payload, **register_proof_fields(identity.private_key, identity.fingerprint)}
+            resp = client.post(url, json=signed, timeout=10.0)
         except httpx.HTTPError as exc:
             last_error = f"network: {exc}"
             log.warning(
@@ -170,6 +205,19 @@ def register(
                 f"control plane rejected our register payload as malformed: {resp.text}"
             )
         if resp.status_code == 403:
+            proof_reason = _proof_refusal_reason(resp)
+            if proof_reason is not None:
+                hint = (
+                    " Check this appliance's clock (NTP); it must be within "
+                    "5 minutes of the control plane's."
+                    if proof_reason == "clock_skew"
+                    else ""
+                )
+                raise RegisterProofRefused(
+                    proof_reason,
+                    f"Control plane refused the registration proof ({proof_reason}); "
+                    f"the pairing code is kept and registration retries.{hint}",
+                )
             raise RegisterCodeRejected(
                 "Pairing code rejected by control plane "
                 "(invalid / expired / already used). "

@@ -1,3 +1,4 @@
+import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -17,6 +18,8 @@ import {
 import { formatDateOnly, termDaysLeft } from "@/lib/localTime";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
@@ -29,6 +32,7 @@ import {
   SiteChip,
 } from "@/components/ownership/pickers";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -152,6 +156,7 @@ export function CircuitEditorModal({
   existing: CircuitRead | null;
   onClose: () => void;
 }) {
+  const own = useOwnershipModules();
   const qc = useQueryClient();
   const [tab, setTab] = useState<EditorTab>("general");
 
@@ -208,11 +213,13 @@ export function CircuitEditorModal({
     queryKey: ["customers", "all"],
     queryFn: () => customersApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.customer,
   });
   const sitesQ = useQuery({
     queryKey: ["sites", "all"],
     queryFn: () => sitesApi.list({ limit: 500 }),
     staleTime: 60_000,
+    enabled: own.site,
   });
   const providers = providersQ.data?.items ?? [];
   const customers = customersQ.data?.items ?? [];
@@ -241,7 +248,13 @@ export function CircuitEditorModal({
         status,
         notes,
       };
-      if (existing) return circuitsApi.update(existing.id, body);
+      if (existing) {
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(existing, body);
+        if (Object.keys(diff).length === 0) return existing;
+        return circuitsApi.update(existing.id, diff);
+      }
       return circuitsApi.create(body as CircuitCreate);
     },
     onSuccess: () => {
@@ -315,27 +328,29 @@ export function CircuitEditorModal({
               ))}
             </select>
           </div>
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              Customer (optional)
-            </label>
-            <select
-              className={inputCls}
-              value={customerId ?? ""}
-              onChange={(e) => setCustomerId(e.target.value || null)}
-            >
-              <option value="">— None —</option>
-              <MissingCustomerOption
-                customerId={customerId}
-                list={customersQ}
-              />
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          </div>
+          {own.customer && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">
+                Customer (optional)
+              </label>
+              <select
+                className={inputCls}
+                value={customerId ?? ""}
+                onChange={(e) => setCustomerId(e.target.value || null)}
+              >
+                <option value="">— None —</option>
+                <MissingCustomerOption
+                  customerId={customerId}
+                  list={customersQ}
+                />
+                {customers.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div>
             <label className="text-xs font-medium text-muted-foreground">
               Transport class
@@ -409,24 +424,26 @@ export function CircuitEditorModal({
               <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 A-end
               </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">
-                  Site
-                </label>
-                <select
-                  className={inputCls}
-                  value={aSiteId ?? ""}
-                  onChange={(e) => setASiteId(e.target.value || null)}
-                >
-                  <option value="">— None —</option>
-                  {sites.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                      {s.code ? ` (${s.code})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {own.site && (
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    Site
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={aSiteId ?? ""}
+                    onChange={(e) => setASiteId(e.target.value || null)}
+                  >
+                    <option value="">— None —</option>
+                    {sites.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                        {s.code ? ` (${s.code})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-xs font-medium text-muted-foreground">
                   Subnet UUID (optional)
@@ -447,24 +464,26 @@ export function CircuitEditorModal({
               <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 Z-end
               </div>
-              <div>
-                <label className="text-xs font-medium text-muted-foreground">
-                  Site
-                </label>
-                <select
-                  className={inputCls}
-                  value={zSiteId ?? ""}
-                  onChange={(e) => setZSiteId(e.target.value || null)}
-                >
-                  <option value="">— None —</option>
-                  {sites.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name}
-                      {s.code ? ` (${s.code})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {own.site && (
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground">
+                    Site
+                  </label>
+                  <select
+                    className={inputCls}
+                    value={zSiteId ?? ""}
+                    onChange={(e) => setZSiteId(e.target.value || null)}
+                  >
+                    <option value="">— None —</option>
+                    {sites.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                        {s.code ? ` (${s.code})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-xs font-medium text-muted-foreground">
                   Subnet UUID (optional)
@@ -554,7 +573,9 @@ export function CircuitEditorModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -667,17 +688,27 @@ export function CircuitsPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => circuitsApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["circuits"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete circuits")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => circuitsApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["circuits"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete circuit"));
+      qc.invalidateQueries({ queryKey: ["circuits"] });
+    },
   });
 
   function toggle(id: string) {
@@ -697,6 +728,11 @@ export function CircuitsPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">WAN circuits</h1>
@@ -868,8 +904,10 @@ export function CircuitsPage() {
                         setProviderFilter("");
                         setTagFilters([]);
                       }}
+                      gate={writeGate}
+                      hint={`Click "New circuit" to add one.`}
                     >
-                      No circuits yet — click "New circuit" to add one.
+                      No circuits yet.
                     </ListEmpty>
                   </td>
                 </tr>
@@ -973,10 +1011,19 @@ export function CircuitsPage() {
           />
         )}
         {editing && (
-          <CircuitEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => circuitsApi.get(editing.id)}
+            title="Edit circuit"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CircuitEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

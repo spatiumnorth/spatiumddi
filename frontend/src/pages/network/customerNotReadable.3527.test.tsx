@@ -100,6 +100,12 @@ const OVERLAY = {
   policy_count: 0,
 };
 
+// The ownership fields follow their feature modules (#4101); these tests are
+// about the customer field itself, so every module is on.
+vi.mock("@/hooks/useFeatureModules", () => ({
+  useFeatureModules: () => ({ ready: true, enabled: () => true }),
+}));
+
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   const pending = () => new Promise(() => {});
@@ -267,7 +273,7 @@ describe("a role refused the customer list (#3527)", () => {
     ).toBeNull();
   });
 
-  it("Save on the multicast form still sends the customer unchanged", async () => {
+  it("Save on the multicast form never sends a customer it could not read", async () => {
     wrap(
       <MulticastGroupModal
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -277,10 +283,15 @@ describe("a role refused the customer list (#3527)", () => {
       />,
     );
     await settle();
+    // Since #4379 a Save sends only what changed, so the hidden customer is
+    // kept by not being sent (never nulled).
+    fireEvent.change(screen.getByDisplayValue(GROUP.name), {
+      target: { value: "renamed" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(update).toHaveBeenCalled());
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect((update.mock.calls[0] as any)[1].customer_id).toBe(HIDDEN);
+    expect((update.mock.calls[0] as any)[1]).toEqual({ name: "renamed" });
   });
 });
 

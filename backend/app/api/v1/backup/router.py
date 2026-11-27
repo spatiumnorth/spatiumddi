@@ -45,7 +45,7 @@ from app.services.backup import (
     build_backup_archive,
 )
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
-from app.services.backup.sections import SECTIONS
+from app.services.backup.sections import SECTIONS, SECTIONS_BY_KEY, also_restored_by_section
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
 # so every body here is authorised from its headers before it is read
@@ -62,6 +62,14 @@ _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 # ── /backup/create-and-download ──────────────────────────────────────
 
 
+class BackupSectionReach(BaseModel):
+    """Tables of one other section that a selective restore also replaces."""
+
+    key: str  #: owning section's key; "" for tables no section claims
+    label: str
+    tables: list[str]
+
+
 class BackupSection(BaseModel):
     """One selectable slice of the backup, as offered to the operator."""
 
@@ -75,6 +83,9 @@ class BackupSection(BaseModel):
     #: False for sections that must always be included; the UI renders those
     #: as fixed rather than as an unticked checkbox.
     selectable: bool
+    #: What a selective restore of this section also replaces from the
+    #: archive, because those tables hold a foreign key into it (#4333).
+    also_restores: list[BackupSectionReach]
 
 
 class BackupSectionCatalog(BaseModel):
@@ -96,6 +107,14 @@ async def list_backup_sections(current_user: SuperAdmin) -> BackupSectionCatalog
                 table_count=len(s.tables),
                 volatile=s.volatile,
                 selectable=s.selectable,
+                also_restores=[
+                    BackupSectionReach(
+                        key=k,
+                        label=SECTIONS_BY_KEY[k].label if k else "Other tables",
+                        tables=tables,
+                    )
+                    for k, tables in also_restored_by_section(s.key).items()
+                ],
             )
             for s in SECTIONS
         ]
@@ -301,6 +320,13 @@ async def restore_backup(
 
     await assert_no_upgrade_in_flight(db, operation_hint="backup restore")
 
+    # #4678 — not while the booted slot and the serving api are different releases.
+    from app.services.upgrades.schema_rollback import (  # noqa: PLC0415
+        assert_restore_allowed_for_release,
+    )
+
+    assert_restore_allowed_for_release()
+
     archive_bytes = await archive.read()
     if not archive_bytes:
         raise HTTPException(status_code=422, detail="archive is empty")
@@ -396,6 +422,7 @@ async def restore_backup(
                     "allow_newer_schema": allow_newer_schema,
                     "warnings": outcome.warnings,
                     "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "adopted_appliances": outcome.adopted_appliances,
                 },
             )
         )

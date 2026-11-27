@@ -81,10 +81,10 @@ not tested and not supported. Report a problem on a supported version in
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
 same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
-OpenShift 4.22.14, both on OpenShift Local: every control-plane pod admitted by
-`restricted-v2`, the BIND9 and Kea agents by the chart's own SCCs, DNS and DHCP
-serving, `helm test` passing. On 4.22 `restricted-v3` exists but does not admit
-the chart's pods, so no `hostUsers` setting is needed. OKD is not tested.
+OpenShift 4.22.14 (Kubernetes 1.35), both on OpenShift Local, from the command
+line and through the web console's Helm install: every control-plane pod
+admitted by `restricted-v2`, the BIND9 and Kea agents by the chart's own SCCs,
+DNS and DHCP serving. OKD is not tested.
 
 ```bash
 helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
@@ -150,7 +150,7 @@ The api, worker, beat, frontend, migrate Job, Postgres and Redis should show
   allows `NET_BIND_SERVICE`) can never be the SCC that admits them. Where
   cluster admins manage SCCs, set `openshift.scc.create: false`: the chart
   still creates the ServiceAccounts, and you grant an equivalent SCC to
-  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (`<fullname>` is
+  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (see **If your cluster admins manage SCCs** below; `<fullname>` is
   `<release>-spatiumddi`, or the release name when it already contains
   `spatiumddi`). `anyuid` is not a substitute: it has no `seccompProfiles`, so it
   rejects every pod that sets `seccompProfile: RuntimeDefault`.
@@ -166,9 +166,156 @@ chown and drop privileges at start). `frontend.tls.enabled` (the appliance's
 `:80` / `:443` nginx) and `frontend.hostNetwork` are refused: let the Route
 terminate TLS. Kea's opt-in
 rogue-DHCP probe and fingerprint sniffer need `NET_RAW` in a process that is not
-Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
+Kea, and are unavailable; so is radvd (`RADVD_MANAGED`), which also needs
+`NET_ADMIN`, in the default and the `-ubi` Kea image alike (the `-ubi` image does
+ship radvd, for platforms where you grant it). `restricted-v3` (4.22+) also requires `hostUsers:
 false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
+
+**Red Hat certification status.** The chart and images are **not yet** Red Hat
+certified. Partner Connect certification components exist for the four `-ubi`
+images, and when the repository secret `PYXIS_API_TOKEN` is set the release
+submits `preflight` results for each image and architecture against the published
+`ghcr.io/spatiumnorth/<image>:<version>-ubi` (the `submit-ubi-preflight` job; it is
+non-gating and skipped without the secret). Certification stays pending until Red
+Hat reviews and publishes them. What exists is everything short of it. Every image carries `name`,
+`vendor`, `version`, `release`, `summary`, `description`, `maintainer` and `url`
+labels (plus the `org.opencontainers.image.*` set) and the project `LICENSE` and
+`NOTICE` under `/licenses`; the chart has a `values.schema.json`,
+`charts.openshift.io/*` annotations in `Chart.yaml` and a `helm test` hook
+(`helm test <release>` checks the api and the frontend answer); and four of the
+images have Red Hat UBI 9 variants, described next.
+
+**UBI image variants and the certified profile (#3913).** The api, frontend,
+`dns-bind9` and `dhcp-kea` images are also published on `ubi9` as
+`ghcr.io/spatiumnorth/<image>:<version>-ubi` (and `:latest-ubi`), GHCR only. They
+are an addition: the default images, the appliance and the default chart values
+are unchanged, and the nightly does not publish `-ubi` tags (the release does,
+after the same Trivy gate, per architecture on a native runner). They run as a
+numeric non-root `USER` and keep the random-uid behaviour above. BIND 9.20 and
+Kea are built from checksummed source, since Red Hat ships neither at these
+versions (see `docs/THIRD_PARTY.md`). Compared with the default images the UBI
+ones lack `whois` and `traceroute` (the Tools page reports the missing binary),
+the NFS backup destination (`libnfs`), `kea-admin` and the SQL lease backends in
+the Kea image, and the frontend's nginx is Red Hat's 1.26.
+
+`charts/spatiumddi/values-openshift-certified.yaml` selects them:
+
+```bash
+oc create secret docker-registry redhat-registry -n spatiumddi \
+  --docker-server=registry.redhat.io \
+  --docker-username=<registry service account> --docker-password=<token>
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+  --version <CHART_VERSION> --namespace spatiumddi --create-namespace \
+  -f values-openshift-certified.yaml
+```
+
+It keeps `openshift.scc.create: true`, so the chart creates the DNS and DHCP
+agents' SecurityContextConstraints exactly as the plain chart does (Red Hat
+confirmed that SCCs in a certified chart are acceptable). The control plane needs
+none and runs under `restricted-v2`; the agents are admitted by the chart's SCCs
+when you enable them. Creating an SCC needs cluster-scoped permissions, so a user
+who is admin of one namespace only cannot install with the agents on: Helm (and
+the web console's Helm install) stops before creating anything, with
+`securitycontextconstraints ... is forbidden ... at the cluster scope`. Where your
+cluster admins manage SCCs, or the installing user is a namespace admin, set
+`openshift.scc.create: false` and follow **If your cluster admins manage SCCs**
+below: a cluster admin applies the SCC files once, and the namespace admin can
+then install.
+
+It also sets `image.tagSuffix: -ubi` (appended to the tag of those four images; the
+agents' BIND9 and Kea included) and runs the bundled PostgreSQL and Redis from
+Red Hat's `registry.redhat.io/rhel9/postgresql-16` and `rhel9/redis-7`
+(`postgresql.image.flavor: rhel`, `redis.image.flavor: rhel`; standalone kind
+only, and the Redis 8-only `aof-load-corrupt-tail-max-size` is not passed to
+Redis 7). Those two need a Red Hat registry pull secret, an account at
+<https://access.redhat.com/terms-based-registry/>; the chart passes
+`image.pullSecrets` to them as to every other pod. The two Red Hat tags are
+immutable `<RHEL minor>-<build>` builds. The `rhel` flavors follow the sclorg
+image contract (`POSTGRESQL_*` variables, `/var/lib/pgsql/data`,
+`/var/lib/redis/data`) and have been rendered and schema-checked, not yet run
+against a `registry.redhat.io` pull. For anything beyond a single pod of each,
+bring your own PostgreSQL and Redis (`externalDatabase`, `externalRedis`).
+
+The release runs Red Hat's `preflight check container` against each `-ubi` image
+(amd64, check only, never submitting); `.github/workflows/build-ubi-images.yml`
+does the same on a PR and weekly.
+
+**If your cluster admins manage SCCs.** Set `openshift.scc.create: false` (with the
+certified profile or without it), for example `--set openshift.scc.create=false`
+after `-f values-openshift-certified.yaml`. The chart still renders the agents' ServiceAccounts (`<fullname>-dns-agent`,
+`<fullname>-dhcp-agent`, where `<fullname>` is `<release>-spatiumddi`, or the
+release name when it already contains `spatiumddi`) but no SCC, so an agent pod is
+admitted under `restricted-v2` and fails to start (`named` and `kea-dhcp4` cannot
+get `NET_BIND_SERVICE` / `NET_RAW`) until a cluster admin has done the following.
+Ready-to-apply manifests ship in the chart under `files/openshift/`; fetch them
+with `helm pull oci://ghcr.io/spatiumnorth/charts/spatiumddi --version <CHART_VERSION> --untar`:
+
+| File | SCC name | Allows | For |
+|---|---|---|---|
+| `dns-agent-scc.yaml` | `spatiumddi-dns-agent` | `NET_BIND_SERVICE` | BIND9 DNS agents |
+| `dhcp-agent-scc.yaml` | `spatiumddi-dhcp-agent` | `NET_BIND_SERVICE`, `NET_RAW` | Kea DHCP agents |
+| `dhcp-agent-hostnetwork-scc.yaml` | `spatiumddi-dhcp-agent-hostnetwork` | the above plus host network / ports | Kea only when a server sets `hostNetwork: true` (use instead of the one above) |
+
+Each is the same SCC the chart renders with `openshift.scc.create: true` (a CI
+check keeps them identical), with a release-independent name: `restricted-v2`
+plus those capabilities and `allowPrivilegeEscalation: true`, not privileged.
+
+1. As a cluster admin, apply the SCC(s) for the agents you will run (cluster-scoped,
+   once per cluster):
+
+   ```bash
+   oc apply -f spatiumddi/files/openshift/dns-agent-scc.yaml
+   oc apply -f spatiumddi/files/openshift/dhcp-agent-scc.yaml   # or dhcp-agent-hostnetwork-scc.yaml
+   ```
+
+2. Grant each SCC to its ServiceAccount (the account does not have to exist yet):
+
+   ```bash
+   oc adm policy add-scc-to-user spatiumddi-dns-agent  -z ddi-spatiumddi-dns-agent  -n spatiumddi
+   oc adm policy add-scc-to-user spatiumddi-dhcp-agent -z ddi-spatiumddi-dhcp-agent -n spatiumddi
+   ```
+
+   (shown for release `ddi` in namespace `spatiumddi`; `-z` takes the
+   ServiceAccount name without the namespace.) Do not grant an SCC to the
+   namespace's `default` account.
+
+3. Enable the agents: `--set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1`
+   and/or `--set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1`
+   on `helm install` / `helm upgrade`. Without a server listed no agent pod is
+   rendered.
+
+4. Verify with the `openshift.io/scc` annotation check above: the DNS agent pods
+   must show `spatiumddi-dns-agent` and the DHCP agent pods `spatiumddi-dhcp-agent`
+   (or `-hostnetwork`). If the agent pods never appear, the grant in step 2 is
+   missing or names the wrong ServiceAccount: the StatefulSet's events show
+   `FailedCreate ... unable to validate against any security context constraint`.
+   Fix the grant and the pods are created without another `helm upgrade`.
+
+To remove the prerequisite after `helm uninstall`, undo the grants and delete the
+SCCs. Deleting an SCC leaves behind the ClusterRole that `add-scc-to-user`
+created, so delete that as well:
+
+```bash
+oc adm policy remove-scc-from-user spatiumddi-dns-agent  -z ddi-spatiumddi-dns-agent  -n spatiumddi
+oc adm policy remove-scc-from-user spatiumddi-dhcp-agent -z ddi-spatiumddi-dhcp-agent -n spatiumddi
+oc delete scc spatiumddi-dns-agent spatiumddi-dhcp-agent
+oc delete clusterrole system:openshift:scc:spatiumddi-dns-agent system:openshift:scc:spatiumddi-dhcp-agent
+```
+
+`openshift.workerNetRaw` is not covered by these files: with `openshift.scc.create: false` it needs an SCC for the worker's ServiceAccount that you write yourself, or leave it off (the default).
+
+With the default `openshift.scc.create: true`, certified profile or not, none of this
+is needed: the chart creates the same SCCs, named
+`<fullname>-<namespace>-dns-agent` / `-dhcp-agent`.
+
+To run Red Hat's checks yourself, install
+[`openshift-preflight`](https://github.com/redhat-openshift-ecosystem/openshift-preflight)
+and run `preflight check container ghcr.io/spatiumnorth/spatiumddi-api:<version>-ubi`
+(add `--platform amd64`). Check-only mode needs no account; do not pass
+`--submit`. The default (non-`-ubi`) images fail `RunAsNonRoot` and
+`BasedOnUbi` by design. For the chart, `chart-verifier verify` against the packaged
+`.tgz` runs the offline checks (`helm lint`, schema, annotations).
 
 **Reaching DNS and DHCP from outside the cluster.** The Route is for the UI
 only: a Route carries HTTP and TLS, not DNS on 53 or DHCP on 67. Both need a

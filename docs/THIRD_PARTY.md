@@ -290,6 +290,7 @@ The bootable image is Debian 13 (trixie), built with
 | [qemu-guest-agent](https://www.qemu.org/) / [open-vm-tools](https://github.com/vmware/open-vm-tools) | GPL v2 / GPL v2 + BSD | Hypervisor integration; both no-op off their platform |
 | [zstd](https://facebook.github.io/zstd/) | BSD 3-Clause / GPL v2 | Image + airgap tarball compression |
 | [jq](https://jqlang.github.io/jq/), [curl](https://curl.se/), less, htop, tcpdump, dnsutils | MIT / curl / GPL / BSD / MPL 2.0 | Operator diagnostics |
+| [pyca/bcrypt](https://github.com/pyca/bcrypt) (python3-bcrypt) | Apache-2.0 | The installer hashes the web UI admin password (#4548) |
 | [Rich](https://github.com/Textualize/rich) + [psutil](https://github.com/giampaolo/psutil) (python3-rich, python3-psutil) | MIT / BSD 3-Clause | The console dashboard on tty1 |
 
 **There is no Docker on the appliance.** It was removed in #183 Phase 7 — the
@@ -330,6 +331,41 @@ invoked as a subprocess — no linking, no derivative work. Anyone repackaging
 SpatiumDDI commercially should read the NPSL themselves rather than assume the
 Apache license covers it.
 
+## Red Hat UBI variants (#3913)
+
+The api, frontend, `dns-bind9` and `dhcp-kea` images are also built on Red Hat
+Universal Base Image 9 (`ghcr.io/spatiumnorth/<image>:<version>-ubi`), for the
+OpenShift certified-image profile. They are an addition: the Alpine / Debian
+images and the appliance are unchanged. Red Hat's UBI repositories carry no
+BIND 9.20, no Kea and none of the build dependencies below, so those are built
+from checksummed upstream source tarballs in a builder stage (each
+`ARG ..._SHA256` in the Dockerfile) and only the runtime result is copied in.
+
+| Component | Version | License | Where |
+|---|---|---|---|
+| [Red Hat UBI 9](https://catalog.redhat.com/software/containers/ubi9/ubi-minimal) | 9.9 | Red Hat UBI EULA (redistributable) plus the licenses of the RPMs it carries | Base of the four `-ubi` images; its AppStream `python3.12`, `nginx` 1.26 and `nmap` / `tcpdump` / `mtr` / `bind-utils` are used as shipped |
+| [ISC BIND 9](https://www.isc.org/bind/) | 9.20.30 (built from source, UBI image) | MPL 2.0 | `dns-bind9` UBI image |
+| [libuv](https://libuv.org/) | 1.52.1 (built from source, UBI image) | MIT | `dns-bind9` UBI image |
+| [Userspace RCU](https://liburcu.org/) | 0.15.6 (built from source, UBI image) | LGPL v2.1 (dynamically linked) | `dns-bind9` UBI image |
+| [ISC Kea DHCP](https://www.isc.org/kea/) | 3.0.5 (built from source, UBI image) | MPL 2.0 | `dhcp-kea` UBI image |
+| [log4cplus](https://github.com/log4cplus/log4cplus) | 2.2.1 (built from source, UBI image) | BSD-2-Clause / Apache 2.0 | `dhcp-kea` UBI image |
+| [jemalloc](https://jemalloc.net/) | 5.3.0 (built from source, UBI image) | BSD-2-Clause | Allocator `named` is linked to in the `dns-bind9` UBI image (#4192) |
+| [radvd](https://radvd.litech.org/) | 2.21 (built from source, UBI image) | BSD-style | `dhcp-kea` UBI image (opt-in `RADVD_MANAGED=1`) |
+| [tini](https://github.com/krallin/tini) | 0.19.0 (built from source) | MIT | PID 1 in the `dns-bind9` and `dhcp-kea` UBI images |
+| [PostgreSQL client 16](https://www.postgresql.org/) (PGDG el9 repository) | 16 | PostgreSQL License | api UBI image (`pg_dump` / `pg_restore`) |
+| Red Hat PostgreSQL 16 / Redis 7 images | `registry.redhat.io/rhel9/postgresql-16`, `rhel9/redis-7` | PostgreSQL License / BSD-3-Clause, under Red Hat's terms | Pulled by the certified profile only (`values-openshift-certified.yaml`); not redistributed by this project |
+
+Build-time only, nothing shipped: Boost 1.89.0 headers and meson 1.9.1 (Kea
+build), flex 2.6.4 and bison 3.8.2 (radvd build). BIND, Kea, libuv, userspace-rcu,
+radvd, flex and bison are fetched with an OpenPGP signature checked against a
+fingerprint pinned in the Dockerfile and `versions.json`, besides the sha256;
+log4cplus (its key cannot be imported by UBI's GnuPG), tini (only release
+binaries are signed), Boost and jemalloc (none published) are sha256-only.
+
+Dropped from the UBI api image because UBI does not carry them:
+`whois`, `traceroute` and `libnfs` (the NFS backup destination and the Tools
+page's whois / traceroute report the missing binary). Dropped from the UBI `dhcp-kea` image: `kea-admin` and the MySQL / PostgreSQL lease backends.
+
 ## Container bases and init
 
 | Component | Version | License | Where |
@@ -339,9 +375,10 @@ Apache license covers it.
 | [technitium/dns-server](https://hub.docker.com/r/technitium/dns-server) | 15.6.2 (digest-pinned; Ubuntu-based) | GPL v3 | Technitium agent image **runtime** — the one agent image that is not Alpine |
 | [python:3.12-slim](https://www.python.org/) | 3.12 | PSF + Debian | API image |
 | [node](https://nodejs.org/) | 22-alpine | MIT | Frontend build stage |
-| [nginx](https://nginx.org/) | 1.31.8-alpine | BSD 2-Clause | Frontend runtime |
+| [nginx](https://nginx.org/) | 1.31.9-alpine | BSD 2-Clause | Frontend runtime |
 | [ASP.NET Core runtime](https://dotnet.microsoft.com/) | 10.0 | MIT | Technitium agent image |
 | [tini](https://github.com/krallin/tini) | Alpine/Debian pkg | MIT | PID 1 in every agent image |
+| [jemalloc](https://jemalloc.net/) | Alpine pkg | BSD-2-Clause | Allocator linked into `named` in the BIND9 agent image (#4192) |
 | [su-exec](https://github.com/ncopa/su-exec) / [gosu](https://github.com/tianon/gosu) | Alpine / Debian pkg | MIT / Apache 2.0 | Privilege drop at entrypoint |
 
 Alpine is pinned at **3.23, not 3.24**, and that pin is load-bearing: 3.24 ships

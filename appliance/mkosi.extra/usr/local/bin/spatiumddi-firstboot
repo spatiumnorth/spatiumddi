@@ -21,7 +21,7 @@ set -eu
 # #2109 — seconds since boot, and when this run began. The slot-image check
 # near the end may wait for as long as this unit has left of its start
 # timeout, so it can report its own verdict instead of being killed mid-wait.
-FIRSTBOOT_TIMEOUT_S=600   # TimeoutStartSec=10min in spatiumddi-firstboot.service
+FIRSTBOOT_TIMEOUT_S=600   # the slot-image check's window, inside TimeoutStartSec=45min (re-anchored after the #4591 reset wait)
 uptime_s() {
     read -r _up _ </proc/uptime && echo "${_up%.*}"
 }
@@ -84,6 +84,8 @@ CONTROL_RELEASE_UNIT=spatiumddi-control-release.service
 APP_KEY_SECRET=spatium-control-app-keys
 CHART_APP_SECRET=spatium-control-spatiumddi-app
 APP_KEY_STAMP=/var/lib/spatiumddi/app-key-secret.done
+# #4548 — bcrypt hash of the web UI admin password, written by spatium-install.
+WEB_ADMIN_HASH_FILE=/var/lib/spatium-state/web-admin-password-hash
 METALLB_MANIFEST="$K3S_MANIFESTS_DIR/spatium-metallb.yaml"
 SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
@@ -325,7 +327,7 @@ chmod 0755 /var/lib/spatiumddi/removable
 # The supervisor (control-plane→host) drops <cid>.request here and the
 # spatiumddi-pcap.path unit watches it; the host runner writes <cid>.pcap
 # + <cid>.state back. Owned by the supervisor's unprivileged uid (the
-# spatium user, 100:101 in the supervisor image) so it can write the
+# spatium user, 10001:10001 in the supervisor image) so it can write the
 # request + clean up afterwards; the host runner writes the pcap/state as
 # root into this dir (root writes anywhere) and the supervisor (dir owner,
 # no sticky bit) can still unlink them. Created up front so the .path unit
@@ -333,7 +335,7 @@ chmod 0755 /var/lib/spatiumddi/removable
 #
 # The supervisor owns this name, so it can replace the directory with a
 # symlink, and chown / chmod follow one: on the next boot they would hand
-# whatever it points at (/etc, say) to uid 100. A symlink is removed (rm does
+# whatever it points at (/etc, say) to the supervisor's uid. A symlink is removed (rm does
 # not follow it), and the chown / chmod are applied to ``.`` from inside the
 # directory, after checking it resolved to itself, so a swap after the check
 # cannot redirect them.
@@ -342,9 +344,23 @@ SPATIUM_PCAP_DIR=/var/lib/spatiumddi/release-state/pcap
 mkdir -p "$SPATIUM_PCAP_DIR"
 if ! ( cd -P "$SPATIUM_PCAP_DIR" 2>/dev/null \
         && [ "$(pwd -P)" = "$(cd -P /var/lib/spatiumddi/release-state && pwd -P)/pcap" ] \
-        && chown 100:101 . && chmod 0755 . ); then
+        && chown 10001:10001 . && chmod 0755 . ); then
     echo "WARN: $SPATIUM_PCAP_DIR is not a plain directory; left as it is" >&2
 fi
+
+# The supervisor's ids moved from 100:101 (host system accounts) to
+# 10001:10001. Files and directories it created in release-state before the
+# upgrade (triggers, the storage/ request directory, markers) still carry the
+# old owner; the sticky directory means the new uid could neither replace nor
+# remove them, while the trigger guard no longer accepts uid 100. The
+# supervisor's entrypoint repeats this on every start (this runs in parallel
+# with the pods, and a pod still on the old image can write 100-owned names
+# until it is replaced). Two levels deep (release-state and its direct
+# subdirectories), files and directories only. -P / -h follow no symlink, and
+# -execdir chowns each entry by its bare name from inside its own directory,
+# so a parent swapped for a symlink mid-walk cannot redirect it.
+find -P /var/lib/spatiumddi/release-state -xdev -maxdepth 2 \( -type f -o -type d \) \
+    -user 100 -group 101 -execdir chown -h 10001:10001 {} + 2>/dev/null || true
 
 # Detect the host's root block device's rotational flag so the
 # supervisor pod (which can't see the host's /proc/mounts properly —
@@ -1334,6 +1350,11 @@ ${API_SIZING_YAML}
       # to add (#1005).
       service:
         trafficDistribution: PreferSameNode
+        # #3645 — the second api Service with internalTrafficPolicy: Local,
+        # which the member supervisors use so their plain-http hop stays on
+        # the node (the frontend stays on the cluster Service). Same value as the supervisor's
+        # HelmChartConfig (#1005).
+        nodeLocal: true
       autoscaling:
         enabled: false
       env:
@@ -1905,6 +1926,201 @@ except Exception:
     else
         echo "WARN: could not reconcile sizing on HelmChartConfig kube-system/spatium-control; the supervisor corrects it on its first heartbeat." >&2
     fi
+    return 0
+}
+
+# #3919 — drop the field manager the preroll patch used from a DaemonSet's
+# managedFields. A patch is an Update and takes ownership of the fields it
+# changes (every role container's .image); helm applies server-side without
+# forcing conflicts (the role chart's upgrade runs --force-conflicts=false), so
+# a later helm apply of a DIFFERENT image (a rollback to a slot without this
+# change, a shared-chart hold, a node joining) was refused "conflict with
+# kubectl-patch". Naming the manager is not enough, since we cannot know that
+# helm's name matches across versions; removing our own entry is: the image
+# field is then unowned or helm's, and helm's next apply takes it without a
+# conflict, as it did before the preroll. The entry is matched by the manager
+# name this function was given (never an operator's own kubectl-patch), and the
+# JSON patch tests the name at its index so a concurrent write cannot make it
+# remove another manager. Never fatal.
+release_preroll_ownership() {
+    local k3s=/usr/local/bin/k3s ns=$1 ds=$2 fm=$3 ops
+    ops=$($k3s kubectl --request-timeout=10s -n "$ns" get daemonset "$ds" \
+        --show-managed-fields -o json 2>/dev/null | python3 -c '
+import json, sys
+
+fm, ds = sys.argv[1:3]
+try:
+    mf = (json.load(sys.stdin).get("metadata") or {}).get("managedFields") or []
+    if not mf:
+        # kubectl leaves managedFields out unless --show-managed-fields is
+        # given; a read with none is a miss to report, never a quiet success.
+        print(f"WARN: DaemonSet {ds} was read with no managedFields; nothing released (#3919).", file=sys.stderr)
+        sys.exit(0)
+    # Highest index first, so a removal does not shift the next.
+    ops = []
+    for i in range(len(mf) - 1, -1, -1):
+        if mf[i].get("manager") == fm:
+            ops.append({"op": "test", "path": f"/metadata/managedFields/{i}/manager", "value": fm})
+            ops.append({"op": "remove", "path": f"/metadata/managedFields/{i}"})
+    if ops:
+        print(json.dumps(ops))
+    else:
+        print(f"WARN: DaemonSet {ds} has no managedFields entry for {fm} after the preroll patch; nothing released (#3919).", file=sys.stderr)
+except Exception:
+    sys.exit(1)
+' "$fm" "$ds") || ops=""
+    [ -n "$ops" ] || return 0
+    $k3s kubectl --request-timeout=10s -n "$ns" patch daemonset "$ds" \
+        --type json -p "$ops" >/dev/null 2>&1 \
+        || echo "WARN: could not release field manager ${fm} on DaemonSet ${ds}; a later helm apply of other images may report a conflict (#3919)." >&2
+    return 0
+}
+
+# #3919 — move the role DaemonSets' pod template onto this slot's tag, ahead
+# of the chart write that follows. Rewriting the HelmChart alone cannot give
+# one roll: helm-controller applies it from a job POD, which needs the kubelet,
+# and by the time that pod has run the kubelet has restarted the role pods on
+# the previous release's image, so the chart's own template change rolled them
+# a second time (26 s on images new to the node). A DaemonSet's template is
+# plain API state, so it can be changed the moment the apiserver answers,
+# before the kubelet starts anything: the old pods (not Ready, their node not
+# yet back) are replaced by pods on the new image, and the helm upgrade that
+# follows finds the live template already equal to its own.
+#
+# Only the four role DaemonSets, and only images on the OLD global tag, so a
+# per-image tag override is left alone. Never fatal: without this the chart
+# write still moves the roles, with the extra roll.
+preroll_role_daemonsets() {
+    local k3s=/usr/local/bin/k3s old=$1 new=$2 ns=spatium ds patch fm=spatium-firstboot-preroll
+    [ -n "$old" ] && [ "$old" != "$new" ] || return 0
+    patch=$(mktemp) || return 0
+    for ds in dhcp-kea dns-bind9 dns-powerdns dns-technitium; do
+        $k3s kubectl --request-timeout=10s -n "$ns" get daemonset "$ds" \
+            --ignore-not-found -o json 2>/dev/null | python3 -c '
+import json, sys
+
+old, new, out = sys.argv[1:4]
+try:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        sys.exit(0)
+    spec = json.loads(raw)["spec"]["template"]["spec"]
+    patch = {}
+    for key in ("containers", "initContainers"):
+        items = []
+        for c in spec.get(key) or []:
+            img = c.get("image", "")
+            repo, sep, tag = img.rpartition(":")
+            if sep and tag == old and "/" not in tag:
+                items.append({"name": c["name"], "image": repo + ":" + new})
+        if items:
+            patch[key] = items
+    if patch:
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump({"spec": {"template": {"spec": patch}}}, fh)
+except Exception:
+    sys.exit(1)
+' "$old" "$new" "$patch" 2>/dev/null || { echo "WARN: could not read DaemonSet $ds; left to the chart write (#3919)." >&2; continue; }
+        [ -s "$patch" ] || continue
+        if $k3s kubectl --request-timeout=30s -n "$ns" patch daemonset "$ds" \
+                --field-manager="$fm" \
+                --type strategic --patch-file "$patch" >/dev/null 2>&1; then
+            echo "Moved DaemonSet ${ds} to ${new} before the kubelet restarts it (#3919)."
+            release_preroll_ownership "$ns" "$ds" "$fm"
+        else
+            echo "WARN: could not patch DaemonSet ${ds}; left to the chart write (#3919)." >&2
+        fi
+        : > "$patch"
+    done
+    rm -f "$patch"
+    return 0
+}
+
+# #3919 — bring the role release (the supervisor's ``spatiumddi-appliance``
+# HelmChart) onto THIS slot's image tag and chart as soon as k3s answers.
+#
+# That HelmChart lives in the datastore, written by the supervisor, so a slot
+# upgrade's reboot leaves the PREVIOUS release's ``global.imageTag`` and chart
+# in it. k3s starts the role DaemonSets (dhcp-kea, dns-*) from it at once, and
+# they came back on the old images; the new supervisor's first lifecycle apply
+# (~2-3 min later, once its own pod is up) then moved the tag and rolled every
+# role pod a second time. Writing the tag here leaves the supervisor's apply
+# with nothing to change, so the roles move once.
+#
+# Properties that keep this from becoming its own source of churn:
+#   * the tag follows the slot that BOOTED (SPATIUMDDI_VERSION is stamped from
+#     the running slot), so a rollback writes the old tag back;
+#   * single-node clusters only. On a cluster the role chart is shared and the
+#     supervisor gates its write on the other nodes' versions and a Rolling
+#     Upgrade's hold (#1710, #1750); this script knows neither, so it leaves
+#     it to them. A node count it cannot read is "not single";
+#   * a HelmChart that does not exist yet (first install) is left to the
+#     supervisor, and one already on this tag is not written (a write is a
+#     helm revision);
+#   * only ``global.imageTag`` changes, and the document is re-dumped the way
+#     the supervisor dumps it (``safe_dump(sort_keys=False)``) with the chart
+#     encoded the way it encodes it, so the supervisor's own apply afterwards
+#     is a no-op on the object;
+#   * never fatal. No ``python3 -`` (#1001): the program is a ``-c`` argument
+#     and its data arrives as argv.
+reconcile_role_chart_tag() {
+    local k3s=/usr/local/bin/k3s nodes cur patch rc old
+    [ -f "$CHART_TGZ" ] || return 0
+    # The supervisor's rolling-upgrade hold file (#1710/#3136): while one is
+    # recorded, the supervisor itself refuses to write this chart from a node
+    # already on the target, so firstboot must not either.
+    [ -e "${SUPERVISOR_STATE_DIR:-/var/persist/spatium-supervisor}/shared-chart-hold" ] && return 0
+    if ! nodes=$($k3s kubectl --request-timeout=10s get nodes -o name 2>/dev/null); then
+        echo "WARN: could not list nodes; role chart tag not reconciled this boot (#3919)." >&2
+        return 0
+    fi
+    [ "$(printf '%s\n' "$nodes" | grep -c .)" = 1 ] || return 0
+    if ! cur=$($k3s kubectl --request-timeout=10s -n kube-system get helmchart \
+            spatiumddi-appliance --ignore-not-found \
+            -o 'jsonpath={.spec.valuesContent}' 2>/dev/null); then
+        echo "WARN: could not read HelmChart kube-system/spatiumddi-appliance; role chart tag not reconciled this boot (#3919)." >&2
+        return 0
+    fi
+    [ -n "$cur" ] || return 0
+    patch=$(mktemp) || return 0
+    rc=0
+    old=$(python3 -c '
+import base64, json, sys
+import yaml
+
+tag, chart, cur, out = sys.argv[1:5]
+try:
+    doc = yaml.safe_load(cur)
+    if not isinstance(doc, dict) or not isinstance(doc.get("global"), dict):
+        sys.exit(1)
+    if str(doc["global"].get("imageTag")) == tag:
+        sys.exit(0)
+    old = str(doc["global"].get("imageTag"))
+    doc["global"]["imageTag"] = tag
+    with open(chart, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode("ascii")
+    values = yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)
+    with open(out, "w", encoding="utf-8") as fh:
+        json.dump({"spec": {"chartContent": b64, "valuesContent": values}}, fh)
+    print(old)
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(1)
+' "$SPATIUMDDI_VERSION" "$CHART_TGZ" "$cur" "$patch" 2>/dev/null) || rc=$?
+    if [ "$rc" != 0 ]; then
+        echo "WARN: could not render the role chart tag patch; not reconciled this boot (#3919)." >&2
+    elif [ -s "$patch" ]; then
+        # The DaemonSets first, see preroll_role_daemonsets.
+        preroll_role_daemonsets "$old" "$SPATIUMDDI_VERSION"
+        if $k3s kubectl --request-timeout=30s -n kube-system patch helmchart \
+                spatiumddi-appliance --type merge --patch-file "$patch" >/dev/null 2>&1; then
+            echo "Moved the role chart (spatiumddi-appliance) to ${SPATIUMDDI_VERSION} ahead of the supervisor (#3919)."
+        else
+            echo "WARN: could not patch HelmChart kube-system/spatiumddi-appliance; the supervisor moves it on its first apply (#3919)." >&2
+        fi
+    fi
+    rm -f "$patch"
     return 0
 }
 
@@ -2556,13 +2772,62 @@ reassert_control_plane_class() {
 # is refused, because a new key there is the bug this exists to prevent.
 # Returns non-zero when it could not make sure the Secret exists; the caller
 # then strips ``auth.existingSecret`` so the chart keeps its own Secret.
+# #1358 — the dedicated at-rest key (CREDENTIAL_ENCRYPTION_KEY) rides in the
+# same Secret as ``credential-key``; the chart wires it into api / worker /
+# beat / migrate as an OPTIONAL secretKeyRef. Adding it is safe on a running
+# install because the api keeps the SECRET_KEY-derived key as a read fallback
+# (app/core/crypto.py), so every value already stored still decrypts. Never
+# overwrites: an existing credential-key is the key, since values written under
+# it are unreadable without it. Best effort by design: ``auth.existingSecret``
+# stays on the strength of ``secret-key`` alone, so a failure here must not
+# make the caller strip it (that would swap in a chart-owned SECRET_KEY).
+#
+# Two guards, both about a reader that does not have the key:
+#  * ``credential-key-since`` is stamped with the version this slot runs. The
+#    api of that version reads the key but keeps WRITING under the
+#    SECRET_KEY-derived one (CREDENTIAL_KEY_SINCE, app/config.py), because
+#    its rollout can still have pods of the previous image, which cannot read
+#    it. The next release writes with it. Without a known version there is no
+#    safe stamp, so no key is added.
+#  * the patch carries the resourceVersion it read, so two nodes adding a key
+#    at once cannot both win: the loser's patch is refused (409) instead of
+#    replacing a key pods may already have started with.
+_new_credential_key_b64() {
+    # A Fernet key is url-safe base64 of 32 random bytes; the Secret's data
+    # field is that string base64'd again.
+    openssl rand 32 | base64 | tr -d '\n' | tr '+/' '-_' | base64 | tr -d '\n'
+}
+
+ensure_credential_key() {
+    local kc="/usr/local/bin/k3s kubectl -n spatium"
+    local got="" rv="" have="" ckey="" since=""
+    # One read for both, so the resourceVersion is the one the key was read at.
+    got=$($kc get secret "$APP_KEY_SECRET" -o jsonpath='{.metadata.resourceVersion} {.data.credential-key}' 2>/dev/null) || return 0
+    rv=${got%% *}
+    have=${got#* }
+    [ "$have" = "$got" ] && have=""
+    [ -z "$have" ] || return 0
+    [ -n "$rv" ] || return 0
+    [ -n "${SPATIUMDDI_VERSION:-}" ] || return 0
+    since=$(printf '%s' "$SPATIUMDDI_VERSION" | base64 | tr -d '\n')
+    ckey=$(_new_credential_key_b64) || return 0
+    [ -n "$ckey" ] || return 0
+    echo "Adding credential-key to ${APP_KEY_SECRET} (#1358)"
+    # Value via stdin (merge patch), never argv.
+    printf '%s' "{\"metadata\":{\"resourceVersion\":\"${rv}\"},\"data\":{\"credential-key\":\"${ckey}\",\"credential-key-since\":\"${since}\"}}" \
+        | $kc patch secret "$APP_KEY_SECRET" --type merge --patch-file /dev/stdin >/dev/null 2>&1 \
+        || echo "WARN: could not add credential-key to ${APP_KEY_SECRET} (or another node added one first); stored credentials stay under the key already in use (#1358)." >&2
+    return 0
+}
+
 ensure_app_key_secret() {
     local kc="/usr/local/bin/k3s kubectl -n spatium"
     # Initialised: this script runs under ``set -u``, where a bare ``local
     # token`` is unset and the metrics-token check below would abort it.
-    local found="" key="" token=""
+    local found="" key="" token="" ckey="" since=""
     found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
     if [ -n "$found" ]; then
+        ensure_credential_key
         date -Iseconds > "$APP_KEY_STAMP"
         return 0
     fi
@@ -2570,6 +2835,20 @@ ensure_app_key_secret() {
     if [ -n "$found" ]; then
         key=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.secret-key}' 2>/dev/null) || return 1
         token=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.metrics-token}' 2>/dev/null) || return 1
+        # A credential-key the chart already minted (#1358) is carried over:
+        # values may have been written under it.
+        ckey=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.credential-key}' 2>/dev/null) || ckey=""
+        since=$($kc get secret "$CHART_APP_SECRET" -o jsonpath='{.data.credential-key-since}' 2>/dev/null) || since=""
+        # No key there: the api running off that Secret has none either, so a
+        # key generated now is new to a RUNNING install. Stamp it (see
+        # ensure_credential_key), or add none when the version is unknown.
+        if [ -z "$ckey" ]; then
+            since=""
+            if [ -n "${SPATIUMDDI_VERSION:-}" ]; then
+                ckey=$(_new_credential_key_b64) || return 1
+                since=$(printf '%s' "$SPATIUMDDI_VERSION" | base64 | tr -d '\n')
+            fi
+        fi
         if [ -z "$key" ]; then
             echo "WARN: ${CHART_APP_SECRET} exists but carries no secret-key; not generating one (#1448)." >&2
             return 1
@@ -2578,8 +2857,19 @@ ensure_app_key_secret() {
     else
         echo "Generating SECRET_KEY into ${APP_KEY_SECRET} (fresh install, #1448)"
         key=$(openssl rand -hex 32 | tr -d '\n' | base64 | tr -d '\n')
+        # Fresh install: no pod has run yet, so no stamp — the key is written
+        # with from the start.
+        ckey=$(_new_credential_key_b64) || return 1
     fi
     [ -n "$token" ] || token=$(openssl rand -hex 24 | tr -d '\n' | base64 | tr -d '\n')
+    # #4548 — the web UI admin password the installer collected, as a bcrypt
+    # hash (spatium-install writes it 0600 to STATE). The api seeds the first
+    # `admin` user with it instead of admin / admin. Only the hash is carried;
+    # a missing file, as on an older STATE, leaves the default account.
+    local ahash=""
+    if [ -s "$WEB_ADMIN_HASH_FILE" ]; then
+        ahash=$(tr -d '\n' < "$WEB_ADMIN_HASH_FILE" | base64 | tr -d '\n') || ahash=""
+    fi
     # Values go through stdin as base64, never argv, so they never show in a
     # process listing. ``create`` (not ``apply``) fails if the Secret appeared
     # meanwhile, so a race can only ever keep the existing key.
@@ -2596,6 +2886,9 @@ ensure_app_key_secret() {
         "data:" \
         "  secret-key: ${key}" \
         "  metrics-token: ${token}" \
+        "${ckey:+  credential-key: ${ckey}}" \
+        "${since:+  credential-key-since: ${since}}" \
+        "${ahash:+  initial-admin-password-hash: ${ahash}}" \
         | $kc create -f - >/dev/null 2>&1; then
         found=$($kc get secret "$APP_KEY_SECRET" --ignore-not-found -o name 2>/dev/null) || return 1
         [ -n "$found" ] || return 1
@@ -2642,8 +2935,57 @@ place_deferred_control_manifest() {
 # Up to 5 min — first boot has to pull no images (everything's in
 # containerd via the airgap-import path) but k3s itself + helm-
 # controller + the supervisor pod still need to settle.
+# #4591 — remember this node's address and the etcd member count, so a later
+# start on another address is recognised without k3s's refusal (spatium-etcd-
+# peer-reset). Skipped when the count cannot be read.
+record_etcd_peer_addr() {
+    _ip=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n 1)
+    # #4592 — on a fresh install the Node registers some time after /readyz
+    # (107 s in a walk), so wait for it, bounded. ``grep -c`` exits 1 on a
+    # count of 0, and under ``set -e`` an assignment takes that status, so
+    # every count read is guarded: this function must never end firstboot.
+    _n=0
+    for _ in $(seq 1 36); do
+        _n=$(/usr/local/bin/k3s kubectl get nodes -l node-role.kubernetes.io/etcd \
+            --no-headers 2>/dev/null | grep -c .) || _n=0
+        [ "${_n:-0}" -gt 0 ] && break
+        sleep 5
+    done
+    if [ -n "$_ip" ] && [ "${_n:-0}" -gt 0 ]; then
+        mkdir -p /var/lib/spatiumddi 2>/dev/null
+        echo "$_ip $_n" > /var/lib/spatiumddi/etcd-peer-addr 2>/dev/null || true
+    fi
+}
 echo "Waiting for k3s /readyz …"
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# #3919 — the role pods must not start on the previous release's image and be
+# rolled again. On a slot upgrade the datastore already holds the role
+# DaemonSets and chart, so as soon as the apiserver answers (well before the
+# readyz poll below succeeds, and before the kubelet restarts the old pods)
+# move them to this slot's tag. A first install has nothing to move; the
+# reconcile returns at once. The call after readyz stays as the retry.
+for _ in $(seq 1 120); do
+    if /usr/local/bin/k3s kubectl --request-timeout=3s get --raw=/livez >/dev/null 2>&1; then
+        reconcile_role_chart_tag || true
+        break
+    fi
+    sleep 1
+done
+# #4591 — a kept /var on a new address: k3s refuses its own etcd member for
+# ~15 min, and only its second start runs spatium-etcd-peer-reset. Waiting 5
+# min failed this oneshot for the whole boot, skipping everything after
+# /readyz. True while k3s's refusal names a single member and this node is not
+# a joined one, i.e. exactly when that reset is going to run.
+etcd_peer_reset_pending() {
+    [ -f /etc/rancher/k3s/config.yaml.d/spatium-cluster.yaml ] && return 1
+    _l=$(journalctl -b -u k3s -o cat --no-pager 2>/dev/null \
+        | grep 'this server is not a member of the etcd cluster' | tail -n 1)
+    [ -n "$_l" ] || return 1
+    _f=$(printf '%s\n' "$_l" | sed -n 's/.*Found \[\([^]]*\)\].*/\1/p')
+    [ -n "$_f" ] || return 1
+    case "$_f" in *' '* | *,*) return 1 ;; esac
+    return 0
+}
 ready=0
 for _ in $(seq 1 60); do
     if /usr/local/bin/k3s kubectl get --raw=/readyz 2>/dev/null | grep -q '^ok'; then
@@ -2652,6 +2994,19 @@ for _ in $(seq 1 60); do
     fi
     sleep 5
 done
+if [ "$ready" != 1 ] && etcd_peer_reset_pending; then
+    echo "k3s refuses its etcd member (kept /var, new address): waiting up to 25 more minutes for spatium-etcd-peer-reset (#4591) …"
+    for _ in $(seq 1 300); do
+        if /usr/local/bin/k3s kubectl get --raw=/readyz 2>/dev/null | grep -q '^ok'; then
+            ready=1
+            break
+        fi
+        sleep 5
+    done
+    # #4592 — the wait spent most of the unit's budget on purpose; the slot-image
+    # check below gets its usual window from here (the unit has 45 min in all).
+    FIRSTBOOT_T0=$(uptime_s 2>/dev/null || echo 0)
+fi
 if [ "$ready" = 1 ]; then
     tighten_kubeconfig
     date -Iseconds > "$STAMP"
@@ -2659,6 +3014,9 @@ if [ "$ready" = 1 ]; then
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
     # #3022 — the bootstrap chart this boot staged goes live, or stays held,
     # before the control chart's own release below.
+    # #3919 — first: the role pods k3s already started are on the previous
+    # release until the role chart carries this slot's tag.
+    reconcile_role_chart_tag || true
     release_bootstrap_manifest || true
     trap - EXIT TERM
     # #1299 — first, while this boot's control chart is still held back.
@@ -2680,6 +3038,10 @@ if [ "$ready" = 1 ]; then
     # Never fails firstboot — the finding lands in the state file + log
     # either way.
     /usr/local/bin/spatiumddi-webui-selfcheck || true
+    # #4592 — last, after the chart releases and the slot commit: on a fresh
+    # install it waits (up to 3 min) for the Node to register, and it must
+    # never fail firstboot.
+    record_etcd_peer_addr || true
     exit 0
 fi
 echo "WARN: k3s /readyz did not respond within 5 minutes." >&2

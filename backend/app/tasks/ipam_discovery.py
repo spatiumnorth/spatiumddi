@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
+from app.core.task_lock import single_flight
 from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
@@ -47,7 +48,9 @@ logger = structlog.get_logger(__name__)
 _DISCOVERY_LOCK_NS = 0x1DA_D15C  # "IPAM DISC"
 
 
-async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
+async def _run_subnet_discovery_async(
+    subnet_id_str: str, dispatched_at: str | None = None
+) -> dict[str, Any]:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
     )
@@ -78,6 +81,21 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
             subnet = await db.get(Subnet, subnet_id)
             if subnet is None or subnet.deleted_at is not None:
                 return {"status": "skipped", "reason": "subnet_missing"}
+
+            # Duplicate queued by the dispatcher while an earlier sweep ran
+            # (#4432). ``single_flight`` defers such a copy until the lock
+            # frees, then it would run a full repeat sweep — one per 60 s tick
+            # the first sweep took. The dispatcher stamps ``dispatched_at``; a
+            # sweep that finished after that moment already did this copy's
+            # work. On-demand runs pass no stamp and always sweep.
+            if dispatched_at is not None and subnet.last_discovery_at is not None:
+                try:
+                    queued_at = datetime.fromisoformat(dispatched_at)
+                except ValueError:
+                    queued_at = None
+                if queued_at is not None and subnet.last_discovery_at >= queued_at:
+                    logger.info("ipam.discovery.no_longer_due", subnet_id=subnet_id_str)
+                    return {"status": "skipped", "reason": "no_longer_due"}
 
             # Fragile-device suppression (#722). Checked here rather than
             # only in the dispatcher because on-demand runs and re-tried
@@ -172,10 +190,15 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
     retry_backoff=True,
     retry_kwargs={"max_retries": 3},
 )
-def run_subnet_discovery(self: Any, subnet_id_str: str) -> dict[str, Any]:  # noqa: ARG001
+@single_flight(lambda subnet_id_str, dispatched_at=None: subnet_id_str)
+def run_subnet_discovery(
+    self: Any, subnet_id_str: str, dispatched_at: str | None = None  # noqa: ARG001
+) -> dict[str, Any]:
     """Sweep one subnet + reconcile. Invoked on-demand and by the beat
-    dispatcher."""
-    return asyncio.run(_run_subnet_discovery_async(subnet_id_str))
+    dispatcher (which passes ``dispatched_at``, an ISO timestamp, so a copy
+    queued behind a running sweep skips once that sweep has stamped the
+    subnet — #4432)."""
+    return asyncio.run(_run_subnet_discovery_async(subnet_id_str, dispatched_at))
 
 
 async def _dispatch_due_async() -> int:
@@ -216,7 +239,7 @@ async def _dispatch_due_async() -> int:
                     skipped_do_not_probe += 1
                     continue
                 try:
-                    run_subnet_discovery.delay(str(s.id))
+                    run_subnet_discovery.delay(str(s.id), now.isoformat())
                     queued += 1
                 except Exception as exc:  # noqa: BLE001 — broker down? give up quietly
                     logger.warning("ipam.discovery.dispatch_enqueue_failed", error=str(exc))

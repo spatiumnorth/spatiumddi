@@ -105,6 +105,15 @@ class ZoneData:
     update_acl: tuple[UpdateAclEntry, ...] = ()
 
 
+class UpdateAclConflictError(ValueError):
+    """An ACL whose entries cannot combine on this driver (#4569).
+
+    Refused when a save changes the ACL, but only warned about when the save
+    leaves a stored ACL untouched: an install that already holds the
+    combination must be able to save the rest of the zone.
+    """
+
+
 @dataclass(frozen=True)
 class UpdateAclEntry:
     """One neutral dynamic-update ACL grant/deny (issue #641).
@@ -429,6 +438,11 @@ class RecordChange:
     # #783 — the complete desired RRset this op resolves to. Set on the
     # agentless path by ``record_ops``; ``None`` when the caller opted out.
     rrset: RRsetData | None = None
+    # #1769 — the per-op escape hatch the caller set on the record payload
+    # (``"add"`` from DNS pools: append this one value, never replace the
+    # RRset). Only meaningful when ``rrset`` is ``None``; a driver with a
+    # per-value append honours it, the rest ignore it.
+    rrset_action: str | None = None
 
 
 @dataclass(frozen=True)
@@ -677,6 +691,7 @@ __all__ = [
     "ServerOptions",
     "TrustAnchorData",
     "TsigKey",
+    "UpdateAclConflictError",
     "UpdateAclEntry",
     "ViewData",
     "ZoneData",

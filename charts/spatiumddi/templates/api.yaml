@@ -359,6 +359,32 @@ spec:
     - name: http
       port: {{ .Values.api.service.port }}
       targetPort: http
+{{- if .Values.api.service.nodeLocal }}
+---
+{{- /* #3645: the appliance's second api Service. internalTrafficPolicy: Local
+       answers only from an api pod on the CALLER's node, so a caller that
+       sends plain http (the supervisor's heartbeat, the frontend's /api proxy)
+       never puts it on the node LAN. With no ready api pod on the node the
+       connection is refused rather than routed to another node; the
+       supervisor then falls back to its pinned https URL. The main Service
+       above is unchanged, for the workers, the role agents and the probes. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-api-local
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  internalTrafficPolicy: Local
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.api.service.port }}
+      targetPort: http
+{{- end }}
 {{- if .Values.api.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2

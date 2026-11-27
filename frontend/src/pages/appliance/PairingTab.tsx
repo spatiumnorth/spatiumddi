@@ -28,6 +28,7 @@ import { ReauthFields } from "@/components/ReauthFields";
 import { cn } from "@/lib/utils";
 import { copyToClipboard } from "@/lib/clipboard";
 import { useSecretCloseGuard } from "@/hooks/useSecretCloseGuard";
+import { FormError } from "@/components/ui/form-error";
 
 /**
  * Appliance → Pairing codes tab (#169 + #170 Wave A3 reshape).
@@ -294,7 +295,15 @@ export function PairingTab() {
         confirmLabel="Revoke"
         tone="destructive"
         loading={revokeMutation.isPending}
-        onClose={() => setRevokeTarget(null)}
+        error={
+          revokeMutation.error
+            ? formatApiError(revokeMutation.error, "Revoke failed")
+            : null
+        }
+        onClose={() => {
+          setRevokeTarget(null);
+          revokeMutation.reset();
+        }}
         onConfirm={() => revokeTarget && revokeMutation.mutate(revokeTarget.id)}
       />
 
@@ -626,9 +635,9 @@ export function GenerateCodeModal({
             </label>
 
             {mutation.error && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+              <FormError className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
                 {formatApiError(mutation.error)}
-              </div>
+              </FormError>
             )}
 
             <div className="flex justify-end gap-2">
@@ -822,9 +831,9 @@ function RevealModal({
             autoFocus
           />
           {mutation.error && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
               {formatApiError(mutation.error)}
-            </div>
+            </FormError>
           )}
           <div className="flex justify-end gap-2">
             <button

@@ -83,8 +83,19 @@ Where the two disagree about a license, THIS file is authoritative.
 - node (frontend build stage) — MIT — https://nodejs.org
 - ASP.NET Core runtime (Technitium agent image) — MIT — https://dotnet.microsoft.com
 - tini — MIT — https://github.com/krallin/tini
+- jemalloc — BSD-2-Clause — https://jemalloc.net
 - su-exec — MIT — https://github.com/ncopa/su-exec
 - gosu — Apache 2.0 — https://github.com/tianon/gosu
+
+── Red Hat UBI image variants (#3913) ───────────────────────────────────────
+- Red Hat Universal Base Image 9 — Red Hat UBI EULA — https://www.redhat.com/en/about/agreements
+- ISC BIND 9, ISC Kea DHCP (built from source) — MPL 2.0 — https://isc.org
+- libuv — MIT — https://libuv.org
+- Userspace RCU (liburcu, dynamically linked) — LGPL 2.1 — https://liburcu.org
+- log4cplus — BSD-2-Clause / Apache 2.0 — https://github.com/log4cplus/log4cplus
+- jemalloc (built from source, linked into named) — BSD-2-Clause — https://jemalloc.net
+- radvd (built from source) — BSD-style — https://radvd.litech.org
+- tini (built from source) — MIT — https://github.com/krallin/tini
 
 ── Operator tooling shipped in the API image ───────────────────────────────
 - nmap (network scanning) — NPSL (Nmap Public Source License) — https://nmap.org

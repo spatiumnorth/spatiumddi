@@ -35,11 +35,11 @@ export function DNSBLPage() {
   const perms = usePermissions();
   const writeGate = permissionGate(
     perms.can("write", "dnsbl"),
-    "Requires write on DNS blocklists",
+    "Requires write on DNSBL lists",
   );
   const deleteGate = permissionGate(
     perms.can("delete", "dnsbl"),
-    "Requires delete on DNS blocklists",
+    "Requires delete on DNSBL lists",
   );
   const canWrite = !writeGate.disabled;
 
@@ -71,7 +71,10 @@ export function DNSBLPage() {
   });
   const deleteList = useMutation({
     mutationFn: (id: string) => dnsblApi.deleteList(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dnsbl-lists"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dnsbl-lists"] });
+      setConfirmDelete(null);
+    },
   });
   const saveSettings = useMutation({
     mutationFn: (data: Partial<DNSBLSettings>) => dnsblApi.updateSettings(data),
@@ -94,7 +97,10 @@ export function DNSBLPage() {
   });
   const deletePinned = useMutation({
     mutationFn: (id: string) => dnsblApi.deletePinned(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dnsbl-pinned"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dnsbl-pinned"] });
+      setConfirmUnpin(null);
+    },
   });
 
   const [newIp, setNewIp] = useState("");
@@ -250,6 +256,7 @@ export function DNSBLPage() {
           <input
             className={cn(inputCls, "w-40")}
             placeholder="203.0.113.5"
+            aria-label="Pinned IP address"
             value={newIp}
             onChange={(e) => setNewIp(e.target.value)}
             {...writeGate}
@@ -257,6 +264,7 @@ export function DNSBLPage() {
           <input
             className={cn(inputCls, "flex-1")}
             placeholder="note (optional)"
+            aria-label="Pinned IP note"
             value={newNote}
             onChange={(e) => setNewNote(e.target.value)}
             {...writeGate}
@@ -417,11 +425,17 @@ export function DNSBLPage() {
           message={`Delete the custom list "${confirmDelete.name}"? This removes its listing history.`}
           confirmLabel="Delete"
           tone="destructive"
-          onClose={() => setConfirmDelete(null)}
-          onConfirm={() => {
-            deleteList.mutate(confirmDelete.id);
+          loading={deleteList.isPending}
+          error={
+            deleteList.error
+              ? formatApiError(deleteList.error, "Delete failed")
+              : null
+          }
+          onClose={() => {
             setConfirmDelete(null);
+            deleteList.reset();
           }}
+          onConfirm={() => deleteList.mutate(confirmDelete.id)}
         />
       )}
       {confirmUnpin && (
@@ -431,11 +445,17 @@ export function DNSBLPage() {
           message={`Stop monitoring ${confirmUnpin.ip}?`}
           confirmLabel="Unpin"
           tone="destructive"
-          onClose={() => setConfirmUnpin(null)}
-          onConfirm={() => {
-            deletePinned.mutate(confirmUnpin.id);
+          loading={deletePinned.isPending}
+          error={
+            deletePinned.error
+              ? formatApiError(deletePinned.error, "Unpin failed")
+              : null
+          }
+          onClose={() => {
             setConfirmUnpin(null);
+            deletePinned.reset();
           }}
+          onConfirm={() => deletePinned.mutate(confirmUnpin.id)}
         />
       )}
     </div>

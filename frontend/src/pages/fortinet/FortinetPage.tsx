@@ -1,3 +1,7 @@
+import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -34,6 +38,7 @@ import {
   usePermissions,
 } from "@/hooks/usePermissions";
 import { secondsFieldError, SYNC_INTERVAL_BOUNDS } from "@/lib/seconds";
+import { FormError } from "@/components/ui/form-error";
 
 // ── Page ─────────────────────────────────────────────────────────────
 
@@ -357,7 +362,18 @@ export function FortinetPage() {
       </div>
 
       {showCreate && <FirewallModal onClose={() => setShowCreate(false)} />}
-      {edit && <FirewallModal firewall={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["fortinet-firewalls"]]}
+          title="Edit FortiGate Firewall"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <FirewallModal firewall={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {objectsFor && (
         <ObjectsModal
           firewall={objectsFor}
@@ -557,6 +573,13 @@ function FirewallModal({
   const [caBundlePem, setCaBundlePem] = useState("");
   const [vdom, setVdom] = useState(firewall?.vdom ?? "root");
   const [apiToken, setApiToken] = useState("");
+  // #4135 — a moved address needs the stored token entered again.
+  const reask = useCredentialReask(
+    { host, port },
+    firewall && { host: firewall.host, port: firewall.port },
+    () => setApiToken(""),
+  );
+  const mustEnter = reask.asks(firewall?.api_token_present);
   const [spaceId, setSpaceId] = useState(firewall?.ipam_space_id ?? "");
   const [dnsGroupId, setDnsGroupId] = useState(firewall?.dns_group_id ?? "");
   const [mirrorAddressObjects, setMirrorAddressObjects] = useState(
@@ -618,7 +641,12 @@ function FirewallModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiToken) update.api_token = apiToken;
-        return fortinetApi.update(firewall!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(firewall!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(firewall!);
+        return fortinetApi.update(firewall!.id, body);
       }
       const create: FortinetFirewallCreate = {
         name,
@@ -747,7 +775,11 @@ function FirewallModal({
         <div className="space-y-2 border-t pt-3">
           <Field
             label="API token"
-            hint="The read-only REST API token. On edit, leave blank to keep the stored token."
+            hint={
+              mustEnter
+                ? reask.hint
+                : "The read-only REST API token. On edit, leave blank to keep the stored token."
+            }
           >
             <input
               className={`${inputCls} font-mono text-[11px]`}
@@ -756,11 +788,13 @@ function FirewallModal({
               value={apiToken}
               onChange={(e) => setApiToken(e.target.value)}
               placeholder={
-                editing && firewall?.api_token_present
-                  ? "••• stored — enter to replace"
-                  : "API token"
+                mustEnter
+                  ? reask.placeholder
+                  : editing && firewall?.api_token_present
+                    ? "••• stored — enter to replace"
+                    : "API token"
               }
-              required={!editing}
+              required={!editing || mustEnter}
             />
           </Field>
         </div>
@@ -915,7 +949,9 @@ function FirewallModal({
           </label>
         </div>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -927,7 +963,9 @@ function FirewallModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending || (!editing && !apiToken)}
+            disabled={
+              saveMut.isPending || ((!editing || mustEnter) && !apiToken)
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}
@@ -994,26 +1032,6 @@ function DeleteFirewallModal({
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {

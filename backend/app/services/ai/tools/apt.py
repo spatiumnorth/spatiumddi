@@ -11,7 +11,7 @@ a credential embedded in a proxy URL reads as ``***``.
 Read-only. No ``propose_update_apt_settings`` — same reasoning as the
 SNMP tool: APT management touches Fernet-encrypted fields + a
 validate-before-swap host runner, and the friendly path is the
-Settings → Appliance → APT form (which has the all-important Validate
+Appliance → Fleet → APT form (which has the all-important Validate
 button). Read visibility is the high value-per-token tool here.
 
 ``module=None`` (always available) — there is no ``appliance.apt``
@@ -70,7 +70,7 @@ async def find_apt_settings(
     sources = [
         {
             "name": s.get("name", ""),
-            "uri": s.get("uri", ""),
+            "uri": mask_proxy_url(str(s.get("uri", ""))),
             "suites": s.get("suites", ""),
             "components": s.get("components", ""),
             "signed_by_key_id": s.get("signed_by_key_id", ""),

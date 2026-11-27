@@ -1,10 +1,12 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   authProvidersApi,
   authApi,
   groupsApi,
   type AuthProvider,
+  type AuthProviderUpdate,
   type AuthProviderType,
   type AuthGroupMapping,
   type AuthGroupMappingCreate,
@@ -29,6 +31,8 @@ import { cn } from "@/lib/utils";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { StepUpSection } from "@/components/StepUpSection";
 import { isStepUpRequired, stepUpBody } from "@/lib/stepup";
+import { FormError } from "@/components/ui/form-error";
+import { changedFields, refetchRow } from "@/hooks/useFreshRow";
 
 const TYPE_LABELS: Record<AuthProviderType, string> = {
   ldap: "LDAP / Active Directory",
@@ -179,6 +183,31 @@ const TACACS_DEFAULTS = {
 };
 
 type ModalMode = "create" | "edit";
+
+// The config keys that decide where a provider's stored secret is sent (#4135).
+const SECRET_DESTINATION_KEYS = [
+  "host",
+  "backup_hosts",
+  "server",
+  "backup_servers",
+  "discovery_url",
+];
+
+function destinationOf(configJson: string): Record<string, unknown> | null {
+  let cfg: Record<string, unknown>;
+  try {
+    cfg = JSON.parse(configJson || "{}") ?? {};
+  } catch {
+    return null; // mid-edit invalid JSON
+  }
+  // The structured fields write the backup lists as newline-joined text where
+  // the stored config holds arrays; compare them the same way.
+  const text = (v: unknown) =>
+    Array.isArray(v) ? v.join("\n") : String(v ?? "").trim();
+  return Object.fromEntries(
+    SECRET_DESTINATION_KEYS.map((k) => [k, text(cfg[k])]),
+  );
+}
 
 interface ProviderForm {
   name: string;
@@ -1281,6 +1310,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
         queryKey: ["auth-providers", providerId, "mappings"],
       });
       qc.invalidateQueries({ queryKey: ["auth-providers"] });
+      setConfirmDeleteId(null);
     },
   });
 
@@ -1481,18 +1511,28 @@ function MappingsSection({ providerId }: { providerId: string }) {
           </div>
         </div>
       )}
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && (
+        <FormError className="text-xs text-destructive">{error}</FormError>
+      )}
       <ConfirmModal
         open={confirmDeleteId !== null}
         title="Delete mapping"
         message="Delete this mapping?"
         confirmLabel="Delete"
         tone="destructive"
+        loading={deleteMut.isPending}
+        error={
+          deleteMut.error
+            ? formatApiError(deleteMut.error, "Delete failed")
+            : null
+        }
         onConfirm={() => {
           if (confirmDeleteId) deleteMut.mutate(confirmDeleteId);
-          setConfirmDeleteId(null);
         }}
-        onClose={() => setConfirmDeleteId(null)}
+        onClose={() => {
+          setConfirmDeleteId(null);
+          deleteMut.reset();
+        }}
       />
     </div>
   );
@@ -1523,6 +1563,40 @@ function ProviderModal({
   function set<K extends keyof ProviderForm>(key: K, value: ProviderForm[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
+
+  // #4135 — a moved host / server / discovery URL needs the stored secret
+  // entered again; the same config keys the API compares.
+  // Invalid JSON while typing keeps the last valid destination, so a stray
+  // brace does not read as "moved".
+  const lastDestination = useRef<Record<string, unknown>>({});
+  const parsedDestination = destinationOf(form.config_json);
+  if (parsedDestination) lastDestination.current = parsedDestination;
+  const reask = useCredentialReask(
+    lastDestination.current,
+    mode === "edit" ? destinationOf(initial.config_json) : null,
+    (moved) =>
+      setForm((prev) => ({
+        ...prev,
+        secrets_dirty: moved,
+        bind_password: "",
+        oidc_client_secret: "",
+        saml_sp_private_key: "",
+        radius_secret: "",
+        tacacs_secret: "",
+      })),
+  );
+  const askSecret = reask.asks(initialProvider?.has_secrets);
+  const enteredSecret =
+    form.type === "ldap"
+      ? form.bind_password
+      : form.type === "oidc"
+        ? form.oidc_client_secret
+        : form.type === "saml"
+          ? form.saml_sp_private_key
+          : form.type === "radius"
+            ? form.radius_secret
+            : form.tacacs_secret;
+  const mustEnterSecret = askSecret && !enteredSecret.trim();
 
   function handleTypeChange(newType: AuthProviderType) {
     // Swap the scaffolds for the new type if the user hasn't meaningfully
@@ -1572,6 +1646,10 @@ function ProviderModal({
   }
 
   function handleSubmit() {
+    if (mustEnterSecret) {
+      setJsonError(`Secrets: ${reask.hint}`);
+      return;
+    }
     try {
       JSON.parse(form.config_json || "{}");
     } catch {
@@ -1719,7 +1797,8 @@ function ProviderModal({
               </label>
               {mode === "edit" &&
                 initialProvider?.has_secrets &&
-                !form.secrets_dirty && (
+                !form.secrets_dirty &&
+                !askSecret && (
                   <button
                     onClick={() => set("secrets_dirty", true)}
                     className="text-xs text-primary hover:underline"
@@ -1729,9 +1808,13 @@ function ProviderModal({
                 )}
             </div>
 
+            {askSecret && (
+              <p className="mb-2 text-xs text-muted-foreground">{reask.hint}</p>
+            )}
             {mode === "edit" &&
             initialProvider?.has_secrets &&
-            !form.secrets_dirty ? (
+            !form.secrets_dirty &&
+            !askSecret ? (
               <div className="rounded-md border bg-muted px-3 py-2 text-xs text-muted-foreground">
                 <ShieldCheck className="mr-1 inline h-3 w-3" /> Secrets are
                 stored. They will be left untouched unless you click
@@ -1745,6 +1828,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.bind_password}
+                  required={askSecret}
                   onChange={(e) => {
                     set("bind_password", e.target.value);
                     set("secrets_dirty", true);
@@ -1761,6 +1845,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.oidc_client_secret}
+                  required={askSecret}
                   onChange={(e) => {
                     set("oidc_client_secret", e.target.value);
                     set("secrets_dirty", true);
@@ -1777,6 +1862,7 @@ function ProviderModal({
                 </label>
                 <textarea
                   value={form.saml_sp_private_key}
+                  required={askSecret}
                   onChange={(e) => {
                     set("saml_sp_private_key", e.target.value);
                     set("secrets_dirty", true);
@@ -1794,6 +1880,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.radius_secret}
+                  required={askSecret}
                   onChange={(e) => {
                     set("radius_secret", e.target.value);
                     set("secrets_dirty", true);
@@ -1810,6 +1897,7 @@ function ProviderModal({
                 <input
                   type="password"
                   value={form.tacacs_secret}
+                  required={askSecret}
                   onChange={(e) => {
                     set("tacacs_secret", e.target.value);
                     set("secrets_dirty", true);
@@ -1844,9 +1932,9 @@ function ProviderModal({
           )}
 
           {(jsonError || error) && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
               {jsonError || error}
-            </div>
+            </FormError>
           )}
         </div>
 
@@ -1859,7 +1947,7 @@ function ProviderModal({
           </button>
           <button
             onClick={handleSubmit}
-            disabled={saving || !form.name.trim()}
+            disabled={saving || !form.name.trim() || mustEnterSecret}
             className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saving ? "Saving…" : "Save"}
@@ -1922,7 +2010,10 @@ export function AuthProvidersPage() {
   });
   const deleteMut = useMutation({
     mutationFn: authProvidersApi.delete,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["auth-providers"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["auth-providers"] });
+      setConfirmDelete(null);
+    },
   });
 
   function initialFormFromProvider(p: AuthProvider): ProviderForm {
@@ -1966,10 +2057,24 @@ export function AuthProvidersPage() {
     setModalMode("create");
   }
 
-  function openEdit(p: AuthProvider) {
+  // Edit reads the provider when it opens (#4236): the list's copy can be
+  // 30 s old and the form is seeded once. A failed read opens nothing, since
+  // seeding from the cached row would bring the stale values back.
+  async function openEdit(listed: AuthProvider) {
+    setMutateError("");
+    let p: AuthProvider | undefined;
+    try {
+      p = await refetchRow<AuthProvider>(qc, [["auth-providers"]], listed.id);
+    } catch (e) {
+      setMutateError(formatApiError(e, "Couldn't read the current values"));
+      return;
+    }
+    if (!p) {
+      setMutateError("That provider was not found; it may have been deleted.");
+      return;
+    }
     setEditing(p);
     setInitialForm(initialFormFromProvider(p));
-    setMutateError("");
     setModalMode("edit");
   }
 
@@ -2031,18 +2136,37 @@ export function AuthProvidersPage() {
         secrets: secrets === undefined ? null : secrets,
       });
     } else if (editing) {
-      updateMut.mutate({
-        id: editing.id,
-        body: {
+      // Send only what the operator changed against what the dialog read
+      // when it opened (#4236); a field another client set since is not put
+      // back. The config is replaced whole, so it goes only when edited.
+      const body: AuthProviderUpdate = changedFields(
+        {
+          name: editing.name,
+          is_enabled: editing.is_enabled,
+          priority: editing.priority,
+          auto_create_users: editing.auto_create_users,
+          auto_update_users: editing.auto_update_users,
+        },
+        {
           name: form.name.trim(),
           is_enabled: form.is_enabled,
           priority: form.priority,
           auto_create_users: form.auto_create_users,
           auto_update_users: form.auto_update_users,
-          config,
-          secrets,
         },
-      });
+      );
+      if (
+        JSON.stringify(config) !==
+        JSON.stringify(JSON.parse(initialForm.config_json || "{}"))
+      )
+        body.config = config;
+      if (secrets !== undefined) body.secrets = secrets;
+      if (Object.keys(body).length === 0) {
+        setModalMode(null);
+        setEditing(null);
+        return;
+      }
+      updateMut.mutate({ id: editing.id, body });
     }
   }
 
@@ -2179,17 +2303,30 @@ export function AuthProvidersPage() {
           error={mutateError}
         />
       )}
+      {mutateError && !modalMode && (
+        <FormError className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          {mutateError}
+        </FormError>
+      )}
       <ConfirmModal
         open={confirmDelete !== null}
         title="Delete auth provider"
         message={`Delete auth provider "${confirmDelete?.name ?? ""}"? Mappings will be deleted too; already-provisioned users remain.`}
         confirmLabel="Delete"
         tone="destructive"
+        loading={deleteMut.isPending}
+        error={
+          deleteMut.error
+            ? formatApiError(deleteMut.error, "Delete failed")
+            : null
+        }
         onConfirm={() => {
           if (confirmDelete) deleteMut.mutate(confirmDelete.id);
-          setConfirmDelete(null);
         }}
-        onClose={() => setConfirmDelete(null)}
+        onClose={() => {
+          setConfirmDelete(null);
+          deleteMut.reset();
+        }}
       />
     </div>
   );

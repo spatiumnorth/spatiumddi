@@ -18,6 +18,7 @@ Two layers here:
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,13 @@ from spatium_dns_agent.drivers.technitium import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _ops_own_every_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests drive ``apply_record_op`` against a fake that has no SOA
+    owner marker; ownership (#1775) has its own tests."""
+    monkeypatch.setenv("TECHNITIUM_ADOPT_EXISTING_ZONES", "true")
+
+
 class _FakeResponse:
     """Stand-in for ``httpx.Response``. A dict body is a JSON answer; a str
     body is a plain-text one (``blocked/export``), whose ``.json()`` raises
@@ -52,6 +60,14 @@ class _FakeResponse:
         if isinstance(self._body, str):
             raise ValueError("not JSON")
         return self._body
+
+
+@pytest.fixture(autouse=True)
+def _no_owner_marker_traffic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests assert the exact calls of a pass. The owner marker (#1775)
+    adds a read of the apex SOA per Primary; it has its own tests in
+    ``test_technitium_foreign_zone_1775.py``."""
+    monkeypatch.setattr(TechnitiumDriver, "_stamp_owner_marker", lambda *a, **k: None)
 
 
 def _without_create_hold(
@@ -1847,6 +1863,83 @@ def test_catalog_rename_deletes_old_zone(tmp_path: Path) -> None:
     assert next(c for c in calls if c[2] == "zones/create")[3]["zone"] == "new.test"
 
 
+# ── Catalog producer keeps transfer / notify (issue #1766) ─────────────
+
+
+def test_catalog_members_override_the_catalog_zones_transfer_and_notify(
+    tmp_path: Path,
+) -> None:
+    """A catalog member otherwise takes transfer / notify / query access from
+    the catalog zone (Deny / None), undoing the #734 grant on every zone."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {"mode": "producer", "zone_name": "cat.test"},
+        [{"zone": "p.test", "type": "Primary"}, {"zone": "s.test", "type": "Secondary"}],
+    )
+    member = [c[3] for c in calls if c[2] == "zones/options/set" and c[3]["zone"] == "p.test"]
+    assert member == [
+        {
+            "zone": "p.test",
+            "catalog": "cat.test",
+            "overrideCatalogZoneTransfer": "true",
+            "overrideCatalogNotify": "true",
+            "overrideCatalogQueryAccess": "true",
+        }
+    ]
+    # Un-enrolling sends no override flags.
+    calls.clear()
+    d._apply_catalog("t", None, [{"zone": "p.test", "type": "Primary"}])
+    assert [c[3] for c in calls if c[2] == "zones/options/set"] == [
+        {"zone": "p.test", "catalog": ""}
+    ]
+
+
+def test_catalog_zone_gets_its_own_transfer_and_notify_options(tmp_path: Path) -> None:
+    """The Catalog zone is created Deny / None; a consumer cannot read it
+    unless the producer configures it."""
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    bundle = _zone_bundle(
+        zones=[{"name": "p.test.", "type": "primary", "records": []}],
+        options={"also_notify": ["192.0.2.50"], "allow_transfer": ["key ddns-key"]},
+        tsig_keys=[{"name": "ddns-key", "secret": "c2VjcmV0", "algorithm": "hmac-sha256"}],
+        catalog={"mode": "producer", "zone_name": "cat.test."},
+    )
+    d.render(bundle)
+    server = _json.loads((tmp_path / "rendered.new" / "server.json").read_text())
+    opts = server["catalog"]["options"]
+    assert opts["zoneTransfer"] == "Allow"
+    assert opts["zoneTransferTsigKeyNames"] == ["ddns-key"]
+    assert opts["notify"] == "SpecifiedNameServers"
+    assert opts["notifyNameServers"] == ["192.0.2.50"]
+
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", server["catalog"], [])
+    sent = [c[3] for c in calls if c[2] == "zones/options/set" and c[3]["zone"] == "cat.test"]
+    assert len(sent) == 1
+    assert sent[0]["zoneTransfer"] == "Allow"
+    assert sent[0]["zoneTransferTsigKeyNames"] == "ddns-key"
+    assert sent[0]["notify"] == "SpecifiedNameServers"
+    assert sent[0]["notifyNameServers"] == "192.0.2.50"
+
+
+def test_catalog_zone_notifies_nobody_without_also_notify_targets(tmp_path: Path) -> None:
+    import json as _json
+
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(
+        _zone_bundle(
+            zones=[{"name": "p.test.", "type": "primary", "records": []}],
+            catalog={"mode": "producer", "zone_name": "cat.test."},
+        )
+    )
+    server = _json.loads((tmp_path / "rendered.new" / "server.json").read_text())
+    assert server["catalog"]["options"]["notify"] == "None"
+
+
 # ── Blocklists (issue #744) ─────────────────────────────────────────────
 
 
@@ -2560,7 +2653,7 @@ def _retire(
 def test_zone_dropped_from_the_bundle_is_deleted(tmp_path: Path) -> None:
     deleted, ledger = _retire(tmp_path, desired=["a.test"], ledger=["a.test", "gone.test"])
     assert deleted == ["gone.test"]
-    assert ledger == ["a.test"]
+    assert ledger == ["a.test"]  # already owned, so it stays
 
 
 def test_only_zones_in_the_ledger_are_candidates(tmp_path: Path) -> None:
@@ -2576,13 +2669,15 @@ def test_first_run_seeds_the_ledger_from_the_previous_render(tmp_path: Path) -> 
     the previous render, so it is still retired."""
     deleted, ledger = _retire(tmp_path, desired=["a.test"], previous=["a.test", "gone.test"])
     assert deleted == ["gone.test"]
-    assert ledger == ["a.test"]
+    # a.test was only in the previous render, never proven ours: the reconcile
+    # claims it once it creates it or it passes the ownership check (#4431).
+    assert ledger == []
 
 
 def test_first_run_without_history_deletes_nothing(tmp_path: Path) -> None:
     deleted, ledger = _retire(tmp_path, desired=["a.test", "b.test"])
     assert deleted == []
-    assert ledger == ["a.test", "b.test"]
+    assert ledger == []  # claimed by the reconcile, not by retirement (#4431)
 
 
 def test_failed_delete_is_retried_and_missing_zone_is_forgotten(tmp_path: Path) -> None:
@@ -4156,8 +4251,13 @@ def test_an_ipv4_mapped_prefix_is_refused() -> None:
 # Secondary TSIG
 
 
-def _secondary_calls(tmp_path: Path, bundle: dict[str, Any], responder: Any = None):
+def _secondary_calls(
+    tmp_path: Path, bundle: dict[str, Any], responder: Any = None, owned: list[str] | None = None
+):
     d = TechnitiumDriver(state_dir=tmp_path)
+    if owned is not None:
+        # Zones this agent put on the daemon earlier (#1775).
+        (tmp_path / "technitium-managed-zones.json").write_text(json.dumps(owned))
     _seed_token(d)
     d.daemon_running = lambda: True  # type: ignore[method-assign]
     d._wait_for_api_up = lambda **_: None  # type: ignore[method-assign]
@@ -4204,6 +4304,7 @@ def test_an_existing_secondary_gets_the_key_through_options(tmp_path: Path) -> N
         tmp_path,
         {"zones": [sec], "options": {}, "tsig_keys": [_MASTER_KEY]},
         respond,
+        owned=["s.test"],
     )
     reapply = [
         c[3]

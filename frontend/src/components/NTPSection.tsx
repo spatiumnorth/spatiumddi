@@ -9,6 +9,7 @@ import {
   type NtpSourceMode,
   type PlatformSettings,
 } from "@/lib/api";
+import { SettingsRow } from "@/components/SettingsRow";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
 
@@ -17,28 +18,6 @@ interface Props {
   isSuperadmin: boolean;
   applianceMode: boolean;
   inputCls: string;
-}
-
-function Field({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-8 py-3">
-      <div className="max-w-xl">
-        <div className="text-sm font-medium">{label}</div>
-        {description && (
-          <div className="text-xs text-muted-foreground">{description}</div>
-        )}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
-  );
 }
 
 export function NTPSection({
@@ -152,7 +131,7 @@ export function NTPSection({
         </div>
       )}
 
-      <Field
+      <SettingsRow
         label="Source mode"
         description="Pool — resolver-expanded NTP pool (e.g. pool.ntp.org); good for internet-connected appliances. Servers — explicit unicast servers only; required for air-gapped sites or compliance shops. Mixed — both, with custom servers taking precedence."
       >
@@ -166,12 +145,12 @@ export function NTPSection({
           <option value="servers">Servers</option>
           <option value="mixed">Mixed</option>
         </select>
-      </Field>
+      </SettingsRow>
 
       {(sourceMode === "pool" || sourceMode === "mixed") && (
-        <Field
+        <SettingsRow
           label="Pool servers"
-          description="Comma- or space-separated list of NTP pool hostnames (e.g. ``pool.ntp.org``, ``2.debian.pool.ntp.org``). Each name expands to multiple servers via DNS. ``iburst`` is implied so initial sync is fast."
+          description="Comma- or space-separated list of NTP pool hostnames (e.g. ‘pool.ntp.org’, ‘2.debian.pool.ntp.org’). Each name expands to multiple servers via DNS. ‘iburst’ is implied so initial sync is fast."
         >
           <input
             type="text"
@@ -181,7 +160,7 @@ export function NTPSection({
             disabled={!isSuperadmin}
             className={cn(inputCls, "w-96 max-w-full font-mono")}
           />
-        </Field>
+        </SettingsRow>
       )}
 
       {(sourceMode === "servers" || sourceMode === "mixed") && (
@@ -190,9 +169,11 @@ export function NTPSection({
             <div>
               <div className="text-sm font-medium">Unicast servers</div>
               <div className="text-xs text-muted-foreground">
-                Explicit NTP servers (host or IP). ``iburst`` speeds initial
-                sync; ``prefer`` tags a canonical source — chrony biases toward
-                it during selection when multiple servers are healthy.
+                Explicit NTP servers (host or IP).{" "}
+                <code className="font-mono">iburst</code> speeds initial sync;{" "}
+                <code className="font-mono">prefer</code> tags a canonical
+                source — chrony biases toward it during selection when multiple
+                servers are healthy.
               </div>
             </div>
             <button
@@ -279,7 +260,7 @@ export function NTPSection({
         </div>
       )}
 
-      <Field
+      <SettingsRow
         label="Serve NTP to clients"
         description="When on, this appliance also acts as an NTP server. Useful for isolated networks where the appliance is the time source. Opens UDP 123 inbound in the host firewall on enable; closes on disable."
       >
@@ -288,12 +269,12 @@ export function NTPSection({
           onChange={setAllowClients}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
       {allowClients && (
-        <Field
+        <SettingsRow
           label="Allowed client CIDRs"
-          description="Comma- or space-separated list of CIDRs allowed to query this appliance for time. Empty = nothing allowed (chrony refuses every query). Use ``0.0.0.0/0`` to allow everything (rare; rely on the host firewall + perimeter instead)."
+          description="Comma- or space-separated list of CIDRs allowed to query this appliance for time. Empty = nothing allowed (chrony refuses every query). Use ‘0.0.0.0/0’ to allow everything (rare; rely on the host firewall + perimeter instead)."
         >
           <input
             type="text"
@@ -303,7 +284,7 @@ export function NTPSection({
             disabled={!isSuperadmin}
             className={cn(inputCls, "w-96 max-w-full font-mono")}
           />
-        </Field>
+        </SettingsRow>
       )}
 
       <div className="mt-4 flex items-center gap-3 border-t pt-4">

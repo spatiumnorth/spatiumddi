@@ -22,7 +22,10 @@ vi.mock("@/lib/api", async () => {
     authApi: { ...actual.authApi, me: async () => ({ id: "u1" }) },
     requestsApi: {
       ...actual.requestsApi,
-      list: () => rows(),
+      listPage: async () => {
+        const items = await rows();
+        return { items, total: items.length };
+      },
       catalog: async () => [],
       resourceOptions: async () => ({
         options: [{ id: "s1", label: "10.0.0.0/24", sublabel: null }],
@@ -60,6 +63,8 @@ function req(over: Partial<ProvisioningRequest>): ProvisioningRequest {
     executed_at: null,
     created_at: "2026-10-01T00:00:00Z",
     modified_at: "2026-10-01T00:00:00Z",
+    can_approve: true,
+    approve_blocked_reason: null,
     ...over,
   };
 }

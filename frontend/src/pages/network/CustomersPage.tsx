@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -15,6 +17,7 @@ import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -75,7 +78,11 @@ function CustomerEditorModal({
           status,
           notes,
         };
-        return customersApi.update(existing.id, body);
+        // Only what changed against the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return customersApi.update(existing.id, changed);
       }
       const body: CustomerCreate = {
         name,
@@ -188,7 +195,9 @@ function CustomerEditorModal({
             />
           </div>
         </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-sm text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -261,17 +270,27 @@ export function CustomersPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => customersApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["customers"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete customers")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => customersApi.remove(id),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["customers"] });
+    },
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete customer"));
       qc.invalidateQueries({ queryKey: ["customers"] });
     },
   });
@@ -296,6 +315,11 @@ export function CustomersPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Customers</h1>
@@ -413,8 +437,10 @@ export function CustomersPage() {
                         setSearch("");
                         setStatusFilter("");
                       }}
+                      gate={writeGate}
+                      hint={`Click "New customer" to add one.`}
                     >
-                      No customers yet — click "New customer" to add one.
+                      No customers yet.
                     </ListEmpty>
                   </td>
                 </tr>
@@ -482,10 +508,19 @@ export function CustomersPage() {
           />
         )}
         {editing && (
-          <CustomerEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => customersApi.get(editing.id)}
+            title="Edit customer"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <CustomerEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

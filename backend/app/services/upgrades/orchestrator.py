@@ -710,6 +710,32 @@ def _enqueue_drive(run_id: uuid.UUID, *, avoid_node: str | None) -> None:
     drive_upgrade_run.apply_async(args=[str(run_id)], kwargs={"avoid_node": avoid_node})
 
 
+# #3851 — the version hand-off's hop chain leaves no durable trace of its own:
+# it lives in one 5 s ETA message a worker holds, and a worker killed with it
+# strands the message for the broker's visibility timeout. Every pass-on
+# refreshes this key instead; the orphan sweep reads it as "the chain is alive".
+# Nine 5 s hops, so a late hop is not a lost one.
+HOP_HEARTBEAT_TTL_S = 45
+
+
+def hop_heartbeat_key(run_id: uuid.UUID | str) -> str:
+    return f"spatium:upgrade:handoff-hop:{run_id}"
+
+
+def touch_hop_heartbeat(run_id: uuid.UUID | str) -> bool:
+    """Refresh the hop heartbeat. True when written; a Redis failure is logged
+    and answers False (the sweep then keeps its legacy grace for the run)."""
+    try:
+        from app.core.redis_client import make_sync_redis  # noqa: PLC0415
+
+        client = make_sync_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
+        client.set(hop_heartbeat_key(run_id), str(time.time()), ex=HOP_HEARTBEAT_TTL_S)
+        return True
+    except Exception as exc:  # noqa: BLE001 - never break an upgrade over a heartbeat
+        logger.warning("upgrade_hop_heartbeat_failed", run_id=str(run_id), error=str(exc))
+        return False
+
+
 def _enqueue_continuation(run_id: uuid.UUID, *, avoid_version: str) -> None:
     """Enqueue the rest of the run for a worker that does NOT run
     ``avoid_version`` (#1710): the flip is rolling the workers off it."""
@@ -1055,9 +1081,24 @@ async def drive_upgrade(
     acquire_started = _monotonic()
     if run.state == "planned":
         # First call — acquire the lease.
-        ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
+        # #4512 — the first read gets the Plan's transient-retry budget (a k3s
+        # restart answers 503 for a while), from a thread since it sleeps.
+        ok, err = await asyncio.to_thread(
+            mutex.acquire,
+            holder=me,
+            lease_duration_seconds=LEASE_DURATION_S,
+            retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S,
+        )
         if not ok:
-            raise OrchestratorError(f"could not acquire upgrade lease: {err}")
+            reason = f"could not acquire upgrade lease: {err}"
+            # Still unreadable / held after the retries: say so on the run,
+            # which stays ``planned`` so Start can be pressed again (#4512).
+            run.last_error = reason
+            await _record_event(db, run, "start_refused", reason=reason)
+            await db.commit()
+            logger.warning("upgrade_start_refused", run_id=str(run.id), reason=reason)
+            raise OrchestratorError(reason)
+        run.last_error = None
         try:
             run.lease_holder = me
             run.lease_acquired_at = _now()
@@ -1093,7 +1134,12 @@ async def drive_upgrade(
         # lease under its own identity, so this one is refused; it takes over
         # only once that lease expired (the previous worker died) or was
         # released (a halt).
-        ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
+        ok, err = await asyncio.to_thread(
+            mutex.acquire,
+            holder=me,
+            lease_duration_seconds=LEASE_DURATION_S,
+            retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S,
+        )
         if not ok:
             raise OrchestratorError(f"can't take over upgrade lease for resume: {err}")
         run.lease_holder = me
@@ -1816,7 +1862,13 @@ async def _finish_with_flip(
             return None
         flip_rec = shared_tags.flip_record(run)
         record = shared_tags.record_of(run)
-        record["flip"] = {**flip_rec, "handed_off_at": _now().isoformat()}
+        # The marker says a hop heartbeat backs this hand-off (#3851); set only
+        # when the first write landed, or the sweep would read its absence as loss.
+        record["flip"] = {
+            **flip_rec,
+            "handed_off_at": _now().isoformat(),
+            "hop_heartbeat": touch_hop_heartbeat(run.id),
+        }
         run.progress = {**run.progress, shared_tags.PROGRESS_KEY: record}
         await _record_event(db, run, "drive_version_handoff", from_tag=from_tag)
         await db.commit()

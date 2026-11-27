@@ -59,7 +59,7 @@ from app.models.ipam import (
 from app.models.nmap import NmapScan
 from app.services.ipam.live_address import get_live_address
 from app.services.ipam.utilization import recount_subnets_and_blocks
-from app.services.nmap import NmapArgError, build_argv
+from app.services.nmap import NmapArgError, build_argv, resolve_target
 
 from .schemas import (
     NmapScanCreate,
@@ -214,6 +214,7 @@ async def create_scan(body: NmapScanCreate, db: DB, current_user: CurrentUser) -
     # before we persist a doomed row.
     try:
         build_argv(target_ip, body.preset, body.port_spec, body.extra_args)
+        await resolve_target(target_ip)
     except NmapArgError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -282,7 +283,11 @@ async def list_scans(
     count_stmt = select(func.count()).select_from(base.subquery())
     total = int((await db.execute(count_stmt)).scalar_one())
 
-    stmt = base.order_by(NmapScan.created_at.desc()).limit(page_size).offset((page - 1) * page_size)
+    stmt = (
+        base.order_by(NmapScan.created_at.desc(), NmapScan.id)
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
     rows = list((await db.execute(stmt)).scalars().all())
     spaces = await _scan_ip_row_spaces(db, rows)
     items = []

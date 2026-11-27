@@ -1,0 +1,123 @@
+{
+  "tables": {
+    "acme_account": "ACME DNS-01 accounts",
+    "address_set": "address sets",
+    "av_flow_profile": "AV flow",
+    "av_reserved_range": "AV reserved ranges",
+    "bacnet_device": "BACnet/IP devices",
+    "dhcp_pool": "DHCP pools",
+    "dhcp_scope": "DHCP scopes",
+    "dhcp_static_assignment": "DHCP static assignments",
+    "dns_acl": "ACLs",
+    "dns_pool": "DNS pools",
+    "dns_record": "DNS records",
+    "dns_server_options": "server options",
+    "dns_tsig_key": "TSIG keys",
+    "dns_view": "views",
+    "dns_zone": "zones",
+    "dns_zone_update_acl": "dynamic-update grants",
+    "dnssec_key": "DNSSEC keys",
+    "ip_address": "addresses",
+    "ip_block": "blocks",
+    "multicast_group_port": "ports",
+    "multicast_membership": "multicast memberships",
+    "ot_device": "OT devices",
+    "ot_zone": "OT zones",
+    "subnet_plan": "subnet plans",
+    "vlan_mapping": "VLAN mappings"
+  },
+  "exempt": {
+    "dhcp_phone_profile_scope": "link row: the phone profile keeps existing, only its scope binding goes",
+    "dns_acl_entry": "the entries of an ACL; they are the ACL, not a separate object",
+    "dns_agent_bundle": "the cached config bundle built for an agent, regenerated from the database",
+    "dns_blocklist_group_assoc": "link row between a blocklist and a group; the blocklist keeps existing",
+    "dns_blocklist_view_assoc": "link row between a blocklist and a view; the blocklist keeps existing",
+    "dns_ingest_snapshot": "transient ingest snapshots, not operator-entered",
+    "dns_metric_sample": "derived metric samples, not operator-entered",
+    "dns_pool_member": "the members of a pool; they are the pool, not a separate object",
+    "dns_record_op": "queued record operations for agents; transient",
+    "dns_server": "the group delete is refused while it holds servers, so it never cascades",
+    "dns_server_runtime_state": "per-server runtime status reported by an agent, not operator-entered",
+    "dns_server_zone_state": "per-server zone sync status reported by an agent, not operator-entered",
+    "dns_trust_anchor": "validation trust anchors held on the group's views; part of the view's configuration",
+    "erl_binding": "the delete is refused while an E911 location binding names the row, so it never cascades",
+    "ip_mac_history": "the address's own MAC history; it is the address, not a separate object",
+    "subnet_domain": "link row between a subnet and a DNS zone; the zone keeps existing",
+    "subnet_utilization_history": "derived daily utilization snapshots, not operator-entered"
+  },
+  "dialogs": {
+    "ip_address": {
+      "root": "ip_address",
+      "includes": [],
+      "tables": [
+        "ot_device",
+        "bacnet_device",
+        "multicast_membership",
+        "dhcp_static_assignment"
+      ],
+      "extra": ["DNS records"]
+    },
+    "subnet": {
+      "root": "subnet",
+      "includes": [],
+      "tables": [
+        "dhcp_scope",
+        "dhcp_pool",
+        "dhcp_static_assignment",
+        "ip_address",
+        "ot_device",
+        "bacnet_device",
+        "multicast_membership",
+        "address_set",
+        "ot_zone"
+      ],
+      "extra": ["the DNS records published for its addresses"]
+    },
+    "ip_block": {
+      "root": "ip_block",
+      "includes": ["subnet"],
+      "tables": ["ip_block"],
+      "extra": []
+    },
+    "ip_space": {
+      "root": "ip_space",
+      "includes": ["ip_block"],
+      "tables": ["subnet_plan", "vlan_mapping", "av_reserved_range"],
+      "extra": []
+    },
+    "multicast_group": {
+      "root": "multicast_group",
+      "includes": [],
+      "tables": [
+        "multicast_group_port",
+        "multicast_membership",
+        "av_flow_profile"
+      ],
+      "extra": []
+    },
+    "dns_zone": {
+      "root": "dns_zone",
+      "includes": [],
+      "tables": [
+        "dns_record",
+        "dns_pool",
+        "dns_zone_update_acl",
+        "dnssec_key",
+        "acme_account"
+      ],
+      "extra": []
+    },
+    "dns_server_group": {
+      "root": "dns_server_group",
+      "includes": ["dns_zone"],
+      "tables": [
+        "dns_zone",
+        "dns_view",
+        "dns_acl",
+        "dns_tsig_key",
+        "dns_server_options"
+      ],
+      "extra": []
+    }
+  }
+}

@@ -1,4 +1,6 @@
 import { ListEmpty } from "@/components/ui/list-read-error";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -39,6 +41,7 @@ import {
 import { SavedViewsMenu } from "@/components/SavedViewsMenu";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -383,6 +386,7 @@ export function ResourcesTab({
       qc.invalidateQueries({ queryKey: ["service", service.id] });
       qc.invalidateQueries({ queryKey: ["service-summary", service.id] });
       onChange();
+      setConfirm(null);
     },
   });
 
@@ -515,7 +519,11 @@ export function ResourcesTab({
             />
           </p>
         )}
-        {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="mt-2 text-xs text-destructive">
+            {error}
+          </FormError>
+        )}
         <p className="mt-2 text-[11px] text-muted-foreground/80">
           Common L3VPN roles: <code>primary</code> / <code>backup</code> /{" "}
           <code>hub</code> / <code>spoke</code>. Free-form — use whatever your
@@ -582,11 +590,15 @@ export function ResourcesTab({
         message={confirm?.message ?? ""}
         confirmLabel="Detach"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={detach.isPending}
+        error={
+          detach.error ? formatApiError(detach.error, "Detach failed") : null
+        }
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          detach.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );
@@ -845,7 +857,13 @@ export function ServiceEditorModal({
         sla_tier: slaTier || null,
         notes,
       };
-      if (existing) return servicesApi.update(existing.id, body);
+      if (existing) {
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const update = changedFields(existing, body as ServiceUpdate);
+        if (Object.keys(update).length === 0) return Promise.resolve(existing);
+        return servicesApi.update(existing.id, update);
+      }
       return servicesApi.create(body as ServiceCreate);
     },
     onSuccess: () => {
@@ -1055,7 +1073,9 @@ export function ServiceEditorModal({
         </div>
       )}
 
-      {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+      {error && (
+        <FormError className="mt-3 text-sm text-destructive">{error}</FormError>
+      )}
 
       <div className="mt-6 flex justify-end gap-2 border-t pt-3">
         <button
@@ -1188,17 +1208,27 @@ export function ServicesPage() {
     [items, selectedIds],
   );
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const bulkDelete = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (ids: string[]) => servicesApi.bulkDelete(ids),
     onSuccess: () => {
       setSelectedIds(new Set());
       qc.invalidateQueries({ queryKey: ["services"] });
     },
+    onError: (e: unknown) =>
+      setDeleteError(formatApiError(e, "Failed to delete services")),
   });
 
   const removeOne = useMutation({
+    onMutate: () => setDeleteError(null),
     mutationFn: (id: string) => servicesApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["services"] }),
+    onError: (e: unknown) => {
+      setDeleteError(formatApiError(e, "Failed to delete service"));
+      qc.invalidateQueries({ queryKey: ["services"] });
+    },
   });
 
   function toggle(id: string) {
@@ -1225,6 +1255,11 @@ export function ServicesPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
+        {deleteError && (
+          <p role="alert" className="text-sm text-destructive">
+            {deleteError}
+          </p>
+        )}
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Services</h1>
@@ -1431,8 +1466,10 @@ export function ServicesPage() {
                           setCustomerFilter("");
                           setTagFilters([]);
                         }}
+                        gate={writeGate}
+                        hint={`Click "New service" to add one.`}
                       >
-                        No services yet — click "New service" to add one.
+                        No services yet.
                       </ListEmpty>
                     )}
                   </td>
@@ -1513,10 +1550,19 @@ export function ServicesPage() {
           />
         )}
         {editing && (
-          <ServiceEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => servicesApi.get(editing.id)}
+            title="Edit Service"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <ServiceEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

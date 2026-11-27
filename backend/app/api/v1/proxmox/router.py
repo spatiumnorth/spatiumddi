@@ -25,6 +25,10 @@ from app.core.exc_text import describe_exc
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
+from app.core.stored_secret_guard import (
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -418,6 +422,13 @@ async def update_node(
         raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
 
     changes = body.model_dump(exclude_unset=True)
+    require_secret_with_destination_change(
+        n,
+        changes,
+        destination=["host", "port"],
+        secrets={"token_secret": n.token_secret_encrypted},
+        blank_keeps=("token_secret",),
+    )
     new_ipam = changes.get("ipam_space_id", n.ipam_space_id)
     new_dns = changes.get("dns_group_id", n.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
@@ -502,6 +513,12 @@ async def test_connection(
         stored = await db.get(ProxmoxNode, body.node_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="Proxmox endpoint not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"host": body.host, "port": body.port, "token_secret": body.token_secret},
+            destination=("host", "port"),
+            secrets={"token_secret": stored.token_secret_encrypted},
+        )
         host = host or stored.host
         port = body.port or stored.port
         verify_tls = body.verify_tls if body.verify_tls is not None else stored.verify_tls

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import {
@@ -16,6 +17,7 @@ import {
 
 import {
   firewallFeedsApi,
+  formatApiError,
   type FirewallFeed,
   type FirewallFeedCreate,
   type FirewallFeedTokenResult,
@@ -30,6 +32,7 @@ import {
   permissionGate,
   usePermissions,
 } from "@/hooks/usePermissions";
+import { FormError } from "@/components/ui/form-error";
 
 // Full poll URL for a feed — prefix the server-relative poll_path with
 // the current origin so operators can paste it straight into a
@@ -294,8 +297,16 @@ export function FirewallFeedsPage() {
         tone="destructive"
         confirmLabel="Rotate token"
         loading={rotateMut.isPending}
+        error={
+          rotateMut.error
+            ? formatApiError(rotateMut.error, "Rotate failed")
+            : null
+        }
         onConfirm={() => rotate && rotateMut.mutate(rotate.id)}
-        onClose={() => setRotate(null)}
+        onClose={() => {
+          setRotate(null);
+          rotateMut.reset();
+        }}
       />
       {del && (
         <DeleteFeedModal
@@ -423,7 +434,11 @@ function RevealModal({
               placeholder="or 6-digit code"
               className={`${inputCls} font-mono`}
             />
-            {error && <p className="text-xs text-destructive">{error}</p>}
+            {error && (
+              <FormError className="text-xs text-destructive">
+                {error}
+              </FormError>
+            )}
             <div className="flex justify-end gap-2 pt-1">
               <button
                 type="button"
@@ -549,7 +564,9 @@ function CreateFeedModal({
           list. The poll URL + token are shown once after create.
         </p>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -630,7 +647,9 @@ function EditFeedModal({
           <span>Enabled</span>
         </label>
 
-        {error && <p className="text-xs text-destructive">{error}</p>}
+        {error && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
 
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -742,23 +761,6 @@ function CopyableValue({ value, mono }: { value: string; mono?: boolean }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {
