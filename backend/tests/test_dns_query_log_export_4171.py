@@ -312,3 +312,63 @@ async def test_view_filter_on_copilot_find_dns_queries(db_session: AsyncSession)
         db_session, su, FindDNSQueriesArgs(server_id=str(e["srv"].id), view="external")
     )
     assert {r["qname"] for r in out} == {"b.example.test", "c.example.test"}
+
+
+@pytest.mark.parametrize("fmt", ["csv", "jsonl"])
+async def test_export_error_statuses_never_500(
+    client: AsyncClient, db_session: AsyncSession, fmt: str
+) -> None:
+    """Missing ids are 404, bad filters 422, a caller without read on ``server``
+    403 -- on both formats, and none of them leaves an audit row."""
+    e = await _estate(db_session)
+    admin = await _user(db_session, None)
+    nobody = await _user(db_session, [{"action": "read", "resource_type": "subnet"}])
+    await db_session.commit()
+    url = f"/api/v1/logs/dns-queries/export.{fmt}"
+    missing = str(uuid.uuid4())
+
+    r = await client.get(url, params={"server_id": missing}, headers=_h(admin))
+    assert r.status_code == 404, r.text
+    r = await client.get(url, params={"group_id": missing}, headers=_h(admin))
+    assert r.status_code == 404, r.text
+    r = await client.get(url, params={"server_id": "not-a-uuid"}, headers=_h(admin))
+    assert r.status_code == 422
+    r = await client.get(url, params={"since": "yesterday-ish"}, headers=_h(admin))
+    assert r.status_code == 422
+    r = await client.get(url, params={"until": "2026-13-45"}, headers=_h(admin))
+    assert r.status_code == 422
+    r = await client.get(url, params={"client_ip": "not an ip!"}, headers=_h(admin))
+    assert r.status_code == 422
+    r = await client.get(url, params={"q": "x" * 300}, headers=_h(admin))
+    assert r.status_code == 422
+    r = await client.get(url, params={"server_id": str(e["srv"].id)}, headers=_h(nobody))
+    assert r.status_code == 403
+    r = await client.get(url)
+    assert r.status_code in (401, 403)
+    audit = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(AuditLog.resource_type == "dns_query_log")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert audit == []
+
+
+async def test_scoped_grant_cannot_export_another_servers_rows_by_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    e = await _estate(db_session)
+    token = await _user(
+        db_session,
+        [{"action": "read", "resource_type": "server", "resource_id": str(e["srv"].id)}],
+    )
+    await db_session.commit()
+    r = await client.get(
+        "/api/v1/logs/dns-queries/export.csv",
+        params={"server_id": str(e["other"].id)},
+        headers=_h(token),
+    )
+    assert r.status_code == 403
