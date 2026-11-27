@@ -20,7 +20,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.stepup import require_stepup_if_granting_superadmin
 from app.core.permissions import caller_can_grant, refuse_and_audit, require_permission
 from app.models.audit import AuditLog
-from app.models.auth import Role, User
+from app.models.auth import Group, Role, User, group_role
 from app.services.superadmin_grant import (
     SuperadminModel,
     leaves_no_active_superadmin,
@@ -347,6 +347,22 @@ async def update_role(
         new_permissions = _perm_list_to_dicts(body.permissions)
         role_id = r.id
         wildcard = permissions_grant_superadmin(new_permissions)
+        # A group bound to a tenant never carries a * / * role (#4263): that
+        # makes every member an effective superadmin, whom no tenant confines.
+        # The group routes refuse attaching one; this refuses growing one.
+        any_wildcard = any(
+            p.get("action") == "*" and p.get("resource_type") == "*" for p in new_permissions
+        )
+        if any_wildcard and await db.scalar(
+            select(Group.id)
+            .join(group_role, group_role.c.group_id == Group.id)
+            .where(group_role.c.role_id == r.id, Group.tenant_id.is_not(None))
+            .limit(1)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="A group bound to a tenant cannot carry a superadmin (* / *) role",
+            )
 
         def _change(model: SuperadminModel) -> None:
             model.role_wildcard[role_id] = wildcard

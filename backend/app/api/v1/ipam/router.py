@@ -1543,8 +1543,13 @@ async def _assert_scoped_zones(
     this a grant on one subnet or set would publish into any zone whose id the
     holder knew. A scoped grant must not reach a zone it never named. A zone in
     ``already`` (a row's current binding) passes, so a re-save is not refused.
-    A caller holding the type-level subnet write is not checked."""
-    if not _subnet_write_is_scoped(user):
+    A caller holding the type-level subnet write is not checked.
+
+    A tenant user (#4263) is always checked, and no grant lets them past: DNS
+    zones stay install-wide in multi-tenancy phase 1, so a tenant publishes
+    only into the zones its subnet was given by a global operator."""
+    tenant_user = session_scope(db) is not None
+    if not tenant_user and not _subnet_write_is_scoped(user):
         return
     wanted = {str(z) for z in zone_ids if z}
     if not wanted:
@@ -1555,6 +1560,14 @@ async def _assert_scoped_zones(
     if primary is not None:
         allowed.add(str(primary))
     for zid in sorted(wanted - allowed):
+        if tenant_user:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "A tenant user can publish only into the DNS zones the subnet already "
+                    "uses (DNS zones are shared across tenants)"
+                ),
+            )
         if not user_has_permission(user, "write", "dns_zone", zid):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

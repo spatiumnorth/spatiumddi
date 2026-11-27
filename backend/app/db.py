@@ -584,8 +584,12 @@ def _audit_chain_hash(session: Session, _flush_context: Any, _instances: Any) ->
 
 @event.listens_for(Session, "do_orm_execute")
 def _filter_tenant_scope(execute_state: Any) -> None:
-    """Narrow IPAM SELECTs to the request's tenant scope (#4263). A session
-    with no scope (every non-tenant caller, every Celery task) does nothing."""
+    """Narrow IPAM SELECTs to the request's tenant scope (#4263), stage 1: the
+    WHERE-only FROMs. Stage 2 (the loader criteria) is
+    ``_filter_tenant_scope_options`` below, registered after the soft-delete
+    hook, whose own rewrite cannot run over a statement already carrying
+    loader criteria. A session with no scope (every non-tenant caller, every
+    Celery task) does nothing."""
     if execute_state.session.info.get("tenant_scope") is None:
         return
     from app.services.tenancy import on_orm_execute
@@ -633,6 +637,19 @@ def _filter_soft_deleted(execute_state: Any) -> None:
     if execute_state.execution_options.get("include_deleted", False):
         return
     execute_state.statement = _apply_soft_delete_filter(execute_state.statement)
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _filter_tenant_scope_options(execute_state: Any) -> None:
+    """Tenant scope (#4263), stage 2: ``with_loader_criteria`` on every
+    tenant-scoped entity. Registered after ``_filter_soft_deleted`` on
+    purpose (see ``_filter_tenant_scope``); listeners run in registration
+    order."""
+    if execute_state.session.info.get("tenant_scope") is None:
+        return
+    from app.services.tenancy import on_orm_execute_options
+
+    on_orm_execute_options(execute_state)
 
 
 def _apply_soft_delete_filter(statement: Any) -> Any:

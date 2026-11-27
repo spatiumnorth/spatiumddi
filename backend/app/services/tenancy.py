@@ -166,26 +166,40 @@ def predicate_for(table: Any, scope: Iterable[uuid.UUID]) -> Any:
     return table.c[column].in_(_ids_select(kind, ids))
 
 
-def apply_tenant_filter(statement: Any, scope: frozenset[uuid.UUID]) -> Any:
-    """``statement`` narrowed to ``scope`` for every tenant-scoped model it
-    references anywhere (joins and subqueries included)."""
+def rewrite_implicit_froms(statement: Any, scope: frozenset[uuid.UUID]) -> Any:
+    """Stage 1: add the tenant predicate to every SELECT in ``statement`` that
+    reaches a tenant-scoped table only through its WHERE clause.
+
+    Runs BEFORE the soft-delete hook (``app.db``): that hook rewrites the same
+    WHERE-only FROMs with ``replacement_traverse``, which cannot clone a
+    statement already carrying ``with_loader_criteria`` options. Were the
+    tenant options added first, the soft-delete rewrite would fail and a
+    tenant user would count trashed rows; so the options come in stage 2."""
     from app.db import _filter_implicit_froms, _scan_statement
 
-    models = tenant_models()
-    referenced, selects = _scan_statement(statement, models)
-    if not referenced:
+    referenced, selects = _scan_statement(statement, tenant_models())
+    if not referenced or not selects:
         return statement
-    if selects:
-        try:
-            statement = _filter_implicit_froms(
-                statement,
-                selects,
-                {m.__tablename__ for m in referenced},
-                predicate=lambda f: predicate_for(f, scope),
-            )
-        except Exception:  # pragma: no cover - defensive: fail closed
-            logger.error("tenant_implicit_from_rewrite_failed", exc_info=True)
-            raise
+    try:
+        return _filter_implicit_froms(
+            statement,
+            selects,
+            {m.__tablename__ for m in referenced},
+            predicate=lambda f: predicate_for(f, scope),
+        )
+    except Exception:  # pragma: no cover - defensive: fail closed
+        logger.error("tenant_implicit_from_rewrite_failed", exc_info=True)
+        raise
+
+
+def add_loader_criteria(statement: Any, scope: frozenset[uuid.UUID]) -> Any:
+    """Stage 2: narrow every tenant-scoped entity ``statement`` loads, joins
+    and subqueries included, with ``with_loader_criteria``. Runs AFTER the
+    soft-delete hook (see :func:`rewrite_implicit_froms`)."""
+    from app.db import _scan_statement
+
+    models = tenant_models()
+    referenced, _ = _scan_statement(statement, models)
     for model in models:
         if model not in referenced:
             continue
@@ -204,12 +218,28 @@ def apply_tenant_filter(statement: Any, scope: frozenset[uuid.UUID]) -> Any:
     return statement
 
 
+def apply_tenant_filter(statement: Any, scope: frozenset[uuid.UUID]) -> Any:
+    """``statement`` narrowed to ``scope`` for every tenant-scoped model it
+    references anywhere (joins and subqueries included): both stages."""
+    return add_loader_criteria(rewrite_implicit_froms(statement, scope), scope)
+
+
 def on_orm_execute(execute_state: Any) -> None:
-    """``do_orm_execute`` hook (mounted from ``app.db``)."""
+    """``do_orm_execute`` hook, stage 1 (mounted from ``app.db`` before the
+    soft-delete hook)."""
     scope = execute_state.session.info.get(SCOPE_KEY)
     if scope is None or not execute_state.is_select:
         return
-    execute_state.statement = apply_tenant_filter(execute_state.statement, scope)
+    execute_state.statement = rewrite_implicit_froms(execute_state.statement, scope)
+
+
+def on_orm_execute_options(execute_state: Any) -> None:
+    """``do_orm_execute`` hook, stage 2 (mounted from ``app.db`` after the
+    soft-delete hook)."""
+    scope = execute_state.session.info.get(SCOPE_KEY)
+    if scope is None or not execute_state.is_select:
+        return
+    execute_state.statement = add_loader_criteria(execute_state.statement, scope)
 
 
 # ── Write guard ─────────────────────────────────────────────────────────────
@@ -221,6 +251,8 @@ _DNS_DHCP_COLUMNS = (
     "dns_zone_id",
     "dns_additional_zone_ids",
     "dhcp_server_group_id",
+    # names the zone DDNS publishes a lease into, by domain, install-wide
+    "ddns_domain_override",
 )
 
 
