@@ -110,7 +110,7 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
   <p class="idx-alt">
     SpatiumDDI is listed in the Red Hat Ecosystem Catalog as
     <a href="https://catalog.redhat.com/en/software/container-stacks/detail/6af49e43879a2dda6c257559">Partner Validated for Red Hat OpenShift</a>,
-    and its UBI 9 images are Red Hat certified.
+    and its Helm chart and UBI 9 images are Red Hat certified.
     Sizing for each platform is on <a href="deployment/SIZING.html">Sizing</a>.
   </p>
 </section>
