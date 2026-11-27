@@ -312,3 +312,67 @@ async def test_copilot_preview_tool_is_read_only(db_session: AsyncSession) -> No
         PreviewZoneTemplateArgs(zone_id=zone.id, template_id="mail-basic", params={}),
     )
     assert "required" in bad["error"]
+
+
+async def test_trashed_foreign_and_unauthored_zone_are_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A soft-deleted zone is 404 on both routes and nothing is written; a zone
+    addressed through the wrong group is 404; a secondary zone is 422 (#2183)."""
+    from datetime import UTC, datetime
+
+    admin = await _user(db_session, None, superadmin=True)
+    grp, zone = await _zone(db_session)
+    grp_other, _zone_other = await _zone(db_session, "elsewhere.test.")
+    sec = DNSZone(group_id=grp.id, name="sec.test.", zone_type="secondary", kind="forward")
+    db_session.add(sec)
+    await db_session.commit()
+    h = _bearer(admin)
+
+    # Wrong group for the zone.
+    for tail in ("/preview", ""):
+        wrong = f"/api/v1/dns/groups/{grp_other.id}/zones/{zone.id}/apply-template{tail}"
+        assert (await client.post(wrong, headers=h, json=MAIL)).status_code == 404
+        ghost = f"/api/v1/dns/groups/{grp.id}/zones/{uuid.uuid4()}/apply-template{tail}"
+        assert (await client.post(ghost, headers=h, json=MAIL)).status_code == 404
+        assert (await client.post(_url(grp, sec, tail), headers=h, json=MAIL)).status_code == 422
+
+    zone.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    db_session.expunge_all()
+    for tail in ("/preview", ""):
+        r = await client.post(_url(grp, zone, tail), headers=h, json=MAIL)
+        assert r.status_code == 404, (tail, r.status_code, r.text)
+    assert await _rows(db_session, zone) == []
+
+    from app.services.ai.tools.dns import PreviewZoneTemplateArgs, preview_zone_template
+
+    out = await preview_zone_template(
+        db_session,
+        admin,
+        PreviewZoneTemplateArgs(
+            zone_id=zone.id, template_id=MAIL["template_id"], params=MAIL["params"]
+        ),
+    )
+    assert out == {"error": "zone not found"}
+
+
+async def test_unknown_view_and_bad_body_are_4xx(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    admin = await _user(db_session, None, superadmin=True)
+    grp, zone = await _zone(db_session)
+    await db_session.commit()
+    h = _bearer(admin)
+    for tail in ("/preview", ""):
+        r = await client.post(
+            _url(grp, zone, tail), headers=h, json={**MAIL, "view_id": str(uuid.uuid4())}
+        )
+        assert r.status_code in (404, 422), (tail, r.status_code, r.text)
+        r = await client.post(_url(grp, zone, tail), headers=h, json={"params": {}})
+        assert r.status_code == 422
+        r = await client.post(
+            _url(grp, zone, tail), headers=h, json={**MAIL, "params": {"mx_host": 5}}
+        )
+        assert r.status_code == 422
+    assert await _rows(db_session, zone) == []
