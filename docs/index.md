@@ -220,6 +220,10 @@ description: SpatiumDDI documentation — setup, architecture, feature specs, de
       <span class="idx-card-title">Behind a Reverse Proxy</span>
       <span class="idx-card-desc">nginx, Caddy, Traefik, HAProxy, Nginx Proxy Manager, K8s Ingress: headers, trusted proxies, streaming, troubleshooting</span>
     </a>
+    <a class="idx-card" href="deployment/RELEASE_VERIFICATION.html">
+      <span class="idx-card-title">Verifying a Release</span>
+      <span class="idx-card-desc">cosign signatures, signed SBOMs and build provenance for images and the Helm chart</span>
+    </a>
     <a class="idx-card" href="deployment/APPLIANCE.html">
       <span class="idx-card-title">OS Appliance Design</span>
       <span class="idx-card-desc">Why k3s, the A/B slot layout, the fleet firewall, control-plane HA internals, the build pipeline</span>

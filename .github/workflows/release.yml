@@ -380,6 +380,48 @@ jobs:
             tag "${IMAGE_PREFIX}/${img}:${VERSION}" "${IMAGE_PREFIX}/${img}@${digest}"
           done
 
+  # ── Sign what was published (#1251) ────────────────────────────────────────
+  # Keyless cosign signature + signed SPDX SBOM + build-provenance attestation
+  # for every scanned digest, by DIGEST (a tag can move, a digest cannot).
+  # ``release`` needs this job, so ``:latest`` (promote-latest) can only move
+  # after every image is signed. id-token: write is granted here and on the
+  # other sign-* jobs only. Verification commands: docs/deployment/RELEASE_VERIFICATION.md.
+  sign-images:
+    name: Sign ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: [meta, images]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.meta.outputs.images) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: digest-${{ matrix.image }}
+          path: digests/
+      - name: Read the scanned digest
+        id: digest
+        run: |
+          set -euo pipefail
+          d=$(cat "digests/${{ matrix.image }}")
+          [ -n "$d" ] || { echo "::error::empty digest for ${{ matrix.image }}"; exit 1; }
+          echo "digest=${d}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/sign-image
+        with:
+          name: ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}
+          digest: ${{ steps.digest.outputs.digest }}
+
   # ── Red Hat UBI 9 variants (#3913) ─────────────────────────────────────────
   # The api, frontend, BIND9 and Kea images rebuilt on ubi9 for OpenShift's
   # certified-image profile (``charts/spatiumddi/values-openshift-certified.yaml``),
@@ -545,6 +587,44 @@ jobs:
               "${IMAGE_PREFIX}/${img}@${amd64}" "${IMAGE_PREFIX}/${img}@${arm64}"
           done
 
+  # Signs the joined multi-arch ``:<version>-ubi`` index (#1251). Not a
+  # dependency of ``release``, like the rest of the UBI path; it gates only
+  # ``:latest-ubi``.
+  sign-ubi:
+    name: Sign ${{ matrix.image_def.image }} (UBI)
+    runs-on: ubuntu-latest
+    needs: [meta, images-ubi]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image_def: ${{ fromJSON(needs.meta.outputs.images_ubi) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve the digest images-ubi just tagged
+        id: digest
+        env:
+          TAGGED: ${{ env.IMAGE_PREFIX }}/${{ matrix.image_def.image }}:${{ needs.meta.outputs.version }}-ubi
+        run: |
+          set -euo pipefail
+          d=$(docker buildx imagetools inspect "$TAGGED" --format '{{json .Manifest}}' | jq -r .digest)
+          [ -n "$d" ] && [ "$d" != "null" ] || { echo "::error::cannot resolve ${TAGGED}"; exit 1; }
+          echo "digest=${d}" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/sign-image
+        with:
+          name: ${{ env.IMAGE_PREFIX }}/${{ matrix.image_def.image }}
+          digest: ${{ steps.digest.outputs.digest }}
+
   # ── Submit preflight results to Red Hat (#3913) ────────────────────────────
   # After images-ubi has published the multi-arch ``:<version>-ubi``, submit
   # `preflight check container` results for each image and architecture to its
@@ -621,6 +701,7 @@ jobs:
       packages: write
     outputs:
       chart_version: ${{ steps.pkg.outputs.chart_version }}
+      chart_digest: ${{ steps.pkg.outputs.chart_digest }}
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
@@ -642,6 +723,7 @@ jobs:
       - id: pkg
         name: Package + push chart
         run: |
+          set -euo pipefail
           VERSION="${{ needs.meta.outputs.version }}"
           # Helm enforces strict SemVer 2, which forbids leading zeroes in
           # MAJOR.MINOR.PATCH, so a CalVer tag drops them (2026.04.20-1 ->
@@ -658,7 +740,38 @@ jobs:
             --destination ./dist
           helm push \
             "./dist/spatiumddi-${CHART_VERSION}.tgz" \
-            "oci://ghcr.io/${{ github.repository_owner }}/charts"
+            "oci://ghcr.io/${{ github.repository_owner }}/charts" | tee push.log
+          # sign-chart signs this exact digest (#1251).
+          CHART_DIGEST=$(sed -n 's/^Digest: *//p' push.log | tail -1)
+          case "$CHART_DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::helm push printed no digest"; exit 1 ;;
+          esac
+          echo "chart_digest=${CHART_DIGEST}" >> "$GITHUB_OUTPUT"
+
+  # Signs the chart's OCI artifact (#1251). No SBOM: a chart is YAML templates;
+  # the images it references each carry theirs.
+  sign-chart:
+    name: Sign Helm chart
+    runs-on: ubuntu-latest
+    needs: [meta, publish-chart]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/sign-image
+        with:
+          name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/spatiumddi
+          digest: ${{ needs.publish-chart.outputs.chart_digest }}
+          sbom: 'false'
 
   # ── Build appliance ISO ─────────────────────────────────────────────────────
   # The build itself lives in build-appliance.yml (reusable, #823), so the
@@ -769,7 +882,7 @@ jobs:
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [meta, images, build-appliance-iso, publish-chart, export-openapi]
+    needs: [meta, images, sign-images, build-appliance-iso, publish-chart, sign-chart, export-openapi]
     permissions:
       contents: write
     outputs:
@@ -1157,7 +1270,7 @@ jobs:
   promote-latest-ubi:
     name: Tag :latest-ubi
     runs-on: ubuntu-latest
-    needs: [meta, release, images-ubi]
+    needs: [meta, release, images-ubi, sign-ubi]
     if: needs.release.outputs.make_latest == 'true'
     permissions:
       contents: read

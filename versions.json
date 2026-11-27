@@ -114,6 +114,26 @@
       "note": "Lock-stepped to k3s's Kubernetes minor, not chosen independently -- the e2e exists to prove the chart on the Kubernetes the appliance actually runs. Digest-pinned because kindest/node tags are re-pushed. Bump with k3s, and take the digest kind publishes for the tag."
     },
 
+    "cosign": {
+      "version": "v3.1.6",
+      "pinned_in": [
+        { "path": ".github/actions/sign-image/action.yml", "match": "cosign-release: '{version}'", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "cosign {version}, installed in CI", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "sigstore/cosign" },
+      "note": "Release signing (#1251): keyless signatures and attestations in .github/actions/sign-image. Build-time CI tool only; nothing ships it. The installer action's own SHA pin is Dependabot's."
+    },
+
+    "syft": {
+      "version": "v1.57.2",
+      "pinned_in": [
+        { "path": ".github/actions/sign-image/action.yml", "match": "syft-version: '{version}'", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "Syft {version}, installed in CI", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "anchore/syft" },
+      "note": "Generates the SPDX SBOM attached to each release image (#1251). Build-time CI tool only; nothing ships it."
+    },
+
     "helm": {
       "version": "v4.3.1",
       "pinned_in": [
