@@ -1759,6 +1759,9 @@ class SecondaryStateEntry(BaseModel):
     and no expiry, and that is reported as ``null``, not as a made-up value."""
 
     zone_name: str = Field(min_length=1, max_length=512)
+    # False: named has dropped its copy (expired, or never transferred) and
+    # answers SERVFAIL; nothing else is then reported.
+    loaded: bool = True
     serial: int | None = Field(default=None, ge=0, le=2**32 - 1)
     expires_at: datetime | None = None
     next_refresh_at: datetime | None = None
@@ -1850,6 +1853,15 @@ async def agent_secondary_state(
         if row is None:
             row = DNSSecondaryZoneState(server_id=server.id, zone_id=zone_id)
             db.add(row)
+        if not e.loaded:
+            # Keep what the last good report said (serial, timers) and close
+            # the clock: a dropped copy is expired as of now, whatever its
+            # expiry said. A zone that never had one stays "never transferred".
+            if row.expires_at is not None:
+                row.expires_at = min(row.expires_at, now)
+            row.next_refresh_at = None
+            row.reported_at = now
+            continue
         row.serial = e.serial
         row.expires_at = e.expires_at
         row.next_refresh_at = e.next_refresh_at

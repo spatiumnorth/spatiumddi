@@ -66,20 +66,22 @@ def _state(
     serial: int | None = 10,
     reported_ago: timedelta = timedelta(minutes=1),
     first_seen_ago: timedelta = timedelta(days=1),
+    timers: tuple[int, int, int] = (REFRESH, RETRY, EXPIRE),
 ) -> DNSSecondaryZoneState:
     """A report whose last good refresh was ``last_refresh_ago`` ago (None =
-    the zone never transferred)."""
+    the zone never transferred), on SOA timers ``(refresh, retry, expire)``."""
+    refresh, retry, expire = timers
     expires = (
-        NOW - last_refresh_ago + timedelta(seconds=EXPIRE) if last_refresh_ago is not None else None
+        NOW - last_refresh_ago + timedelta(seconds=expire) if last_refresh_ago is not None else None
     )
     return DNSSecondaryZoneState(
         server_id=server.id,
         zone_id=zone.id,
         serial=serial if last_refresh_ago is not None else None,
         expires_at=expires,
-        soa_refresh=REFRESH,
-        soa_retry=RETRY,
-        soa_expire=EXPIRE,
+        soa_refresh=refresh,
+        soa_retry=retry,
+        soa_expire=expire,
         reported_at=NOW - reported_ago,
         created_at=NOW - first_seen_ago,
     )
@@ -381,6 +383,148 @@ async def test_silent_agent_paused_and_maintenance_servers_do_not_fire(
     assert (
         await _ids(alerts_svc._matching_dns_secondary_zone_stale_subjects, db_session, rule) == {}
     )
+
+
+# Timers as live BIND 9.20 runs them (#4732): the lab zone's SOA said refresh 60 /
+# retry 30 / expire 600, and named checked it every 4-5 min, backed off after a
+# miss, and kept the copy until the 10 min were up.
+SHORT = (60, 30, 600)
+
+
+@pytest.mark.asyncio
+async def test_short_soa_timers_do_not_make_a_healthy_zone_fail_or_expire(
+    db_session: AsyncSession,
+) -> None:
+    """named never refreshes faster than 5 min, so a zone with ``refresh 60``
+    last checked 4 min ago is on schedule, and one whose whole expire is inside
+    the alert's window is not "expiring" while it keeps refreshing."""
+    srv, zone, _ = await _setup(db_session)
+    db_session.add(
+        _state(
+            srv,
+            zone,
+            last_refresh_ago=timedelta(minutes=4),
+            timers=SHORT,
+            reported_ago=timedelta(seconds=30),
+        )
+    )
+    x = await _rule(db_session, XFER, threshold_percent=1)
+    stale = await _rule(db_session, STALE, threshold_percent=3, threshold_days=1)
+    await db_session.commit()
+    assert (
+        await _ids(alerts_svc._matching_dns_secondary_transfer_failed_subjects, db_session, x) == {}
+    )
+    assert (
+        await _ids(alerts_svc._matching_dns_secondary_zone_stale_subjects, db_session, stale) == {}
+    )
+    from app.services.dns.secondary_health import load_health
+
+    (h,) = await load_health(db_session, now=NOW)
+    assert (h.state, h.failed_attempts) == ("in_sync", 0)
+
+
+@pytest.mark.asyncio
+async def test_a_short_expire_zone_that_stops_refreshing_is_expiring(
+    db_session: AsyncSession,
+) -> None:
+    srv, zone, _ = await _setup(db_session)
+    db_session.add(
+        _state(
+            srv,
+            zone,
+            last_refresh_ago=timedelta(minutes=14),
+            timers=(60, 30, 900),
+            reported_ago=timedelta(seconds=30),
+        )
+    )
+    stale = await _rule(db_session, STALE, threshold_percent=3, threshold_days=1)
+    await db_session.commit()
+    assert await _ids(
+        alerts_svc._matching_dns_secondary_zone_stale_subjects, db_session, stale
+    ) == {f"{srv.id}:{zone.id}": "critical"}
+
+
+@pytest.mark.asyncio
+async def test_a_report_older_than_a_refresh_is_judged_as_of_its_own_time(
+    db_session: AsyncSession,
+) -> None:
+    """The report was taken 2 min ago, 3 s before a refresh fell due. Judged at
+    ``now`` that refresh is missed, though it may well have worked since; as of
+    the report it is on schedule (seen live: an alert opened and closed within
+    two minutes of every refresh)."""
+    srv, zone, _ = await _setup(db_session)
+    db_session.add(
+        _state(
+            srv,
+            zone,
+            last_refresh_ago=timedelta(seconds=3600 + 600 - 3 + 120),
+            reported_ago=timedelta(seconds=120),
+        )
+    )
+    x = await _rule(db_session, XFER, threshold_percent=1)
+    await db_session.commit()
+    assert (
+        await _ids(alerts_svc._matching_dns_secondary_transfer_failed_subjects, db_session, x) == {}
+    )
+
+
+@pytest.mark.asyncio
+async def test_not_loaded_report_expires_the_copy_and_keeps_alerting(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """named drops an expired copy and rndc then says ``zone not loaded``: the
+    agent reports ``loaded: false``, which closes the clock on the stored copy
+    and keeps the report fresh, so the alert does not age out after 30 min."""
+    srv, zone, headers = await _setup(db_session)
+    zone_id, zone_name, srv_id = zone.id, zone.name, srv.id
+    # Last good refresh was 9 min ago on a 10 min expire: not expired yet.
+    db_session.add(
+        _state(
+            srv,
+            zone,
+            last_refresh_ago=timedelta(minutes=9),
+            timers=SHORT,
+            reported_ago=timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+    r = await client.post(
+        "/api/v1/dns/agents/secondary-state",
+        headers=headers,
+        json={"zones": [{"zone_name": zone_name, "loaded": False}]},
+    )
+    assert r.json() == {"updated": 1, "skipped": 0}
+    db_session.expire_all()
+    row = (await db_session.execute(select(DNSSecondaryZoneState))).scalar_one()
+    assert (row.server_id, row.zone_id, row.serial, row.soa_expire) == (srv_id, zone_id, 10, 600)
+    assert row.expires_at is not None and row.expires_at <= datetime.now(UTC)
+    assert row.reported_at >= NOW
+    x = await _rule(db_session, XFER)
+    await db_session.commit()
+    got = await alerts_svc._matching_dns_secondary_transfer_failed_subjects(db_session, x)
+    assert [(sid, sev) for sid, _d, _m, sev in got] == [(f"{srv_id}:{zone_id}", "critical")]
+
+
+@pytest.mark.asyncio
+async def test_not_loaded_report_for_a_zone_never_transferred_stays_never_transferred(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    srv, zone, headers = await _setup(db_session)
+    zone_name = zone.name
+    await db_session.commit()
+    r = await client.post(
+        "/api/v1/dns/agents/secondary-state",
+        headers=headers,
+        json={"zones": [{"zone_name": zone_name, "loaded": False}]},
+    )
+    assert r.json() == {"updated": 1, "skipped": 0}
+    db_session.expire_all()
+    row = (await db_session.execute(select(DNSSecondaryZoneState))).scalar_one()
+    assert row.expires_at is None and row.serial is None
+    from app.services.dns.secondary_health import load_health
+
+    (h,) = await load_health(db_session)
+    assert h.state == "never_transferred"
 
 
 # ── Trash ─────────────────────────────────────────────────────────────────

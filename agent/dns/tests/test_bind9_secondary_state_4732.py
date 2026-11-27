@@ -7,6 +7,7 @@ which must come out as ``None`` and not as a guessed time.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -78,3 +79,49 @@ def test_periodic_secondary_state_reports_what_named_says(
     net = got["example.net"]
     assert net["serial"] is None and net["expires_at"] is None
     assert net["soa_refresh"] is None
+
+
+# ── what a real BIND 9.20.30 secondary printed (captured live, #4732) ─────────
+
+_FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _fx(name: str) -> str:
+    return (_FIXTURES / f"zonestatus_secondary_{name}_4732.txt").read_text()
+
+
+def test_real_zonestatus_output_parses_in_every_live_state() -> None:
+    # In sync, and primary down before / after the first missed refresh: the
+    # same keys; a failed attempt moves ``next refresh`` out, not ``expires``.
+    for name, serial, nxt, exp in (
+        ("in_sync", 2, "2026-11-27T22:17:32+00:00", "2026-11-27T22:26:41+00:00"),
+        ("primary_down", 1, "2026-11-27T22:03:22+00:00", "2026-11-27T22:08:58+00:00"),
+        ("after_failed_refresh", 1, "2026-11-27T22:11:28+00:00", "2026-11-27T22:08:58+00:00"),
+    ):
+        out = _fx(name)
+        assert bind9._zonestatus_serial(out) == serial
+        assert _zonestatus_time(out, "next refresh") == nxt
+        assert _zonestatus_time(out, "expires") == exp
+        assert _zonestatus_time(out, "last loaded") is not None
+
+
+def test_expired_zone_is_reported_not_loaded_instead_of_left_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """named drops an expired secondary copy and then answers ``zone not
+    loaded`` (rc 1). Leaving the zone out of the report froze the control
+    plane on the snapshot taken before it expired."""
+    d = Bind9Driver.__new__(Bind9Driver)
+    d._rendered_secondaries = ["expired.test", "absent.test"]  # type: ignore[attr-defined]
+    monkeypatch.setattr(bind9.shutil, "which", lambda _n: "/usr/sbin/rndc")
+    monkeypatch.setattr(Bind9Driver, "_zone_rndc_scopes", lambda self, z: [[z]])
+    monkeypatch.setattr(Bind9Driver, "_rndc_base", lambda self: ["rndc"])
+
+    def fake_run(_base: list[str], *args: str) -> tuple[int, str, str]:
+        if args[1] == "expired.test.":
+            return 1, "", _fx("expired")
+        return 1, "", "rndc: 'zonestatus' failed: not found\nno matching zone 'absent.test'\n"
+
+    monkeypatch.setattr(bind9, "_rndc_run", fake_run)
+    monkeypatch.setattr(Bind9Driver, "_served_soa", lambda self, z: (None, 0, None, False))
+    assert d.periodic_secondary_state() == [{"zone_name": "expired.test", "loaded": False}]

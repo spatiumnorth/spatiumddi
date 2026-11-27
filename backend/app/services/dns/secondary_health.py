@@ -12,6 +12,10 @@ Everything is derived from the receiving side's own clock arithmetic:
 
 * ``expires_at`` is the last successful refresh plus the SOA expire, so the
   last refresh that worked is ``expires_at - soa_expire``.
+* named holds a zone to a floor of 5 min between refreshes and retries, and a
+  report is judged as of the moment it was taken, not of the moment it is read.
+* An expired copy is dropped by named (``zone not loaded``); the agent reports
+  that as ``loaded: false``, which keeps the last facts and closes the expiry.
 * A refresh is due ``soa_refresh`` after that and is retried every
   ``soa_retry`` while it fails, so the number of attempts missed since is
   ``(now - due) // soa_retry``: an estimate of consecutive failures, not a
@@ -47,9 +51,13 @@ DEFAULT_FAILURE_THRESHOLD = 3  # consecutive missed refresh attempts
 DEFAULT_STALE_MULTIPLE = 3  # x the SOA refresh
 DEFAULT_EXPIRY_DAYS = 1
 
-# Grace after a refresh falls due before it counts as missed: the transfer
-# itself takes time and named does not start it on the dot.
-_MIN_RETRY_SECONDS = 60
+# named never refreshes or retries a zone faster than this, whatever its SOA
+# says (``DNS_ZONE_MINREFRESH`` / ``DNS_ZONE_MINRETRY``, 5 min): a zone with
+# ``refresh 60`` is checked about every 4-5 min, so reading 60 as the cadence
+# counts a healthy zone as four missed refreshes. Observed live on BIND 9.20.
+# The retry also backs off after a failure, so the count past the first miss
+# is an estimate that errs high.
+_BIND_MIN_INTERVAL = 300
 
 
 @dataclass
@@ -80,8 +88,8 @@ def _serial_behind(held: int, best: int) -> int:
 
 
 def _timers(st: DNSSecondaryZoneState, zone: DNSZone) -> tuple[int, int, int]:
-    refresh = st.soa_refresh or int(zone.refresh or 0) or 3600
-    retry = max(st.soa_retry or int(zone.retry or 0) or 600, _MIN_RETRY_SECONDS)
+    refresh = max(st.soa_refresh or int(zone.refresh or 0) or 3600, _BIND_MIN_INTERVAL)
+    retry = max(st.soa_retry or int(zone.retry or 0) or 600, _BIND_MIN_INTERVAL)
     expire = st.soa_expire or int(zone.expire or 0) or 604800
     return refresh, retry, expire
 
@@ -96,8 +104,15 @@ def assess(
     stale_multiple: int = DEFAULT_STALE_MULTIPLE,
     expiry_window: timedelta = timedelta(days=DEFAULT_EXPIRY_DAYS),
 ) -> SecondaryHealth:
+    # The state is the snapshot's: a report is up to one agent interval old, and
+    # judged against ``now`` a refresh that landed after it reads as a miss.
+    now = min(now, st.reported_at)
     refresh, retry, expire = _timers(st, zone)
     last_refresh = st.expires_at - timedelta(seconds=expire) if st.expires_at is not None else None
+    if last_refresh is not None:
+        # After a full transfer named sets the expiry a little LATER than the SOA
+        # expire (800 s on a 600 s one, live), which puts this in the future.
+        last_refresh = min(last_refresh, now)
     # The clock failures are counted from: the last refresh that worked, or
     # the first report of a zone that never has.
     origin = last_refresh if last_refresh is not None else st.created_at
@@ -117,7 +132,9 @@ def assess(
     elif st.expires_at is None and st.serial is None:
         state = "never_transferred"
         detail = f"no copy yet; first seen {_ago(now - st.created_at)} ago"
-    elif expires_in is not None and timedelta(seconds=expires_in) <= expiry_window:
+    elif expires_in is not None and timedelta(seconds=expires_in) <= expiry_window and failed >= 1:
+        # Only once a refresh has been missed: a zone whose whole SOA expire is
+        # inside the window is always "about to expire" on a healthy schedule.
         state = "expiring"
         detail = f"expires in {_ago(timedelta(seconds=expires_in))} without a refresh"
     elif failed >= 1:

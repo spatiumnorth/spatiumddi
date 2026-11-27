@@ -1,0 +1,11 @@
+name: sec.test
+type: secondary
+files: /var/lib/spatium-dns-agent/rendered/zones/sec.test.db
+serial: 1
+nodes: 3
+last loaded: Fri, 27 Nov 2026 21:46:52 GMT
+next refresh: Fri, 27 Nov 2026 22:11:28 GMT
+expires: Fri, 27 Nov 2026 22:08:58 GMT
+secure: no
+dynamic: no
+reconfigurable via modzone: no

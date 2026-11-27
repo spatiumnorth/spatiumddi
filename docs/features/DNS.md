@@ -3629,7 +3629,12 @@ NULL is "unknown", never "fine". Other drivers do not report yet.
 the control plane works the last successful refresh out from it, and a refresh
 is due one SOA refresh after that and retried every SOA retry. Missed attempts
 are therefore an **estimate** from the secondary's own timers; rndc names no
-failure reason, so none is shown. States: `in_sync`, `lagging` (behind the
+failure reason, so none is shown. named never refreshes or retries faster than
+5 minutes whatever the SOA says, so those two timers are floored at 300 s, and a
+report is judged as of the moment it was taken. A copy named has dropped
+(`zone not loaded`, once it expires) is reported `loaded: false`, which closes
+its expiry. `expiring` needs a missed refresh as well as an expiry inside the
+rule's window. Verified against BIND 9.20.30 / 9.20.31. States: `in_sync`, `lagging` (behind the
 newest copy any server of the group holds), `stale`, `failing`, `expiring`,
 `expired`, `never_transferred`.
 

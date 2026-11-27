@@ -6670,8 +6670,10 @@ class Bind9Driver(DriverBase):
         control plane derives the time of the last transfer that worked from
         it; a zone that never transferred has no ``expires`` and reports
         ``null`` for it, never a guess. rndc names no failure reason, so
-        none is reported. A zone ``rndc`` cannot answer for is left out. The
-        reads run on the bounded apply pool.
+        none is reported. A zone named has dropped (``zone not loaded``:
+        expired, or never transferred) is reported ``loaded: false``; one
+        ``rndc`` cannot answer for any other way is left out. The reads run
+        on the bounded apply pool.
         """
         if not shutil.which("rndc"):
             return []
@@ -6679,8 +6681,14 @@ class Bind9Driver(DriverBase):
 
         def read(key: str) -> dict[str, Any] | None:
             scopes = self._zone_rndc_scopes(key + ".")
-            rc, out, _err = _rndc_run(self._rndc_base(), "zonestatus", *scopes[0])
+            rc, out, err = _rndc_run(self._rndc_base(), "zonestatus", *scopes[0])
             if rc != 0:
+                # named drops a secondary copy that expired (and one that has
+                # not transferred yet) and then answers ``zone not loaded``:
+                # that is the state to report, not silence, or the control
+                # plane keeps judging the last snapshot taken before it expired.
+                if "not loaded" in f"{out}\n{err}":
+                    return {"zone_name": key, "loaded": False}
                 return None
             soa = self._served_soa(key + ".")[0]
             return {
