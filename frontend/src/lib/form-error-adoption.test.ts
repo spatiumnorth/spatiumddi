@@ -65,6 +65,32 @@ export function plainErrorComponents(source: string): string[] {
   return out;
 }
 
+// A tinted refusal box whose red is on the box (`border-destructive/30
+// bg-destructive/10`) and on a heading inside it, so no text class sits on the
+// box for the scans above to read: Sync with server's push errors (#4942).
+const BOX_OPENING =
+  /<(?<tag>div|p|section|aside)\b(?<attrs>[^<>]*?\bclassName="(?<cls>[^"]*)"[^<>]*)>/g;
+
+export function plainTintedBoxes(source: string, rel = ""): string[] {
+  if (!source.includes("Modal") && !source.includes("fixed inset")) return [];
+  const out: string[] = [];
+  for (const m of source.matchAll(BOX_OPENING)) {
+    const { attrs, cls } = m.groups as { attrs: string; cls: string };
+    if (!/\bborder-destructive\/\d+/.test(cls)) continue;
+    if (!/\bbg-destructive\/\d+/.test(cls)) continue;
+    if (/role=/.test(attrs)) continue;
+    // A static warning that names a failure mode, not a result.
+    if (rel === "components/ui/delete-choice-modal.tsx") continue;
+    // Only a box that talks about an error: a static warning ("irreversible")
+    // is advice, not a result the operator is waiting on.
+    const inner = source.slice(m.index, m.index + 400);
+    if (!/errors?\b|refus|fail/i.test(inner.slice(m[0].length))) continue;
+    const line = source.slice(0, m.index).split("\n").length;
+    out.push(`line ${line}`);
+  }
+  return out;
+}
+
 // Boxes that are stored or passive state, shown on page load rather than in
 // response to something the operator just did. A role="alert" there would be
 // announced on every load (FleetTab and ClusterUpgradeTab render many rows), so
@@ -105,7 +131,11 @@ const exempted = new Map<string, string[]>();
 for (const f of files(SRC)) {
   const rel = relative(SRC, f);
   const text = readFileSync(f, "utf8");
-  const all = [...plainRefusalBoxes(text, true), ...plainErrorComponents(text)];
+  const all = [
+    ...plainRefusalBoxes(text, true),
+    ...plainErrorComponents(text),
+    ...plainTintedBoxes(text, rel),
+  ];
   const skip = STANDING_STATE[rel]?.names ?? [];
   const hits = all.filter((h) => !skip.includes(h));
   if (hits.length) found.set(rel, hits);
@@ -155,6 +185,14 @@ describe("dialog refusals are announced (#3821)", () => {
     expect(plainRefusalBoxes(hint)).toEqual([]);
     const comp = `\nfunction ConflictList({ c }) {\n  return <div className="text-red-900">{c}</div>;\n}\n`;
     expect(plainErrorComponents(comp)).toEqual(["ConflictList"]);
+  });
+
+  it("detects a tinted refusal box without a role (#4942)", () => {
+    const box = `function XModal(){ return <Modal><div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-3"><div className="text-destructive">Push errors</div></div></Modal>; }`;
+    expect(plainTintedBoxes(box)).toEqual(["line 1"]);
+    expect(
+      plainTintedBoxes(box.replace("<div ", '<div role="alert" ')),
+    ).toEqual([]);
   });
 
   it("no error or refusal box is drawn without a role", () => {

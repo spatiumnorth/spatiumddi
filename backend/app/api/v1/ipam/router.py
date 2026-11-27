@@ -1446,6 +1446,8 @@ _SPACE_BINDING_FIELDS = (
     "ddns_hostname_policy",
     "ddns_ttl",
     "do_not_probe",
+    # Install-wide: which space is the default is not a property of one space.
+    "is_default",
 )
 _BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
     "parent_block_id",
@@ -1460,6 +1462,7 @@ _BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
 # refused as a change.
 _SPACE_NULL_IS_NOOP = frozenset(
     {
+        "is_default",
         "dns_group_ids",
         "dns_additional_zone_ids",
         "ddns_enabled",
@@ -10239,8 +10242,10 @@ async def _backfill_reverse_zones(
 
     resp = BackfillReverseZonesResponse()
     for s in subnets:
-        # Pre-check: does every reverse zone of the subnet's set already exist
-        # (in any group)? If so, it's not a candidate for backfill.
+        # The zones of the subnet's set that exist BEFORE the call, in any
+        # group or view: "created" is only what the call made. Whether the
+        # SUBNET's own group (and view) holds one is decided by the helper
+        # (#4941); a zone of the name elsewhere is not the subnet's.
         try:
             expected = compute_reverse_zone_names(str(s.network))
         except Exception:  # noqa: BLE001
@@ -10249,15 +10254,10 @@ async def _backfill_reverse_zones(
         have = set(
             (
                 await db.execute(
-                    select(DNSZone.name).where(
-                        DNSZone.name.in_(expected), DNSZone.kind == "reverse"
-                    )
+                    select(DNSZone.id).where(DNSZone.name.in_(expected), DNSZone.kind == "reverse")
                 )
             ).scalars()
         )
-        if have.issuperset(expected):
-            resp.skipped += 1
-            continue
         try:
             zones = await ensure_reverse_zones_for_subnet(
                 db, s, user, honour_opt_out=honour_opt_out
@@ -10267,12 +10267,12 @@ async def _backfill_reverse_zones(
             continue
         # Only zones this call made are "created"; one that already existed
         # is returned by the helper too.
-        made = [z for z in zones if z.name not in have]
+        made = [z for z in zones if z.id not in have]
         if made:
             for z in made:
                 resp.created.append({"subnet": str(s.network), "zone": z.name})
         else:
-            # Subnet has no effective DNS group → nothing to do.
+            # Subnet has no effective DNS group, or its zones all exist → nothing to do.
             resp.skipped += 1
     return resp
 

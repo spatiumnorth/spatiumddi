@@ -156,7 +156,10 @@ export function UnifiControllerDetailPage() {
                 : "never"}
             </p>
             {c.last_sync_error && (
-              <div className="mt-2 flex items-start gap-1 rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-xs text-destructive">
+              <div
+                role="alert"
+                className="mt-2 flex items-start gap-1 rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-xs text-destructive"
+              >
                 <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
                 <span className="break-all">{c.last_sync_error}</span>
               </div>

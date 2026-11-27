@@ -1676,7 +1676,10 @@ function NmapScanLiveResult({ scanId }: { scanId: string }) {
   const scan = scanQ.data;
   if (!scan && !perms.isLoading && (!canRead || scanQ.isError)) {
     return (
-      <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-[11px] text-destructive">
+      <div
+        role="alert"
+        className="mt-2 rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-[11px] text-destructive"
+      >
         {!canRead && perms.isError
           ? `The scan started, but its progress was not requested. ${PERMISSIONS_UNREADABLE}`
           : !canRead
@@ -1821,7 +1824,10 @@ function NmapScanLiveResult({ scanId }: { scanId: string }) {
       )}
 
       {scan.status === "failed" && scan.error_message && (
-        <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-1.5 text-destructive">
+        <div
+          role="alert"
+          className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-1.5 text-destructive"
+        >
           {scan.error_message}
         </div>
       )}
