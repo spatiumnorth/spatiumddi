@@ -222,3 +222,76 @@ async def test_mcp_tool(db_session: AsyncSession) -> None:
     )
     assert out["suggestions"][0]["kind"] == "extends_after"
     assert REGISTRY.get("find_dhcp_pool_expansion").default_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_trash_and_param_validation(client: AsyncClient, db_session: AsyncSession) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    # Trashed pool / scope / subnet: 404, nothing suggested.
+    for what in ("pool", "scope", "subnet"):
+        scope = await _scope(db_session, "10.76.0.0/24")
+        pool = await _pool(db_session, scope, "10.76.0.10", "10.76.0.19")
+        target = {
+            "pool": pool,
+            "scope": scope,
+            "subnet": await db_session.get(Subnet, scope.subnet_id),
+        }[what]
+        target.deleted_at = now
+        await db_session.commit()
+        db_session.expunge_all()  # as a later request: no identity-map hit
+        r = await _get(client, db_session, pool)
+        assert r.status_code == 404, (what, r.status_code, r.text)
+
+    # A trashed neighbour (pool, static) is not live, so it neither blocks a
+    # candidate nor is offered as a pool to extend.
+    scope = await _scope(db_session, "10.77.0.0/24")
+    pool = await _pool(db_session, scope, "10.77.0.10", "10.77.0.19")
+    gone = await _pool(db_session, scope, "10.77.0.20", "10.77.0.29")
+    gone.deleted_at = now
+    await db_session.commit()
+    db_session.expunge_all()
+    r = await _get(client, db_session, pool)
+    assert r.status_code == 200
+    first = r.json()["suggestions"][0]
+    assert first["kind"] == "extends_after" and first["end_ip"] == "10.77.0.254"
+
+    # Query bounds are validation errors, not 500s.
+    for params in ({"limit": 0}, {"limit": 51}, {"min_size": 0}, {"limit": "x"}):
+        r = await _get(client, db_session, pool, **params)
+        assert r.status_code == 422, params
+    # Not a uuid.
+    user = await _user(db_session)
+    tok = create_access_token(str(user.id))
+    r = await client.get(
+        "/api/v1/dhcp/pools/nope/expansion-suggestions",
+        headers={"Authorization": f"Bearer {tok}"},
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_trash_permission_and_bad_id(db_session: AsyncSession) -> None:
+    from datetime import UTC, datetime
+
+    from app.services.ai.tools.base import REGISTRY, ToolArgumentError, ToolPermissionDenied
+
+    name = "find_dhcp_pool_expansion"
+    scope = await _scope(db_session, "10.78.0.0/24")
+    pool = await _pool(db_session, scope, "10.78.0.10", "10.78.0.19")
+    admin = await _user(db_session)
+    nobody = await _user(db_session, superadmin=False)
+    with pytest.raises(ToolPermissionDenied):
+        await REGISTRY.call(
+            name, {"pool_id": str(pool.id)}, db=db_session, user=nobody, effective={name}
+        )
+    with pytest.raises(ToolArgumentError):
+        await REGISTRY.call(name, {"pool_id": "nope"}, db=db_session, user=admin, effective={name})
+    pool.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    db_session.expunge_all()
+    out = await REGISTRY.call(
+        name, {"pool_id": str(pool.id)}, db=db_session, user=admin, effective={name}
+    )
+    assert out == {"error": "Pool not found"}

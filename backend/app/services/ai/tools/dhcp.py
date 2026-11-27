@@ -853,7 +853,7 @@ async def find_dhcp_pool_occupancy(
 
 
 class FindDHCPPoolExpansionArgs(BaseModel):
-    pool_id: str = Field(description="UUID of the dynamic IPv4 DHCP pool to extend.")
+    pool_id: uuid.UUID = Field(description="UUID of the dynamic IPv4 DHCP pool to extend.")
     limit: int = Field(default=5, ge=1, le=50)
 
 
@@ -880,7 +880,7 @@ async def find_dhcp_pool_expansion(
 
     from app.services.dhcp.pool_expansion import suggest_pool_expansion
 
-    pool = await db.get(DHCPPool, uuid.UUID(args.pool_id))
+    pool = await db.get(DHCPPool, args.pool_id)
     if pool is None:
         return {"error": "Pool not found"}
     if pool.pool_type != "dynamic":
