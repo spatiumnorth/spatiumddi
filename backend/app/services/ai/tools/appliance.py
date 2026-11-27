@@ -414,6 +414,91 @@ async def find_appliance_storage(
     }
 
 
+# ── find_appliance_disk_health ─────────────────────────────────────
+
+
+class FindApplianceDiskHealthArgs(BaseModel):
+    problems_only: bool = Field(
+        default=True,
+        description=(
+            "Return only appliances with a disk finding (SMART failing, "
+            "remapped / pending sectors, media errors, wear at or above the "
+            "threshold). Set false to list every appliance's disks."
+        ),
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+@register_tool(
+    name="find_appliance_disk_health",
+    permission="superadmin",
+    description=(
+        "Report per-disk SMART health and wear across the appliance fleet "
+        "(superadmin only, #4731): model, serial, SMART overall status, "
+        "temperature, power-on hours, NVMe percentage used and spare, "
+        "reallocated / pending sectors, media errors, with classified "
+        "findings. Use to answer 'is any disk failing or nearly worn out?' "
+        "or 'which node should I replace a disk on?'. IMPORTANT: a disk "
+        "with smart_available=false (a virtual disk, a RAID controller "
+        "volume) is NOT healthy, it is 'not available'; and an appliance "
+        "missing from `appliances` under the default problems_only=true may "
+        "simply not have reported. Every result carries `not_reporting` "
+        "(hostnames with no current reading, whatever the filter). Read-only."
+    ),
+    args_model=FindApplianceDiskHealthArgs,
+    category="admin",
+    default_enabled=True,
+)
+async def find_appliance_disk_health(
+    db: AsyncSession, user: User, args: FindApplianceDiskHealthArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+
+    from app.services.appliance import disk_health  # noqa: PLC0415
+
+    stmt = select(Appliance).where(Appliance.revoked_at.is_(None)).order_by(Appliance.hostname)
+    rows = list((await db.execute(stmt)).scalars().all())
+    out: list[dict[str, Any]] = []
+    not_reporting: list[str] = []
+    for row in rows:
+        ch = row.cluster_health if isinstance(row.cluster_health, dict) else {}
+        block: dict[str, Any] = ch.get("disk_health") or {}
+        reported = disk_health.is_current(block)
+        if not reported:
+            not_reporting.append(row.hostname)
+        findings = disk_health.evaluate_disks(block) if reported else []
+        if args.problems_only and not findings:
+            continue
+        out.append(
+            {
+                "appliance_id": str(row.id),
+                "hostname": row.hostname,
+                "state": row.state,
+                "reported": reported,
+                "smartctl_available": block.get("smartctl_available") if reported else None,
+                "disks": block.get("disks") or [] if reported else [],
+                "worst_severity": disk_health.worst_severity(findings),
+                "findings": [
+                    {
+                        "severity": f.severity,
+                        "kind": f.kind,
+                        "disk": f.disk,
+                        "detail": f.detail,
+                    }
+                    for f in findings
+                ],
+            }
+        )
+    out = out[: args.limit]
+    return {
+        "appliances": out,
+        "count": len(out),
+        "not_reporting": not_reporting,
+        "not_reporting_count": len(not_reporting),
+    }
+
+
 # ── find_appliance_removable ───────────────────────────────────────
 
 

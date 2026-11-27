@@ -388,6 +388,23 @@ RULE_TYPE_CLUSTER_DNS_DEGRADED = "cluster_dns_degraded"
 # not a clean bill of health.
 RULE_TYPE_APPLIANCE_STORAGE_DEGRADED = "appliance_storage_degraded"
 
+# Issue #4731: per-disk SMART health and wear, reported by the supervisor
+# (``cluster_health["disk_health"]``) and classified by
+# ``services/appliance/disk_health``. Subject = the appliance, one event per
+# node however many disks are affected. Two rules, so an operator can route
+# "a disk says it is failing" (act now) apart from "a disk is nearly worn
+# out" (plan a replacement): ``appliance_disk_smart_failing`` (SMART overall
+# health FAILED, pending / reallocated sectors, media errors, exhausted spare
+# capacity) and ``appliance_disk_wear_high`` (``threshold_percent`` of rated
+# life used, default 90). Both seeded DISABLED: SMART is hardware an operator
+# may not care about on a VM host, and a worn-out disk is a standing
+# condition that would notify on day one of an upgrade.
+RULE_TYPE_APPLIANCE_DISK_SMART_FAILING = "appliance_disk_smart_failing"
+# Kept equal to ``services/appliance/disk_health.DEFAULT_WEAR_THRESHOLD``
+# (a test pins it): the Fleet chip and the rule use the same default.
+DEFAULT_DISK_WEAR_THRESHOLD = 90
+RULE_TYPE_APPLIANCE_DISK_WEAR_HIGH = "appliance_disk_wear_high"
+
 # Issue #2240: an appliance's ``/var`` data partition filling. Subject =
 # appliance.
 #
@@ -459,6 +476,8 @@ _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
 _CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
 _APPLIANCE_STORAGE_RULE_NAME = "Appliance storage redundancy degraded"
 _APPLIANCE_DISK_RULE_NAME = "Appliance data partition (/var) filling"
+_APPLIANCE_DISK_SMART_RULE_NAME = "Appliance disk SMART failing"
+_APPLIANCE_DISK_WEAR_RULE_NAME = "Appliance disk wear high"
 # The warning threshold when the rule leaves ``threshold_percent`` NULL.
 _APPLIANCE_DISK_USAGE_DEFAULT_PCT = 80
 # Fixed, like ``_NODE_PRESSURE_FULL_CRITICAL_PCT``: a few points before the
@@ -805,6 +824,8 @@ RULE_TYPES = frozenset(
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
         RULE_TYPE_APPLIANCE_DISK_USAGE,
+        RULE_TYPE_APPLIANCE_DISK_SMART_FAILING,
+        RULE_TYPE_APPLIANCE_DISK_WEAR_HIGH,
         RULE_TYPE_APPLIANCE_HEARTBEAT_STALE,
         RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY,
         RULE_TYPE_DECOM_EXPIRING,
@@ -5324,6 +5345,115 @@ async def _matching_appliance_storage_subjects(
     return matches
 
 
+async def _matching_appliance_disk_health_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    disk_rule: str,
+    wear_threshold: int,
+) -> list[tuple[str, str, str, str]]:
+    """Shared body of the two #4731 disk matchers.
+
+    ``disk_rule`` is ``smart`` or ``wear`` (``disk_health.RULE_*``);
+    ``wear_threshold`` is only the wear rule's own parameter, passed in so
+    the SMART rule never reads a column it does not declare. Reads the
+    ``disk_health`` block the supervisor folds into ``cluster_health`` and
+    classifies it through ``services/appliance/disk_health.evaluate_disks``,
+    the function behind the Fleet chip and the copilot tool.
+
+    Silent on revoked / unapproved rows, on supervisors that never reported
+    (UNKNOWN, not healthy) and on disks that hide SMART ("not available" is
+    not a finding). A reading that DISAPPEARS or goes stale (the hourly
+    collector stopped) holds an OPEN event at its existing severity instead
+    of resolving it: ``evaluate_all`` resolves every subject a pass leaves
+    out, and unknown is not recovered. Same hold as
+    ``appliance_storage_degraded``.
+    """
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+    from app.services.appliance import disk_health  # noqa: PLC0415
+
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.revoked_at.is_(None),
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    open_severity_by_subject: dict[str, str] = {
+        ev.subject_id: ev.severity
+        for ev in (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    matches: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        subject_id = str(a.id)
+        ch = a.cluster_health if isinstance(a.cluster_health, dict) else {}
+        block = ch.get("disk_health")
+        if not disk_health.is_current(block):
+            held = open_severity_by_subject.get(subject_id)
+            if held is None:
+                continue  # never reported / not current: UNKNOWN, not an alarm
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"Disk health on {a.hostname} can no longer be read: the SMART "
+                    "collector has stopped reporting (it may have been rolled back "
+                    "to a slot that predates it). The open alert is left standing "
+                    "because unknown is not recovered.",
+                    held,
+                )
+            )
+            continue
+        findings = disk_health.evaluate_disks(block, wear_threshold=wear_threshold, rule=disk_rule)
+        if not findings:
+            continue
+        severity = disk_health.worst_severity(findings) or rule.severity
+        detail = " ".join(f.detail for f in findings)
+        matches.append((subject_id, a.hostname, f"Disks on {a.hostname}: {detail}", severity))
+    return matches
+
+
+async def _matching_appliance_disk_smart_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str, str]]:
+    """``appliance_disk_smart_failing`` (#4731)."""
+    return await _matching_appliance_disk_health_subjects(
+        db, rule, "smart", DEFAULT_DISK_WEAR_THRESHOLD
+    )
+
+
+async def _matching_appliance_disk_wear_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str, str]]:
+    """``appliance_disk_wear_high`` (#4731)."""
+    # ``is not None``, not ``or``: 0 is a legitimate (if loud) threshold.
+    threshold = (
+        int(rule.threshold_percent)
+        if rule.threshold_percent is not None
+        else DEFAULT_DISK_WEAR_THRESHOLD
+    )
+    return await _matching_appliance_disk_health_subjects(db, rule, "wear", threshold)
+
+
 def _var_usage(cluster_health: Any) -> tuple[int, int] | None:
     """``(used_bytes, total_bytes)`` of a node's ``/var`` from its reported
     ``host_disk_partitions``, or None when there is no usable reading.
@@ -6429,6 +6559,55 @@ async def seed_appliance_storage_alert_rule() -> None:
                 enabled=True,
             )
         )
+        await session.commit()
+
+
+async def seed_appliance_disk_health_alert_rules() -> None:
+    """Seed the two #4731 rules, DISABLED.
+
+    Keyed on ``name``: an operator who enables, retunes, renames or deletes
+    one is never overridden (a deleted one is re-created disabled at next
+    start, like the other startup-seeded infrastructure rules).
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    specs = (
+        (
+            _APPLIANCE_DISK_SMART_RULE_NAME,
+            RULE_TYPE_APPLIANCE_DISK_SMART_FAILING,
+            None,
+            "Fires when an appliance's disk reports SMART overall-health FAILED "
+            "(critical), has sectors waiting to be remapped or already remapped, "
+            "logs media errors, or has run out of spare capacity. Silent on disks "
+            "that hide SMART (virtual disks, RAID volumes) and on supervisors too "
+            "old to report. Auto-resolves when the condition clears; a collector "
+            "that stops reporting holds an open alert rather than resolving it.",
+        ),
+        (
+            _APPLIANCE_DISK_WEAR_RULE_NAME,
+            RULE_TYPE_APPLIANCE_DISK_WEAR_HIGH,
+            DEFAULT_DISK_WEAR_THRESHOLD,
+            "Fires when an SSD / NVMe disk has used at least the threshold "
+            f"percentage of its rated endurance ({DEFAULT_DISK_WEAR_THRESHOLD}% by "
+            "default; critical at 100%). The planned-replacement warning for a "
+            "single-disk node with no RAID to absorb the failure.",
+        ),
+    )
+    async with AsyncSessionLocal() as session:
+        for name, rule_type, threshold, description in specs:
+            if await session.scalar(select(AlertRule).where(AlertRule.name == name)) is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=name,
+                    description=description,
+                    rule_type=rule_type,
+                    severity="warning",
+                    enabled=False,
+                    threshold_percent=threshold,
+                )
+            )
         await session.commit()
 
 
@@ -8784,6 +8963,14 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
                 storage_hits = await _matching_appliance_storage_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in storage_hits]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_DISK_SMART_FAILING:
+                smart_hits = await _matching_appliance_disk_smart_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in smart_hits]
+                subject_type = "appliance"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_DISK_WEAR_HIGH:
+                wear_hits = await _matching_appliance_disk_wear_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in wear_hits]
                 subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_APPLIANCE_DISK_USAGE:
                 disk_hits = await _matching_appliance_disk_usage_subjects(db, rule, now)

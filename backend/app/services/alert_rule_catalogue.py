@@ -477,6 +477,26 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
             )
         ],
     ),
+    (
+        a.RULE_TYPE_APPLIANCE_DISK_SMART_FAILING,
+        "Appliance disk SMART failing",
+        "Infrastructure",
+        [],
+    ),
+    (
+        a.RULE_TYPE_APPLIANCE_DISK_WEAR_HIGH,
+        "Appliance disk wear high",
+        "Infrastructure",
+        [
+            _pct(
+                "Wear threshold (%)",
+                90,
+                "Warns when an SSD / NVMe disk has used at least this share of its "
+                "rated endurance; critical at 100%. Silent on disks that do not "
+                "report wear (spinning disks, virtual disks).",
+            )
+        ],
+    ),
     (a.RULE_TYPE_APPLIANCE_HEARTBEAT_STALE, "Appliance heartbeat lost", "Infrastructure", []),
     (
         a.RULE_TYPE_POSTGRES_INSTANCE_UNHEALTHY,

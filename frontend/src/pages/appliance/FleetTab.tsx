@@ -70,6 +70,7 @@ import {
   storageChipClass,
   storageSeverityClass,
 } from "@/lib/storage-health";
+import { diskChip, fmtPowerOn } from "@/lib/disk-health";
 import { heldByEviction, hostnamesBeingEvicted } from "@/lib/cluster-eviction";
 import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
@@ -2463,6 +2464,7 @@ export function ApplianceTableRow({
             </span>
           )}
           <ClusterStatusChip row={row} />
+          <DiskHealthChip row={row} />
         </div>
         {row.supervisor_version && (
           <div className="text-xs text-muted-foreground">
@@ -2867,6 +2869,8 @@ export function ApplianceDrilldownModal({
         )}
 
         {row.state === "approved" && <ApplianceStorageSection row={row} />}
+
+        {row.state === "approved" && <ApplianceDiskHealthSection row={row} />}
 
         {row.state === "approved" && <ApplianceRemovableSection row={row} />}
 
@@ -3856,6 +3860,135 @@ function ApplianceRemovableSection({ row }: { row: ApplianceRow }) {
             setEjecting(null);
           }}
         />
+      )}
+    </div>
+  );
+}
+
+// #4731 — per-node disk-health chip. Nothing for a node that never reported;
+// "n/a" (neutral, never green) for one whose disks hide SMART.
+function DiskHealthChip({ row }: { row: ApplianceRow }) {
+  if (row.state !== "approved") return null;
+  const chip = diskChip(row);
+  if (!chip) return null;
+  return (
+    <span
+      className={cn(_CLUSTER_CHIP_BASE, chip.className)}
+      title="SMART health and wear, read hourly on the node"
+    >
+      {chip.label}
+    </span>
+  );
+}
+
+function ApplianceDiskHealthSection({ row }: { row: ApplianceRow }) {
+  const reading = row.cluster_health?.disk_health;
+  if (!row.disk_reported || !reading) return null;
+  const disks = reading.disks ?? [];
+  const findings = row.disk_findings ?? [];
+  return (
+    <div className="border-t pt-4">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Disk health
+      </h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        SMART data read hourly on the node. A disk that hides SMART (a virtual
+        disk, a RAID controller volume) shows &quot;not available&quot; — that
+        is not the same as healthy.
+      </p>
+      {findings.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {findings.map((f, i) => (
+            <li
+              key={`${f.kind}-${f.disk}-${i}`}
+              className={cn(
+                "rounded-md border px-2 py-1.5 text-[11px]",
+                storageSeverityClass(f.severity),
+              )}
+            >
+              {f.detail}
+            </li>
+          ))}
+        </ul>
+      )}
+      {!reading.smartctl_available ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Not available: smartmontools is not installed on this node.
+        </p>
+      ) : disks.length === 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Not available: no physical disks were found.
+        </p>
+      ) : (
+        <div className="mt-2 overflow-x-auto rounded-md border">
+          <table className="w-full text-xs">
+            <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-1.5 text-left font-medium">Disk</th>
+                <th className="px-3 py-1.5 text-left font-medium">Health</th>
+                <th className="px-3 py-1.5 text-left font-medium">Temp</th>
+                <th className="px-3 py-1.5 text-left font-medium">Wear</th>
+                <th className="px-3 py-1.5 text-left font-medium">
+                  Realloc / pending
+                </th>
+                <th className="px-3 py-1.5 text-left font-medium">Media err</th>
+                <th className="px-3 py-1.5 text-left font-medium">Power-on</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {disks.map((d) => {
+                const sev =
+                  findings.find((f) => f.disk === d.name)?.severity ?? null;
+                return (
+                  <tr key={d.name}>
+                    <td className="px-3 py-1.5">
+                      <div className="font-mono">{d.name}</div>
+                      <div className="text-[10px] text-muted-foreground">
+                        {[d.model, d.serial].filter(Boolean).join(" · ")}
+                      </div>
+                    </td>
+                    <td className="px-3 py-1.5">
+                      {d.smart_available ? (
+                        <span
+                          className={cn(
+                            "inline-flex rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                            storageSeverityClass(
+                              d.smart_passed === false ? "critical" : sev,
+                            ),
+                          )}
+                        >
+                          {d.smart_passed === false ? "FAILED" : "passed"}
+                        </span>
+                      ) : (
+                        <span className="text-muted-foreground">
+                          not available
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      {d.temperature_c == null ? "—" : `${d.temperature_c} °C`}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      {d.percentage_used == null
+                        ? "—"
+                        : `${d.percentage_used}% used`}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      {d.reallocated_sectors == null &&
+                      d.pending_sectors == null
+                        ? "—"
+                        : `${d.reallocated_sectors ?? "?"} / ${d.pending_sectors ?? "?"}`}
+                    </td>
+                    <td className="px-3 py-1.5">{d.media_errors ?? "—"}</td>
+                    <td className="px-3 py-1.5">
+                      {fmtPowerOn(d.power_on_hours)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );

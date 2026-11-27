@@ -1,0 +1,3 @@
+### Added
+
+- The Fleet view now shows per-disk SMART health and wear for each appliance: a disk-health chip on every node and a table in the node drilldown with the disk model and serial, SMART status, temperature, percentage of rated life used, reallocated and pending sectors, media errors and power-on hours. A host timer reads it hourly with `smartctl` (smartmontools is now in the appliance image) and the supervisor reports it; nothing leaves the node. Disks that hide SMART, such as a VM's virtual disk, show "not available" rather than healthy. Two new alert rules, **Appliance disk SMART failing** and **Appliance disk wear high** (default 90%), ship disabled, and the Copilot gains `find_appliance_disk_health`. (#4731)

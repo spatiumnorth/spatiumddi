@@ -4234,6 +4234,136 @@ def read_storage_health() -> dict[str, object]:
     }
 
 
+# ── Issue #4731 — per-disk SMART / wear ───────────────────────────────
+#
+# The host runner ``spatiumddi-smart-collect`` (root, hourly timer) runs
+# ``smartctl --json -a`` per physical disk and writes a trimmed document
+# here; reading SMART needs a raw-device ioctl the supervisor's uid does
+# not have. This reduces that document to the fields the Fleet view and the
+# disk alert rules use. Interpretation lives here and on the control plane,
+# never in the runner.
+_DISK_SMART_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/disk-smart.json")
+
+# A document older than this was written by a timer that has stopped (the
+# runner fires hourly); reporting it would show a reading nobody took today.
+_DISK_SMART_MAX_AGE_SECONDS = 3 * 3600
+
+# ATA attribute ids. 5 / 197 are the sectors that are, or are about to be,
+# remapped; the next three each report remaining life as a normalised value
+# counting down from 100, depending on the vendor.
+_ATA_REALLOCATED = 5
+_ATA_PENDING = 197
+_ATA_LIFE_LEFT_IDS = (177, 231, 233)
+
+
+def _as_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _reduce_smart_disk(entry: dict[str, object]) -> dict[str, object]:
+    """One disk's compact record from a runner entry.
+
+    ``smart_available`` is False for a disk that hides SMART (a VM's virtual
+    disk, a RAID controller's volume). That is "not available", and every
+    consumer renders it that way: absence of a reading is never a clean
+    bill of health.
+    """
+    smart = entry.get("smart")
+    smart = smart if isinstance(smart, dict) else {}
+    device = smart.get("device") if isinstance(smart.get("device"), dict) else {}
+    protocol = str(device.get("protocol") or "").lower() or None
+    capacity = smart.get("user_capacity")
+    size = _as_int(capacity.get("bytes")) if isinstance(capacity, dict) else None
+    status = smart.get("smart_status")
+    passed = status.get("passed") if isinstance(status, dict) else None
+    nvme = smart.get("nvme_smart_health_information_log")
+    nvme = nvme if isinstance(nvme, dict) else {}
+    table = (
+        smart.get("ata_smart_attributes", {}).get("table")
+        if isinstance(smart.get("ata_smart_attributes"), dict)
+        else None
+    )
+    attrs: dict[int, dict[str, object]] = {}
+    for a in table if isinstance(table, list) else []:
+        aid = _as_int(a.get("id")) if isinstance(a, dict) else None
+        if aid is not None:
+            attrs[aid] = a
+
+    def raw(attr_id: int) -> int | None:
+        a = attrs.get(attr_id)
+        r = a.get("raw") if a else None
+        return _as_int(r.get("value")) if isinstance(r, dict) else None
+
+    used = _as_int(nvme.get("percentage_used")) if nvme else None
+    if used is None:
+        rotation = smart.get("rotation_rate")
+        # An SSD reports rotation_rate 0 (or none at all); a spinning disk's
+        # "life left" attributes mean something else, so they are not read.
+        if rotation in (0, None):
+            for aid in _ATA_LIFE_LEFT_IDS:
+                left = _as_int(attrs[aid].get("value")) if aid in attrs else None
+                if left is not None and 0 <= left <= 100:
+                    used = 100 - left
+                    break
+    temp = smart.get("temperature")
+    poh = smart.get("power_on_time")
+    return {
+        "name": str(entry.get("name") or "?"),
+        "model": smart.get("model_name") or smart.get("model_family"),
+        "serial": smart.get("serial_number"),
+        "firmware": smart.get("firmware_version"),
+        "protocol": protocol,
+        "size_bytes": size,
+        "smart_available": isinstance(passed, bool),
+        "smart_passed": passed if isinstance(passed, bool) else None,
+        "temperature_c": _as_int(temp.get("current")) if isinstance(temp, dict) else None,
+        "power_on_hours": _as_int(poh.get("hours")) if isinstance(poh, dict) else None,
+        "percentage_used": used,
+        "available_spare": _as_int(nvme.get("available_spare")) if nvme else None,
+        "available_spare_threshold": (
+            _as_int(nvme.get("available_spare_threshold")) if nvme else None
+        ),
+        "media_errors": _as_int(nvme.get("media_errors")) if nvme else None,
+        "reallocated_sectors": raw(_ATA_REALLOCATED),
+        "pending_sectors": raw(_ATA_PENDING),
+    }
+
+
+def read_disk_health() -> dict[str, object] | None:
+    """Per-disk SMART snapshot for the Fleet view (#4731).
+
+    Shape::
+
+        {"smartctl_available": bool, "collected_at": <epoch>, "disks": [...]}
+
+    ``None`` when the runner's document is absent, unreadable or stale: a
+    slot too old to ship the runner, a timer that stopped, a non-appliance
+    host. That is UNKNOWN (the key is left out of the heartbeat), never "no
+    disks" and never "healthy". ``smartctl_available`` False means the host
+    has no smartmontools, which every surface renders as "not available".
+    """
+    try:
+        doc = json.loads(_DISK_SMART_SIDECAR.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    collected = _as_int(doc.get("collected_at"))
+    if collected is None or time.time() - collected > _DISK_SMART_MAX_AGE_SECONDS:
+        return None
+    disks = doc.get("disks")
+    return {
+        "smartctl_available": doc.get("smartctl") is True,
+        "collected_at": collected,
+        "disks": [
+            _reduce_smart_disk(e) for e in (disks if isinstance(disks, list) else [])
+            if isinstance(e, dict)
+        ],
+    }
+
+
 # ── Issue #989 item 3 — removable (USB) disks ────────────────────────
 #
 # The single-appliance operator with no NAS and no cloud account backs
@@ -4973,6 +5103,12 @@ def collect() -> dict[str, object]:
             "storage": read_storage_health(),
             "removable": read_removable_state(),
         }
+        # #4731 — per-disk SMART / wear. Left out when unknown (see
+        # ``read_disk_health``), so an old backend ignores it and a missing
+        # reading is never mistaken for a healthy one.
+        _disk_health = read_disk_health()
+        if _disk_health is not None:
+            _extra["disk_health"] = _disk_health
         _network = read_network_state()
         if _network is not None:
             _extra["network"] = _network
