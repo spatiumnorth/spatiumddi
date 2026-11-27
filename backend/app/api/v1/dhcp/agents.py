@@ -3172,4 +3172,8 @@ async def agent_discover_rates(
         clients=[ClientReading(c.mac, c.discovers, c.giaddr) for c in body.clients],
         relays=[RelayReading(r.giaddr, r.discovers, r.distinct_macs) for r in body.relays],
     )
+    # ``get_db`` never commits and ``record_rates`` / ``claim_batch`` do not
+    # either: without this the 200 below is a lie and the batch is rolled back
+    # when the session closes (the table stays empty, the alert never fires).
+    await db.commit()
     return counts

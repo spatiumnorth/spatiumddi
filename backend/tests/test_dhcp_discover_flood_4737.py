@@ -168,6 +168,34 @@ async def test_ingest_stores_the_latest_reading(
     assert by_kind["relay"].distinct_macs == 150
 
 
+async def test_ingest_is_committed_not_just_flushed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A second connection must see the reading once the 200 is returned.
+
+    The other ingest tests read through the same session the handler used, so
+    they pass whether or not the handler commits; the handler once did not,
+    and every batch was rolled back when its request session closed.
+    """
+    from app.db import AsyncSessionLocal
+
+    srv = await _live_server(db_session)
+    sid = srv.id
+    r = await _post(
+        client,
+        srv,
+        {"window_seconds": 60, "clients": [{"mac": MAC, "discovers": 90, "giaddr": RELAY}]},
+    )
+    assert r.status_code == 200, r.text
+    async with AsyncSessionLocal() as other:
+        n = (
+            await other.execute(
+                select(DHCPDiscoverRate).where(DHCPDiscoverRate.server_id == sid)
+            )
+        ).scalars().all()
+    assert [x.subject for x in n] == [MAC]
+
+
 async def test_ingest_replaces_rather_than_accumulates_and_ignores_an_older_window(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
