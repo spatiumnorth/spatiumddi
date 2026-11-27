@@ -131,7 +131,10 @@ def _disk_findings(disk: dict[str, Any], wear_threshold: int) -> list[DiskFindin
         )
     spare = _num(disk.get("available_spare"))
     spare_min = _num(disk.get("available_spare_threshold"))
-    if spare is not None and spare_min is not None and spare <= spare_min:
+    # A threshold of 0 means the controller declares none (QEMU's emulated NVMe
+    # reports spare 0 / threshold 0 on a healthy disk); a real drive that is
+    # out of spare raises its own critical warning, which is ``smart_failed``.
+    if spare is not None and spare_min and spare <= spare_min:
         out.append(
             DiskFinding(
                 "critical",

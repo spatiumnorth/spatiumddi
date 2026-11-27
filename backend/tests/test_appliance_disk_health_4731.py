@@ -90,6 +90,14 @@ def test_wear_threshold_and_exhausted_spare() -> None:
     assert [(x.kind, x.severity) for x in spare] == [("spare_low", "critical")]
 
 
+def test_a_zero_spare_threshold_is_no_threshold() -> None:
+    # QEMU's emulated NVMe reports spare 0 / threshold 0 on a healthy disk;
+    # live-tested on a VM, where it raised a critical "0% spare" finding next
+    # to a "passed" health chip. A drive that is really out of spare says so
+    # itself (critical_warning -> smart_status.passed False -> smart_failed).
+    assert dh.evaluate_disks(_block(_disk(available_spare=0, available_spare_threshold=0))) == []
+
+
 def test_a_disk_that_hides_smart_is_not_available_and_not_a_finding() -> None:
     vm = _disk(
         "vda",
