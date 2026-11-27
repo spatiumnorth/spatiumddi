@@ -125,3 +125,116 @@ async def test_preset_value_renders_in_kea_class(db_session: AsyncSession) -> No
     assert opt["data"] == "0104ac101e03"
     defs = {d["code"]: d for d in cfg["Dhcp4"]["option-def"]}
     assert defs[43]["type"] == "binary"
+
+
+async def _plain_user(db: AsyncSession, permissions: list[dict[str, str]] | None = None) -> str:
+    from app.models.auth import Group, Role
+
+    u = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="T",
+        hashed_password=hash_password("x"),
+        is_superadmin=False,
+        is_active=True,
+    )
+    u.groups = []
+    if permissions:
+        role = Role(name=f"r-{uuid.uuid4().hex[:8]}", permissions=permissions)
+        group = Group(name=f"g-{uuid.uuid4().hex[:8]}")
+        group.roles = [role]
+        u.groups = [group]
+        db.add_all([role, group])
+    db.add(u)
+    await db.flush()
+    token = create_access_token(str(u.id))
+    await db.commit()
+    return token
+
+
+async def test_api_permission_and_input_errors(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """No dhcp_scope read -> 403 (never 500, never the catalogue); anonymous ->
+    401; a reader gets 422 for empty / excess / malformed controllers."""
+    nobody = {"Authorization": f"Bearer {await _plain_user(db_session)}"}
+    for url in (
+        "/api/v1/dhcp/vendor-presets",
+        "/api/v1/dhcp/vendor-presets/unifi/encode?controller=172.16.30.3",
+    ):
+        assert (await client.get(url)).status_code == 401
+        assert (await client.get(url, headers=nobody)).status_code == 403
+
+    reader = {
+        "Authorization": "Bearer "
+        + await _plain_user(db_session, [{"action": "read", "resource_type": "dhcp_scope"}])
+    }
+    base = "/api/v1/dhcp/vendor-presets"
+    assert (await client.get(base, headers=reader)).status_code == 200
+    # Unknown preset is 404 before the address is even looked at.
+    assert (await client.get(f"{base}/zzz/encode?controller=x", headers=reader)).status_code == 404
+    for qs in (
+        "",  # none
+        "?controller=",  # blank
+        "?controller=172.16.30.3&controller=172.16.30.4",  # UniFi takes one
+        "?controller=2001:db8::1",  # IPv6
+        "?controller=172.16.30.3/24",
+    ):
+        r = await client.get(f"{base}/unifi/encode{qs}", headers=reader)
+        assert r.status_code == 422, (qs, r.status_code)
+        assert r.json()["detail"]
+    many = "&".join(f"controller=10.0.0.{i}" for i in range(1, 65))
+    r = await client.get(f"{base}/cisco-wlc/encode?{many}", headers=reader)
+    assert r.status_code == 422
+    ok = "&".join(f"controller=10.0.0.{i}" for i in range(1, 64))
+    r = await client.get(f"{base}/cisco-wlc/encode?{ok}", headers=reader)
+    assert r.status_code == 200 and r.json()["byte_length"] == 254
+
+
+async def test_mcp_tool_matches_rest_and_needs_dhcp_scope_read(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.tools import REGISTRY
+    from app.services.ai.tools.base import ToolPermissionDenied
+
+    u = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="T",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(u)
+    await db_session.flush()
+    name = "find_dhcp_vendor_presets"
+    out = await REGISTRY.call(
+        name,
+        {"preset_id": "unifi", "controllers": ["172.16.30.3"]},
+        db=db_session,
+        user=u,
+        effective={name},
+    )
+    assert out["encoded"]["value"] == "0104ac101e03"
+    out = await REGISTRY.call(
+        name,
+        {"preset_id": "unifi", "controllers": ["nope"]},
+        db=db_session,
+        user=u,
+        effective={name},
+    )
+    assert "not an IPv4" in out["error"] and "encoded" not in out
+    out = await REGISTRY.call(name, {"preset_id": "zzz"}, db=db_session, user=u, effective={name})
+    assert out["error"] == "Unknown vendor preset"
+
+    nobody = User(
+        username=f"u-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="T",
+        hashed_password=hash_password("x"),
+        is_superadmin=False,
+    )
+    nobody.groups = []
+    db_session.add(nobody)
+    await db_session.flush()
+    with pytest.raises(ToolPermissionDenied):
+        await REGISTRY.call(name, {}, db=db_session, user=nobody, effective={name})
