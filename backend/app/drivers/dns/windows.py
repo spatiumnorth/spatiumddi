@@ -296,7 +296,7 @@ class WindowsDNSDriver(DNSDriver):
         host = getattr(server, "host", None)
         if not host:
             raise RuntimeError("WindowsDNSDriver: server.host is required")
-        port = getattr(server, "api_port", None) or 53
+        port = getattr(server, "port", None) or 53
         rtype = change.record.record_type.upper()
 
         # TSIG is not modelled on DNSServer (the getattr shims were always None;
@@ -589,11 +589,12 @@ class WindowsDNSDriver(DNSDriver):
         host = getattr(server, "host", None)
         if not host:
             raise RuntimeError("WindowsDNSDriver.pull_zone_records: server.host is required")
-        port = getattr(server, "api_port", None) or 53
+        port = getattr(server, "port", None) or 53
         return await axfr_zone_records(
             host=host,
             port=port,
             zone_name=zone_name,
+            connect_timeout=5,
             log_driver="windows_dns",
             server_id=str(getattr(server, "id", "")),
             tsig=tsig,
