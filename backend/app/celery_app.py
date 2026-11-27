@@ -239,6 +239,7 @@ celery_app = SpatiumCelery(
         "app.tasks.wol_scheduler",
         "app.tasks.wol_calendar",
         "app.tasks.agent_bundles",
+        "app.tasks.dhcp_agent_bundles",
     ],
 )
 
@@ -337,6 +338,8 @@ celery_app.conf.update(
         # latency-bound ipam/dns/dhcp work, and so an operator can give
         # them a dedicated worker (concurrency 1, its own memory cap).
         "app.tasks.agent_bundles.*": {"queue": "bundles"},
+        # #1111 — DHCP agent bundle renders share the bundles queue.
+        "app.tasks.dhcp_agent_bundles.*": {"queue": "bundles"},
     },
     beat_schedule={
         # #1111 — every 30 s, enqueue a render for any enabled agent-based
@@ -345,6 +348,13 @@ celery_app.conf.update(
         # one after commit; this is the belt and braces for a lost broker
         # message or a worker restart mid-render, bounding staleness to
         # one tick — the class of the long-poll's own 12 s wake tick.
+        # #1111 — DHCP: every 15 s, render any agent server whose stored
+        # bundle is missing, behind its dirty sequence or older than
+        # ``dhcp_agent_bundle_refresh_seconds``.
+        "dhcp-agent-bundle-sweep": {
+            "task": "app.tasks.dhcp_agent_bundles.render_stale_sweep",
+            "schedule": schedule(run_every=15.0),
+        },
         "dns-agent-bundle-sweep": {
             "task": "app.tasks.agent_bundles.render_missing_sweep",
             "schedule": schedule(run_every=30.0),

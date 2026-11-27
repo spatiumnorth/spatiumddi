@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import hmac
 import ipaddress
+import json
 import os
 import time
 import uuid
@@ -30,6 +31,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB
 from app.api.v1.dhcp._audit import write_audit
+from app.config import settings
 from app.core.agent_wake import (
     WAKE_TICK_SECONDS,
     WakeResult,
@@ -44,7 +46,6 @@ from app.core.dns_names import sanitize_hostname
 from app.core.http_etag import etag_matches, format_etag
 from app.core.jwt_compat import JWTError
 from app.core.versions import is_installed_target
-from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
     DHCPLease,
@@ -87,13 +88,19 @@ from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
 from app.services.appliance.syslog import syslog_bundle
+from app.services.dhcp.agent_bundle import (
+    RENDERED_BY_API,
+    enqueue_renders,
+    is_current,
+    load_stored,
+    render_and_store,
+)
 from app.services.dhcp.agent_token import (
     hash_token,
     mint_agent_token,
     needs_rotation,
     verify_agent_token,
 )
-from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.ha_members import kea_ha_members
 from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
@@ -760,6 +767,7 @@ async def agent_config_longpoll(
         return duplicate_instance_response("DHCP", server.name)
 
     deadline = asyncio.get_running_loop().time() + LONGPOLL_TIMEOUT_SECONDS
+    stale_since: float | None = None
     async with wake_subscription(dhcp_wake_channels(server)) as wake:
         # #358 — subscribe before the first bundle build so a committed +
         # published config change wakes this poll immediately; Redis-down
@@ -789,14 +797,47 @@ async def agent_config_longpoll(
                 # agent's leftover) or a second live agent. Either way it must
                 # not ship ops; the new owner's polls do.
                 return duplicate_instance_response("DHCP", server.name)
-            bundle = await build_config_bundle(db, server)
+            # #1111 — the bundle is rendered by the worker and served as stored;
+            # the poll only builds it (inline) when no current one arrives
+            # within the grace below.
+            stored = await load_stored(db, server.id)
+            if not is_current(server, stored):
+                now = asyncio.get_running_loop().time()
+                if stale_since is None:
+                    stale_since = now
+                    await enqueue_renders([server.id])
+                if now - stale_since < settings.dhcp_agent_bundle_inline_grace_seconds and (
+                    deadline - now > 0
+                ):
+                    # Hold for the worker's render; it wakes this channel when
+                    # it stores one. Nothing is pending, end the read txn.
+                    await db.commit()
+                    if await wake.wait(min(1.0, deadline - now)) == WakeResult.SHUTDOWN:
+                        deadline = asyncio.get_running_loop().time()
+                    continue
+                try:
+                    await render_and_store(db, server, rendered_by=RENDERED_BY_API)
+                    await db.commit()
+                    stored = await load_stored(db, server.id)
+                except Exception:
+                    await db.rollback()
+                    # The rollback expired everything this pass loaded.
+                    await refresh_agent_server(db, server)
+                    stored = await load_stored(db, server.id)
+                    if stored is None:
+                        raise
+                    # Cache fallback (non-negotiable #5): an older stored
+                    # bundle beats failing the poll.
+                    logger.exception("dhcp_agent_bundle_inline_render_failed")
+            stale_since = None
+            assert stored is not None  # noqa: S101 — is_current or the render above
             # #3241: a bundle with no failover block tells the agent to run no
             # HA hook, so it stops reporting an HA state. Whatever state it
             # reported last describes a relationship the server has left (its
             # group's mode, its group, its partner or its peer URL changed), and
             # every way out of HA ends in this bundle, so it is forgotten here.
             # On every pass: a poll that answers 304 clears a stale row too.
-            if bundle.failover is None and _forget_ha_state(server):
+            if not stored.has_failover and _forget_ha_state(server):
                 await db.commit()
                 logger.info("dhcp_ha_state_cleared", server_id=str(server.id), why="no_ha_hook")
             # Issue #153 — fold the rendered snmpd.conf hash into the ETag
@@ -888,7 +929,10 @@ async def agent_config_longpoll(
                 f"|resolver:{int(bool(resolver_block.get('enabled')))}"
                 f":{resolver_block.get('config_hash', '')}"
             )
-            etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
+            etag = (
+                "sha256:"
+                + hashlib.sha256(f"{stored.bundle_etag}|{fleet_marker}".encode()).hexdigest()
+            )
 
             # Pending ops fast-path. Issue #182: paused servers don't ship
             # ops — they accumulate as ``pending`` and dispatch as soon as
@@ -922,243 +966,7 @@ async def agent_config_longpoll(
                 return {
                     "server_id": str(server.id),
                     "etag": etag,
-                    "bundle": {
-                        "server_name": bundle.server_name,
-                        "driver": bundle.driver,
-                        "roles": list(bundle.roles),
-                        # Issue #365 — server-wide Kea interfaces-config. The
-                        # agent's render_kea reads ``dhcp_socket_type`` here;
-                        # ``raw`` (from group socket_mode "direct") lets Kea
-                        # receive broadcast DISCOVERs from directly-attached
-                        # clients, ``udp`` is relay-only. Folded into the
-                        # bundle ETag so a mode change wakes the long-poll.
-                        "server": {
-                            "interfaces": ["*"],
-                            "dhcp_socket_type": bundle.dhcp_socket_type,
-                            # #637 — group-wide Kea lease cache. Scopes may
-                            # override (see the per-scope keys below); the agent
-                            # falls back to these when the scope value is null.
-                            "lease_cache_threshold": bundle.lease_cache_threshold,
-                            "lease_cache_max_age": bundle.lease_cache_max_age,
-                            # #980 — Kea's packet-worker pool. Serialized here
-                            # as well as folded into the ETag; those are
-                            # separate steps and skipping this one is the #430
-                            # silent no-op the lease-cache keys above call out.
-                            "kea_thread_pool_size": bundle.kea_thread_pool_size,
-                            "kea_packet_logging": bundle.kea_packet_logging,
-                        },
-                        "scopes": [
-                            {
-                                "subnet_cidr": s.subnet_cidr,
-                                "lease_time": s.lease_time,
-                                # #430 — min/max were settable + in the ETag but
-                                # never shipped, so the agent never rendered
-                                # min/max-valid-lifetime (silent no-op).
-                                "min_lease_time": s.min_lease_time,
-                                "max_lease_time": s.max_lease_time,
-                                # #637 — per-scope lease-cache override; null =
-                                # inherit the group value from the "server" block
-                                # above. Serialized here as well as folded into
-                                # the ETag: those are separate steps, and skipping
-                                # this one is exactly the #430 silent no-op.
-                                "lease_cache_threshold": s.lease_cache_threshold,
-                                "lease_cache_max_age": s.lease_cache_max_age,
-                                "options": s.options,
-                                # Issue #330 — the agent's render_kea branches on
-                                # these to emit a Dhcp6/subnet6 entry for v6
-                                # scopes. Without them every scope rendered as
-                                # Dhcp4 regardless of family. v6_address_mode
-                                # gates whether the v6 subnet serves pools /
-                                # options (stateful | stateless | slaac).
-                                "address_family": s.address_family,
-                                "v6_address_mode": s.v6_address_mode,
-                                # Issue #337 — relay-agent IPs the agent's
-                                # render_kea emits as ``relay: {"ip-addresses":
-                                # [...]}`` so a centralized Kea matches this
-                                # scope on giaddr for relayed remote subnets.
-                                "relay_addresses": list(s.relay_addresses),
-                                # #2731: the classes of the PXE profile bound
-                                # to this scope. The agent has Kea evaluate
-                                # them for this subnet alone; rendered for the
-                                # whole server, one scope's profile booted the
-                                # PXE clients of every scope on it.
-                                "pxe_class_names": list(s.pxe_class_names),
-                                "pools": [
-                                    {
-                                        "start_ip": p.start_ip,
-                                        "end_ip": p.end_ip,
-                                        "pool_type": p.pool_type,
-                                        # DHCPv6 prefix delegation (#368) — the
-                                        # agent's render_kea reads these for
-                                        # pool_type == "pd". Null for v4 / range
-                                        # pools.
-                                        "pd_prefix": p.pd_prefix,
-                                        "delegated_length": p.delegated_length,
-                                        "excluded_prefix": p.excluded_prefix,
-                                        "class_restriction": p.class_restriction,
-                                        # #858 — per-pool option overrides are
-                                        # settable and ETag-hashed, and the
-                                        # control-plane driver renders them, but
-                                        # were omitted here: the same silent drop
-                                        # #430 hit for statics' options_override
-                                        # (serialized on the very next block).
-                                        "options_override": p.options_override,
-                                    }
-                                    for p in s.pools
-                                ],
-                                "statics": [
-                                    {
-                                        "ip_address": st.ip_address,
-                                        "mac_address": st.mac_address,
-                                        "hostname": st.hostname,
-                                        # #430 — client_id + options_override
-                                        # are settable, ETag-hashed, and the
-                                        # agent renderer reads them, but were
-                                        # omitted here: a client-id-keyed
-                                        # reservation silently fell back to MAC
-                                        # and per-host options were dropped.
-                                        "client_id": st.client_id,
-                                        "options_override": st.options_override,
-                                        # DHCPv6 DUID (#368) — keys the v6
-                                        # reservation instead of the MAC.
-                                        "duid": st.duid,
-                                    }
-                                    for st in s.statics
-                                ],
-                            }
-                            for s in bundle.scopes
-                        ],
-                        "client_classes": [
-                            {
-                                "name": c.name,
-                                "match_expression": c.match_expression,
-                                # ``options`` stays for an agent older than
-                                # #1229, which renders it into both daemons.
-                                # A newer agent reads ``address_family`` and
-                                # the per-family maps instead. It carries the
-                                # Dhcp4 share, not the whole map: an ``ipv6``
-                                # or ``dual`` class may now hold an IPv6
-                                # ``dns-servers``, which an old agent would
-                                # put into Dhcp4 and have the config refused.
-                                "options": c.options_v4,
-                                "address_family": c.address_family,
-                                "options_v4": c.options_v4,
-                                "options_v6": c.options_v6,
-                            }
-                            for c in bundle.client_classes
-                        ],
-                        # #858 — PXE + phone classes were folded into the bundle
-                        # ETag and rendered by the control-plane driver, but
-                        # never serialized here. The consequence was worse than a
-                        # plain omission: editing a PXE profile DID move the
-                        # ETag, so it broke every agent's /config long-poll and
-                        # they all re-fetched — a payload with no PXE classes in
-                        # it, which re-rendered byte-identical config. A
-                        # guaranteed no-op resync of the whole group, and a
-                        # feature (README-advertised PXE provisioning profiles)
-                        # that could never reach agent-managed Kea at all.
-                        "pxe_classes": [
-                            {
-                                "name": p.name,
-                                "match_expression": p.match_expression,
-                                "next_server": p.next_server,
-                                "boot_file_name": p.boot_file_name,
-                                "is_ipxe_chain": p.is_ipxe_chain,
-                            }
-                            for p in bundle.pxe_classes
-                        ],
-                        "phone_classes": [
-                            {
-                                "name": c.name,
-                                "match_expression": c.match_expression,
-                                "options": c.options,
-                            }
-                            for c in bundle.phone_classes
-                        ],
-                        # #700 — fingerprint-driven device policies. Serialized
-                        # here for the reason #858 documents one block up: a
-                        # class that is ETag-hashed and rendered by the
-                        # control-plane driver but absent from the wire cannot
-                        # reach agent-managed Kea, which is how both the
-                        # appliance and the Compose stack run DHCP — i.e. the
-                        # feature would work nowhere it actually runs.
-                        "device_policy_classes": [
-                            {
-                                "name": c.name,
-                                "match_expression": c.match_expression,
-                                "options": c.options,
-                                "lease_time": c.lease_time,
-                            }
-                            for c in bundle.device_policy_classes
-                        ],
-                        # #858 — Kea types a raw ``code:NN`` option as BINARY,
-                        # so an operator's string value ("not a valid string of
-                        # hexadecimal digits") fails the WHOLE config. The real
-                        # type comes from the VoIP / option-code catalogues,
-                        # which live in this package and not the agent's, so the
-                        # control plane resolves the definitions once and the
-                        # agent emits them verbatim — rather than keeping a
-                        # second copy of the table, which is the drift that
-                        # caused #856.
-                        "option_defs": option_defs_for_option_maps(
-                            [bundle.options.options]
-                            + [s.options for s in bundle.scopes]
-                            + [p.options_override for s in bundle.scopes for p in s.pools]
-                            + [st.options_override for s in bundle.scopes for st in s.statics]
-                            + [c.options for c in bundle.client_classes]
-                            + [c.options for c in bundle.phone_classes]
-                            # #700 — a device policy can deliver a raw
-                            # ``code:NN`` vendor option just as a phone profile
-                            # can; without its definition Kea types the value
-                            # BINARY and rejects the WHOLE config.
-                            + [c.options for c in bundle.device_policy_classes]
-                        ),
-                        "mac_blocks": [
-                            {
-                                "mac_address": m.mac_address,
-                                "reason": m.reason,
-                                "description": m.description,
-                            }
-                            for m in bundle.mac_blocks
-                        ],
-                        # Kea HA hook configuration — absent when the
-                        # server isn't part of a failover channel. The
-                        # agent's render_kea.py keys off the presence of
-                        # this ``peers`` list to decide whether to emit
-                        # ``libdhcp_ha.so``.
-                        "failover": (
-                            {
-                                "channel_id": bundle.failover.channel_id,
-                                "channel_name": bundle.failover.channel_name,
-                                "mode": bundle.failover.mode,
-                                "this_server_name": bundle.failover.this_server_name,
-                                "peers": list(bundle.failover.peers),
-                                "heartbeat_delay_ms": bundle.failover.heartbeat_delay_ms,
-                                "max_response_delay_ms": bundle.failover.max_response_delay_ms,
-                                "max_ack_delay_ms": bundle.failover.max_ack_delay_ms,
-                                "max_unacked_clients": bundle.failover.max_unacked_clients,
-                                # HA peer credential (PEM). Absent until every
-                                # Kea member advertises ``ha_peer_tls``; an
-                                # agent that predates it ignores the key.
-                                "tls": (
-                                    {
-                                        "ca_pem": bundle.failover.tls_ca_pem,
-                                        "cert_pem": bundle.failover.tls_cert_pem,
-                                        "key_pem": bundle.failover.tls_key_pem,
-                                    }
-                                    if bundle.failover.tls_key_pem
-                                    else None
-                                ),
-                            }
-                            if bundle.failover is not None
-                            else None
-                        ),
-                        # IPv6 Router Advertisements (issue #524) — the
-                        # pre-rendered radvd.conf the agent writes + runs
-                        # radvd from when RADVD_MANAGED=1. Empty string when
-                        # no scope in the group has ``ra_enabled`` set.
-                        "radvd_conf": bundle.radvd_conf,
-                    },
+                    "bundle": json.loads(stored.body),
                     "pending_ops": pending_ops,
                     # Phase 8f-3 — fleet upgrade intent the operator set
                     # from the Fleet view. Agent reads desired_*, compares

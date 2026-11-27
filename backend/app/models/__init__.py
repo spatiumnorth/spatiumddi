@@ -38,6 +38,7 @@ from app.models.cutover import (
     CutoverPlan,
 )
 from app.models.dhcp import (
+    DHCPAgentBundle,
     DHCPClientClass,
     DHCPConfigOp,
     DHCPFailoverRelationship,
@@ -257,6 +258,7 @@ __all__ = [
     "Router",
     "VLAN",
     "VRF",
+    "DHCPAgentBundle",
     "DHCPServerGroup",
     "DHCPServer",
     "DHCPFailoverRelationship",

@@ -410,6 +410,12 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     maintenance_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # #1111 — bumped in the transaction of every change that feeds this
+    # server's config bundle; ``DHCPAgentBundle.dirty_watermark`` is the value
+    # the stored bundle was rendered at (``services.dhcp.agent_bundle``).
+    bundle_dirty_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
     config_pushed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -1638,7 +1644,44 @@ def _generate_ha_peer_credential(
         target.ha_peer_credential_encrypted = encrypted_credential()
 
 
+class DHCPAgentBundle(UUIDPrimaryKeyMixin, Base):
+    """The rendered config bundle of one agent-based DHCP server (#1111).
+
+    Built by the worker (``tasks.dhcp_agent_bundles``) and served by the agent
+    long-poll instead of rebuilding the group's scopes, pools and
+    reservations on the api's request loop once per agent per tick. One row
+    per server, replaced in place. ``bundle_etag`` is the driver bundle's own
+    ``compute_etag`` (the long-poll still mixes the per-server fleet and host
+    config blocks into the served ETag); ``body`` is the agent's wire
+    ``bundle`` object as compact JSON text. ``dirty_watermark`` is
+    ``DHCPServer.bundle_dirty_seq`` as the render read it; ``renderer_revision``
+    is ``agent_bundle.RENDERER_REVISION`` of the code that rendered it.
+    """
+
+    __tablename__ = "dhcp_agent_bundle"
+    __table_args__ = (UniqueConstraint("server_id", name="uq_dhcp_agent_bundle_server"),)
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    dirty_watermark: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    renderer_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    bundle_etag: Mapped[str] = mapped_column(String(128), nullable=False)
+    # False when the bundle carries no failover block (the long-poll clears
+    # the server's reported HA state for such a bundle, #3241).
+    has_failover: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    rendered_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    render_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    built_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 __all__ = [
+    "DHCPAgentBundle",
     "DHCPServerGroup",
     "DHCPServer",
     "DHCPScope",

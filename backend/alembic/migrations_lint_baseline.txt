@@ -768,6 +768,8 @@ backend/alembic/versions/e7a2c91d4f60_metallb_control_plane_vip.py:drop_column:6
 backend/alembic/versions/e7a2c91d4f60_metallb_control_plane_vip.py:drop_column:68
 backend/alembic/versions/e7a3c0d519f4_rogue_dhcp_detection.py:drop_table:121
 backend/alembic/versions/e7a3c0d519f4_rogue_dhcp_detection.py:drop_table:124
+backend/alembic/versions/e7a3c91d5b28_dhcp_agent_bundle.py:drop_column:64
+backend/alembic/versions/e7a3c91d5b28_dhcp_agent_bundle.py:drop_table:65
 backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:82
 backend/alembic/versions/e7a3f1c0d294_appliance_syslog_settings.py:drop_column:84
 backend/alembic/versions/e7b2d4c81f06_audit_chain_checkpoint.py:drop_table:41
