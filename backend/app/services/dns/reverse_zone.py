@@ -139,6 +139,121 @@ async def _inherited_dns_group(db: AsyncSession, subnet: Subnet) -> uuid.UUID | 
     return None
 
 
+async def _resolve_reverse_group(
+    db: AsyncSession,
+    subnet: Subnet,
+    *,
+    dns_group_id: uuid.UUID | None = None,
+    dns_zone_id: uuid.UUID | None = None,
+) -> DNSServerGroup | None:
+    """The server group ``subnet``'s reverse zones live in, or ``None`` when it
+    has none (explicit argument, the subnet's zone / ``dns_group_ids``, then the
+    inherited DNS, spatiumddi#1149). Shared by the create path and
+    :func:`plan_reverse_zones` so a preview cannot drift from the commit."""
+    group_id = dns_group_id
+    if group_id is None:
+        # Direct subnet-level zone assignment
+        subnet_zone_id = getattr(subnet, "dns_zone_id", None) or dns_zone_id
+        if subnet_zone_id:
+            zone = await db.get(DNSZone, subnet_zone_id)
+            if zone is not None:
+                group_id = zone.group_id
+    if group_id is None:
+        subnet_groups = getattr(subnet, "dns_group_ids", None) or []
+        if subnet_groups:
+            try:
+                group_id = uuid.UUID(str(subnet_groups[0]))
+            except (ValueError, TypeError):
+                group_id = None
+    if group_id is None:
+        # spatiumddi#1149 — nothing on the subnet itself: a subnet left on
+        # "Inherit from parent" (the console's default, which sends no DNS
+        # fields at all) takes its block's or space's group, so it gets the
+        # reverse zone Getting Started promises "once the subnet has an
+        # effective DNS group/zone". Consulted only when the subnet names no
+        # DNS of its own, so every subnet that resolved a group before
+        # resolves the same one now.
+        group_id = await _inherited_dns_group(db, subnet)
+
+    if group_id is None:
+        logger.debug(
+            "reverse_zone_skipped_no_group",
+            subnet_id=str(subnet.id),
+            network=str(subnet.network),
+        )
+        return None
+
+    group = await db.get(DNSServerGroup, group_id)
+    if group is None:
+        logger.warning(
+            "reverse_zone_group_missing",
+            subnet_id=str(subnet.id),
+            group_id=str(group_id),
+        )
+    return group
+
+
+async def _live_reverse_zones(
+    db: AsyncSession,
+    group: DNSServerGroup,
+    names: list[str],
+    view_id: uuid.UUID | None,
+) -> list[DNSZone]:
+    """Zones of ``names`` already live in ``group`` (one query; trashed rows are
+    filtered by the soft-delete layer, so a trashed zone is absent, not
+    restored). #4941 — a forward zone pinned to a view takes its PTRs only into
+    a reverse zone of that view or of none (#4797), so a zone of the name pinned
+    to ANOTHER view of the group is not the subnet's: it neither stands in for
+    it nor is it returned, and the one made later is pinned to the forward
+    zone's view (the (group, view, name) key lets both exist). A same-view zone
+    beats an unpinned one of the name; never row order."""
+    found = [
+        z
+        for z in (
+            (
+                await db.execute(
+                    select(DNSZone).where(DNSZone.group_id == group.id, DNSZone.name.in_(names))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if view_id is None or z.view_id is None or z.view_id == view_id
+    ]
+    found.sort(key=lambda z: z.view_id != view_id)
+    by_name: dict[str, DNSZone] = {}
+    for z in found:
+        by_name.setdefault(z.name, z)
+    return list(by_name.values())
+
+
+async def plan_reverse_zones(
+    db: AsyncSession,
+    subnet: Subnet,
+    names: list[str],
+    *,
+    honour_opt_out: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Read-only twin of :func:`ensure_reverse_zones_for_subnet` for the names
+    in ``names`` (the zone set of the CIDR the subnet will have): the
+    ``(existing, will_create)`` lists the commit will produce (#4987). Same
+    opt-out, group resolution, view pin, authored-zone and cloud opt-out rules;
+    a subnet with no DNS group, or opted out, gets ``([], [])``. Writes nothing.
+    """
+    if honour_opt_out and getattr(subnet, "skip_reverse_zone", False):
+        return [], []
+    group = await _resolve_reverse_group(db, subnet)
+    if group is None:
+        return [], []
+    view_id = await _forward_view_id(db, subnet, None, group.id)
+    by_name = {z.name: z for z in await _live_reverse_zones(db, group, names, view_id)}
+    existing = [n for n in names if n in by_name and ipam_authors_zone(by_name[n])]
+    missing = [n for n in names if n not in by_name]
+    if missing and await cloud_reverse_optout_driver(db, group) is not None:
+        missing = []
+    return existing, missing
+
+
 async def ensure_reverse_zones_for_subnet(
     db: AsyncSession,
     subnet: Subnet,
@@ -183,46 +298,10 @@ async def ensure_reverse_zones_for_subnet(
         return []
 
     # 1. Resolve the server group
-    group_id = dns_group_id
-    if group_id is None:
-        # Direct subnet-level zone assignment
-        subnet_zone_id = getattr(subnet, "dns_zone_id", None) or dns_zone_id
-        if subnet_zone_id:
-            zone = await db.get(DNSZone, subnet_zone_id)
-            if zone is not None:
-                group_id = zone.group_id
-    if group_id is None:
-        subnet_groups = getattr(subnet, "dns_group_ids", None) or []
-        if subnet_groups:
-            try:
-                group_id = uuid.UUID(str(subnet_groups[0]))
-            except (ValueError, TypeError):
-                group_id = None
-    if group_id is None:
-        # spatiumddi#1149 — nothing on the subnet itself: a subnet left on
-        # "Inherit from parent" (the console's default, which sends no DNS
-        # fields at all) takes its block's or space's group, so it gets the
-        # reverse zone Getting Started promises "once the subnet has an
-        # effective DNS group/zone". Consulted only when the subnet names no
-        # DNS of its own, so every subnet that resolved a group before
-        # resolves the same one now.
-        group_id = await _inherited_dns_group(db, subnet)
-
-    if group_id is None:
-        logger.debug(
-            "reverse_zone_skipped_no_group",
-            subnet_id=str(subnet.id),
-            network=str(subnet.network),
-        )
-        return []
-
-    group = await db.get(DNSServerGroup, group_id)
+    group = await _resolve_reverse_group(
+        db, subnet, dns_group_id=dns_group_id, dns_zone_id=dns_zone_id
+    )
     if group is None:
-        logger.warning(
-            "reverse_zone_group_missing",
-            subnet_id=str(subnet.id),
-            group_id=str(group_id),
-        )
         return []
 
     # 2. Compute the reverse FQDNs — one per /24 (nibble piece) the subnet spans
@@ -243,24 +322,8 @@ async def ensure_reverse_zones_for_subnet(
     # stands in for it nor is it returned, and the one made below is pinned
     # to the forward zone's view (the (group, view, name) key lets both exist).
     view_id = await _forward_view_id(db, subnet, dns_zone_id, group.id)
-    found = [
-        z
-        for z in (
-            (
-                await db.execute(
-                    select(DNSZone).where(DNSZone.group_id == group.id, DNSZone.name.in_(names))
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if view_id is None or z.view_id is None or z.view_id == view_id
-    ]
-    # Same-view zone beats an unpinned one of the name; never row order.
-    found.sort(key=lambda z: z.view_id != view_id)
-    by_name: dict[str, DNSZone] = {}
-    for z in found:
-        by_name.setdefault(z.name, z)
+    found = await _live_reverse_zones(db, group, names, view_id)
+    by_name = {z.name: z for z in found}
     if found and any(n not in by_name for n in names):
         # #3503 — a zone created below is audited, and that audit row's flush
         # takes the audit-chain lock. The caller's PTR may then go into one of

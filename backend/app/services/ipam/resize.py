@@ -849,21 +849,19 @@ async def preview_subnet_resize(
             )
         ) or 0
 
-    # Reverse-zone coverage — compute the aligned zone names for old and
-    # new to surface what will be backfilled. ``compute_reverse_zone_names``
-    # is idempotent; nothing here writes anything.
-    from app.services.dns.reverse_zone import compute_reverse_zone_names
+    # Reverse-zone coverage of the NEW CIDR, as the commit will find it.
+    # Nothing here writes anything.
+    from app.services.dns.reverse_zone import compute_reverse_zone_names, plan_reverse_zones
 
-    try:
-        old_rev = compute_reverse_zone_names(canonical_old)
-    except ValueError:
-        old_rev = []
     try:
         new_rev = compute_reverse_zone_names(canonical_new)
     except ValueError:
         new_rev = []
-    reverse_existing = list(old_rev)
-    reverse_will_create = [n for n in new_rev if n not in set(old_rev)]
+    # #4987 — the same lookups the commit's ensure_reverse_zones_for_subnet
+    # runs, read-only: a zone is "existing" only when the subnet's DNS group
+    # holds it live, and "create" only what the commit will make (none for a
+    # subnet with no DNS group or opted out of its reverse zone).
+    reverse_existing, reverse_will_create = await plan_reverse_zones(db, subnet, new_rev)
 
     # Warnings (non-blocking).
     if pool_count:
