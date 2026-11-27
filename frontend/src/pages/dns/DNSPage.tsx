@@ -13817,7 +13817,10 @@ export function SyncWithServersResultModal({
                   !!srv.error ||
                   (srv.result?.zones_pushed_to_server?.length ?? 0) > 0 ||
                   (srv.result?.zones_imported?.length ?? 0) > 0 ||
-                  (srv.result?.zones_push_to_server_errors?.length ?? 0) > 0
+                  (srv.result?.zones_push_to_server_errors?.length ?? 0) > 0 ||
+                  (srv.result?.items ?? []).some(
+                    (it) => (it.push_errors?.length ?? 0) > 0,
+                  )
                 }
               >
                 <summary className="cursor-pointer select-none border-b bg-muted/20 px-3 py-1.5 text-xs font-medium flex items-center justify-between">
@@ -13897,6 +13900,30 @@ export function SyncWithServersResultModal({
                                   {e}
                                 </li>
                               ),
+                            )}
+                          </ul>
+                        </div>
+                      )}
+                      {srv.result.items.some(
+                        (it) => it.push_errors.length > 0,
+                      ) && (
+                        <div
+                          role="alert"
+                          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs"
+                        >
+                          <div className="font-medium text-destructive">
+                            Record push errors
+                          </div>
+                          <ul className="mt-1 ml-4 list-disc text-muted-foreground">
+                            {srv.result.items.flatMap((it) =>
+                              it.push_errors.map((e, i) => (
+                                <li
+                                  key={`${it.zone}-${i}`}
+                                  className="font-mono text-[11px] break-all"
+                                >
+                                  {it.zone}: {e}
+                                </li>
+                              )),
                             )}
                           </ul>
                         </div>
