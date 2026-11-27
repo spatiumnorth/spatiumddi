@@ -1,6 +1,7 @@
 """Pure phpIPAM-shape -> canonical-IR mappers (issue #4734).
 
-phpIPAM serialises every scalar as a string, names its keys by table column
+phpIPAM's scalars are integers or strings depending on the column (and version),
+so every reader here goes through :func:`to_int` / :func:`truthy`; it names its keys by table column
 (``vlanId`` is a VLAN's id, ``number`` its VID, ``tag`` an address's state id),
 and carries custom fields as extra keys named after their columns. These
 functions take one raw object and return an IR dataclass from

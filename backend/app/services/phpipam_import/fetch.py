@@ -2,8 +2,9 @@
 
 Each ``fetch_*`` coroutine reads one phpIPAM controller through
 :class:`~app.services.phpipam_import.client.PhpipamClient` and returns the raw
-object dicts. phpIPAM serialises every scalar as a string (``"vlanId": "3"``),
-so the typing happens in ``mapping.py``, not here.
+object dicts. Scalars arrive as integers on current phpIPAM (``"vlanId": 3``) and
+as strings on others (``mask``, custom-field values), so the typing happens in
+``mapping.py``, not here.
 
 The per-subnet shape of the address pull is the point of :func:`fetch_addresses`:
 phpIPAM has no "all addresses" endpoint and no pagination, so one request per
