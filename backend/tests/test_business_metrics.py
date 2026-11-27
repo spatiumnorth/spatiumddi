@@ -669,3 +669,17 @@ async def test_the_cache_never_serves_a_broad_scrape_to_a_narrow_one(
     _, dns_text = await _scrape(f"Bearer {dns_raw}")  # inside the TTL
     assert _families_in(dns_text) == {_DNS_SRV, _ALERTS}
     assert "10.70.0.0/24" not in dns_text
+
+
+@pytest.mark.asyncio
+async def test_a_subnet_in_a_trashed_space_is_not_reported(db_session: AsyncSession) -> None:
+    """The space alone in the Trash (its subnet row not stamped): the join on
+    the space must still drop the subnet's series."""
+    await _servers_and_traffic(db_session)
+    subnet = (await db_session.execute(select(Subnet))).scalars().one()
+    space = await db_session.get(IPSpace, subnet.space_id)
+    assert space is not None
+    space.deleted_at = datetime.now(UTC)
+    await db_session.flush()
+    text = await _render_uncached(db_session)
+    assert str(subnet.id) not in text
