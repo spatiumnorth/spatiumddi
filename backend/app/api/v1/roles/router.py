@@ -243,10 +243,14 @@ def _audit(
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
-@router.get("", response_model=list[RoleResponse])
+@router.get(
+    "",
+    response_model=list[RoleResponse],
+    dependencies=[Depends(require_permission("read", "role"))],
+)
 async def list_roles(db: DB, _: CurrentUser) -> list[RoleResponse]:
-    """Any authenticated user may list roles (the Groups admin page needs
-    this to populate the role picker). Mutations require admin on `role`."""
+    """List roles; needs `read` on `role` (the Groups admin page uses this
+    to populate the role picker). Mutations require admin on `role`."""
     res = await db.execute(select(Role).order_by(Role.is_builtin.desc(), Role.name))
     return [_to_response(r) for r in res.scalars().all()]
 
@@ -287,7 +291,11 @@ async def create_role(
     return _to_response(r)
 
 
-@router.get("/{role_id}", response_model=RoleResponse)
+@router.get(
+    "/{role_id}",
+    response_model=RoleResponse,
+    dependencies=[Depends(require_permission("read", "role"))],
+)
 async def get_role(role_id: uuid.UUID, db: DB, _: CurrentUser) -> RoleResponse:
     r = await db.get(Role, role_id)
     if r is None:

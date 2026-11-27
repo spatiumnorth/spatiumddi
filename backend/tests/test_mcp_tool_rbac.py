@@ -290,18 +290,10 @@ async def test_registry_call_enforces_permission_for_chat_too(db_session: AsyncS
 # the REST route it mirrors.
 _SESSION_ONLY_TOOLS = {
     "maintenance_status",
-    "find_lldp_settings",
     "find_branding_settings",
     "global_search",
     "ask_yes_no",
-    "find_ntp_settings",
-    "find_apt_settings",
-    "find_resolver_settings",
     "help_write_permission",
-    "find_snmp_settings",
-    "find_retention_settings",
-    "find_ssh_settings",
-    "find_syslog_settings",
 }
 
 
@@ -311,6 +303,29 @@ def test_session_only_tools_are_the_reviewed_set() -> None:
         "a tool gated on a session alone must be listed here after checking that "
         f"its REST route is gated no more strictly: {sorted(open_tools ^ _SESSION_ONLY_TOOLS)}"
     )
+
+
+_SETTINGS_TOOLS = [
+    "find_lldp_settings",
+    "find_ntp_settings",
+    "find_apt_settings",
+    "find_resolver_settings",
+    "find_snmp_settings",
+    "find_retention_settings",
+    "find_ssh_settings",
+    "find_syslog_settings",
+]
+
+
+@pytest.mark.parametrize("name", _SETTINGS_TOOLS)
+@pytest.mark.asyncio
+async def test_settings_tools_need_read_on_settings(db_session: AsyncSession, name: str) -> None:
+    tool = next(t for t in REGISTRY.all() if t.name == name)
+    assert tool.permission == ("read", "settings")
+    user = await _user(db_session)
+    assert _denied(await _call(db_session, user, name))
+    reader = await _user(db_session, permissions=[{"action": "read", "resource_type": "settings"}])
+    assert not _denied(await _call(db_session, reader, name))
 
 
 @pytest.mark.parametrize("name", ["list_alerts", "list_alert_rules"])

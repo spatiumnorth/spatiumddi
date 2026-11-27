@@ -142,6 +142,12 @@ function address(over: Partial<IPAddress> = {}): IPAddress {
 /** Allocate IP on an IPv4 subnet whose next free address is 10.0.0.2. */
 function allocateIp(defs: CustomField[] = []) {
   answer("customFieldsApi", "list", () => Promise.resolve(defs));
+  // The first read of the subnet's DNS gates Allocate (#4860); a test that
+  // staged its own answer keeps it.
+  if (!answers.ipamApi?.getEffectiveSubnetDns)
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({ dns_group_ids: [], dns_zone_id: null }),
+    );
   answer("ipamApi", "previewNextIp", () =>
     Promise.resolve({ address: "10.0.0.2", strategy: "sequential" }),
   );
@@ -705,6 +711,9 @@ describe("Allocate IP names as next available only what it allocates (#1307)", (
     );
     const nextAddress = sink({ id: "ip-new", address: "fd86:929:20::77c2" });
     answer("ipamApi", "nextAddress", nextAddress);
+    answer("ipamApi", "getEffectiveSubnetDns", () =>
+      Promise.resolve({ dns_group_ids: [], dns_zone_id: null }),
+    );
     open(<AddAddressModal subnetId="sub-v6" onClose={() => {}} />);
 
     expect(await screen.findByText(/picked when you allocate/)).toBeTruthy();

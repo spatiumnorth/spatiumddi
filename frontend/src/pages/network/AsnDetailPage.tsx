@@ -20,6 +20,8 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { RdapPanel } from "@/components/network/rdap-panel";
 import { cn } from "@/lib/utils";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused } from "@/lib/refusal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { CommunitiesTab } from "./CommunitiesTab";
 import { PeeringsTab } from "./PeeringsTab";
@@ -173,16 +175,28 @@ export function AsnDetailPage() {
     enabled: !!id && tab === "rpki",
   });
 
-  const { data: spaces } = useQuery({
+  // #4636 — the built-in Network Editor reads ASNs but not IP spaces /
+  // blocks; a refused read is said, not drawn as "linked to none".
+  const {
+    data: spaces,
+    error: spacesError,
+    isError: spacesFailed,
+  } = useQuery({
     queryKey: ["ipam-spaces"],
     queryFn: () => ipamApi.listSpaces(),
     enabled: !!id && tab === "ipam",
+    retry: (n, err) => !isRefused(err) && n < 3,
   });
 
-  const { data: blocks } = useQuery({
+  const {
+    data: blocks,
+    error: blocksError,
+    isError: blocksFailed,
+  } = useQuery({
     queryKey: ["ipam-blocks"],
     queryFn: () => ipamApi.listBlocks(),
     enabled: !!id && tab === "ipam",
+    retry: (n, err) => !isRefused(err) && n < 3,
   });
 
   const { data: alertEvents } = useQuery({
@@ -545,7 +559,11 @@ export function AsnDetailPage() {
               <h2 className="mb-2 text-sm font-semibold">IP Spaces</h2>
               {linkedSpaces.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  No linked spaces/blocks
+                  {spacesFailed ? (
+                    <ListReadError error={spacesError} what="IP spaces" />
+                  ) : spaces ? (
+                    "No linked spaces/blocks"
+                  ) : null}
                 </p>
               ) : (
                 <div className="rounded-lg border">
@@ -582,7 +600,11 @@ export function AsnDetailPage() {
               <h2 className="mb-2 text-sm font-semibold">IP Blocks</h2>
               {linkedBlocks.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  No linked spaces/blocks
+                  {blocksFailed ? (
+                    <ListReadError error={blocksError} what="IP blocks" />
+                  ) : blocks ? (
+                    "No linked spaces/blocks"
+                  ) : null}
                 </p>
               ) : (
                 <div className="rounded-lg border">

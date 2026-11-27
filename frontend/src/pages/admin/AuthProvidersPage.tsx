@@ -321,8 +321,11 @@ function LdapConfigFields({
     <div className="space-y-3">
       <div className="grid grid-cols-[1fr_120px] gap-3">
         <div>
-          <label className={label}>LDAP host</label>
+          <label htmlFor="auth-providers-ldap-host" className={label}>
+            LDAP host
+          </label>
           <input
+            id="auth-providers-ldap-host"
             value={cfg.host}
             onChange={(e) => setCfg({ host: e.target.value })}
             placeholder="ldap.example.com"
@@ -330,8 +333,11 @@ function LdapConfigFields({
           />
         </div>
         <div>
-          <label className={label}>Port</label>
+          <label htmlFor="auth-providers-port" className={label}>
+            Port
+          </label>
           <input
+            id="auth-providers-port"
             type="number"
             value={cfg.port}
             onChange={(e) => setCfg({ port: Number(e.target.value) || 0 })}
@@ -340,8 +346,11 @@ function LdapConfigFields({
         </div>
       </div>
       <div>
-        <label className={label}>Backup hosts</label>
+        <label htmlFor="auth-providers-backup-hosts" className={label}>
+          Backup hosts
+        </label>
         <textarea
+          id="auth-providers-backup-hosts"
           value={cfg.backup_hosts}
           onChange={(e) => setCfg({ backup_hosts: e.target.value })}
           placeholder="dc2.example.com&#10;dc3.example.com:636"
@@ -391,8 +400,11 @@ function LdapConfigFields({
       )}
 
       <div>
-        <label className={label}>Service bind DN</label>
+        <label htmlFor="auth-providers-service-bind-dn" className={label}>
+          Service bind DN
+        </label>
         <input
+          id="auth-providers-service-bind-dn"
           value={cfg.bind_dn}
           onChange={(e) => setCfg({ bind_dn: e.target.value })}
           placeholder="CN=spatium-svc,OU=ServiceAccounts,DC=example,DC=com"
@@ -402,8 +414,11 @@ function LdapConfigFields({
 
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className={label}>User search base DN</label>
+          <label htmlFor="auth-providers-user-search-base-dn" className={label}>
+            User search base DN
+          </label>
           <input
+            id="auth-providers-user-search-base-dn"
             value={cfg.user_base_dn}
             onChange={(e) => setCfg({ user_base_dn: e.target.value })}
             placeholder="OU=Users,DC=example,DC=com"
@@ -411,8 +426,14 @@ function LdapConfigFields({
           />
         </div>
         <div>
-          <label className={label}>Group search base DN (optional)</label>
+          <label
+            htmlFor="auth-providers-group-search-base-dn-optional"
+            className={label}
+          >
+            Group search base DN (optional)
+          </label>
           <input
+            id="auth-providers-group-search-base-dn-optional"
             value={cfg.group_base_dn}
             onChange={(e) => setCfg({ group_base_dn: e.target.value })}
             placeholder="OU=Groups,DC=example,DC=com"
@@ -422,11 +443,12 @@ function LdapConfigFields({
       </div>
 
       <div>
-        <label className={label}>
+        <label htmlFor="auth-providers-user-filter" className={label}>
           User filter{" "}
           <span className="opacity-60">— must contain {"{username}"}</span>
         </label>
         <input
+          id="auth-providers-user-filter"
           value={cfg.user_filter}
           onChange={(e) => setCfg({ user_filter: e.target.value })}
           placeholder="(&(objectClass=user)(sAMAccountName={username}))"
@@ -440,42 +462,67 @@ function LdapConfigFields({
         </summary>
         <div className="mt-3 grid grid-cols-2 gap-3">
           <div>
-            <label className={label}>Username attribute</label>
+            <label
+              htmlFor="auth-providers-username-attribute"
+              className={label}
+            >
+              Username attribute
+            </label>
             <input
+              id="auth-providers-username-attribute"
               value={cfg.attr_username}
               onChange={(e) => setCfg({ attr_username: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Email attribute</label>
+            <label htmlFor="auth-providers-email-attribute" className={label}>
+              Email attribute
+            </label>
             <input
+              id="auth-providers-email-attribute"
               value={cfg.attr_email}
               onChange={(e) => setCfg({ attr_email: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Display-name attribute</label>
+            <label
+              htmlFor="auth-providers-display-name-attribute"
+              className={label}
+            >
+              Display-name attribute
+            </label>
             <input
+              id="auth-providers-display-name-attribute"
               value={cfg.attr_display_name}
               onChange={(e) => setCfg({ attr_display_name: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Group-membership attribute</label>
+            <label
+              htmlFor="auth-providers-group-membership-attribute"
+              className={label}
+            >
+              Group-membership attribute
+            </label>
             <input
+              id="auth-providers-group-membership-attribute"
               value={cfg.attr_member_of}
               onChange={(e) => setCfg({ attr_member_of: e.target.value })}
               className={input}
             />
           </div>
           <div className="col-span-2">
-            <label className={label}>
+            <label
+              htmlFor="auth-providers-tls-ca-certificate-path-option"
+              className={label}
+            >
               TLS CA certificate path (optional, in-container)
             </label>
             <input
+              id="auth-providers-tls-ca-certificate-path-option"
               value={cfg.tls_ca_cert_file}
               onChange={(e) => setCfg({ tls_ca_cert_file: e.target.value })}
               placeholder="/etc/ssl/certs/corp-ca.pem"
@@ -524,8 +571,11 @@ function OidcConfigFields({
   return (
     <div className="space-y-3">
       <div>
-        <label className={label}>Discovery URL</label>
+        <label htmlFor="auth-providers-discovery-url" className={label}>
+          Discovery URL
+        </label>
         <input
+          id="auth-providers-discovery-url"
           value={cfg.discovery_url}
           onChange={(e) => setCfg({ discovery_url: e.target.value })}
           placeholder="https://login.example.com/.well-known/openid-configuration"
@@ -538,8 +588,11 @@ function OidcConfigFields({
       </div>
 
       <div>
-        <label className={label}>Client ID</label>
+        <label htmlFor="auth-providers-client-id" className={label}>
+          Client ID
+        </label>
         <input
+          id="auth-providers-client-id"
           value={cfg.client_id}
           onChange={(e) => setCfg({ client_id: e.target.value })}
           placeholder="application-id-from-idp"
@@ -548,8 +601,14 @@ function OidcConfigFields({
       </div>
 
       <div>
-        <label className={label}>Scopes (space-separated)</label>
+        <label
+          htmlFor="auth-providers-scopes-space-separated"
+          className={label}
+        >
+          Scopes (space-separated)
+        </label>
         <input
+          id="auth-providers-scopes-space-separated"
           value={scopesText}
           onChange={(e) =>
             setCfg({
@@ -575,32 +634,47 @@ function OidcConfigFields({
         </summary>
         <div className="mt-3 grid grid-cols-2 gap-3">
           <div>
-            <label className={label}>Username claim</label>
+            <label htmlFor="auth-providers-username-claim" className={label}>
+              Username claim
+            </label>
             <input
+              id="auth-providers-username-claim"
               value={cfg.claim_username}
               onChange={(e) => setCfg({ claim_username: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Email claim</label>
+            <label htmlFor="auth-providers-email-claim" className={label}>
+              Email claim
+            </label>
             <input
+              id="auth-providers-email-claim"
               value={cfg.claim_email}
               onChange={(e) => setCfg({ claim_email: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Display-name claim</label>
+            <label
+              htmlFor="auth-providers-display-name-claim"
+              className={label}
+            >
+              Display-name claim
+            </label>
             <input
+              id="auth-providers-display-name-claim"
               value={cfg.claim_display_name}
               onChange={(e) => setCfg({ claim_display_name: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Groups claim</label>
+            <label htmlFor="auth-providers-groups-claim" className={label}>
+              Groups claim
+            </label>
             <input
+              id="auth-providers-groups-claim"
               value={cfg.claim_groups}
               onChange={(e) => setCfg({ claim_groups: e.target.value })}
               className={input}
@@ -646,8 +720,14 @@ function SamlConfigFields({
   return (
     <div className="space-y-3">
       <div>
-        <label className={label}>IdP metadata URL (optional)</label>
+        <label
+          htmlFor="auth-providers-idp-metadata-url-optional"
+          className={label}
+        >
+          IdP metadata URL (optional)
+        </label>
         <input
+          id="auth-providers-idp-metadata-url-optional"
           value={cfg.idp_metadata_url}
           onChange={(e) => setCfg({ idp_metadata_url: e.target.value })}
           placeholder="https://idp.example.com/saml/metadata"
@@ -662,8 +742,11 @@ function SamlConfigFields({
 
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className={label}>IdP entity ID</label>
+          <label htmlFor="auth-providers-idp-entity-id" className={label}>
+            IdP entity ID
+          </label>
           <input
+            id="auth-providers-idp-entity-id"
             value={cfg.idp_entity_id}
             onChange={(e) => setCfg({ idp_entity_id: e.target.value })}
             placeholder="https://idp.example.com/"
@@ -671,8 +754,11 @@ function SamlConfigFields({
           />
         </div>
         <div>
-          <label className={label}>IdP SSO URL</label>
+          <label htmlFor="auth-providers-idp-sso-url" className={label}>
+            IdP SSO URL
+          </label>
           <input
+            id="auth-providers-idp-sso-url"
             value={cfg.idp_sso_url}
             onChange={(e) => setCfg({ idp_sso_url: e.target.value })}
             placeholder="https://idp.example.com/sso"
@@ -682,8 +768,11 @@ function SamlConfigFields({
       </div>
 
       <div>
-        <label className={label}>IdP SLO URL (optional)</label>
+        <label htmlFor="auth-providers-idp-slo-url-optional" className={label}>
+          IdP SLO URL (optional)
+        </label>
         <input
+          id="auth-providers-idp-slo-url-optional"
           value={cfg.idp_slo_url}
           onChange={(e) => setCfg({ idp_slo_url: e.target.value })}
           placeholder="https://idp.example.com/slo"
@@ -692,8 +781,14 @@ function SamlConfigFields({
       </div>
 
       <div>
-        <label className={label}>IdP signing certificate (PEM)</label>
+        <label
+          htmlFor="auth-providers-idp-signing-certificate-pem"
+          className={label}
+        >
+          IdP signing certificate (PEM)
+        </label>
         <textarea
+          id="auth-providers-idp-signing-certificate-pem"
           value={cfg.idp_x509_cert}
           onChange={(e) => setCfg({ idp_x509_cert: e.target.value })}
           rows={4}
@@ -703,8 +798,11 @@ function SamlConfigFields({
       </div>
 
       <div>
-        <label className={label}>SP entity ID (optional)</label>
+        <label htmlFor="auth-providers-sp-entity-id-optional" className={label}>
+          SP entity ID (optional)
+        </label>
         <input
+          id="auth-providers-sp-entity-id-optional"
           value={cfg.sp_entity_id}
           onChange={(e) => setCfg({ sp_entity_id: e.target.value })}
           placeholder="leave blank to derive from app base URL"
@@ -741,8 +839,14 @@ function SamlConfigFields({
         </summary>
         <div className="mt-3 grid grid-cols-2 gap-3">
           <div>
-            <label className={label}>Username attribute</label>
+            <label
+              htmlFor="auth-providers-username-attribute-2"
+              className={label}
+            >
+              Username attribute
+            </label>
             <input
+              id="auth-providers-username-attribute-2"
               value={cfg.attr_username}
               onChange={(e) => setCfg({ attr_username: e.target.value })}
               className={input}
@@ -752,24 +856,36 @@ function SamlConfigFields({
             </p>
           </div>
           <div>
-            <label className={label}>Email attribute</label>
+            <label htmlFor="auth-providers-email-attribute-2" className={label}>
+              Email attribute
+            </label>
             <input
+              id="auth-providers-email-attribute-2"
               value={cfg.attr_email}
               onChange={(e) => setCfg({ attr_email: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Display-name attribute</label>
+            <label
+              htmlFor="auth-providers-display-name-attribute-2"
+              className={label}
+            >
+              Display-name attribute
+            </label>
             <input
+              id="auth-providers-display-name-attribute-2"
               value={cfg.attr_display_name}
               onChange={(e) => setCfg({ attr_display_name: e.target.value })}
               className={input}
             />
           </div>
           <div>
-            <label className={label}>Groups attribute</label>
+            <label htmlFor="auth-providers-groups-attribute" className={label}>
+              Groups attribute
+            </label>
             <input
+              id="auth-providers-groups-attribute"
               value={cfg.attr_groups}
               onChange={(e) => setCfg({ attr_groups: e.target.value })}
               className={input}
@@ -821,8 +937,11 @@ function RadiusConfigFields({
     <div className="space-y-3">
       <div className="grid grid-cols-[1fr_120px] gap-3">
         <div>
-          <label className={label}>RADIUS server</label>
+          <label htmlFor="auth-providers-radius-server" className={label}>
+            RADIUS server
+          </label>
           <input
+            id="auth-providers-radius-server"
             value={cfg.server}
             onChange={(e) => setCfg({ server: e.target.value })}
             placeholder="radius.example.com"
@@ -830,8 +949,11 @@ function RadiusConfigFields({
           />
         </div>
         <div>
-          <label className={label}>Auth port</label>
+          <label htmlFor="auth-providers-auth-port" className={label}>
+            Auth port
+          </label>
           <input
+            id="auth-providers-auth-port"
             type="number"
             value={cfg.port}
             onChange={(e) => setCfg({ port: Number(e.target.value) || 0 })}
@@ -840,8 +962,11 @@ function RadiusConfigFields({
         </div>
       </div>
       <div>
-        <label className={label}>Backup servers</label>
+        <label htmlFor="auth-providers-backup-servers" className={label}>
+          Backup servers
+        </label>
         <textarea
+          id="auth-providers-backup-servers"
           value={cfg.backup_servers}
           onChange={(e) => setCfg({ backup_servers: e.target.value })}
           placeholder="radius2.example.com&#10;radius3.example.com:1812"
@@ -856,8 +981,11 @@ function RadiusConfigFields({
 
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className={label}>Timeout (seconds)</label>
+          <label htmlFor="auth-providers-timeout-seconds" className={label}>
+            Timeout (seconds)
+          </label>
           <input
+            id="auth-providers-timeout-seconds"
             type="number"
             value={cfg.timeout}
             onChange={(e) => setCfg({ timeout: Number(e.target.value) || 0 })}
@@ -865,8 +993,11 @@ function RadiusConfigFields({
           />
         </div>
         <div>
-          <label className={label}>Retries</label>
+          <label htmlFor="auth-providers-retries" className={label}>
+            Retries
+          </label>
           <input
+            id="auth-providers-retries"
             type="number"
             value={cfg.retries}
             onChange={(e) => setCfg({ retries: Number(e.target.value) || 0 })}
@@ -876,8 +1007,11 @@ function RadiusConfigFields({
       </div>
 
       <div>
-        <label className={label}>NAS identifier</label>
+        <label htmlFor="auth-providers-nas-identifier" className={label}>
+          NAS identifier
+        </label>
         <input
+          id="auth-providers-nas-identifier"
           value={cfg.nas_identifier}
           onChange={(e) => setCfg({ nas_identifier: e.target.value })}
           placeholder="spatiumddi"
@@ -895,8 +1029,14 @@ function RadiusConfigFields({
         </summary>
         <div className="mt-3 grid grid-cols-2 gap-3">
           <div>
-            <label className={label}>Groups attribute</label>
+            <label
+              htmlFor="auth-providers-groups-attribute-2"
+              className={label}
+            >
+              Groups attribute
+            </label>
             <input
+              id="auth-providers-groups-attribute-2"
               value={cfg.attr_groups}
               onChange={(e) => setCfg({ attr_groups: e.target.value })}
               placeholder="Filter-Id"
@@ -908,10 +1048,14 @@ function RadiusConfigFields({
             </p>
           </div>
           <div>
-            <label className={label}>
+            <label
+              htmlFor="auth-providers-extra-dictionary-path-in-conta"
+              className={label}
+            >
               Extra dictionary path (in-container, optional)
             </label>
             <input
+              id="auth-providers-extra-dictionary-path-in-conta"
               value={cfg.dictionary_path}
               onChange={(e) => setCfg({ dictionary_path: e.target.value })}
               placeholder="/etc/spatium/radius/dictionary.corp"
@@ -964,8 +1108,11 @@ function TacacsConfigFields({
     <div className="space-y-3">
       <div className="grid grid-cols-[1fr_120px] gap-3">
         <div>
-          <label className={label}>TACACS+ server</label>
+          <label htmlFor="auth-providers-tacacs-server" className={label}>
+            TACACS+ server
+          </label>
           <input
+            id="auth-providers-tacacs-server"
             value={cfg.server}
             onChange={(e) => setCfg({ server: e.target.value })}
             placeholder="tacacs.example.com"
@@ -973,8 +1120,11 @@ function TacacsConfigFields({
           />
         </div>
         <div>
-          <label className={label}>Port</label>
+          <label htmlFor="auth-providers-port-2" className={label}>
+            Port
+          </label>
           <input
+            id="auth-providers-port-2"
             type="number"
             value={cfg.port}
             onChange={(e) => setCfg({ port: Number(e.target.value) || 0 })}
@@ -983,8 +1133,11 @@ function TacacsConfigFields({
         </div>
       </div>
       <div>
-        <label className={label}>Backup servers</label>
+        <label htmlFor="auth-providers-backup-servers-2" className={label}>
+          Backup servers
+        </label>
         <textarea
+          id="auth-providers-backup-servers-2"
           value={cfg.backup_servers}
           onChange={(e) => setCfg({ backup_servers: e.target.value })}
           placeholder="tacacs2.example.com&#10;tacacs3.example.com:49"
@@ -998,8 +1151,11 @@ function TacacsConfigFields({
       </div>
 
       <div>
-        <label className={label}>Timeout (seconds)</label>
+        <label htmlFor="auth-providers-timeout-seconds-2" className={label}>
+          Timeout (seconds)
+        </label>
         <input
+          id="auth-providers-timeout-seconds-2"
           type="number"
           value={cfg.timeout}
           onChange={(e) => setCfg({ timeout: Number(e.target.value) || 0 })}
@@ -1013,8 +1169,11 @@ function TacacsConfigFields({
         </summary>
         <div className="mt-3 grid grid-cols-1 gap-3">
           <div>
-            <label className={label}>Groups AV-pair</label>
+            <label htmlFor="auth-providers-groups-av-pair" className={label}>
+              Groups AV-pair
+            </label>
             <input
+              id="auth-providers-groups-av-pair"
               value={cfg.attr_groups}
               onChange={(e) => setCfg({ attr_groups: e.target.value })}
               placeholder="priv-lvl"
@@ -1140,10 +1299,14 @@ function TestConnectionPanel({
       {showUser && providerType === "ldap" && (
         <div className="flex items-end gap-2 pt-2">
           <div className="flex-1">
-            <label className="block text-xs text-muted-foreground">
+            <label
+              htmlFor="auth-providers-username"
+              className="block text-xs text-muted-foreground"
+            >
               Username
             </label>
             <input
+              id="auth-providers-username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
               placeholder="alice"
@@ -1151,10 +1314,14 @@ function TestConnectionPanel({
             />
           </div>
           <div className="flex-1">
-            <label className="block text-xs text-muted-foreground">
+            <label
+              htmlFor="auth-providers-password-optional"
+              className="block text-xs text-muted-foreground"
+            >
               Password (optional)
             </label>
             <input
+              id="auth-providers-password-optional"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
@@ -1224,6 +1391,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editExternal, setEditExternal] = useState("");
   const [editGroupId, setEditGroupId] = useState("");
+  const [editBase, setEditBase] = useState<AuthGroupMapping | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // #1476 — the save the server answered with "step up first": a mapping
@@ -1314,10 +1482,44 @@ function MappingsSection({ providerId }: { providerId: string }) {
     },
   });
 
-  function beginEdit(m: AuthGroupMapping) {
-    setEditingId(m.id);
-    setEditExternal(m.external_group);
-    setEditGroupId(m.internal_group_id);
+  // Edit reads the mapping when it opens: the row in the list can be stale,
+  // and the Save used to send both fields back, undoing a change made from
+  // another session. Save now sends only what was changed against `editBase`.
+  async function beginEdit(m: AuthGroupMapping) {
+    setError(null);
+    try {
+      const fresh = await refetchRow<AuthGroupMapping>(
+        qc,
+        [["auth-providers", providerId, "mappings"]],
+        m.id,
+      );
+      if (!fresh) {
+        setError("Failed to read the mapping: it may have been deleted.");
+        return;
+      }
+      setEditBase(fresh);
+      setEditingId(fresh.id);
+      setEditExternal(fresh.external_group);
+      setEditGroupId(fresh.internal_group_id);
+    } catch (err) {
+      setError(formatApiError(err, "Failed to read the mapping"));
+    }
+  }
+
+  function saveEdit() {
+    if (!editBase) return;
+    const body = changedFields(
+      {
+        external_group: editBase.external_group,
+        internal_group_id: editBase.internal_group_id,
+      },
+      { external_group: editExternal, internal_group_id: editGroupId },
+    ) as AuthGroupMappingUpdate;
+    if (Object.keys(body).length === 0) {
+      setEditingId(null);
+      return;
+    }
+    updateMut.mutate({ mappingId: editBase.id, body });
   }
 
   return (
@@ -1375,15 +1577,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
                   <td className="px-2 py-1">
                     <div className="flex justify-end gap-1">
                       <button
-                        onClick={() =>
-                          updateMut.mutate({
-                            mappingId: m.id,
-                            body: {
-                              external_group: editExternal,
-                              internal_group_id: editGroupId,
-                            },
-                          })
-                        }
+                        onClick={saveEdit}
                         className="rounded-md bg-primary px-2 py-0.5 text-xs text-primary-foreground"
                         disabled={updateMut.isPending}
                       >
@@ -1438,10 +1632,14 @@ function MappingsSection({ providerId }: { providerId: string }) {
       ) : (
         <div className="flex items-end gap-2 border-t pt-3">
           <div className="flex-[2]">
-            <label className="block text-xs text-muted-foreground">
+            <label
+              htmlFor="auth-providers-external-group-dn"
+              className="block text-xs text-muted-foreground"
+            >
               External group DN
             </label>
             <input
+              id="auth-providers-external-group-dn"
               value={draftExternal}
               onChange={(e) => setDraftExternal(e.target.value)}
               placeholder="CN=DDI Admins,OU=Groups,DC=example,DC=com"
@@ -1449,10 +1647,14 @@ function MappingsSection({ providerId }: { providerId: string }) {
             />
           </div>
           <div className="flex-1">
-            <label className="block text-xs text-muted-foreground">
+            <label
+              htmlFor="auth-providers-internal-group"
+              className="block text-xs text-muted-foreground"
+            >
               Internal group
             </label>
             <select
+              id="auth-providers-internal-group"
               value={draftGroupId}
               onChange={(e) => setDraftGroupId(e.target.value)}
               className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-sm"
@@ -1688,10 +1890,14 @@ function ProviderModal({
           {/* Basics */}
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="auth-providers-name"
+                className="block text-xs font-medium text-muted-foreground"
+              >
                 Name
               </label>
               <input
+                id="auth-providers-name"
                 value={form.name}
                 onChange={(e) => set("name", e.target.value)}
                 placeholder="Corporate AD"
@@ -1699,10 +1905,14 @@ function ProviderModal({
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="auth-providers-type"
+                className="block text-xs font-medium text-muted-foreground"
+              >
                 Type
               </label>
               <select
+                id="auth-providers-type"
                 value={form.type}
                 onChange={(e) =>
                   handleTypeChange(e.target.value as AuthProviderType)
@@ -1721,10 +1931,14 @@ function ProviderModal({
 
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="auth-providers-priority"
+                className="block text-xs font-medium text-muted-foreground"
+              >
                 Priority
               </label>
               <input
+                id="auth-providers-priority"
                 type="number"
                 value={form.priority}
                 onChange={(e) => set("priority", Number(e.target.value))}
@@ -1822,10 +2036,14 @@ function ProviderModal({
               </div>
             ) : form.type === "ldap" ? (
               <div>
-                <label className="block text-xs text-muted-foreground">
+                <label
+                  htmlFor="auth-providers-service-bind-password"
+                  className="block text-xs text-muted-foreground"
+                >
                   Service bind password
                 </label>
                 <input
+                  id="auth-providers-service-bind-password"
                   type="password"
                   value={form.bind_password}
                   required={askSecret}
@@ -1839,10 +2057,14 @@ function ProviderModal({
               </div>
             ) : form.type === "oidc" ? (
               <div>
-                <label className="block text-xs text-muted-foreground">
+                <label
+                  htmlFor="auth-providers-client-secret"
+                  className="block text-xs text-muted-foreground"
+                >
                   Client secret
                 </label>
                 <input
+                  id="auth-providers-client-secret"
                   type="password"
                   value={form.oidc_client_secret}
                   required={askSecret}
@@ -1856,11 +2078,15 @@ function ProviderModal({
               </div>
             ) : form.type === "saml" ? (
               <div>
-                <label className="block text-xs text-muted-foreground">
+                <label
+                  htmlFor="auth-providers-sp-private-key-pem-optional-on"
+                  className="block text-xs text-muted-foreground"
+                >
                   SP private key (PEM, optional — only needed if you sign
                   AuthnRequests)
                 </label>
                 <textarea
+                  id="auth-providers-sp-private-key-pem-optional-on"
                   value={form.saml_sp_private_key}
                   required={askSecret}
                   onChange={(e) => {
@@ -1874,10 +2100,14 @@ function ProviderModal({
               </div>
             ) : form.type === "radius" ? (
               <div>
-                <label className="block text-xs text-muted-foreground">
+                <label
+                  htmlFor="auth-providers-radius-shared-secret"
+                  className="block text-xs text-muted-foreground"
+                >
                   RADIUS shared secret
                 </label>
                 <input
+                  id="auth-providers-radius-shared-secret"
                   type="password"
                   value={form.radius_secret}
                   required={askSecret}
@@ -1891,10 +2121,14 @@ function ProviderModal({
               </div>
             ) : (
               <div>
-                <label className="block text-xs text-muted-foreground">
+                <label
+                  htmlFor="auth-providers-tacacs-shared-secret"
+                  className="block text-xs text-muted-foreground"
+                >
                   TACACS+ shared secret
                 </label>
                 <input
+                  id="auth-providers-tacacs-shared-secret"
                   type="password"
                   value={form.tacacs_secret}
                   required={askSecret}

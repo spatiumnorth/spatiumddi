@@ -351,6 +351,22 @@ async def list_requests(
 # ── Approval policies (operator-tunable rules) ─────────────────────────────
 
 
+class GateablePair(BaseModel):
+    action: str
+    resource_type: str
+
+
+@router.get("/policies/gateable", response_model=list[GateablePair])
+async def list_gateable_pairs(_admin: SuperAdmin) -> list[GateablePair]:
+    """The ``(action, resource_type)`` pairs a policy can be saved for (#4910):
+    what ``_validate_gateable`` accepts, so the editor offers only those."""
+    return [
+        GateablePair(action=a, resource_type=r)
+        for a, r in sorted(gateable_pairs())
+        if a in GATEABLE_ACTIONS and r in GATEABLE_RESOURCE_TYPES
+    ]
+
+
 @router.get("/policies", response_model=list[ApprovalPolicyResponse])
 async def list_policies(_admin: SuperAdmin, db: DB) -> list[ApprovalPolicyResponse]:
     # #2: the policy list exposes which (resource, threshold) pairs are

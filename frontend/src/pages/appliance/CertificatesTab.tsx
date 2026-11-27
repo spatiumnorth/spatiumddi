@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -513,6 +513,30 @@ function CertificateCard({
               </button>
             )
           )}
+          {!cert.pending && (
+            <button
+              type="button"
+              onClick={() => {
+                void applianceTlsApi.downloadPem(cert.id).then((pem) => {
+                  const url = URL.createObjectURL(
+                    new Blob([pem], { type: "application/x-pem-file" }),
+                  );
+                  const a = document.createElement("a");
+                  a.href = url;
+                  a.download = `${cert.name}.pem`;
+                  document.body.appendChild(a);
+                  a.click();
+                  document.body.removeChild(a);
+                  URL.revokeObjectURL(url);
+                });
+              }}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+              title="Download the public certificate (no key), e.g. for an agent's TLS_CA_PATH"
+            >
+              <Download className="h-3 w-3" />
+              Download cert
+            </button>
+          )}
           <button
             type="button"
             onClick={onDelete}
@@ -824,10 +848,14 @@ function GenerateCsrModal({
         </div>
 
         <div>
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="certificates-tab-key-type"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Key type
           </label>
           <select
+            id="certificates-tab-key-type"
             value={keyType}
             onChange={(e) => setKeyType(e.target.value as CSRKeyType)}
             className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm"
@@ -1479,7 +1507,10 @@ function AcmeIssueModal({
         {tab === "account" && (
           <div className="space-y-3">
             <div>
-              <label className="block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="certificates-tab-acme-directory-url"
+                className="block text-xs font-medium text-muted-foreground"
+              >
                 ACME directory URL
                 <span className="text-destructive"> *</span>
               </label>
@@ -1500,6 +1531,7 @@ function AcmeIssueModal({
                 ))}
               </div>
               <input
+                id="certificates-tab-acme-directory-url"
                 type="text"
                 value={directoryUrl}
                 onChange={(e) => setDirectoryUrl(e.target.value)}
@@ -1562,10 +1594,17 @@ function AcmeIssueModal({
 
         {tab === "challenge" && (
           <div className="space-y-2">
-            <label className="block text-xs font-medium text-muted-foreground">
+            <span
+              id="certificates-tab-challenge-type-label"
+              className="block text-xs font-medium text-muted-foreground"
+            >
               Challenge type
-            </label>
-            <div className="space-y-1.5">
+            </span>
+            <div
+              role="radiogroup"
+              aria-labelledby="certificates-tab-challenge-type-label"
+              className="space-y-1.5"
+            >
               {ACME_CHALLENGE_OPTIONS.map((opt) => (
                 <label
                   key={opt.value}
@@ -1826,13 +1865,18 @@ function FieldText({
   placeholder?: string;
   hint?: string;
 }) {
+  const id = useId();
   return (
     <div>
-      <label className="block text-xs font-medium text-muted-foreground">
+      <label
+        htmlFor={id}
+        className="block text-xs font-medium text-muted-foreground"
+      >
         {label}
         {required && <span className="text-destructive"> *</span>}
       </label>
       <input
+        id={id}
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -1864,13 +1908,18 @@ function FieldTextarea({
   placeholder?: string;
   hint?: string;
 }) {
+  const id = useId();
   return (
     <div>
-      <label className="block text-xs font-medium text-muted-foreground">
+      <label
+        htmlFor={id}
+        className="block text-xs font-medium text-muted-foreground"
+      >
         {label}
         {required && <span className="text-destructive"> *</span>}
       </label>
       <textarea
+        id={id}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         required={required}
@@ -1916,7 +1965,10 @@ function FormActions({
 
 function ErrorBanner({ message }: { message: string }) {
   return (
-    <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive"
+    >
       <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
       <span>{message}</span>
     </div>

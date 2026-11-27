@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 
 import { authApi, settingsApi, versionApi } from "@/lib/api";
 import { NTPSection } from "@/components/NTPSection";
+import { NtpSyncState } from "./NtpSyncState";
 import { TimezoneSection } from "@/components/TimezoneSection";
 
 /**
@@ -58,6 +59,7 @@ export function NTPTab() {
           123 in the host firewall).
         </p>
       </div>
+      <NtpSyncState />
       <NTPSection
         values={settings}
         isSuperadmin={isSuperadmin}

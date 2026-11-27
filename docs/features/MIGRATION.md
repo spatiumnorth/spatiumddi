@@ -13,7 +13,7 @@ Three sibling importers share one design — a per-source parser feeding
 a shared canonical intermediate representation (IR), then a
 source-agnostic two-phase **preview → commit** pipeline. Each lives
 behind a togglable feature module so operators who don't need the
-surface can hide it (Settings → Features).
+surface can hide it (Features & Integrations).
 
 The fourth column below is **not** an importer. The Windows cutover
 (#756) picks up where they stop — the estate is already in
@@ -376,7 +376,7 @@ SpatiumDDI already owns, reservations synthesised from live Windows
 leases, and the `is_active` flag on a managed scope.
 
 Behind the `migration.cutover` feature module, which ships **disabled**
-(Settings → Features, group **Tools**) — unlike the three importers, which
+(Features & Integrations, group **Tools**) — unlike the three importers, which
 stay on because a fresh install is exactly when an estate gets imported. A
 cutover is the far end of that journey: it happens after a parity check and a
 parallel run, only on installs leaving Windows
@@ -792,7 +792,7 @@ one-shot migration tool that turns existing zone data into native SpatiumDDI zon
 - Five sources, one canonical IR + commit pipeline:
   - **BIND9** — upload a `.zip` / `.tar.gz` of the `named.conf` tree; the parser reads `named.conf` itself (an `include`d file is not read, and the preview names each include so you can paste its zone declarations into `named.conf`), resolves zone files via four strategies (relative path, absolute path, `directory` option, search), tolerates `view {}` blocks, reads a secondary / stub zone's `masters` / `primaries` list (addresses, `port`, IPv6, named lists; a `key` / `tls` clause is not carried) and imports that zone with its masters and no records (they come from the masters, #4259; one with no readable master is skipped with a warning), and feeds the same canonical-zone shape the other sources do
   - **Windows DNS** — live pull over WinRM via the existing `WindowsDNSDriver`; honours system zones (TrustAnchors / `_msdcs.*`) by routing them through a dedicated branch instead of trying to migrate them
-  - **PowerDNS** — live pull over the authoritative REST API (`X-API-Key` auth, hard cap of 5000 zones / 60 s socket timeout); hoists SOA from rrset content, splits MX / SRV priority into the dedicated columns, drops disabled records + DNSSEC + LUA / ALIAS with distinct warnings
+  - **PowerDNS** — live pull over the authoritative REST API (`X-API-Key` auth, hard cap of 5000 zones / 60 s socket timeout); hoists SOA from rrset content, splits MX / SRV priority into the dedicated columns, drops disabled records + DNSSEC records with distinct warnings; SVCB / HTTPS / DNAME always import, and ALIAS / LUA import only when every server in the target group runs the PowerDNS driver (otherwise they are dropped with a warning naming the target's driver)
   - **Technitium** — live pull over the console REST API (token auth); only `Primary` zones import, with secondary / stub / forwarder / catalog reported as warnings rather than minted as rows SpatiumDDI would then serve authoritatively. Technitium returns structured `rData` whose field names differ from its own *write* API and which renders numeric rdata as enum names, so the importer inverts that back to wire values (`DANE-EE` / `SPKI` / `SHA2-256` → `3 1 1 <hex>`), passing unknown enum members through unchanged
 - Preview-before-commit on every source — operator sees the conflict picker (skip / overwrite / rename) before any rows are written
 - Per-zone savepoint commit so a failure on zone N rolls back N but keeps zones 1..N-1 — no all-or-nothing import abort

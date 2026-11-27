@@ -16,6 +16,7 @@
  *   user has no false sense that they can force-commit.
  */
 
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle, CheckCircle2, X } from "lucide-react";
@@ -44,7 +45,10 @@ import { FormError } from "@/components/ui/form-error";
 function ConflictList({ conflicts }: { conflicts: ResizeConflict[] }) {
   if (conflicts.length === 0) return null;
   return (
-    <div className="rounded border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-900/20">
+    <div
+      role="alert"
+      className="rounded border border-red-300 bg-red-50 p-3 dark:border-red-900 dark:bg-red-900/20"
+    >
       <div className="mb-1 flex items-center gap-2 text-sm font-medium text-red-900 dark:text-red-200">
         <AlertCircle className="h-4 w-4" />
         {conflicts.length} conflict{conflicts.length === 1 ? "" : "s"} — commit
@@ -136,11 +140,15 @@ function TypeToConfirm({
 }) {
   return (
     <div className="space-y-1">
-      <label className="text-xs font-medium">
+      <label
+        htmlFor="resize-modals-type-the-new-cidr-to-confirm"
+        className="text-xs font-medium"
+      >
         Type the new CIDR to confirm:{" "}
         <span className="font-mono">{expected}</span>
       </label>
       <input
+        id="resize-modals-type-the-new-cidr-to-confirm"
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -344,16 +352,28 @@ export function ResizeSubnetModal({
     >
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className="mb-1 block text-xs font-medium">Current CIDR</label>
+          <label
+            htmlFor="resize-modals-current-cidr"
+            className="mb-1 block text-xs font-medium"
+          >
+            Current CIDR
+          </label>
           <input
+            id="resize-modals-current-cidr"
             readOnly
             value={subnet.network}
             className="w-full rounded border bg-muted px-2 py-1 font-mono text-sm"
           />
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium">New CIDR</label>
+          <label
+            htmlFor="resize-modals-new-cidr"
+            className="mb-1 block text-xs font-medium"
+          >
+            New CIDR
+          </label>
           <input
+            id="resize-modals-new-cidr"
             type="text"
             value={newCidr}
             onChange={(e) => {
@@ -466,7 +486,7 @@ export function ResizeSubnetModal({
                 <span className="text-muted-foreground">DHCP scopes:</span>{" "}
                 {preview.affected_dhcp_scopes}
                 {preview.affected_dhcp_scopes > 0
-                  ? ` (${preview.affected_dhcp_pools} pools, ${preview.affected_dhcp_static_assignments} statics)`
+                  ? ` (${countNoun(preview.affected_dhcp_pools, "pool")}, ${countNoun(preview.affected_dhcp_static_assignments, "static")})`
                   : ""}
               </div>
               <div>
@@ -687,16 +707,28 @@ export function ResizeBlockModal({
     >
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <label className="mb-1 block text-xs font-medium">Current CIDR</label>
+          <label
+            htmlFor="resize-modals-current-cidr-2"
+            className="mb-1 block text-xs font-medium"
+          >
+            Current CIDR
+          </label>
           <input
+            id="resize-modals-current-cidr-2"
             readOnly
             value={block.network}
             className="w-full rounded border bg-muted px-2 py-1 font-mono text-sm"
           />
         </div>
         <div>
-          <label className="mb-1 block text-xs font-medium">New CIDR</label>
+          <label
+            htmlFor="resize-modals-new-cidr-2"
+            className="mb-1 block text-xs font-medium"
+          >
+            New CIDR
+          </label>
           <input
+            id="resize-modals-new-cidr-2"
             type="text"
             value={newCidr}
             onChange={(e) => {

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -543,7 +544,10 @@ function EventLogTab({ sources }: { sources: LogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear since filter"
               className="rounded text-[11px] text-muted-foreground hover:text-foreground"
             >
@@ -884,7 +888,10 @@ function RefreshButton({
 function QueryErrorBanner({ query }: { query: { error: unknown } }) {
   const detail = formatApiError(query.error, String(query.error));
   return (
-    <div className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
+    <div
+      role="alert"
+      className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive"
+    >
       <p className="font-medium">Query failed</p>
       <p className="mt-1 whitespace-pre-wrap break-words text-xs">{detail}</p>
     </div>
@@ -1372,7 +1379,10 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear"
               className="rounded p-0.5 text-muted-foreground hover:text-foreground"
             >
@@ -1524,7 +1534,7 @@ export function DNSQueryAnalyticsStrip({
         <span className="text-muted-foreground/70">
           {loading
             ? "computing…"
-            : `${filterLabel ? `${filterLabel} · ` : ""}${total.toLocaleString()} queries${filterLabel ? "" : " in window"}`}
+            : `${filterLabel ? `${filterLabel} · ` : ""}${total.toLocaleString()} ${total === 1 ? "query" : "queries"}${filterLabel ? "" : " in window"}`}
         </span>
         <label className="ml-auto flex cursor-pointer items-center gap-1.5 font-normal normal-case tracking-normal">
           <input
@@ -1884,7 +1894,10 @@ function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
           {since && (
             <button
               type="button"
-              onClick={() => setSince("")}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSince("");
+              }}
               title="Clear"
               className="rounded p-0.5 text-muted-foreground hover:text-foreground"
             >
