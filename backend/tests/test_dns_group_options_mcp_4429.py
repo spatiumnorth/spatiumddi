@@ -24,7 +24,7 @@ from app.models.auth import Group, Role, User
 from app.models.dns import DNSServer, DNSServerGroup, DNSServerOptions, DNSTrustAnchor
 from app.services.ai import operations
 from app.services.ai.tools import REGISTRY
-from app.services.ai.tools.base import ToolPermissionDenied
+from app.services.ai.tools.base import ToolArgumentError, ToolPermissionDenied
 
 
 @pytest_asyncio.fixture
@@ -287,3 +287,76 @@ async def test_trust_anchor_add_and_delete_refusals(db_session: AsyncSession) ->
         ).scalars()
     )
     assert actions == ["create", "delete"]
+
+
+async def test_missing_group_and_foreign_anchor_are_refused_cleanly(
+    db_session: AsyncSession,
+) -> None:
+    """Unknown group / anchor ids answer a refusal, never an exception, and an
+    anchor of another group cannot be deleted through this group (#4429)."""
+    sa = await _user(db_session, superadmin=True)
+    ghost = uuid.uuid4()
+    out = await _call(db_session, sa, "find_dns_group_options", {"group_id": str(ghost)})
+    assert "not found" in out["error"]
+    for name, args in (
+        (
+            "propose_update_dns_group_options",
+            {"group_id": str(ghost), "blackhole": ["192.0.2.0/24"]},
+        ),
+        (
+            "propose_add_dns_trust_anchor",
+            {
+                "group_id": str(ghost),
+                "zone_name": ".",
+                "algorithm": 8,
+                "key_tag": 20326,
+                "public_key": "AwEAAQ==",
+            },
+        ),
+        (
+            "propose_delete_dns_trust_anchor",
+            {"group_id": str(ghost), "anchor_id": str(uuid.uuid4())},
+        ),
+    ):
+        out = await _call(db_session, sa, name, args)
+        assert out["kind"] == "proposal_rejected", (name, out)
+
+    a, b = await _group(db_session), await _group(db_session)
+    added = await _call(
+        db_session,
+        sa,
+        "propose_add_dns_trust_anchor",
+        {
+            "group_id": str(a),
+            "zone_name": "corp.example",
+            "algorithm": 8,
+            "key_tag": 1,
+            "public_key": "AwEAAQ==",
+        },
+    )
+    res = await _apply(db_session, sa, "add_dns_trust_anchor", added)
+    out = await _call(
+        db_session,
+        sa,
+        "propose_delete_dns_trust_anchor",
+        {"group_id": str(b), "anchor_id": res["id"]},
+    )
+    assert out["kind"] == "proposal_rejected"
+    # Apply-time (a stale proposal) raises a ValueError, not an HTTPException.
+    op = operations.get_operation("delete_dns_trust_anchor")
+    assert op is not None
+    with pytest.raises(ValueError):
+        await op.apply(db_session, sa, op.args_model(group_id=b, anchor_id=uuid.UUID(res["id"])))
+    assert (await db_session.execute(select(DNSTrustAnchor))).scalar_one() is not None
+
+
+async def test_invalid_args_are_rejected_not_500(db_session: AsyncSession) -> None:
+    sa = await _user(db_session, superadmin=True)
+    gid = await _group(db_session)
+    with pytest.raises(ToolArgumentError, match="forward_policy"):
+        await _call(
+            db_session,
+            sa,
+            "propose_update_dns_group_options",
+            {"group_id": str(gid), "forward_policy": "bogus"},
+        )
