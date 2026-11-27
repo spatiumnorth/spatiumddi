@@ -175,10 +175,10 @@
     {
       "type": "stat",
       "title": "p95 latency",
-      "description": "",
+      "description": "Excludes the agents' /agents/config long-poll, which the server holds open by design (about 10 s) and would otherwise pin every quantile there.",
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template!~\".*/agents/config\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -383,10 +383,10 @@
     {
       "type": "timeseries",
       "title": "p50 / p95 / p99 latency",
-      "description": "",
+      "description": "Excludes the agents' /agents/config long-poll, which the server holds open by design (about 10 s) and would otherwise pin every quantile there.",
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template!~\".*/agents/config\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A",
           "datasource": {
@@ -395,7 +395,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template!~\".*/agents/config\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B",
           "datasource": {
@@ -404,7 +404,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template!~\".*/agents/config\",path_template=~\"/api/v1/dhcp.*\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C",
           "datasource": {
@@ -556,10 +556,10 @@
     {
       "type": "table",
       "title": "Slowest routes by p95 (last $__range)",
-      "description": "",
+      "description": "Excludes the agents' /agents/config long-poll, which the server holds open by design (about 10 s) and would otherwise pin every quantile there.",
       "targets": [
         {
-          "expr": "topk(15, histogram_quantile(0.95, sum by (le, method, path_template) (increase(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template=~\"/api/v1/dhcp.*\"}[$__range]))))",
+          "expr": "topk(15, histogram_quantile(0.95, sum by (le, method, path_template) (increase(spatiumddi_api_request_duration_seconds_bucket{job=~\"$job\",path_template!~\".*/agents/config\",path_template=~\"/api/v1/dhcp.*\"}[$__range]))))",
           "format": "table",
           "instant": true,
           "refId": "A",

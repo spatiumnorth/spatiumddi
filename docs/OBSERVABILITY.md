@@ -1113,7 +1113,7 @@ and a **Job** variable (the scrape job name).
 
 | Dashboard | File | Panels |
 |---|---|---|
-| **SpatiumDDI Overview** | `spatiumddi-overview.json` | request rate, 5xx ratio, p95 latency, in-flight requests; requests by method and status; p50/p95/p99; 4xx/5xx; busiest, slowest and failing routes; login and API-token use |
+| **SpatiumDDI Overview** | `spatiumddi-overview.json` | request rate, 5xx ratio, p95 latency, in-flight requests; requests by method and status; p50/p95/p99; 4xx/5xx; busiest, slowest and failing routes (latency panels leave out the agents' `/agents/config` long-poll, held open ~10 s by design) |
 | **SpatiumDDI IPAM** | `spatiumddi-ipam.json` | the same API panels filtered to `/api/v1/ipam` |
 | **SpatiumDDI DNS** | `spatiumddi-dns.json` | API panels for `/api/v1/dns`; DNS agent config long-poll outcomes; inline bundle renders and failures; DNS query-log forwarding sent / dropped by target |
 | **SpatiumDDI DHCP** | `spatiumddi-dhcp.json` | API panels for `/api/v1/dhcp`; DHCP activity-log forwarding sent / dropped by target |
@@ -1122,11 +1122,12 @@ and a **Job** variable (the scrape job name).
 [#889](https://github.com/spatiumnorth/spatiumddi/issues/889), can map
 them): `spatiumddi_api_requests_total`,
 `spatiumddi_api_request_duration_seconds`,
-`spatiumddi_api_active_requests`, `spatiumddi_auth_login_total`,
-`spatiumddi_auth_token_usage_total`, `spatiumddi_agent_bundle_*`, and
+`spatiumddi_api_active_requests`, `spatiumddi_agent_bundle_*`, and
 `spatiumddi_log_stream_{sent,dropped}_total`.
 
-> **What the dashboards do not show yet.** Subnet utilisation, DHCP pool
+> **What the dashboards do not show yet.** Login and API-token use:
+> `spatiumddi_auth_login_total` and `spatiumddi_auth_token_usage_total` are
+> registered but nothing increments them, so no panel is built on them. Subnet utilisation, DHCP pool
 > utilisation, lease counts, zone and record counts and per-server
 > status need the IPAM / DHCP / DNS metric families listed in § 6 as
 > planned ([#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146)).

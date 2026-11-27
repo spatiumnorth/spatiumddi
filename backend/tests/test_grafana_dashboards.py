@@ -10,6 +10,7 @@ data-source UID: they must import against any Prometheus.
 
 from __future__ import annotations
 
+import ast
 import json
 import pathlib
 import re
@@ -84,8 +85,77 @@ def _datasource_uids(node: object) -> list[str]:
     return out
 
 
-def _problems(dash: dict, registered: set[str]) -> list[str]:
+def _metric_defs() -> dict[str, tuple[set[str], bool]]:
+    """``{metric name: (label names, is it ever updated)}`` from app/metrics.py.
+
+    "Updated" means the module-level constant it is bound to appears in some
+    other place in backend/app: a family that is registered but never
+    incremented exposes no series, so a panel built on it is empty forever.
+    """
+    tree = ast.parse((_BACKEND_APP / "metrics.py").read_text())
+    sources = [p.read_text() for p in _BACKEND_APP.rglob("*.py")]
+    defs: dict[str, tuple[set[str], bool]] = {}
+    for node in tree.body:
+        if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)):
+            continue
+        call = node.value
+        if not (
+            isinstance(call.func, ast.Name) and call.func.id in {"Counter", "Gauge", "Histogram"}
+        ):
+            continue
+        name = ast.literal_eval(call.args[0])
+        labels_node = call.args[2] if len(call.args) > 2 else None
+        for kw in call.keywords:
+            if kw.arg == "labelnames":
+                labels_node = kw.value
+        labels = set(ast.literal_eval(labels_node)) if labels_node is not None else set()
+        const = node.targets[0].id  # type: ignore[attr-defined]
+        uses = sum(len(re.findall(rf"\b{const}\b", src)) for src in sources)
+        defs[name] = (labels, uses > 1)
+    return defs
+
+
+_SELECTOR_RE = re.compile(r"\b(spatiumddi_[a-z0-9_]+)\s*\{([^}]*)\}")
+_MATCHER_LABEL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:=~|!~|!=|=)")
+_BY_RE = re.compile(r"\b(?:by|without)\s*\(([^)]*)\)")
+
+
+def _metric_problems(dash: dict) -> list[str]:
+    defs = _metric_defs()
     problems: list[str] = []
+    for expr in _exprs(dash):
+        base = {
+            n: next(
+                (b for b in (n, *(n[: -len(s)] for s in _SUFFIXES if n.endswith(s))) if b in defs),
+                None,
+            )
+            for n in _METRIC_RE.findall(expr)
+        }
+        for name, b in base.items():
+            if b is not None and not defs[b][1]:
+                problems.append(f"{name} is registered but never updated: no series")
+        for name, body in _SELECTOR_RE.findall(expr):
+            b = base.get(name)
+            if b is None:
+                continue
+            bad = set(_MATCHER_LABEL_RE.findall(body)) - defs[b][0] - {"job", "instance", "le"}
+            problems += [f"{name} has no label {lab!r}" for lab in sorted(bad)]
+        # ``by (...)`` is checked only when the expression queries one family.
+        families = {b for b in base.values() if b}
+        if len(families) == 1:
+            (fam,) = families
+            for grp in _BY_RE.findall(expr):
+                bad = (
+                    {x.strip() for x in grp.split(",") if x.strip()}
+                    - defs[fam][0]
+                    - {"le", "job", "instance"}
+                )
+                problems += [f"{fam} has no label {lab!r} (grouping)" for lab in sorted(bad)]
+    return problems
+
+
+def _problems(dash: dict, registered: set[str]) -> list[str]:
+    problems: list[str] = _metric_problems(dash)
     names = {m for e in _exprs(dash) for m in _METRIC_RE.findall(e)}
     problems += [f"unknown metric {n}" for n in sorted(names) if not _known(n, registered)]
     problems += [
@@ -144,3 +214,21 @@ def test_negative_control_unknown_metric_and_datasource() -> None:
     problems = _problems(bad, _registered_names())
     assert "unknown metric spatiumddi_dns_queries_total" in problems
     assert "hard-coded datasource 'abc123'" in problems
+
+
+def test_negative_control_dead_metric_and_labels() -> None:
+    bad = {
+        "templating": {"list": [{"type": "datasource"}]},
+        "panels": [
+            {"targets": [{"expr": 'sum(rate(spatiumddi_auth_login_total{job=~"$job"}[5m]))'}]},
+            {
+                "targets": [
+                    {"expr": 'sum by (nope) (rate(spatiumddi_api_requests_total{bogus="x"}[5m]))'}
+                ]
+            },
+        ],
+    }
+    problems = _problems(bad, _registered_names())
+    assert "spatiumddi_auth_login_total is registered but never updated: no series" in problems
+    assert "spatiumddi_api_requests_total has no label 'bogus'" in problems
+    assert "spatiumddi_api_requests_total has no label 'nope' (grouping)" in problems
