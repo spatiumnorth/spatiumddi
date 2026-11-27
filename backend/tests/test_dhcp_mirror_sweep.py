@@ -171,7 +171,10 @@ async def test_sweep_frees_a_mirror_of_a_soft_deleted_reservation_losslessly(
     # The operator's columns rode onto the retained reservation, so restoring the
     # scope brings them back rather than resurrecting a blank row.
     await db_session.refresh(st)
-    assert st.ipam_metadata_snapshot == {"description": "rack 4, port 12", "tags": {"owner": "lab"}}
+    # The snapshot also carries the address's MAC history (#4913).
+    snap = dict(st.ipam_metadata_snapshot or {})
+    snap.pop("mac_history", None)
+    assert snap == {"description": "rack 4, port 12", "tags": {"owner": "lab"}}
 
 
 @pytest.mark.asyncio

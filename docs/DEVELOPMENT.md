@@ -867,6 +867,15 @@ goes on long-lived `release/X.Y.Z` branches (#3948), for example
   before it has shipped, and the release is tagged on that commit. Squash,
   because `protect-main` requires linear history; the branch's own PRs stay
   linked from the merge PR and from their issues.
+- **Soak pre-releases are the one exception.** A SemVer pre-release tag
+  (`1.0.1-soak.1`) on a commit that is on a `release/*` branch is built and
+  published as a GitHub pre-release, with the usual appliance ISO and slot
+  image, so QA can install what the branch holds before it merges. CI must
+  have passed on that exact commit (a push to a release branch always runs the
+  full suite), the changelog fragments need not be folded (the notes are built
+  from them in the runner, never committed), and it never moves `:latest`, is
+  never GitHub's Latest release and is not offered as an in-product update. A
+  final tag off `main` is still refused.
 - **Keep the branches current.** Merge `main` into each release branch after
   every release-candidate fix, and `release/1.0.1` into `release/1.1.0`, so
   the final merge into `main` is small and every fix reaches the later

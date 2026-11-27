@@ -98,11 +98,13 @@ ready=1
 date() {{ echo 2026-10-06T20:00:00+00:00; }}
 ip() {{ :; }}
 tighten_kubeconfig() {{ :; }}
+record_etcd_peer_addr() {{ :; }}
 pin_control_failure_policy() {{ :; }}
 place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
 place_deferred_control_manifest() {{ :; }}
 skip_tls_manifest_reapply() {{ :; }}
+control_converged_allow_commit() {{ :; }}
 commit_slot_if_healthy() {{ echo committed > "{tmp_path}/committed"; }}
 is_trial_boot() {{ return {0 if trial else 1}; }}
 {real.replace(HELPER, str(helper))}
@@ -147,7 +149,9 @@ def test_the_gate_sits_right_before_the_commit() -> None:
     branch = [ln.strip() for ln in _ready_branch().splitlines()]
     assert "slot_images_allow_commit || exit 1" in branch, "the ready branch has no image gate (#1630)"
     gate = branch.index("slot_images_allow_commit || exit 1")
-    assert branch[gate + 1] == "commit_slot_if_healthy"
+    # #4707 — the control-chart gate sits between the image gate and the commit
+    assert branch[gate + 1 : gate + 2] != ["commit_slot_if_healthy"]
+    assert branch[branch.index("control_converged_allow_commit || exit 1") + 1] == "commit_slot_if_healthy"
     assert branch.index("place_deferred_control_manifest") < gate
 
 
@@ -180,9 +184,9 @@ def test_the_gate_gives_the_helper_what_is_left_of_the_units_timeout(tmp_path, u
 
 def test_the_timeout_in_the_script_is_the_units() -> None:
     unit = (FIRSTBOOT.parents[3] / "etc" / "systemd" / "system" / "spatiumddi-firstboot.service").read_text()
-    assert "TimeoutStartSec=10min" in unit.splitlines()
-    assert "FIRSTBOOT_TIMEOUT_S=600   # TimeoutStartSec=10min in spatiumddi-firstboot.service" in _lines(), (
-        "spatiumddi-firstboot sizes the image check's wait to its unit's TimeoutStartSec; "
+    assert "TimeoutStartSec=45min" in unit.splitlines()
+    assert any(l.startswith("FIRSTBOOT_TIMEOUT_S=600 ") and "TimeoutStartSec=45min" in l for l in _lines()), (
+        "spatiumddi-firstboot sizes the image check's wait inside its unit's TimeoutStartSec; "
         "change both together"
     )
 
@@ -255,11 +259,13 @@ ready=1
 date() {{ echo 2026-10-06T20:00:00+00:00; }}
 ip() {{ :; }}
 tighten_kubeconfig() {{ :; }}
+record_etcd_peer_addr() {{ :; }}
 pin_control_failure_policy() {{ :; }}
 place_deferred_tls_manifest() {{ :; }}
 reassert_control_plane_class() {{ :; }}
 place_deferred_control_manifest() {{ :; }}
 skip_tls_manifest_reapply() {{ :; }}
+control_converged_allow_commit() {{ :; }}
 commit_slot_if_healthy() {{
     if [ -f "{done}" ]; then echo after; else echo before; fi > "{tmp_path}/committed"
 }}

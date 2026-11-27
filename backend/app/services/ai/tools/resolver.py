@@ -7,7 +7,7 @@ upstream resolvers does it use?", "is DNSSEC / DNS-over-TLS on?". No redaction
 community / syslog CA PEM).
 
 There is NO ``propose_*`` write tool — resolver config is changed through the
-Appliance → DNS Resolver form, same as NTP / SNMP / SSH. The dedicated UI form
+Appliance → Fleet → DNS Resolver form, same as NTP / SNMP / SSH. The dedicated UI form
 is the friendly path and there aren't compelling LLM-driven workflows yet.
 """
 
@@ -31,7 +31,7 @@ class FindResolverSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_resolver_settings",
-    permission="authenticated",
+    permission=("read", "settings"),
     description=(
         "Return the appliance DNS resolver (systemd-resolved) configuration: "
         "the mode (``automatic`` — per-link NetworkManager / DHCP DNS, or "

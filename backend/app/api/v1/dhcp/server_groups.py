@@ -54,7 +54,11 @@ from app.services.dhcp.windows_failover_report import group_failover_report
 router = APIRouter(
     prefix="/server-groups",
     tags=["dhcp"],
-    dependencies=[Depends(require_resource_permission("dhcp_server"))],
+    # Gated on ``dhcp_server`` but audited as ``dhcp_server_group``: a refusal is
+    # written under the audited type (#4718) so it lists with the group's changes.
+    dependencies=[
+        Depends(require_resource_permission("dhcp_server", audit_resource_type="dhcp_server_group"))
+    ],
 )
 
 VALID_MODES = {"standalone", "load-balancing", "hot-standby"}

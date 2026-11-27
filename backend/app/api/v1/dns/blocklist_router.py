@@ -44,12 +44,14 @@ from app.core.safe_fetch import (
     mask_url_credentials,
 )
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
+from app.drivers.dns import blocklist_capable
 from app.models.audit import AuditLog
 from app.models.dns import (
     FEED_WILDCARD_MODES,
     DNSBlockList,
     DNSBlockListEntry,
     DNSBlockListException,
+    DNSServer,
     DNSServerGroup,
     DNSView,
 )
@@ -263,7 +265,9 @@ class BlockListUpdate(BaseModel):
     block_mode: str | None = None
     sinkhole_ip: str | None = None
     feed_wildcard_mode: str | None = None
-    # Deprecated boolean spelling (#4190); ``feed_wildcard_mode`` wins.
+    # Deprecated boolean spelling (#4190); ``feed_wildcard_mode`` wins. Kept
+    # on the model, not folded here: whether it means a change depends on the
+    # stored mode (#4446), which only the handler knows.
     feed_entries_are_wildcard: bool | None = None
     enabled: bool | None = None
 
@@ -271,16 +275,6 @@ class BlockListUpdate(BaseModel):
     @classmethod
     def _v_wildcard_mode(cls, v: str | None) -> str | None:
         return None if v is None else _check_wildcard_mode(v)
-
-    @model_validator(mode="after")
-    def _fold_legacy_wildcard(self) -> Self:
-        legacy = self.feed_entries_are_wildcard
-        if legacy is not None and "feed_wildcard_mode" not in self.model_fields_set:
-            self.feed_wildcard_mode = _legacy_wildcard_mode(legacy)
-            self.model_fields_set.add("feed_wildcard_mode")
-        self.model_fields_set.discard("feed_entries_are_wildcard")
-        self.feed_entries_are_wildcard = None
-        return self
 
     @field_validator("source_type")
     @classmethod
@@ -370,6 +364,10 @@ class BlockListResponse(BaseModel):
     # through a view) is estimated at 80 % or more of its agents' memory
     # limit. Each view that applies a list loads its own copy of it.
     memory_warning: str | None = None
+    # #4573 / #4608 — set when a group this list is applied to (directly or
+    # through a view) has no server that renders a blocklist (PowerDNS, Windows
+    # DNS, a cloud driver): the list blocks nothing there.
+    unapplied_warning: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -563,6 +561,48 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
     )
 
 
+# Which drivers render a blocklist is the driver's ``blocklist`` capability
+# (``app.drivers.dns.blocklist_capable``). A group whose servers all lack it
+# applies nothing (#4573, #4608).
+async def _refuse_blocklist_inert_groups(db: DB, group_ids: set[uuid.UUID]) -> None:
+    """422 when a newly assigned group has servers and none renders a
+    blocklist. Transition-only, like the Technitium refusal: the caller passes
+    the NEWLY assigned groups, so a stored assignment stays editable and
+    removable (its response carries ``unapplied_warning``).
+    """
+    for name in sorted((await _inert_group_names(db, group_ids)).values()):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Group {name!r} has no server that can apply a blocklist: only BIND9 "
+                "and agent-managed Technitium do, and its servers use drivers with no "
+                "RPZ (PowerDNS, Windows DNS, cloud DNS). Assign the list to a BIND9 group."
+            ),
+        )
+
+
+async def _inert_group_names(db: DB, group_ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    if not group_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(DNSServer.group_id, DNSServer.driver).where(DNSServer.group_id.in_(group_ids))
+        )
+    ).all()
+    capable: dict[uuid.UUID, bool] = {}
+    for gid, driver in rows:
+        capable[gid] = capable.get(gid, False) or blocklist_capable(driver)
+    inert = {gid for gid, ok in capable.items() if not ok}
+    if not inert:
+        return {}
+    rows = (
+        await db.execute(
+            select(DNSServerGroup.id, DNSServerGroup.name).where(DNSServerGroup.id.in_(inert))
+        )
+    ).all()
+    return {gid: name for gid, name in rows}
+
+
 async def _with_memory_warnings(db: DB, lists: list[DNSBlockList]) -> list[BlockListResponse]:
     """Responses for ``lists``, each carrying its groups' memory warning
     (#3551). One estimate per affected group, however many lists share it."""
@@ -570,10 +610,20 @@ async def _with_memory_warnings(db: DB, lists: list[DNSBlockList]) -> list[Block
     warns = await memory_warnings_by_group(
         db, [gid for bl in lists for gid in sorted(_blocklist_group_ids(bl))]
     )
+    inert_by_id = await _inert_group_names(
+        db, {gid for bl in lists for gid in _blocklist_group_ids(bl)}
+    )
     for resp, bl in zip(out, lists, strict=True):
         hit = next((warns[g] for g in sorted(_blocklist_group_ids(bl)) if g in warns), None)
         if hit is not None:
             resp.memory_warning = hit.message
+        inert = {n for g, n in inert_by_id.items() if g in _blocklist_group_ids(bl)}
+        if inert:
+            resp.unapplied_warning = (
+                "No server in these groups renders a blocklist, so this list blocks nothing on: "
+                + ", ".join(sorted(inert))
+                + "."
+            )
     return out
 
 
@@ -1256,6 +1306,7 @@ async def update_blocklist(
     # NOT NULL column is a 422.
     changes = resolve_update_changes(
         body,
+        exclude={"feed_entries_are_wildcard"},
         clearable={"feed_url", "sinkhole_ip"},
         non_nullable={
             "name",
@@ -1269,6 +1320,17 @@ async def update_blocklist(
             "enabled",
         },
     )
+    legacy = body.feed_entries_are_wildcard
+    if (
+        legacy is not None
+        and "feed_wildcard_mode" not in body.model_fields_set
+        # The read model reports True for everything but "never", so a client
+        # echoing back what it GOT sends the value the stored mode already
+        # derives; that is no change, and must not collapse by_syntax into
+        # always (#4446).
+        and legacy != (bl.feed_wildcard_mode != "never")
+    ):
+        changes["feed_wildcard_mode"] = _legacy_wildcard_mode(legacy)
     if (
         "feed_url" in changes
         and changes["feed_url"]
@@ -1437,6 +1499,7 @@ async def update_assignments(
                 raise technitium_api_scope.refusal(
                     f"blocklists are not applied to the Technitium server " f"(group {g.name!r})."
                 )
+        await _refuse_blocklist_inert_groups(db, {g.id for g in groups} - old_group_ids)
         if {g.id for g in groups} != old_direct_group_ids:
             changed.append("server_group_ids")
         bl.server_groups = groups
@@ -1460,6 +1523,7 @@ async def update_assignments(
                     f"blocklists are not applied to the Technitium server (group {g.name!r})."
                 )
             current[g.id] = g
+        await _refuse_blocklist_inert_groups(db, {g.id for g in added} - old_group_ids)
         new_groups = [g for gid, g in current.items() if gid not in remove]
         if {g.id for g in new_groups} != old_direct_group_ids:
             changed.append("server_group_ids")
@@ -1471,6 +1535,9 @@ async def update_assignments(
         )
         if len(views) != len(set(body.view_ids)):
             raise HTTPException(status_code=404, detail="One or more views not found")
+        await _refuse_blocklist_inert_groups(
+            db, {v.group_id for v in views if v.id not in old_view_ids} - old_group_ids
+        )
         if {v.id for v in views} != old_view_ids:
             changed.append("view_ids")
         bl.views = views
@@ -1488,6 +1555,7 @@ async def update_assignments(
             raise HTTPException(status_code=404, detail="One or more views not found")
         for v in vadded:
             vcurrent[v.id] = v
+        await _refuse_blocklist_inert_groups(db, {v.group_id for v in vadded} - old_group_ids)
         new_views = [v for vid, v in vcurrent.items() if vid not in vremove]
         if {v.id for v in new_views} != old_view_ids:
             changed.append("view_ids")

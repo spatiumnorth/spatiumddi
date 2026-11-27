@@ -7,6 +7,9 @@
 {{- $quorum := add (div $replicas 2) 1 -}}
 {{- $master := .Values.redis.sentinel.masterName -}}
 {{- $authEnabled := .Values.redis.auth.enabled -}}
+{{- if eq (.Values.redis.image.flavor | default "docker") "rhel" }}
+{{- fail "redis.image.flavor: rhel supports kind: standalone only (the Sentinel StatefulSets run the official redis image's entrypoint and /data layout, #3913)" }}
+{{- end }}
 # ─────────────────────────────────────────────────────────────────────────────
 # Redis HA via Sentinel (#272 Phase 3).
 #

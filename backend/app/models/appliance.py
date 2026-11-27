@@ -749,6 +749,16 @@ class Appliance(Base):
     # in the red banner.
     role_switch_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     role_switch_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # #4646 — assigned roles the supervisor did NOT start because the control
+    # plane has no agent key for them (``dns-bind9``, ``dhcp`` …). ``[]`` =
+    # nothing waiting. Overwritten each heartbeat that carries the field; an
+    # older supervisor omits it and the stored value is left alone.
+    roles_awaiting_key: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=sa.text("'[]'::jsonb"),
+    )
 
     # #170 Wave E — service-container watchdog payload from the
     # supervisor. Free-form ``{<compose-service>: {role, status,

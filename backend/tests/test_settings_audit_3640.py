@@ -279,3 +279,78 @@ async def test_branding_save_that_changes_nothing_writes_no_row_3847(
     assert r.status_code == 200, r.text
     rows = [r for r in await _audit_rows(db_session) if r.resource_id == "branding"]
     assert rows == []
+
+
+def _png(tag: bytes) -> bytes:
+    return b"\x89PNG\r\n\x1a\n" + tag * 16
+
+
+async def _put_logo(client: AsyncClient, headers: dict[str, str], data: bytes) -> Any:
+    return await client.put(
+        "/api/v1/settings/branding/logo",
+        headers=headers,
+        files={"file": ("logo.png", data, "image/png")},
+    )
+
+
+def _logo_rows(rows: list[AuditLog]) -> list[AuditLog]:
+    return [r for r in rows if r.resource_id == "branding_logo"]
+
+
+@pytest.mark.asyncio
+async def test_logo_upload_names_replaced_logo_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    import hashlib
+
+    headers = await _superadmin(db_session)
+    a, b = _png(b"A"), _png(b"B")
+    assert (await _put_logo(client, headers, a)).status_code == 200
+    assert (await _put_logo(client, headers, b)).status_code == 200
+    rows = _logo_rows(await _audit_rows(db_session))
+    assert len(rows) == 2
+    first = next(r for r in rows if r.old_value is None)
+    second = next(r for r in rows if r.old_value is not None)
+    assert first.new_value == {"sha256": hashlib.sha256(a).hexdigest(), "byte_size": len(a)}
+    assert second.old_value == {"sha256": hashlib.sha256(a).hexdigest(), "byte_size": len(a)}
+    assert second.new_value == {"sha256": hashlib.sha256(b).hexdigest(), "byte_size": len(b)}
+
+
+@pytest.mark.asyncio
+async def test_logo_reupload_of_stored_bytes_writes_no_row_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    a = _png(b"A")
+    first = await _put_logo(client, headers, a)
+    assert first.status_code == 200
+    again = await _put_logo(client, headers, a)
+    assert again.status_code == 200
+    assert again.json() == first.json()
+    assert len(_logo_rows(await _audit_rows(db_session))) == 1
+
+
+@pytest.mark.asyncio
+async def test_logo_delete_names_removed_logo_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    import hashlib
+
+    headers = await _superadmin(db_session)
+    a = _png(b"A")
+    assert (await _put_logo(client, headers, a)).status_code == 200
+    r = await client.delete("/api/v1/settings/branding/logo", headers=headers)
+    assert r.status_code == 204
+    deletes = [x for x in _logo_rows(await _audit_rows(db_session)) if x.action == "delete"]
+    assert len(deletes) == 1
+    assert deletes[0].old_value == {"sha256": hashlib.sha256(a).hexdigest(), "byte_size": len(a)}
+
+
+@pytest.mark.asyncio
+async def test_logo_delete_with_none_stored_writes_no_row_4272(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _superadmin(db_session)
+    r = await client.delete("/api/v1/settings/branding/logo", headers=headers)
+    assert r.status_code == 204
+    assert _logo_rows(await _audit_rows(db_session)) == []

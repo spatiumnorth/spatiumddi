@@ -10,6 +10,7 @@ import {
   type SshAuthorizedKey,
 } from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { SettingsRow } from "@/components/SettingsRow";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
 
@@ -18,28 +19,6 @@ interface Props {
   isSuperadmin: boolean;
   applianceMode: boolean;
   inputCls: string;
-}
-
-function Field({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-8 py-3">
-      <div className="max-w-xl">
-        <div className="text-sm font-medium">{label}</div>
-        {description && (
-          <div className="text-xs text-muted-foreground">{description}</div>
-        )}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
-  );
 }
 
 // A minimal OpenSSH public-key sanity check, mirroring the server-side
@@ -371,7 +350,7 @@ export function SSHSection({
         )}
       </div>
 
-      <Field
+      <SettingsRow
         label="Password authentication"
         description="When on, the admin user can log in with a password. Turning it off requires at least one authorized key (otherwise you'd lock yourself out)."
       >
@@ -380,9 +359,9 @@ export function SSHSection({
           onChange={setPasswordAuth}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="Permit root login"
         description="When off (recommended), the root user cannot SSH in directly — log in as admin and escalate. Leave off unless a tool specifically needs root SSH."
       >
@@ -391,9 +370,9 @@ export function SSHSection({
           onChange={setAllowRoot}
           disabled={!isSuperadmin}
         />
-      </Field>
+      </SettingsRow>
 
-      <Field
+      <SettingsRow
         label="SSH port"
         description="The port sshd listens on. Ports below 1024 are not allowed (except 22). Port 22 stays open in the host firewall as an escape hatch, so a bad port change can't lock you out — unless you turn on the source restriction below, which retires that floor."
       >
@@ -410,7 +389,7 @@ export function SSHSection({
             portInvalid && "border-destructive",
           )}
         />
-      </Field>
+      </SettingsRow>
 
       <div className="rounded-md border bg-muted/30 p-3">
         <div className="mb-2 flex items-center justify-between">
@@ -539,8 +518,8 @@ export function SSHSection({
               <code>{doors.caller_ip ?? "unknown"}</code>). Enforcing an SSH
               scope that excludes that address as well leaves the appliance
               console as the only way in, unless you can reach one of those
-              networks another way. Change it under Fleet &rarr; Firewall &rarr;
-              Web UI access, or add your network to the list above.
+              networks another way. Change it under Appliance &rarr; Firewall
+              &rarr; Web UI access, or add your network to the list above.
             </span>
           </div>
         )}
@@ -566,7 +545,7 @@ export function SSHSection({
               : "Save SSH settings"}
         </button>
         {saveErr && (
-          <span className="text-xs text-destructive">
+          <span role="alert" className="text-xs text-destructive">
             Failed to save: {saveErr}
           </span>
         )}

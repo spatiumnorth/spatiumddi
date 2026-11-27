@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Network,
@@ -77,6 +78,7 @@ export function BlockSyncPage() {
   const [reconcilePreview, setReconcilePreview] = useState<{
     target: BlockTarget;
     diff: BlockTargetDiff | null;
+    error?: string | null;
   } | null>(null);
   const [liftTarget, setLiftTarget] = useState<NetworkBlock | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
@@ -117,22 +119,29 @@ export function BlockSyncPage() {
       target: BlockTarget;
       preview: boolean;
     }) => blockSyncApi.reconcile(target.target_kind, target.target_id, preview),
-    onError: (e) => setPageError(errMsg(e, "Reconcile failed")),
+    // The Reconcile dialog is modal and covers the page banner, so while it
+    // is open the failure is drawn inside it (#4949).
+    onError: (e) => {
+      const msg = errMsg(e, "Reconcile failed");
+      setReconcilePreview((cur) => (cur ? { ...cur, error: msg } : cur));
+      setPageError(msg);
+    },
   });
 
   function previewReconcile(target: BlockTarget) {
     setPageError(null);
-    setReconcilePreview({ target, diff: null });
+    setReconcilePreview({ target, diff: null, error: null });
     reconcileMut.mutate(
       { target, preview: true },
       {
-        onSuccess: (diff) => setReconcilePreview({ target, diff }),
+        onSuccess: (diff) => setReconcilePreview({ target, diff, error: null }),
       },
     );
   }
 
   function pushReconcile(target: BlockTarget) {
     setPageError(null);
+    setReconcilePreview((cur) => (cur ? { ...cur, error: null } : cur));
     reconcileMut.mutate(
       { target, preview: false },
       {
@@ -151,7 +160,6 @@ export function BlockSyncPage() {
       invalidateAll();
       setLiftTarget(null);
     },
-    onError: (e) => setPageError(errMsg(e, "Failed to lift block")),
   });
 
   return (
@@ -198,7 +206,10 @@ export function BlockSyncPage() {
       </div>
 
       {pageError && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
           {pageError}
         </div>
       )}
@@ -496,7 +507,9 @@ export function BlockSyncPage() {
         <ReconcilePreviewModal
           target={reconcilePreview.target}
           diff={reconcilePreview.diff}
+          error={reconcilePreview.error ?? null}
           loading={reconcileMut.isPending}
+          onRetry={() => previewReconcile(reconcilePreview.target)}
           onClose={() => setReconcilePreview(null)}
           onConfirm={() => pushReconcile(reconcilePreview.target)}
         />
@@ -515,8 +528,14 @@ export function BlockSyncPage() {
         tone="destructive"
         confirmLabel="Lift block"
         loading={liftMut.isPending}
+        error={
+          liftMut.error ? errMsg(liftMut.error, "Failed to lift block") : null
+        }
         onConfirm={() => liftTarget && liftMut.mutate(liftTarget.id)}
-        onClose={() => setLiftTarget(null)}
+        onClose={() => {
+          setLiftTarget(null);
+          liftMut.reset();
+        }}
       />
     </div>
   );
@@ -1155,7 +1174,9 @@ function NewBlockModal({
                   >
                     <span className="font-medium">{d.target_name}</span>
                     {d.error ? (
-                      <span className="text-destructive">{d.error}</span>
+                      <span role="alert" className="text-destructive">
+                        {d.error}
+                      </span>
                     ) : d.to_add.length > 0 ? (
                       <span className="text-emerald-600 dark:text-emerald-400">
                         + {d.to_add.join(", ")}
@@ -1209,13 +1230,17 @@ function NewBlockModal({
 function ReconcilePreviewModal({
   target,
   diff,
+  error,
   loading,
+  onRetry,
   onClose,
   onConfirm,
 }: {
   target: BlockTarget;
   diff: BlockTargetDiff | null;
+  error: string | null;
   loading: boolean;
+  onRetry: () => void;
   onClose: () => void;
   onConfirm: () => void;
 }) {
@@ -1227,10 +1252,14 @@ function ReconcilePreviewModal({
           converges. Review the diff below before pushing.
         </p>
         <div className="rounded-md border p-3 text-xs">
-          {diff === null ? (
+          {error && diff === null ? (
+            <FormError className="text-destructive">{error}</FormError>
+          ) : diff === null ? (
             <p className="text-muted-foreground">Reading device…</p>
           ) : diff.error ? (
-            <p className="text-destructive">{diff.error}</p>
+            <p role="alert" className="text-destructive">
+              {diff.error}
+            </p>
           ) : diff.to_add.length === 0 && diff.to_remove.length === 0 ? (
             <p className="text-muted-foreground">
               Already in sync — nothing to change.
@@ -1260,6 +1289,9 @@ function ReconcilePreviewModal({
             </div>
           )}
         </div>
+        {error && diff !== null && (
+          <FormError className="text-xs text-destructive">{error}</FormError>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -1268,9 +1300,23 @@ function ReconcilePreviewModal({
           >
             Cancel
           </button>
+          {error && diff === null && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Retry preview
+            </button>
+          )}
           <button
             type="button"
             onClick={onConfirm}
+            title={
+              error && diff === null
+                ? "The device could not be read — retry the preview first"
+                : undefined
+            }
             disabled={loading || diff === null || !!diff?.error}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
@@ -1283,24 +1329,3 @@ function ReconcilePreviewModal({
 }
 
 // ── Small labelled field ──────────────────────────────────────────────
-function Field({
-  label,
-  hint,
-  className,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className={`space-y-1 ${className ?? ""}`}>
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
-    </div>
-  );
-}

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useNavigate } from "react-router-dom";
@@ -466,7 +467,10 @@ export function NetworkPage() {
             </button>
             <span className="h-4 w-px bg-border" />
             <button
-              onClick={() => setSelected(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelected(new Set());
+              }}
               className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
             >
               Clear
@@ -502,9 +506,10 @@ export function NetworkPage() {
                     setActiveFilter("all");
                     setTagFilters([]);
                   }}
+                  gate={writeGate}
+                  hint="Add a router or switch to start discovering IPs."
                 >
-                  No network devices yet — add a router or switch to start
-                  discovering IPs.
+                  No network devices yet.
                 </ListEmpty>
               </p>
               <button

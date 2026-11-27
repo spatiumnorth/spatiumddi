@@ -34,6 +34,7 @@ from app.services.factory_reset import (
     FactoryResetMutexError,
     apply_factory_reset,
     preview_factory_reset,
+    section_description,
 )
 from app.services.factory_reset.runner import (
     FactoryResetBlockedError,
@@ -111,7 +112,7 @@ async def list_sections(current_user: SuperAdmin) -> FactorySectionCatalog:
             SectionCatalogEntry(
                 key=s.key,
                 label=s.label,
-                description=s.description,
+                description=section_description(s),
                 phrase=s.phrase,
                 kind=s.kind,
                 table_count=len(s.tables),

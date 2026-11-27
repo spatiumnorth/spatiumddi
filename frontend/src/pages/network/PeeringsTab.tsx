@@ -10,6 +10,8 @@ import {
   type BGPRelationshipType,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { FormError } from "@/components/ui/form-error";
@@ -123,11 +125,16 @@ function PeeringFormModal({
       const peer = thisIsLocal ? counterAsnId : thisAsnId;
       const rel = thisIsLocal ? relationship : invertRelationship(relationship);
       if (existing) {
-        return asnsApi.updatePeering(existing.id, {
+        const full = {
           relationship_type:
             existing.local_asn_id === thisAsnId ? rel : invertRelationship(rel),
           description,
-        });
+        };
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const update = changedFields(existing, full);
+        if (Object.keys(update).length === 0) return Promise.resolve(existing);
+        return asnsApi.updatePeering(existing.id, update);
       }
       return asnsApi.createPeering({
         local_asn_id: local,
@@ -160,10 +167,14 @@ function PeeringFormModal({
         {!isEdit && (
           <>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="peerings-tab-counterparty-asn"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Counterparty ASN
               </label>
               <select
+                id="peerings-tab-counterparty-asn"
                 className={inputCls}
                 value={counterAsnId}
                 onChange={(e) => setCounterAsnId(e.target.value)}
@@ -189,10 +200,17 @@ function PeeringFormModal({
               )}
             </div>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <span
+                id="peerings-tab-direction-label"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Direction
-              </label>
-              <div className="flex flex-col gap-1">
+              </span>
+              <div
+                role="radiogroup"
+                aria-labelledby="peerings-tab-direction-label"
+                className="flex flex-col gap-1"
+              >
                 <label className="flex items-start gap-2 rounded border p-2 text-sm hover:bg-accent cursor-pointer">
                   <input
                     type="radio"
@@ -224,10 +242,17 @@ function PeeringFormModal({
           </>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <span
+            id="peerings-tab-relationship-label"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Relationship
-          </label>
-          <div className="flex flex-col gap-1">
+          </span>
+          <div
+            role="radiogroup"
+            aria-labelledby="peerings-tab-relationship-label"
+            className="flex flex-col gap-1"
+          >
             {RELATIONSHIPS.map((r) => (
               <label
                 key={r}
@@ -254,10 +279,14 @@ function PeeringFormModal({
           </div>
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="peerings-tab-description"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <textarea
+            id="peerings-tab-description"
             className={cn(inputCls, "min-h-[60px]")}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -338,6 +367,12 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
         </button>
       </div>
 
+      <FormError className="text-sm">
+        {deleteMut.error
+          ? formatApiError(deleteMut.error, "Delete failed")
+          : null}
+      </FormError>
+
       {peerings.length === 0 ? (
         <p className="rounded-lg border p-8 text-center text-sm text-muted-foreground">
           No BGP peerings recorded for this ASN.
@@ -407,6 +442,7 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
                             const counter = isLocal
                               ? `AS${p.peer_asn_number}`
                               : `AS${p.local_asn_number}`;
+                            deleteMut.reset();
                             if (
                               confirm(
                                 `Delete peering with ${counter} (${rel})? This cannot be undone.`,
@@ -433,15 +469,37 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
         </div>
       )}
 
-      {showForm && (
+      {showForm && !editing && (
         <PeeringFormModal
           thisAsnId={asnId}
-          existing={editing}
+          existing={null}
           onClose={() => {
             setShowForm(false);
             setEditing(null);
           }}
         />
+      )}
+      {showForm && editing && (
+        <FreshEdit
+          row={editing}
+          queryKeys={[["asn-peerings", asnId]]}
+          title="Edit BGP peering"
+          onClose={() => {
+            setShowForm(false);
+            setEditing(null);
+          }}
+        >
+          {(fresh) => (
+            <PeeringFormModal
+              thisAsnId={asnId}
+              existing={fresh}
+              onClose={() => {
+                setShowForm(false);
+                setEditing(null);
+              }}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );
