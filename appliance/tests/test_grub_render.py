@@ -107,7 +107,7 @@ def test_grubenv_vars_stay_literal(var: str) -> None:
 # 3. All four --id= entries present.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EXPECTED_IDS = ["--id=slot_a", "--id=slot_b", "--id=slot_a_verbose", "--id=rescue"]
+_EXPECTED_IDS = ["--id=slot_a", "--id=slot_b", "--id=verbose", "--id=rescue"]
 
 
 @pytest.mark.parametrize("entry_id", _EXPECTED_IDS)
@@ -246,19 +246,90 @@ def test_uuid_b_not_in_slot_a_body() -> None:
     )
 
 
-def test_uuid_a_in_rescue_and_verbose_entries() -> None:
-    """slot_a_verbose and rescue always use root-A UUID (they boot slot A)."""
-    out = _render()
-    for entry_id in ("--id=slot_a_verbose", "--id=rescue"):
-        start = out.find(f"{entry_id} {{")
+def _resolve_active(out: str, default: str, saved: str = "") -> dict[str, str]:
+    """Evaluate the #4961 active-slot block the way grub would.
+
+    ``default`` is ${default} after the header folds next_entry/saved_entry into
+    it; ``saved`` is grubenv's saved_entry. Interprets the ``set sp_act`` lines
+    in order, then the if/else on ${sp_act}. Returns {entry id: "<title>\n<body>"}
+    for verbose + rescue with the sp_act_* variables substituted.
+    """
+    import re
+
+    env_vars = {"default": default, "saved_entry": saved}
+    m0 = re.search(r"^set sp_act=(\w+)$", out, re.M)
+    assert m0, "sp_act initialiser not found"
+    sp_act = m0.group(1)
+    for var, val, newv in re.findall(
+        r'^if \[ "\$\{(\w+)\}" = "(\w+)" \]; then set sp_act=(\w+); fi$', out, re.M
+    ):
+        if env_vars.get(var, "") == val:
+            sp_act = newv
+    m = re.search(
+        r'if \[ "\$\{sp_act\}" = "slot_b" \]; then\n(.*?)\nelse\n(.*?)\nfi', out, re.S
+    )
+    assert m, "active-slot block not found"
+    branch = m.group(1) if sp_act == "slot_b" else m.group(2)
+    env = {k: v.strip('"') for k, v in re.findall(r"set (\w+)=(\S.*)", branch)}
+
+    def sub(text: str) -> str:
+        return re.sub(r"\$\{(sp_act_\w+)\}", lambda mm: env[mm.group(1)], text)
+
+    res = {}
+    for eid in ("verbose", "rescue"):
+        start = out.find(f"--id={eid} {{")
+        line_start = out.rfind("\n", 0, start) + 1
         end = out.find("\n}", start) + 2
-        block = out[start:end]
-        assert UUID_A in block, (
-            f"UUID_A missing from {entry_id} menuentry body"
-        )
-        assert UUID_B not in block, (
-            f"UUID_B leaked into {entry_id} menuentry body (should always use UUID_A)"
-        )
+        res[eid] = sub(out[line_start:end])
+    return res
+
+
+@pytest.mark.parametrize(
+    "default,saved,expect",
+    [
+        ("rescue", "slot_b", UUID_B),  # grub-reboot rescue while slot B is active
+        ("verbose", "slot_b", UUID_B),  # grub-reboot verbose while slot B is active
+        ("rescue", "slot_a", UUID_A),
+        ("slot_b", "slot_a", UUID_B),  # trial boot into slot B
+        ("slot_a", "slot_b", UUID_A),  # one-shot back to slot A
+        ("verbose", "", UUID_A),  # no saved_entry: fail-safe slot A
+    ],
+)
+def test_oneshot_entry_follows_the_active_slot(default, saved, expect) -> None:
+    """#4961 walk finding: `grub-reboot verbose|rescue` must not fall to slot A."""
+    out = _render()
+    res = _resolve_active(out, default, saved)
+    for eid in ("verbose", "rescue"):
+        assert f"root=UUID={expect}" in res[eid], (default, saved, eid)
+
+
+@pytest.mark.parametrize(
+    "default,uuid,other,label",
+    [
+        ("slot_b", UUID_B, UUID_A, "slot B"),
+        ("slot_a", UUID_A, UUID_B, "slot A"),
+        ("", UUID_A, UUID_B, "slot A"),
+    ],
+)
+def test_verbose_and_rescue_follow_active_slot(default, uuid, other, label) -> None:
+    """#4961: verbose + recovery boot the default entry's slot, UUID and title."""
+    out = _render(ver_a="2026.06.01-1", ver_b="2026.06.02-1",
+                  extra_args=["--machine-id", MACHINE_ID])
+    ver = "2026.06.02-1" if label == "slot B" else "2026.06.01-1"
+    for eid, blk in _resolve_active(out, default).items():
+        assert f"--set=root {uuid}" in blk and f"root=UUID={uuid} " in blk
+        assert other not in blk
+        assert f"SpatiumDDI Appliance {ver} ({label}, " in blk.splitlines()[0]
+        assert f"systemd.machine_id={MACHINE_ID}" in blk
+
+
+def test_verbose_and_rescue_have_no_slot_a_literals() -> None:
+    """The entries must not hardcode a slot UUID (the #4961 defect)."""
+    out = _render()
+    for eid in ("verbose", "rescue"):
+        start = out.find(f"--id={eid} {{")
+        blk = out[start : out.find("\n}", start)]
+        assert UUID_A not in blk and UUID_B not in blk
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,15 +353,17 @@ def test_version_label_in_slot_b_title() -> None:
 
 
 def test_version_label_in_verbose_title() -> None:
-    """The slot_a_verbose entry title uses the slot A version."""
-    out = _render(ver_a="2026.06.11-1")
+    """The verbose entry title carries each slot's version."""
+    out = _render(ver_a="2026.06.11-1", ver_b="2026.06.12-1")
     assert "SpatiumDDI Appliance 2026.06.11-1 (slot A, verbose boot)" in out
+    assert "SpatiumDDI Appliance 2026.06.12-1 (slot B, verbose boot)" in out
 
 
 def test_version_label_in_rescue_title() -> None:
-    """The rescue entry title uses the slot A version."""
-    out = _render(ver_a="2026.06.11-1")
-    assert "SpatiumDDI Appliance 2026.06.11-1 (rescue / single-user)" in out
+    """The recovery entry title carries each slot's version."""
+    out = _render(ver_a="2026.06.11-1", ver_b="2026.06.12-1")
+    assert "SpatiumDDI Appliance 2026.06.11-1 (slot A, recovery)" in out
+    assert "SpatiumDDI Appliance 2026.06.12-1 (slot B, recovery)" in out
 
 
 def test_bare_title_when_no_version() -> None:

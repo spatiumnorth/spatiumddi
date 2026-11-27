@@ -1683,21 +1683,42 @@ def _patch_grub_cfg_slot_uuid(partlabel: str, new_uuid: str,
     )
 
     patched_count = 0
+    old_uuids: set[str] = set()
 
     def replace_block(match: re.Match[str]) -> str:
         nonlocal patched_count
         head, body, tail = match.groups()
+        old_uuids.update(u.lower() for u in _UUID_RE.findall(body))
         new_body, n = _UUID_RE.subn(new_uuid, body)
         patched_count += n
         return head + new_body + tail
 
     # Patch EVERY menuentry for this slot, not just the first (#551): the
-    # slot has more than one entry (``--id=slot_a``, ``--id=slot_a_verbose``,
-    # the rescue entry), all keyed off the same partition. count=1 left the
-    # verbose + rescue entries pointing at the pre-upgrade UUID → unbootable
-    # when the fallback path (no spatium-grub-render) runs. The block_re is
-    # anchored to slot_id so the OTHER slot's entries are never touched.
+    # slot can have more than one entry (``--id=slot_a`` plus, on renders
+    # before #4961, ``--id=slot_a_verbose``), all keyed off the same
+    # partition. count=1 left the verbose entry pointing at the pre-upgrade
+    # UUID → unbootable when the fallback path (no spatium-grub-render)
+    # runs. The block_re is anchored to slot_id so the OTHER slot's entries
+    # are never touched.
     new_cfg = block_re.sub(replace_block, cfg)
+
+    # #4961: the verbose + recovery entries boot ${sp_act_uuid}, which is set
+    # outside any menuentry from each slot's UUID. Re-point the line carrying
+    # this slot's old UUID too, or those entries keep the pre-upgrade
+    # filesystem.
+    def replace_set(match: re.Match[str]) -> str:
+        nonlocal patched_count
+        if match.group(2).lower() in old_uuids:
+            patched_count += 1
+            return match.group(1) + new_uuid
+        return match.group(0)
+
+    if old_uuids:
+        new_cfg = re.sub(
+            r"(set sp_act_uuid=)(" + _UUID_RE.pattern + r")",
+            replace_set,
+            new_cfg,
+        )
     if patched_count == 0:
         print(f"WARN: couldn't locate {slot_id} menuentry in {cfg_path}; "
               "grub.cfg not updated", file=sys.stderr)
