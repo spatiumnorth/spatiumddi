@@ -555,7 +555,12 @@ async def list_objects(
             await db.execute(
                 select(DDIMirrorObject)
                 .where(*cond)
-                .order_by(DDIMirrorObject.kind, DDIMirrorObject.name, DDIMirrorObject.source_ref)
+                .order_by(
+                    DDIMirrorObject.kind,
+                    DDIMirrorObject.name,
+                    DDIMirrorObject.source_ref,
+                    DDIMirrorObject.id,
+                )
                 .limit(limit)
                 .offset(offset)
             )
