@@ -23,7 +23,7 @@ a TSIG-signed AXFR (#734), the rest over their own authenticated API.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -917,6 +917,7 @@ async def _additive_push(
     apply: bool,
     skip_apex_ns: bool = False,
     inline_only: bool = False,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> PushResult:
     """For every DB row whose key isn't on the wire, send a create op via
     the driver. Errors are collected, not raised, so one bad record
@@ -927,6 +928,10 @@ async def _additive_push(
     instead of one per record. The ABC default falls back to a
     sequential loop for agent-based drivers (BIND9) where the control
     plane never calls the record writer anyway.
+
+    ``before_send`` (#4808) is awaited right before the batch goes to the
+    driver, once the serial bump and everything above it is written: the
+    scheduled sync commits there, so the provider call holds no transaction.
     """
     rel = targets_are_relative(primary)
     on_wire_keys = {_key(r, zone.name, relative_targets=rel) for r in on_wire}
@@ -1049,6 +1054,8 @@ async def _additive_push(
     ]
 
     try:
+        if before_send is not None:
+            await before_send()
         results = await driver.apply_record_changes(primary, changes)
     except Exception as exc:  # noqa: BLE001 — whole-batch failure, surface once
         logger.warning(
@@ -1196,6 +1203,7 @@ async def sync_zone_with_server(
     apply: bool = True,
     server: Any | None = None,
     wire: WireRead | None = None,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> SyncResult:
     """Bi-directional additive sync between DB and the zone's primary server.
 
@@ -1203,7 +1211,9 @@ async def sync_zone_with_server(
     :func:`fetch_wire`, so the caller could make the network call with no
     session open and hand the result to a fresh one. Its ``primary`` must be
     bound to ``db``. Without it the read happens here, on ``db``'s own
-    transaction (the request-scoped callers).
+    transaction (the request-scoped callers). ``before_send`` is awaited just
+    before the push phase's batch goes to the driver; the scheduled sync passes
+    ``db.commit`` so that call holds no transaction either (#4808).
 
     ``server`` (#1697) syncs with that server instead of the primary, so a
     group-level Sync walks each server's own copy rather than the primary's
@@ -1270,6 +1280,7 @@ async def sync_zone_with_server(
         db_rows,
         apply=apply,
         skip_apex_ns=not read_sees_apex_ns,
+        before_send=before_send,
     )
 
     logger.info(
