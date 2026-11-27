@@ -1,4 +1,4 @@
 {
   "_comment": "Ordered forward-merge chain (release-forward-merge.yml). Each branch is merged into the next one automatically. main -> first branch is NOT in the chain: syncrel.sh handles it. Add a new release branch at its position; this file is the only place the order lives.",
-  "chain": ["release/1.0.1", "release/1.0.2", "release/1.1.0", "release/1.2.0"]
+  "chain": ["release/1.0.1", "release/1.0.2", "release/1.0.3", "release/1.1.0", "release/1.2.0"]
 }
