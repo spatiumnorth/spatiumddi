@@ -1001,6 +1001,66 @@ async def find_dhcp_responders(
     ]
 
 
+class FindDHCPDiscoverSourcesArgs(BaseModel):
+    server_id: str | None = Field(default=None, description="Filter to one DHCP server UUID.")
+    kind: str | None = Field(
+        default=None, description="mac (one client) or relay (many MACs via one relay)."
+    )
+    min_per_minute: float = Field(
+        default=0, ge=0, le=1_000_000, description="Only MACs at or above this DISCOVERs/min."
+    )
+
+
+@register_tool(
+    name="find_dhcp_discover_sources",
+    permission=("read", "dhcp_server"),
+    description=(
+        "List the client MACs and relays whose DHCPDISCOVER rate the agent's "
+        "DISCOVER watch reported in the last few minutes (issue #4737) -- the "
+        "readings behind the dhcp_discover_flood alert. Each row names the "
+        "MAC or relay, DISCOVERs per minute, the subnet / scope it lands in, "
+        "and (relays) how many distinct MACs it forwarded. Use for 'which "
+        "device is flooding my DHCP server?'. Read-only; empty for servers "
+        "whose agent does not run the watch, which is NOT the same as 'no "
+        "flood'."
+    ),
+    args_model=FindDHCPDiscoverSourcesArgs,
+    category="dhcp",
+    # Read-only agent telemetry; no secrets, no off-prem calls, no writes.
+    default_enabled=True,
+    module="core.dhcp",
+)
+async def find_dhcp_discover_sources(
+    db: AsyncSession, user: User, args: FindDHCPDiscoverSourcesArgs
+) -> dict[str, Any]:
+    from app.services.dhcp import discover_rates  # noqa: PLC0415
+
+    sid: uuid.UUID | None = None
+    if args.server_id:
+        try:
+            sid = uuid.UUID(args.server_id)
+        except ValueError:
+            return {"error": f"invalid server_id: {args.server_id!r}"}
+        if await db.get(DHCPServer, sid) is None:
+            return {"error": f"DHCP server {args.server_id} not found"}
+    if args.kind is not None and args.kind not in (
+        discover_rates.KIND_MAC,
+        discover_rates.KIND_RELAY,
+    ):
+        return {"error": "kind must be 'mac' or 'relay'"}
+    readings = await discover_rates.list_readings(
+        db, kind=args.kind, server_id=sid, min_per_minute=args.min_per_minute
+    )
+    out = []
+    for r in readings:
+        d = discover_rates.source_dict(r)
+        d["server_id"] = str(r.server.id)
+        d["server_name"] = r.server.name
+        d["window_end"] = d["window_end"].isoformat()
+        out.append(d)
+    return {"sources": out, "count": len(out)}
+
+
 class FindDHCPServerStatsArgs(BaseModel):
     server_id: str = Field(description="DHCP server UUID to summarize.")
     range: str = Field(default="1h", description="Time window: 1h, 6h, 24h, or 7d.")

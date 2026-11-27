@@ -146,7 +146,7 @@ def _recency(default: int, what: str) -> ParamSpec:
     )
 
 
-def _floor(label: str, default: int, hint: str) -> ParamSpec:
+def _floor(label: str, default: int | None, hint: str) -> ParamSpec:
     # ``min_free_addresses`` is reused as an absolute floor by these rules;
     # the API validator requires >= 1.
     return ParamSpec(
@@ -303,6 +303,29 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
                 "Fires when the kernel socket dropped at least this many packets "
                 "over the window.",
             )
+        ],
+    ),
+    (
+        a.RULE_TYPE_DHCP_DISCOVER_FLOOD,
+        "DHCP DISCOVER flood (one MAC or relay)",
+        "DHCP",
+        [
+            _count(
+                "DISCOVERs per minute from one MAC",
+                a._DHCP_DISCOVER_PER_MIN_DEFAULT,
+                "Fires when one client MAC sends DHCPDISCOVERs at this rate or "
+                "faster. A real client sends a few while it waits for an OFFER, "
+                "then stops. Needs the DHCP agent's DISCOVER watch "
+                "(DHCP_DISCOVER_WATCH_ENABLED=1).",
+                min_=1,
+            ),
+            _floor(
+                "Distinct MACs per relay (optional)",
+                None,
+                "Also fire when one relay forwarded DISCOVERs for at least this "
+                "many different client MACs in one window (a MAC-rotating flood). "
+                "Leave empty to watch the per-MAC rate only.",
+            ),
         ],
     ),
     (a.RULE_TYPE_DHCP_AGENT_DUPLICATE_INSTANCE, "Two DHCP agents on one server", "DHCP", []),

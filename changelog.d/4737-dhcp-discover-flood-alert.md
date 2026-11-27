@@ -1,0 +1,3 @@
+### Added
+
+- DHCP: a `dhcp_discover_flood` alert rule names a client MAC that sends DHCPDISCOVERs at a rate no real client does, or a relay forwarding DISCOVERs for many distinct MACs in a window, with the subnet and rate, while the pool still has free addresses. It reads per-source counts from a new opt-in DISCOVER watch on the DHCP agent (`DHCP_DISCOVER_WATCH_ENABLED=1`); older agents keep working and the rule simply has no data for them. The rule is seeded disabled, and the readings are also available at `GET /dhcp/servers/{id}/discover-sources` and through the `find_dhcp_discover_sources` copilot tool. (#4737)

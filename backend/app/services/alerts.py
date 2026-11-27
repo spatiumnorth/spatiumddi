@@ -549,6 +549,17 @@ RULE_TYPE_DNS_RATE_LIMIT_DROPPING = "dns_rate_limit_dropping"
 # ``receive_drop`` is counted by the worker, after the queue.
 RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
 
+# Issue #4737 — one client MAC sending DHCPDISCOVERs at a rate no real client
+# does, or many distinct MACs arriving through one relay in a window: a
+# misbehaving device or a MAC-rotating flood that drains a pool while the
+# utilisation alerts (which only fire once it is nearly full) and rogue-DHCP
+# detection (which looks for unexpected servers) stay quiet. Reads the
+# per-source counts the agent's opt-in DISCOVER watch ships
+# (``dhcp_discover_rate``). Subject = one MAC or relay on one server. Seeded
+# DISABLED: the right threshold depends on the site, and an agent that does not
+# run the watch has nothing to report.
+RULE_TYPE_DHCP_DISCOVER_FLOOD = "dhcp_discover_flood"
+
 # Issue #1110 — a DHCP scope served by two or more servers that do not
 # coordinate: Windows DHCP members holding it with no failover relationship
 # covering it on both, over overlapping ranges; or a Windows member holding a
@@ -785,6 +796,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_STALE_IP_COUNT,
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
         RULE_TYPE_DHCP_PACKETS_DROPPED,
+        RULE_TYPE_DHCP_DISCOVER_FLOOD,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
@@ -889,6 +901,14 @@ _DNS_RATE_LIMIT_DROP_MIN_DEFAULT = 100
 # about it only past a threshold.
 _DHCP_PACKET_LOSS_WINDOW = timedelta(minutes=15)
 _DHCP_PACKET_LOSS_MIN_DEFAULT = 1
+
+# #4737 — ``threshold_percent`` is reused as DISCOVERs per minute from ONE MAC,
+# ``min_free_addresses`` as distinct MACs through ONE relay in a window. An
+# ordinary client sends a handful of DISCOVERs while it waits for an OFFER, then
+# stops; 30 a minute is a device that never stops. The relay signal is off
+# until the operator sets it: how many MACs a relay legitimately carries in a
+# minute is a fact about the site (a lecture hall joining at 09:00).
+_DHCP_DISCOVER_PER_MIN_DEFAULT = 30
 
 # Issue #285 Phase 2d — how long a control-plane-rendered firewall hash may
 # go un-applied (ok-status) before it's "stalled". Comfortably larger than
@@ -2298,6 +2318,77 @@ async def _matching_dns_rate_limit_dropping_subjects(
             "possible amplification attempt or misbehaving client."
         )
         matches.append((str(sid), name, message))
+    return matches
+
+
+async def _matching_dhcp_discover_flood_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Client MACs (and relays) whose DISCOVER rate would drain a pool (#4737).
+
+    Two signals off the readings the agent's DISCOVER watch ships. A MAC fires
+    at ``threshold_percent`` DISCOVERs per minute (default
+    :data:`_DHCP_DISCOVER_PER_MIN_DEFAULT`); a relay fires when it forwarded
+    DISCOVERs for at least ``min_free_addresses`` distinct MACs in a window
+    (off while empty -- see the default's comment).
+
+    A reading resolves to the live scope its relay address falls in
+    (:func:`app.services.dhcp.discover_rates.resolve_scope`) and is skipped,
+    not alarmed on, when that scope is in the Trash or has no live dynamic
+    pool: there is nothing there for the flood to exhaust, and an alert for it
+    would only be noise the operator cannot act on. A direct broadcast, or a
+    relay outside every scope, cannot be attributed and is reported against
+    its server. Restoring the scope brings the alert back on the next
+    window, because the reading was never deleted. Servers whose agent does
+    not run the watch have no readings and are never mentioned.
+
+    Open-while-true: auto-resolves once the source stops (its reading goes
+    stale after :data:`app.services.dhcp.discover_rates.FRESH_SECONDS`) or
+    falls under the threshold.
+    """
+    from app.services.dhcp import discover_rates  # noqa: PLC0415
+
+    per_min = (
+        rule.threshold_percent
+        if rule.threshold_percent is not None
+        else _DHCP_DISCOVER_PER_MIN_DEFAULT
+    )
+    relay_macs = rule.min_free_addresses
+    matches: list[tuple[str, str, str]] = []
+    for reading in await discover_rates.list_readings(db):
+        rate = reading.rate
+        server = reading.server
+        where = server.name
+        if reading.match.scope is not None and reading.match.subnet is not None:
+            where = f"{reading.match.subnet.network} ({reading.match.scope.name}) on {server.name}"
+        if rate.kind == discover_rates.KIND_MAC:
+            if reading.per_minute < per_min:
+                continue
+            matches.append(
+                (
+                    f"mac:{server.id}:{rate.subject}",
+                    f"{rate.subject} — {where}",
+                    f"Client {rate.subject} sent {rate.discovers} DHCPDISCOVERs in "
+                    f"{rate.window_seconds} s ({reading.per_minute:.0f}/min, threshold "
+                    f"{_thr(per_min)}/min) to {where}. A real client stops once it is "
+                    "offered an address; a device that does not, or one rotating its MAC, "
+                    "drains the pool.",
+                )
+            )
+        elif rate.kind == discover_rates.KIND_RELAY and relay_macs is not None:
+            if (rate.distinct_macs or 0) < relay_macs:
+                continue
+            matches.append(
+                (
+                    f"relay:{server.id}:{rate.subject}",
+                    f"relay {rate.subject} — {where}",
+                    f"Relay {rate.subject} forwarded DHCPDISCOVERs for {rate.distinct_macs} "
+                    f"distinct client MACs in {rate.window_seconds} s ({rate.discovers} "
+                    f"DISCOVERs, threshold {_thr(relay_macs)} MACs) to {where}. Many "
+                    "MACs from one port is the signature of a MAC-rotating flood.",
+                )
+            )
     return matches
 
 
@@ -7129,6 +7220,57 @@ async def seed_dhcp_packets_dropped_alert_rule() -> None:
         await session.commit()
 
 
+_DHCP_DISCOVER_FLOOD_RULE_NAME = "DHCP DISCOVER flood"
+
+
+async def seed_dhcp_discover_flood_alert_rule() -> None:
+    """Seed the #4737 rule, DISABLED by default.
+
+    Off for two reasons that are not the "optional subsystem" one. The threshold
+    is a fact about the site, and a default that is right for an office is
+    noise on a conference network. And the rule reads nothing until the DHCP
+    agent runs the DISCOVER watch (``DHCP_DISCOVER_WATCH_ENABLED=1``, which
+    needs ``CAP_NET_RAW`` like the other sniffers), so enabling it on an
+    install that does not is silent rather than wrong.
+
+    Keyed on ``name``; an operator who enables, edits or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DHCP_DISCOVER_FLOOD_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DHCP_DISCOVER_FLOOD_RULE_NAME,
+                description=(
+                    "Fires when one client MAC sends DHCPDISCOVERs faster than the "
+                    "threshold per minute, or (optionally) when one relay forwards "
+                    "DISCOVERs for many distinct MACs in a window -- the shapes of a "
+                    "misbehaving device and of a MAC-rotating flood, both of which "
+                    "drain a pool long before the pool-utilisation alerts fire. "
+                    "Needs the DHCP agent's DISCOVER watch "
+                    "(DHCP_DISCOVER_WATCH_ENABLED=1); a server whose agent does not "
+                    "run it has nothing to report and is never alarmed on. "
+                    "Auto-resolves once the source stops."
+                ),
+                rule_type=RULE_TYPE_DHCP_DISCOVER_FLOOD,
+                threshold_percent=_DHCP_DISCOVER_PER_MIN_DEFAULT,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DNS_NXDOMAIN_SPIKE_RULE_NAME = "DNS NXDOMAIN spike"
 _DNS_QUERY_RATE_SPIKE_RULE_NAME = "DNS query-rate spike"
 
@@ -8401,6 +8543,7 @@ async def seed_dns_dga_alert_rule() -> None:
 _RULE_TYPE_MODULE: dict[str, str] = {
     RULE_TYPE_DHCP_POOL_EXHAUSTION: "core.dhcp",
     RULE_TYPE_DHCP_PACKETS_DROPPED: "core.dhcp",
+    RULE_TYPE_DHCP_DISCOVER_FLOOD: "core.dhcp",
     RULE_TYPE_DHCP_SCOPE_UNCOORDINATED: "core.dhcp",
     RULE_TYPE_DHCP_RELAY_VIP_DIRECT_SOCKET: "core.dhcp",
     RULE_TYPE_DNSSEC_MULTI_SIGNER: "core.dns",
@@ -8575,6 +8718,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_dhcp_packets_dropped_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dhcp_server"
+            elif rule.rule_type == RULE_TYPE_DHCP_DISCOVER_FLOOD:
+                base = await _matching_dhcp_discover_flood_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dhcp_discover_source"
             elif rule.rule_type == RULE_TYPE_DNS_RATE_LIMIT_DROPPING:
                 base = await _matching_dns_rate_limit_dropping_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

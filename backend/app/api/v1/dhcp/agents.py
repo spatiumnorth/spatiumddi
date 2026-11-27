@@ -415,6 +415,54 @@ class RAObservationBatch(BaseModel):
     batch_id: BatchId = None
 
 
+class DiscoverClientEntry(BaseModel):
+    """One client MAC whose DISCOVER count in the window cleared the agent's floor (#4737)."""
+
+    mac: str = Field(min_length=12, max_length=32)
+    discovers: int = Field(ge=1, le=10_000_000)
+    giaddr: str | None = Field(default=None, max_length=45)
+
+    @field_validator("giaddr")
+    @classmethod
+    def _v_giaddr(cls, v: str | None) -> str | None:
+        return _valid_ip_or_none(v)
+
+
+class DiscoverRelayEntry(BaseModel):
+    """One relay and how many distinct MACs it forwarded DISCOVERs for (#4737)."""
+
+    giaddr: str = Field(max_length=45)
+    discovers: int = Field(ge=1, le=10_000_000)
+    distinct_macs: int = Field(ge=1, le=10_000_000)
+
+    @field_validator("giaddr")
+    @classmethod
+    def _v_giaddr(cls, v: str) -> str:
+        out = _valid_ip_or_none(v)
+        if out is None:
+            raise ValueError("giaddr must be an IP address")
+        return out
+
+
+def _valid_ip_or_none(v: str | None) -> str | None:
+    if v is None or not v.strip():
+        return None
+    try:
+        return str(ipaddress.ip_address(v.strip()))
+    except ValueError as exc:
+        raise ValueError("giaddr must be an IP address") from exc
+
+
+class DiscoverRateBatch(BaseModel):
+    window_seconds: int = Field(default=60, ge=10, le=3600)
+    # The end of the counted window; the agent stamps it so a replayed batch
+    # keeps its age. Omitted = now.
+    window_end: datetime | None = None
+    clients: list[DiscoverClientEntry] = Field(default_factory=list, max_length=500)
+    relays: list[DiscoverRelayEntry] = Field(default_factory=list, max_length=200)
+    batch_id: BatchId = None
+
+
 # ── Batch-ingest responses (#1077) ──────────────────────────────────────────
 #
 # Every batch-ingest route answers an ``IngestAck`` subclass: the shared
@@ -454,6 +502,12 @@ class DHCPFingerprintsAck(IngestAck):
 class DHCPOffersAck(IngestAck):
     """Per-classification counts (``expected`` / ``acknowledged`` / ``rogue`` /
     ``skipped``) from ``record_offers``."""
+
+
+class DiscoverRatesAck(IngestAck):
+    clients: int = 0
+    relays: int = 0
+    skipped: int = 0
 
 
 class RAObservationsAck(IngestAck):
@@ -3078,4 +3132,44 @@ async def agent_ra_observations(
         for o in body.observations[:200]
     ]
     counts = await record_observations(db, server, observations)
+    return counts
+
+
+@router.post("/discover-rates", response_model=DiscoverRatesAck)
+async def agent_discover_rates(
+    body: DiscoverRateBatch,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, Any]:
+    """Ingest the DISCOVER-rate readings from the agent's DISCOVER watch (#4737).
+
+    The agent ships, once a window, the client MACs and relays whose DISCOVER
+    count cleared its floor. We keep the latest reading per source; the
+    ``dhcp_discover_flood`` alert reads them. An agent that never sends this
+    (older, or the watch not enabled) leaves the table empty and the rule with
+    nothing to fire on. Capped at 500 clients and 200 relays per request. No
+    audit row -- high-volume telemetry.
+    """
+    from app.services.dhcp.discover_rates import (  # noqa: PLC0415
+        ClientReading,
+        RelayReading,
+        record_rates,
+    )
+
+    server, _ = auth
+    if not await claim_batch(
+        db, server_id=server.id, batch_id=body.batch_id, stream="dhcp.discover_rates"
+    ):
+        return duplicate_response()
+    window_end = body.window_end or datetime.now(UTC)
+    if window_end.tzinfo is None:
+        window_end = window_end.replace(tzinfo=UTC)
+    counts = await record_rates(
+        db,
+        server,
+        window_seconds=body.window_seconds,
+        window_end=window_end,
+        clients=[ClientReading(c.mac, c.discovers, c.giaddr) for c in body.clients],
+        relays=[RelayReading(r.giaddr, r.discovers, r.distinct_macs) for r in body.relays],
+    )
     return counts

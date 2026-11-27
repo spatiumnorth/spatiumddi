@@ -433,7 +433,7 @@ SECTIONS: tuple[Section, ...] = (
             "backup; restoring this only matters when you need "
             "historical chart data after a disaster recovery."
         ),
-        tables=("dns_metric_sample", "dhcp_metric_sample"),
+        tables=("dns_metric_sample", "dhcp_metric_sample", "dhcp_discover_rate"),
         volatile=True,
     ),
     Section(

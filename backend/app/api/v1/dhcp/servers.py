@@ -56,6 +56,7 @@ from app.services.agents.memory_status import (
 from app.services.agents.spool_status import SpoolStatus
 from app.services.api_token_scopes import token_outbound
 from app.services.appliance.ownership import owning_appliance_for_dhcp_server
+from app.services.dhcp import discover_rates
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.option_spelling import group_drivers, scopes_losing_raw_options
@@ -1842,6 +1843,52 @@ class DHCPServerStatsResponse(BaseModel):
     range: str
     bucket_seconds: int
     rate_buckets: list[DHCPRateBucket]
+
+
+class DiscoverSource(BaseModel):
+    """One client MAC or relay the DISCOVER watch reported (#4737)."""
+
+    kind: str  # "mac" | "relay"
+    subject: str  # the client MAC, or the relay address
+    giaddr: str | None = None
+    discovers: int
+    per_minute: float
+    distinct_macs: int | None = None  # relays only
+    window_seconds: int
+    window_end: datetime
+    subnet: str | None = None
+    scope_name: str | None = None
+
+
+class DiscoverSourcesResponse(BaseModel):
+    server_id: uuid.UUID
+    sources: list[DiscoverSource]
+
+
+@router.get("/{server_id}/discover-sources", response_model=DiscoverSourcesResponse)
+async def get_server_discover_sources(
+    server_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    kind: str | None = Query(None, pattern="^(mac|relay)$"),
+    min_per_minute: float = Query(0, ge=0, le=1_000_000),
+) -> DiscoverSourcesResponse:
+    """The client MACs and relays the agent's DISCOVER watch reported recently (#4737).
+
+    The same readings the ``dhcp_discover_flood`` alert evaluates, highest rate
+    first. A source resolving to a scope in the Trash, or to one with no live
+    dynamic pool, is left out, as it is for the alert. Empty for an agent that
+    does not run the watch. Read-only: no audit row.
+    """
+    if await db.get(DHCPServer, server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    readings = await discover_rates.list_readings(
+        db, kind=kind, server_id=server_id, min_per_minute=min_per_minute
+    )
+    return DiscoverSourcesResponse(
+        server_id=server_id,
+        sources=[DiscoverSource(**discover_rates.source_dict(r)) for r in readings],
+    )
 
 
 @router.get("/{server_id}/memory-history", response_model=MemoryHistory)

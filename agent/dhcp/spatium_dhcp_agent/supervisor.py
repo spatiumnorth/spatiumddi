@@ -19,6 +19,7 @@ import structlog
 from .bootstrap import ensure_token
 from .config import AgentConfig
 from .dhcp_fingerprint import DhcpFingerprintShipper
+from .discover_watch import DiscoverWatchShipper
 from .rogue_probe import RogueProbeShipper
 from .ha_status import HAStatusPoller
 from .heartbeat import HeartbeatClient
@@ -52,7 +53,13 @@ SPOOL_SHARES: dict[str, float] = {
     "mac_sightings": 0.05,
     "fingerprints": 0.04,
     "ra_observations": 0.06,
+    "discover_rates": 0.02,
 }
+
+#: #4737 — a DISCOVER-rate window older than this is no longer evidence of a
+#: flood (the control plane reads only the last few minutes), so a spooled one
+#: is dropped rather than replayed.
+DISCOVER_RATES_MAX_AGE_SECONDS = 900.0
 
 
 def _log_max_age_seconds() -> float | None:
@@ -75,6 +82,8 @@ def build_spool_manager(cfg: AgentConfig) -> SpoolManager:
     manager = SpoolManager(cfg.state_dir)
     for stream, share in SPOOL_SHARES.items():
         age = _log_max_age_seconds() if stream == "dhcp_log" else None
+        if stream == "discover_rates":
+            age = DISCOVER_RATES_MAX_AGE_SECONDS
         manager.declare(stream, share, max_age_seconds=age)
     return manager
 
@@ -174,6 +183,18 @@ def run(cfg: AgentConfig) -> int:
         )
         log.info("dhcp_ra_sniffer_enabled")
 
+    # Per-MAC / per-relay DISCOVER rate watch (issue #4737) — opt-in for the
+    # same CAP_NET_RAW + scapy reasons as fingerprinting. Counts DISCOVERs per
+    # window and ships the sources above a floor; the control plane's
+    # ``dhcp_discover_flood`` alert decides what is a flood.
+    discover_watch_enabled = os.environ.get("DHCP_DISCOVER_WATCH_ENABLED", "0") == "1"
+    discover_watch: DiscoverWatchShipper | None = None
+    if discover_watch_enabled:
+        discover_watch = DiscoverWatchShipper(
+            cfg, token_ref, spool=spools.get("discover_rates")
+        )
+        log.info("dhcp_discover_watch_enabled")
+
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
@@ -211,6 +232,12 @@ def run(cfg: AgentConfig) -> int:
                 daemon=True,
             )
         )
+    if discover_watch is not None:
+        threads.append(
+            threading.Thread(
+                target=discover_watch.run, name="discover-watch", daemon=True
+            )
+        )
     for t in threads:
         t.start()
 
@@ -234,6 +261,8 @@ def run(cfg: AgentConfig) -> int:
             mac_sighting_shipper.stop()
         if ra_sniffer_shipper is not None:
             ra_sniffer_shipper.stop()
+        if discover_watch is not None:
+            discover_watch.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

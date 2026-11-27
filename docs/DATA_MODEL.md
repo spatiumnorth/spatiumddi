@@ -275,6 +275,7 @@ Supporting tables:
 | `DHCPPXEProfile` / `DHCPPXEArchMatch` | `dhcp_pxe_profile` / `dhcp_pxe_arch_match` | PXE / iPXE per-arch provisioning |
 | `DHCPPhoneProfile` / `DHCPPhoneProfileScope` | `dhcp_phone_profile` / `dhcp_phone_profile_scope` | VoIP phone option profiles |
 | `DHCPObservedResponder` / `DHCPResponderAllowlist` | `dhcp_observed_responder` / `dhcp_responder_allowlist` | rogue-DHCP detection |
+| `DHCPDiscoverRate` | `dhcp_discover_rate` | latest per-MAC / per-relay DISCOVER-rate reading from the agent DISCOVER watch (#4737) |
 | `DHCPFingerprint` | `dhcp_fingerprint` | passive fingerprint records (`dhcp_fingerprint.py`) |
 
 ---

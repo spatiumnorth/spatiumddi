@@ -1365,6 +1365,51 @@ How the kill is seen depends on the deployment:
 > two halves read as one time-ordered stream. See
 > [`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
 
+## 4e. DISCOVER-flood detection (#4737)
+
+One misbehaving device, or a client rotating its MAC, can drain a pool in
+minutes. The pool-utilisation alerts fire only once the pool is nearly full, and
+rogue-DHCP detection (#370) looks for unexpected *servers*, not chatty clients.
+The **`dhcp_discover_flood`** alert rule names the source while there is still
+free space to act in.
+
+**Data source.** Kea keeps no per-client DISCOVER count (its `pkt4-discover-received`
+statistic is one number per server), so the agent counts them itself: an opt-in
+scapy sniffer, `DHCP_DISCOVER_WATCH_ENABLED=1` (same `CAP_NET_RAW` and scapy
+posture as the fingerprint sniffer; optional `DHCP_DISCOVER_WATCH_IFACE`,
+`DHCP_DISCOVER_WATCH_CLIENT_FLOOR` default 5, `DHCP_DISCOVER_WATCH_RELAY_FLOOR`
+default 10). Each 60 s window it counts DISCOVERs per client MAC and distinct
+MACs per relay (`giaddr`), and posts only the sources above a floor to
+`POST /api/v1/dhcp/agents/discover-rates`. The stream is new and optional:
+an older agent never sends it, the table stays empty and the rule has nothing to
+fire on; an older control plane answers 404 and the batch waits in the
+`discover_rates` spool (entries older than 15 minutes are dropped, a window that
+old is no longer evidence). Memory is bounded (50,000 MACs per window) so a
+MAC-rotating flood cannot grow the agent without limit.
+
+**The rule** (seeded **disabled** -- the right threshold is a fact about the
+site):
+
+* **Per MAC** -- fires when one MAC sends at least `threshold_percent` (reused
+  as a count; default 30) DISCOVERs per minute.
+* **Per relay** -- when `min_free_addresses` (reused as a count; empty = off) is
+  set, fires when one relay forwarded DISCOVERs for at least that many
+  *distinct* MACs in a window, the shape of a MAC-rotating flood.
+
+The alert names the MAC or relay, the rate, and the subnet / scope the relay
+address falls in (a direct broadcast, or a relay outside every scope, is
+reported against the server). It auto-resolves when the source stops or falls
+under the threshold. A reading that resolves to a scope in the **Trash**, or to
+one with no live dynamic pool, is ignored: there is nothing there to exhaust.
+Restoring the scope brings the alert back on the next window; deleting a server
+removes its readings. Attributing the source to a switch port through the SNMP
+MAC-to-port mapping is a later step.
+
+`GET /api/v1/dhcp/servers/{id}/discover-sources` and the
+`find_dhcp_discover_sources` copilot tool list the readings the rule evaluates
+(empty for a server whose agent does not run the watch, which is not the same
+as "no flood").
+
 ## 5. DHCP Lease Tracking
 
 Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server, not managed directly.
@@ -1569,7 +1614,7 @@ Two mechanisms close that, push-plus-pull like the Windows path:
   under `<state dir>/spool/<stream>/` (`/var/lib/spatium-dhcp-agent/spool/`)
   and replayed in order on reconnect, surviving agent restarts. Streams:
   `lease_events`, `dhcp_log`, `metrics`, `mac_sightings`, `fingerprints`,
-  `ra_observations`. The rogue-DHCP probe and HA status are deliberately
+  `ra_observations`, `discover_rates`. The rogue-DHCP probe and HA status are deliberately
   **not** spooled — they are current-state readings with no observation
   time, and replaying a stale one would be wrong rather than late. Same
   settings as the DNS agent: `AGENT_SPOOL_ENABLED` (default `true`),
