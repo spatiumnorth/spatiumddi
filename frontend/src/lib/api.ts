@@ -6492,6 +6492,52 @@ export interface Page<T> {
   page_size: number;
 }
 
+// #4830 — a record create / update / delete held until ``scheduled_at`` (UTC).
+export type DNSScheduledChangeState =
+  | "pending"
+  | "running"
+  | "executed"
+  | "failed"
+  | "cancelled";
+
+export interface DNSScheduledChange {
+  id: string;
+  zone_id: string;
+  record_id: string | null;
+  action: "create" | "update" | "delete";
+  payload: Record<string, unknown>;
+  record_label: string;
+  scheduled_at: string;
+  state: DNSScheduledChangeState;
+  result_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_by_user_id: string | null;
+  created_by_display: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DNSScheduledChangePage {
+  items: DNSScheduledChange[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface DNSScheduledChangeCreate {
+  action: "create" | "update" | "delete";
+  scheduled_at: string;
+  record_id?: string;
+  record?: {
+    name: string;
+    record_type: string;
+    value: string;
+    ttl?: number | null;
+  };
+  changes?: { value?: string; ttl?: number | null };
+}
+
 export interface DNSRecord {
   id: string;
   zone_id: string;
@@ -7173,6 +7219,35 @@ export const dnsApi = {
       .put<DNSRecord>(
         `/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`,
         data,
+      )
+      .then((r) => r.data),
+  // #4830 — record changes held until a set time. ``scheduled_at`` is UTC.
+  listScheduledChanges: (
+    groupId: string,
+    zoneId: string,
+    params?: { state?: string; page?: number; page_size?: number },
+  ) =>
+    api
+      .get<DNSScheduledChangePage>(
+        `/dns/groups/${groupId}/zones/${zoneId}/scheduled-changes`,
+        { params },
+      )
+      .then((r) => r.data),
+  createScheduledChange: (
+    groupId: string,
+    zoneId: string,
+    data: DNSScheduledChangeCreate,
+  ) =>
+    api
+      .post<DNSScheduledChange>(
+        `/dns/groups/${groupId}/zones/${zoneId}/scheduled-changes`,
+        data,
+      )
+      .then((r) => r.data),
+  cancelScheduledChange: (groupId: string, zoneId: string, id: string) =>
+    api
+      .post<DNSScheduledChange>(
+        `/dns/groups/${groupId}/zones/${zoneId}/scheduled-changes/${id}/cancel`,
       )
       .then((r) => r.data),
   // ``permanent`` is superadmin-only server-side (#4078).
