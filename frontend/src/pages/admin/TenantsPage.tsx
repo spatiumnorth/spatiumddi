@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Layers, Pencil, Plus, Trash2 } from "lucide-react";
+import { FreshEdit } from "@/components/FreshEdit";
 import { Field } from "@/components/ui/field";
+import { changedFields } from "@/hooks/useFreshRow";
 import { FormError } from "@/components/ui/form-error";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { Modal } from "@/components/ui/modal";
@@ -33,7 +35,10 @@ function TenantForm({
   const mutation = useMutation({
     mutationFn: () =>
       tenant
-        ? tenantsApi.update(tenant.id, { name, description })
+        ? tenantsApi.update(
+            tenant.id,
+            changedFields(tenant, { name, description }),
+          )
         : tenantsApi.create({ name, description }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["tenants"] });
@@ -344,7 +349,18 @@ export function TenantsPage() {
       {showCreate && (
         <TenantForm tenant={null} onClose={() => setShowCreate(false)} />
       )}
-      {edit && <TenantForm tenant={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          load={() => tenantsApi.get(edit.id)}
+          title="Edit tenant"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <TenantForm tenant={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {spacesFor && (
         <SpacesModal tenant={spacesFor} onClose={() => setSpacesFor(null)} />
       )}
