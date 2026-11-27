@@ -802,6 +802,19 @@ migrate:
   tolerations:
   affinity:
 
+# ── Grafana dashboards (#4739) ───────────────────────────────────────────────
+# Renders the DNS / DHCP / IPAM / Overview dashboards under dashboards/ as
+# ConfigMaps for the Grafana sidecar (kube-prometheus-stack, grafana chart).
+# Default off: most installs have no Grafana sidecar. ``namespace`` must be one
+# the sidecar watches (kube-prometheus-stack: its own, or searchNamespace=ALL).
+grafanaDashboards:
+  enabled: false
+  namespace: ""          # default: the release namespace
+  label: grafana_dashboard
+  labelValue: "1"
+  annotations: {}
+    # grafana_folder: SpatiumDDI   # sidecar folder (needs sidecar.dashboards.folderAnnotation)
+
 # ── Ingress (for the frontend; API is routed through the frontend nginx) ─────
 ingress:
   enabled: false

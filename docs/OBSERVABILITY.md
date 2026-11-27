@@ -15,9 +15,9 @@ container streams.
 > not shipped code** and are flagged inline as planned: a centralized
 > log store + collector (Loki / Grafana / Vector / Promtail — § 2), a
 > generic control-plane log-explorer API (§ 3), the IPAM / DHCP / DNS /
-> Celery / Database Prometheus metric families (§ 6), and the product
-> Grafana dashboard bundle (§ 8). No Loki / Grafana / Vector / Promtail
-> service ships in any `docker-compose*.yml` or in `charts/`.
+> Celery / Database Prometheus metric families (§ 6). The Grafana dashboard
+> bundle (§ 8) ships, limited to the metrics that exist. No Loki / Grafana /
+> Vector / Promtail service ships in any `docker-compose*.yml` or in `charts/`.
 
 ### Native admin surfaces (since `2026.04.26-1`)
 
@@ -1104,34 +1104,61 @@ All services expose:
 
 ## 8. Bundled Grafana Dashboards
 
-> **Status: planned / not shipped as a product bundle.** No
-> operator-facing Grafana dashboard set ships with the product, and
-> the dashboards below depend on the planned (un-emitted) metric
-> families in § 6. What *does* exist is a single **perf-testing**
-> "war room" dashboard at
-> [`perf/dashboards/grafana/dashboards/warroom.json`](https://github.com/spatiumnorth/spatiumddi/blob/main/perf/dashboards/grafana/dashboards/warroom.json)
-> (with provisioning under `perf/dashboards/grafana/provisioning/` and
-> a matching scrape config at `perf/dashboards/prometheus/prometheus.yml`).
-> That stack is for the load/soak test harness under `perf/`, not for
-> production observability, and it scrapes the perf exporters rather
-> than the product `/metrics` endpoint's request family.
+Four importable dashboards ship in
+[`charts/spatiumddi/dashboards/`](https://github.com/spatiumnorth/spatiumddi/tree/main/charts/spatiumddi/dashboards)
+(Grafana 10+, schema 39). They live under the chart so the Helm
+`.Files` loader can render them; the same files are what you import by
+hand. Each has a **Data source** variable (any Prometheus, no pinned UID)
+and a **Job** variable (the scrape job name).
 
-The intended product dashboard bundle, once the § 6 metric families
-are emitted, would be:
+| Dashboard | File | Panels |
+|---|---|---|
+| **SpatiumDDI Overview** | `spatiumddi-overview.json` | request rate, 5xx ratio, p95 latency, in-flight requests; requests by method and status; p50/p95/p99; 4xx/5xx; busiest, slowest and failing routes; login and API-token use |
+| **SpatiumDDI IPAM** | `spatiumddi-ipam.json` | the same API panels filtered to `/api/v1/ipam` |
+| **SpatiumDDI DNS** | `spatiumddi-dns.json` | API panels for `/api/v1/dns`; DNS agent config long-poll outcomes; inline bundle renders and failures; DNS query-log forwarding sent / dropped by target |
+| **SpatiumDDI DHCP** | `spatiumddi-dhcp.json` | API panels for `/api/v1/dhcp`; DHCP activity-log forwarding sent / dropped by target |
 
-| Dashboard | Contents |
-|---|---|
-| **SpatiumDDI Overview** | API request rate, error rate, p95 latency, active users |
-| **IP Utilization** | Top subnets by utilization, space-wide heatmap, trending |
-| **DHCP Health** | Server status, lease counts, pool utilization, sync lag |
-| **DNS Health** | Server status, zone counts, sync lag, blocklist hit rate |
-| **System Health** | DB connections, replication lag, Redis memory, Celery queues |
-| **Audit Activity** | Actions per hour, top users, failed auth attempts |
+**Metric families used** (so an InfluxDB user, § 6 and
+[#889](https://github.com/spatiumnorth/spatiumddi/issues/889), can map
+them): `spatiumddi_api_requests_total`,
+`spatiumddi_api_request_duration_seconds`,
+`spatiumddi_api_active_requests`, `spatiumddi_auth_login_total`,
+`spatiumddi_auth_token_usage_total`, `spatiumddi_agent_bundle_*`, and
+`spatiumddi_log_stream_{sent,dropped}_total`.
 
-Until then, the **shipped** in-product equivalents are the Dashboard
-sub-tabs and Platform Insights surfaces described in the Overview.
+> **What the dashboards do not show yet.** Subnet utilisation, DHCP pool
+> utilisation, lease counts, zone and record counts and per-server
+> status need the IPAM / DHCP / DNS metric families listed in § 6 as
+> planned ([#2146](https://github.com/spatiumnorth/spatiumddi/issues/2146)).
+> Until `/metrics` emits them the dashboards stay on API, agent-delivery
+> and log-forwarding signals, and there are no server / group / scope
+> variables because no emitted metric carries those labels.
+> `backend/tests/test_grafana_dashboards.py` fails if a dashboard queries
+> a metric `backend/app` does not register, so a panel cannot be added
+> ahead of its metric. The in-product Dashboard tabs (see the Overview)
+> remain the source for those figures.
 
----
+**Import by hand.** In Grafana: Dashboards, New, Import, upload the JSON
+file, pick your Prometheus data source. Or provision the files from a
+directory with a standard
+[dashboard provider](https://grafana.com/docs/grafana/latest/administration/provisioning/#dashboards).
+The scrape job needs the bearer token described in § 6.
+
+**Import with Helm (Grafana sidecar).** Off by default:
+
+```yaml
+grafanaDashboards:
+  enabled: true
+  namespace: monitoring        # a namespace the sidecar watches
+  annotations:
+    grafana_folder: SpatiumDDI  # optional; needs sidecar folderAnnotation
+```
+
+This renders one ConfigMap per dashboard with the label
+`grafana_dashboard: "1"` (change it with `grafanaDashboards.label` if your
+sidecar uses another). The perf-testing "war room" dashboard at
+`perf/dashboards/grafana/dashboards/warroom.json` is separate and is for
+the load-test harness only.
 
 ## 9. Alerting
 

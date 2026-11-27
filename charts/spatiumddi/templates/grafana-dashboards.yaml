@@ -1,0 +1,26 @@
+{{- /*
+  Grafana dashboards (#4739). Opt-in: one ConfigMap per dashboard JSON under
+  charts/spatiumddi/dashboards/, carrying the label the Grafana sidecar
+  (grafana.sidecar.dashboards.label, default grafana_dashboard) watches.
+  The JSON uses a ${datasource} variable, so they import against any Prometheus.
+*/ -}}
+{{- if .Values.grafanaDashboards.enabled }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "spatiumddi.fullname" $ }}-dashboard-{{ base $path | trimSuffix ".json" }}
+  namespace: {{ $.Values.grafanaDashboards.namespace | default $.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.labels" $ | nindent 4 }}
+    {{ $.Values.grafanaDashboards.label }}: {{ $.Values.grafanaDashboards.labelValue | quote }}
+  {{- with $.Values.grafanaDashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{ base $path }}: |-
+    {{- $.Files.Get $path | nindent 4 }}
+{{- end }}
+{{- end }}

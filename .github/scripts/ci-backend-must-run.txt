@@ -241,3 +241,7 @@ docker-compose.dev.yml
 # test_host_timezone_4416.py (#4416) checks the frontend's host time zone alias
 # table mirrors the backend's, so editing that table must run it.
 frontend/src/lib/hostTimezones.ts
+
+# test_grafana_dashboards.py (#4739) validates the shipped Grafana dashboard
+# JSON against the metric names backend/app registers, so editing one must run it.
+charts/spatiumddi/dashboards/

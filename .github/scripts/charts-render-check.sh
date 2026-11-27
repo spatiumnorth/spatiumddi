@@ -254,13 +254,14 @@ helm dependency update "$METALLB"
 # ── Umbrella chart ──────────────────────────────────────────────────────────
 # Every template gate on: the agents, ingress, the slot-image mirror, HPA, the
 # three RBAC toggles + service control + appliance host mounts, frontend TLS,
-# Redis auth. ``chart-toggle-coverage.py`` fails this script if a template
+# Redis auth, the Grafana dashboards (#4739). ``chart-toggle-coverage.py`` fails this script if a template
 # grows a gate that no set below flips.
 UMBRELLA_ALL_ON=(
     --set dnsAgents.enabled=true
     --set dhcpAgents.enabled=true
     --set ingress.enabled=true
     --set slotImageMirror.enabled=true
+    --set grafanaDashboards.enabled=true
     --set api.autoscaling.enabled=true
     --set api.serviceAccount.enabled=true
     --set worker.serviceAccount.enabled=true
