@@ -154,8 +154,8 @@ def _load_layers() -> None:
     lazily, only does so after the first packet it can never read. Import them
     before the socket opens.
     """
-    import scapy.layers.dhcp  # noqa: F401, PLC0415
-    import scapy.layers.l2  # noqa: F401, PLC0415
+    import scapy.layers.dhcp  # noqa: F401
+    import scapy.layers.l2  # noqa: F401
 
 
 def sniff_interfaces(iface: str) -> list[str] | str | None:

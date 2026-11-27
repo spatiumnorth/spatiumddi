@@ -189,10 +189,10 @@ async def test_ingest_is_committed_not_just_flushed(
     assert r.status_code == 200, r.text
     async with AsyncSessionLocal() as other:
         n = (
-            await other.execute(
-                select(DHCPDiscoverRate).where(DHCPDiscoverRate.server_id == sid)
-            )
-        ).scalars().all()
+            (await other.execute(select(DHCPDiscoverRate).where(DHCPDiscoverRate.server_id == sid)))
+            .scalars()
+            .all()
+        )
     assert [x.subject for x in n] == [MAC]
 
 
