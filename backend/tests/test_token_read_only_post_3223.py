@@ -54,6 +54,7 @@ EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
         "/api/v1/logs/dns-queries/analytics",
         "/api/v1/multicast/groups/bulk-allocate/preview",
         "/api/v1/ot/devices/import/preview",
+        "/api/v1/presence",
         "/api/v1/tools/mac-vendor",
         "/api/v1/wake-scheduler/preview-targets",
         "/api/v1/wake-scheduler/schedules/{schedule_id}/preview-targets",
