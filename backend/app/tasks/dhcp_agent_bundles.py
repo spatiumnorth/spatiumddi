@@ -26,10 +26,10 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dhcp_server_channel, publish_wake
 from app.db import task_session
-from app.tasks.module_gate import module_gated
 from app.drivers.dhcp import is_agentless
 from app.models.dhcp import DHCPAgentBundle, DHCPServer
 from app.services.dhcp import agent_bundle as store
+from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
 
