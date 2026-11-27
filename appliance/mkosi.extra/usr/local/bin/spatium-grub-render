@@ -79,6 +79,10 @@ SLOT_VERSIONS = "/var/lib/spatiumddi/release-state/slot-versions.json"
 # filters on.
 SLOT_PARTLABELS = {"root_a", "root_b"}
 
+# Persisted machine-id candidates (#4954), authoritative first. spatium-etc-render
+# keeps STATE_DIR/machine-id and restores it into /etc/machine-id each boot.
+MACHINE_ID_PATHS = ("/var/lib/spatium-state/machine-id", "/etc/machine-id")
+
 # Version sentinels that mean "no real version" → render a bare title with
 # no version chunk. Mirrors slot_version_label()/_read_active_appliance_version()
 # in spatium-upgrade-slot, which return these for an empty/staging/unreadable
@@ -168,6 +172,36 @@ def discover_live_uuids() -> dict[str, str]:
     return uuids
 
 
+def live_machine_id() -> str | None:
+    """The host's persisted machine-id, or None when there is no valid one.
+
+    #4954: mkosi.finalize truncates /etc/machine-id, so every slot image ships
+    it empty, and systemd-journald opens /var/log/journal/<id> BEFORE the /etc
+    overlay (which carries the persisted id) is mounted -- it falls back to the
+    DMI product UUID and writes a second journal directory, so `journalctl -b`
+    is empty after a slot upgrade. Passing the id on the kernel cmdline
+    (systemd.machine_id=) puts it in effect in PID 1 before anything else runs.
+    """
+    for path in MACHINE_ID_PATHS:
+        try:
+            val = Path(path).read_text(encoding="ascii").strip().lower()
+        except (OSError, ValueError):
+            continue
+        if _valid_machine_id(val):
+            return val
+    return None
+
+
+def _valid_machine_id(val: str | None) -> bool:
+    """32 lowercase hex chars, not all zero (what systemd accepts)."""
+    return (
+        bool(val)
+        and len(val) == 32
+        and all(c in "0123456789abcdef" for c in val)
+        and val != "0" * 32
+    )
+
+
 def per_slot_versions() -> dict[str, str]:
     """Read slot-versions.json → {"slot_a": ver, "slot_b": ver}.
 
@@ -246,7 +280,8 @@ def render_verbose_block() -> str:
 
 
 def render_text(uuid_a: str, uuid_b: str,
-                ver_a: str | None, ver_b: str | None) -> str:
+                ver_a: str | None, ver_b: str | None,
+                machine_id: str | None = None) -> str:
     """Render the full grub.cfg text.
 
     Pure function of its inputs (the --print mode exercises this directly so
@@ -261,6 +296,9 @@ def render_text(uuid_a: str, uuid_b: str,
     substituted. The four menuentries are emitted in order: --id=slot_a,
     --id=slot_b, --id=slot_a_verbose, --id=rescue.
     """
+    # #4954: pin the persisted machine-id on every cmdline (see live_machine_id).
+    # Invalid / absent -> nothing emitted, the pre-#4954 behaviour.
+    mid = f" systemd.machine_id={machine_id}" if _valid_machine_id(machine_id) else ""
     title_a = _title(ver_a, "(slot A)")
     title_b = _title(ver_b, "(slot B)")
     title_a_verbose = _title(ver_a, "(slot A, verbose boot)")
@@ -326,7 +364,7 @@ def render_text(uuid_a: str, uuid_b: str,
         "",
         f'menuentry "{title_a}" --id=slot_a {{',
         f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
-        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw \\",
+        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw{mid} \\",
         "        ${sp_log} audit=0 ${sp_systemd} ${sp_console} \\",
         "        console=tty0 console=ttyS0,115200n8",
         "    initrd /boot/initrd.img",
@@ -334,7 +372,7 @@ def render_text(uuid_a: str, uuid_b: str,
         "",
         f'menuentry "{title_b}" --id=slot_b {{',
         f"    search --no-floppy --fs-uuid --set=root {uuid_b}",
-        f"    linux /boot/vmlinuz root=UUID={uuid_b} rw \\",
+        f"    linux /boot/vmlinuz root=UUID={uuid_b} rw{mid} \\",
         "        ${sp_log} audit=0 ${sp_systemd} ${sp_console} \\",
         "        console=tty0 console=ttyS0,115200n8",
         "    initrd /boot/initrd.img",
@@ -345,7 +383,7 @@ def render_text(uuid_a: str, uuid_b: str,
         "    # kernel message for a bug report. Also passes spatium-console=off",
         "    # so getty@tty1 wins tty1 (no dashboard overpainting the log).",
         f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
-        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw \\",
+        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw{mid} \\",
         "        spatium-console=off \\",
         "        console=tty0 console=ttyS0,115200n8",
         "    initrd /boot/initrd.img",
@@ -355,7 +393,7 @@ def render_text(uuid_a: str, uuid_b: str,
         "    # Boots slot_a into rescue.target — single-user, root shell only,",
         "    # no k3s, no getty@tty1.",
         f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
-        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw \\",
+        f"    linux /boot/vmlinuz root=UUID={uuid_a} rw{mid} \\",
         "        console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target",
         "    initrd /boot/initrd.img",
         "}",
@@ -482,6 +520,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     p.add_argument("--ver-a", help="DRY-RUN: slot A version label")
     p.add_argument("--ver-b", help="DRY-RUN: slot B version label")
+    p.add_argument("--machine-id", help="DRY-RUN: machine-id for systemd.machine_id=")
     return p.parse_args(argv)
 
 
@@ -497,7 +536,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         sys.stdout.write(
-            render_text(args.root_a_uuid, args.root_b_uuid, args.ver_a, args.ver_b)
+            render_text(args.root_a_uuid, args.root_b_uuid, args.ver_a, args.ver_b,
+                        args.machine_id)
         )
         return 0
 
@@ -546,6 +586,7 @@ def main(argv: list[str] | None = None) -> int:
         uuids["root_b"],
         vers.get("slot_a"),
         vers.get("slot_b"),
+        live_machine_id(),
     )
     rc = write_atomic(GRUB_CFG, text)
     if rc == 0:
