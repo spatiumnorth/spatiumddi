@@ -52,6 +52,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     ownership,
     pairing,
     pcap,
+    presence,
     proposals,
     provisioning_requests,
     radvd,
