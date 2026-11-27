@@ -1695,6 +1695,12 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         "tcp_clients": getattr(opts, "tcp_clients", None) if opts else None,
         "clients_per_query": getattr(opts, "clients_per_query", None) if opts else None,
         "max_clients_per_query": (getattr(opts, "max_clients_per_query", None) if opts else None),
+        "recursive_clients": getattr(opts, "recursive_clients", None) if opts else None,
+        "serve_stale_enabled": (
+            bool(getattr(opts, "serve_stale_enabled", False)) if opts else False
+        ),
+        "stale_answer_ttl": getattr(opts, "stale_answer_ttl", None) if opts else None,
+        "max_stale_ttl": getattr(opts, "max_stale_ttl", None) if opts else None,
         # dnsdist front for PowerDNS (issue #146 Phase 2). The PowerDNS agent
         # renders dnsdist.conf from these; the sidecar watches + reloads it.
         "dnsdist_enabled": (bool(getattr(opts, "dnsdist_enabled", False)) if opts else False),

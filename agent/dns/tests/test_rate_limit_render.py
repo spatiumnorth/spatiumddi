@@ -70,6 +70,30 @@ def test_amplification_without_rrl() -> None:
     assert "rate-limit {" not in out
 
 
+def test_resolver_limits_and_serve_stale_render() -> None:
+    out = _render_rate_limit_block(
+        {
+            "recursive_clients": 5000,
+            "serve_stale_enabled": True,
+            "stale_answer_ttl": 30,
+            "max_stale_ttl": 86400,
+        }
+    )
+    assert "    recursive-clients 5000;" in out
+    assert "    stale-answer-enable yes;" in out
+    assert "    stale-answer-ttl 30;" in out
+    assert "    max-stale-ttl 86400;" in out
+
+
+def test_serve_stale_ttls_need_serve_stale_on() -> None:
+    out = _render_rate_limit_block(
+        {"serve_stale_enabled": False, "stale_answer_ttl": 30, "max_stale_ttl": 60}
+    )
+    assert out == ""
+    assert "stale-answer-enable yes;" in _render_rate_limit_block({"serve_stale_enabled": True})
+    assert "stale-answer-ttl" not in _render_rate_limit_block({"serve_stale_enabled": True})
+
+
 def test_partial_amplification_omits_unset() -> None:
     out = _render_rate_limit_block({"tcp_clients": 150})
     assert "tcp-clients 150;" in out

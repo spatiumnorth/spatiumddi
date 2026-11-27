@@ -142,6 +142,10 @@ _POWERDNS_NOT_APPLIED: dict[str, str] = {
     "tcp_clients": "PowerDNS has no TCP client limit rendered from the group",
     "clients_per_query": "PowerDNS has no clients-per-query setting",
     "max_clients_per_query": "PowerDNS has no clients-per-query setting",
+    "recursive_clients": "PowerDNS authoritative does not recurse",
+    "serve_stale_enabled": "PowerDNS authoritative has no resolver cache to serve stale from",
+    "stale_answer_ttl": "PowerDNS authoritative has no resolver cache to serve stale from",
+    "max_stale_ttl": "PowerDNS authoritative has no resolver cache to serve stale from",
     "doq_enabled": "the PowerDNS dnsdist front has no DNS-over-QUIC listener",
     "doq_port": "the PowerDNS dnsdist front has no DNS-over-QUIC listener",
 }
@@ -240,6 +244,10 @@ _BIND9_APPLIED = frozenset(
         "tcp_clients",
         "clients_per_query",
         "max_clients_per_query",
+        "recursive_clients",
+        "serve_stale_enabled",
+        "stale_answer_ttl",
+        "max_stale_ttl",
     }
 )
 _POWERDNS_APPLIED = frozenset(

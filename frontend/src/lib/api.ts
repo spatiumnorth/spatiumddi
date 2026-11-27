@@ -6010,6 +6010,11 @@ export interface DNSServerOptions {
   tcp_clients: number | null;
   clients_per_query: number | null;
   max_clients_per_query: number | null;
+  // Resolver limits + serve-stale (#3567)
+  recursive_clients: number | null;
+  serve_stale_enabled: boolean;
+  stale_answer_ttl: number | null;
+  max_stale_ttl: number | null;
   // dnsdist front for PowerDNS (issue #146 Phase 2)
   dnsdist_enabled: boolean;
   dnsdist_max_qps_per_client: number | null;

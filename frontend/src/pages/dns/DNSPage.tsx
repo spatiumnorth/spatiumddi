@@ -8873,6 +8873,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
   const [tcpClients, setTcpClients] = useState("");
   const [clientsPerQuery, setClientsPerQuery] = useState("");
   const [maxClientsPerQuery, setMaxClientsPerQuery] = useState("");
+  const [recursiveClients, setRecursiveClients] = useState("");
+  const [serveStale, setServeStale] = useState(false);
+  const [staleAnswerTtl, setStaleAnswerTtl] = useState("");
+  const [maxStaleTtl, setMaxStaleTtl] = useState("");
   // dnsdist front for PowerDNS (#146 Phase 2).
   const [dnsdistEnabled, setDnsdistEnabled] = useState(false);
   const [dnsdistMaxQps, setDnsdistMaxQps] = useState("");
@@ -8927,6 +8931,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
     setTcpClients(opts.tcp_clients?.toString() ?? "");
     setClientsPerQuery(opts.clients_per_query?.toString() ?? "");
     setMaxClientsPerQuery(opts.max_clients_per_query?.toString() ?? "");
+    setRecursiveClients(opts.recursive_clients?.toString() ?? "");
+    setServeStale(opts.serve_stale_enabled);
+    setStaleAnswerTtl(opts.stale_answer_ttl?.toString() ?? "");
+    setMaxStaleTtl(opts.max_stale_ttl?.toString() ?? "");
     setDnsdistEnabled(opts.dnsdist_enabled);
     setDnsdistMaxQps(opts.dnsdist_max_qps_per_client?.toString() ?? "");
     setDnsdistAction(opts.dnsdist_action);
@@ -9111,6 +9119,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
       tcp_clients: numOrNull(tcpClients),
       clients_per_query: numOrNull(clientsPerQuery),
       max_clients_per_query: numOrNull(maxClientsPerQuery),
+      recursive_clients: numOrNull(recursiveClients),
+      serve_stale_enabled: serveStale,
+      stale_answer_ttl: numOrNull(staleAnswerTtl),
+      max_stale_ttl: numOrNull(maxStaleTtl),
       dnsdist_enabled: dnsdistEnabled,
       dnsdist_max_qps_per_client: numOrNull(dnsdistMaxQps),
       dnsdist_action: dnsdistAction,
@@ -9160,6 +9172,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
         tcp_clients: o.tcp_clients ?? null,
         clients_per_query: o.clients_per_query ?? null,
         max_clients_per_query: o.max_clients_per_query ?? null,
+        recursive_clients: o.recursive_clients ?? null,
+        serve_stale_enabled: o.serve_stale_enabled,
+        stale_answer_ttl: o.stale_answer_ttl ?? null,
+        max_stale_ttl: o.max_stale_ttl ?? null,
         dnsdist_enabled: o.dnsdist_enabled,
         dnsdist_max_qps_per_client: o.dnsdist_max_qps_per_client ?? null,
         dnsdist_action: o.dnsdist_action,
@@ -9661,6 +9677,10 @@ export function OptionsTab({ groupId }: { groupId: string }) {
             "tcp_clients",
             "clients_per_query",
             "max_clients_per_query",
+            "recursive_clients",
+            "serve_stale_enabled",
+            "stale_answer_ttl",
+            "max_stale_ttl",
           )}
           <label className="flex items-center gap-2 cursor-pointer text-sm">
             <input
@@ -9722,7 +9742,71 @@ export function OptionsTab({ groupId }: { groupId: string }) {
                 placeholder="default"
               />
             </Field>
+            <Field label="recursive-clients">
+              <input
+                type="number"
+                min={1}
+                className={inputCls}
+                value={recursiveClients}
+                disabled={lock("recursive_clients")}
+                title={lockTitle("recursive_clients")}
+                onChange={(e) => {
+                  setRecursiveClients(e.target.value);
+                  setDirty(true);
+                }}
+                placeholder="default (1000)"
+              />
+            </Field>
           </div>
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={serveStale}
+              disabled={lock("serve_stale_enabled")}
+              title={lockTitle("serve_stale_enabled")}
+              onChange={(e) => {
+                setServeStale(e.target.checked);
+                setDirty(true);
+              }}
+              className="h-4 w-4"
+            />
+            serve-stale (answer from an expired cache entry while the upstream
+            is unreachable)
+          </label>
+          {serveStale && (
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="stale-answer-ttl (seconds)">
+                <input
+                  type="number"
+                  min={1}
+                  className={inputCls}
+                  value={staleAnswerTtl}
+                  disabled={lock("stale_answer_ttl")}
+                  title={lockTitle("stale_answer_ttl")}
+                  onChange={(e) => {
+                    setStaleAnswerTtl(e.target.value);
+                    setDirty(true);
+                  }}
+                  placeholder="default"
+                />
+              </Field>
+              <Field label="max-stale-ttl (seconds)">
+                <input
+                  type="number"
+                  min={1}
+                  className={inputCls}
+                  value={maxStaleTtl}
+                  disabled={lock("max_stale_ttl")}
+                  title={lockTitle("max_stale_ttl")}
+                  onChange={(e) => {
+                    setMaxStaleTtl(e.target.value);
+                    setDirty(true);
+                  }}
+                  placeholder="default"
+                />
+              </Field>
+            </div>
+          )}
         </div>
       </div>
 

@@ -857,6 +857,10 @@ DNSServerOptions.minimal_responses: bool            -- default false; emit "mini
 DNSServerOptions.tcp_clients: int | null            -- optional; max simultaneous TCP clients
 DNSServerOptions.clients_per_query: int | null      -- optional; starting per-query duplicate-client cap
 DNSServerOptions.max_clients_per_query: int | null  -- optional; ceiling for clients_per_query
+DNSServerOptions.recursive_clients: int | null      -- optional; "recursive-clients" cap on simultaneous recursive lookups
+DNSServerOptions.serve_stale_enabled: bool          -- default false; "stale-answer-enable yes;" (answer from expired cache)
+DNSServerOptions.stale_answer_ttl: int | null       -- optional; "stale-answer-ttl", only rendered while serve-stale is on
+DNSServerOptions.max_stale_ttl: int | null          -- optional; "max-stale-ttl", only rendered while serve-stale is on
 ```
 
 - **BIND9:** renders into `options {}`:

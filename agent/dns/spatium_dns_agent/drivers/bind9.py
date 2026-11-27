@@ -773,8 +773,9 @@ def _render_rate_limit_block(opts: dict[str, Any]) -> str:
     options{} block is byte-identical for groups that haven't opted in.
 
     Emitted inside ``options {}``: ``minimal-responses``, ``tcp-clients``,
-    ``clients-per-query``, ``max-clients-per-query`` (each only when set), and
-    the ``rate-limit { … }`` stanza (only when ``rrl_enabled``)."""
+    ``clients-per-query``, ``max-clients-per-query``, ``recursive-clients``
+    (each only when set), ``stale-answer-enable`` with its TTLs (#3567, only
+    when ``serve_stale_enabled``), and the ``rate-limit { … }`` stanza (only when ``rrl_enabled``)."""
     lines: list[str] = []
     if opts.get("minimal_responses"):
         lines.append("    minimal-responses yes;")
@@ -782,10 +783,17 @@ def _render_rate_limit_block(opts: dict[str, Any]) -> str:
         ("tcp_clients", "tcp-clients"),
         ("clients_per_query", "clients-per-query"),
         ("max_clients_per_query", "max-clients-per-query"),
+        ("recursive_clients", "recursive-clients"),
     ):
         val = opts.get(key)
         if val is not None:
             lines.append(f"    {directive} {int(val)};")
+    if opts.get("serve_stale_enabled"):
+        lines.append("    stale-answer-enable yes;")
+        if opts.get("stale_answer_ttl") is not None:
+            lines.append(f"    stale-answer-ttl {int(opts['stale_answer_ttl'])};")
+        if opts.get("max_stale_ttl") is not None:
+            lines.append(f"    max-stale-ttl {int(opts['max_stale_ttl'])};")
     if opts.get("rrl_enabled"):
         rrl = [
             "    rate-limit {",

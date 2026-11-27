@@ -307,6 +307,31 @@ def test_render_server_config_rrl_default_noop(zone: ZoneData) -> None:
     assert "tcp-clients" not in out
 
 
+def test_render_server_config_resolver_limits_and_serve_stale(zone: ZoneData) -> None:
+    """#3567 — recursive-clients and serve-stale render into options{}."""
+    opts = ServerOptions(
+        recursive_clients=5000, serve_stale_enabled=True, stale_answer_ttl=30, max_stale_ttl=86400
+    )
+    out = BIND9Driver().render_server_config(
+        SimpleNamespace(id="x", name="ns1"), opts, bundle=_bundle_with_opts(zone, opts)
+    )
+    assert "recursive-clients 5000;" in out
+    assert "stale-answer-enable yes;" in out
+    assert "stale-answer-ttl 30;" in out
+    assert "max-stale-ttl 86400;" in out
+
+
+def test_render_server_config_serve_stale_gates_its_ttls(zone: ZoneData) -> None:
+    """#3567 — the TTLs render only while serve-stale is on; defaults render none."""
+    for opts in (ServerOptions(), ServerOptions(stale_answer_ttl=30, max_stale_ttl=60)):
+        out = BIND9Driver().render_server_config(
+            SimpleNamespace(id="x", name="ns1"), opts, bundle=_bundle_with_opts(zone, opts)
+        )
+        assert "recursive-clients" not in out
+        assert "stale-answer" not in out
+        assert "max-stale-ttl" not in out
+
+
 def test_render_server_config_query_log_switch(zone: ZoneData) -> None:
     """#2249 — an explicit ``querylog yes;`` with query logging on, mirroring
     the agent renderer, and nothing with it off so an existing group's

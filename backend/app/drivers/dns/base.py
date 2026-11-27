@@ -241,6 +241,10 @@ class ServerOptions:
     tcp_clients: int | None = None
     clients_per_query: int | None = None
     max_clients_per_query: int | None = None
+    recursive_clients: int | None = None
+    serve_stale_enabled: bool = False
+    stale_answer_ttl: int | None = None
+    max_stale_ttl: int | None = None
     # dnsdist front for PowerDNS (issue #146 Phase 2). Default-off no-op.
     dnsdist_enabled: bool = False
     dnsdist_max_qps_per_client: int | None = None

@@ -1335,6 +1335,11 @@ class ServerOptionsUpdate(BaseModel):
     tcp_clients: int | None = Field(default=None, ge=1, le=10000)
     clients_per_query: int | None = Field(default=None, ge=1, le=1000)
     max_clients_per_query: int | None = Field(default=None, ge=1, le=10000)
+    # Resolver limits + serve-stale (#3567)
+    recursive_clients: int | None = Field(default=None, ge=1, le=1000000)
+    serve_stale_enabled: bool | None = None
+    stale_answer_ttl: int | None = Field(default=None, ge=1, le=86400)
+    max_stale_ttl: int | None = Field(default=None, ge=1, le=31536000)
     # dnsdist front for PowerDNS (#146 Phase 2)
     dnsdist_enabled: bool | None = None
     dnsdist_max_qps_per_client: int | None = Field(default=None, ge=1, le=1000000)
@@ -1477,6 +1482,10 @@ class ServerOptionsResponse(BaseModel):
     tcp_clients: int | None
     clients_per_query: int | None
     max_clients_per_query: int | None
+    recursive_clients: int | None
+    serve_stale_enabled: bool
+    stale_answer_ttl: int | None
+    max_stale_ttl: int | None
     dnsdist_enabled: bool
     dnsdist_max_qps_per_client: int | None
     dnsdist_action: str
@@ -4919,6 +4928,9 @@ async def update_options(
         "tcp_clients",
         "clients_per_query",
         "max_clients_per_query",
+        "recursive_clients",
+        "stale_answer_ttl",
+        "max_stale_ttl",
         "dnsdist_max_qps_per_client",
         "dnsdist_dynblock_qps",
         # Issue #50 — clearing the cert (un-linking it before deleting the

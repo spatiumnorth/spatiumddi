@@ -23,6 +23,7 @@ from typing import Any
 
 _NO_QUERY_LOG = "query logging is not collected from Technitium servers yet"
 _NO_DNSDIST = "the dnsdist front is part of the PowerDNS image only"
+_NO_SERVE_STALE = "the Technitium agent does not apply serve-stale settings"
 
 #: field -> (default, why Technitium cannot honour another value)
 #:
@@ -36,6 +37,10 @@ UNSUPPORTED_OPTIONS: dict[str, tuple[Any, str]] = {
     "tcp_clients": (None, "Technitium has no TCP client limit setting"),
     "clients_per_query": (None, "Technitium has no clients-per-query setting"),
     "max_clients_per_query": (None, "Technitium has no clients-per-query setting"),
+    "recursive_clients": (None, "Technitium has no recursive-clients limit setting"),
+    "serve_stale_enabled": (False, _NO_SERVE_STALE),
+    "stale_answer_ttl": (None, _NO_SERVE_STALE),
+    "max_stale_ttl": (None, _NO_SERVE_STALE),
     "allow_query_cache": (
         ["localhost", "localnets"],
         "Technitium has no separate cache-access ACL (allow_recursion is the "
