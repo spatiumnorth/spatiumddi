@@ -187,3 +187,45 @@ async def test_catalog_lists_alert_events(client: AsyncClient, db_session: Async
 
     types = (await list_event_types(None))["event_types"]  # type: ignore[arg-type]
     assert "alert.fired" in types and "alert.resolved" in types
+
+
+async def test_mcp_catalog_agrees_with_rest(client: AsyncClient, db_session: AsyncSession) -> None:
+    """The copilot's ``get_webhook_event_types`` must list what REST lists, or an
+    assistant validating a proposed subscription rejects ``alert.fired``."""
+    from app.api.v1.webhooks.router import list_event_types
+    from app.services.ai.tools.webhooks import GetWebhookEventTypesArgs, get_webhook_event_types
+
+    rest = (await list_event_types(None))["event_types"]  # type: ignore[arg-type]
+    mcp = (await get_webhook_event_types(db_session, None, GetWebhookEventTypesArgs()))[  # type: ignore[arg-type]
+        "event_types"
+    ]
+    assert "alert.fired" in mcp and "alert.resolved" in mcp
+    assert mcp == rest
+
+
+async def test_disabling_a_rule_over_rest_publishes_resolved(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.core.security import create_access_token, hash_password
+    from app.models.auth import User
+
+    admin = User(
+        username=f"al-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.test",
+        display_name="Alert Admin",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(admin)
+    await db_session.commit()
+    hdr = {"Authorization": f"Bearer {create_access_token(str(admin.id))}"}
+    await _sub(db_session, ["alert.resolved"])
+    rule = await _rule(db_session)
+    ev = await _fire(db_session, rule)
+    assert await _outbox(db_session) == []
+
+    r = await client.patch(f"/api/v1/alerts/rules/{rule.id}", json={"enabled": False}, headers=hdr)
+    assert r.status_code == 200, r.text
+    rows = await _outbox(db_session)
+    assert [x.event_type for x in rows] == ["alert.resolved"]
+    assert rows[0].payload["event_id"] == str(ev.id)
