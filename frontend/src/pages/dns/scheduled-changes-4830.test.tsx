@@ -12,13 +12,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
 import type { DNSScheduledChange } from "@/lib/api";
+import { ScheduledChangesPanel } from "./ScheduledChanges";
 import {
   buildScheduleBody,
   localToUtcIso,
-  ScheduledChangesPanel,
   validateSchedule,
   type ScheduleForm,
-} from "./ScheduledChanges";
+} from "./scheduledChangesForm";
 
 const list = vi.fn();
 const cancel = vi.fn();
