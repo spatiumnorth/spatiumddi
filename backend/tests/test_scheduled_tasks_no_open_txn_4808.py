@@ -399,3 +399,29 @@ async def test_dns_pull_zone_deleted_mid_transfer_is_skipped(
     out = await dns_pull._run_sync()
     assert out["status"] == "ran"
     assert (out["imported"], out["pushed"], out["errors"]) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_dns_pull_push_phase_runs_with_no_open_transaction(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The push to the server (a DB row the wire lacks) is the other network
+    call of the sweep; it must not run inside the apply transaction either."""
+    zone, _servers = await _zone(db_session, "windows_dns")
+    await _enable_sync(db_session)
+    driver = _Driver()
+    _serve(monkeypatch, driver, [])
+    monkeypatch.setattr(dns_pull, "get_driver", lambda name: driver)
+    sessions = _install(monkeypatch, dns_pull)
+    seen: list[bool] = []
+    real = driver.apply_record_changes
+
+    async def _push(server: Any, changes: list[Any]) -> Any:
+        seen.append(_any_open_txn(sessions))
+        return await real(server, changes)
+
+    monkeypatch.setattr(driver, "apply_record_changes", _push)
+    out = await dns_pull._run_sync()
+    assert out["status"] == "ran" and out["errors"] == 0
+    assert out["pushed"] == 1
+    assert seen == [False]
