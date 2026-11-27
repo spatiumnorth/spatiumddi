@@ -1772,7 +1772,14 @@ class SecondaryStateReport(BaseModel):
     zones: list[SecondaryStateEntry] = Field(max_length=20000)
 
 
-@router.post("/secondary-state")
+class SecondaryStateAck(BaseModel):
+    """How many of a secondary-state report's zones were stored (#4732)."""
+
+    updated: int
+    skipped: int
+
+
+@router.post("/secondary-state", response_model=SecondaryStateAck)
 async def agent_secondary_state(
     body: SecondaryStateReport,
     db: DB,
