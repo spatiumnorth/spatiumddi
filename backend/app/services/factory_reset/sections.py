@@ -233,6 +233,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "dhcp_fingerprint",
         ),
         cascade_dependents=(
+            "dhcp_agent_bundle",
             "dhcp_device_policy",
             "dhcp_failover_relationship",
             "dhcp_observed_responder",
