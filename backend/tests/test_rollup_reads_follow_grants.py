@@ -216,7 +216,7 @@ async def test_integrations_summary_only_shows_readable_integrations(
     resp = await client.get("/api/v1/dashboards/integrations/summary", headers=viewer)
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert len(body["panels"]) == 11
+    assert len(body["panels"]) == 12  # + vsphere (#4740)
     assert "docker-reconcile-target" in [e["target_display"] for e in body["recent_errors"]]
 
 
