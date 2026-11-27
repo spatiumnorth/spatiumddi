@@ -1446,6 +1446,8 @@ _SPACE_BINDING_FIELDS = (
     "ddns_hostname_policy",
     "ddns_ttl",
     "do_not_probe",
+    # Install-wide: which space is the default is not a property of one space.
+    "is_default",
 )
 _BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
     "parent_block_id",
@@ -1460,6 +1462,7 @@ _BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
 # refused as a change.
 _SPACE_NULL_IS_NOOP = frozenset(
     {
+        "is_default",
         "dns_group_ids",
         "dns_additional_zone_ids",
         "ddns_enabled",

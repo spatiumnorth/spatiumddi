@@ -3892,6 +3892,41 @@ export interface BrandingLogoInfo {
   media_type: string;
 }
 
+/** What `GET /settings` returns to a caller without `read` on `settings`: only
+ *  these fields (the API's `SettingsPublicResponse`). Everything outside
+ *  Settings → read only these; the rest of `PlatformSettings` is present for
+ *  a holder of `read:settings`, and absent otherwise. */
+export type PlatformSettingsPublic = Pick<
+  PlatformSettings,
+  | "app_title"
+  | "session_timeout_minutes"
+  | "auto_logout_minutes"
+  | "utilization_warn_threshold"
+  | "utilization_critical_threshold"
+  | "utilization_max_prefix_ipv4"
+  | "utilization_max_prefix_ipv6"
+  | "subnet_tree_default_expanded_depth"
+  | "dns_default_ttl"
+  | "dns_default_zone_type"
+  | "dns_recursive_by_default"
+  | "dhcp_default_dns_servers"
+  | "dhcp_default_domain_name"
+  | "dhcp_default_domain_search"
+  | "dhcp_default_ntp_servers"
+  | "dhcp_default_lease_time"
+  | "integration_kubernetes_enabled"
+  | "integration_docker_enabled"
+  | "integration_proxmox_enabled"
+  | "integration_tailscale_enabled"
+  | "integration_unifi_enabled"
+  | "integration_cloud_enabled"
+  | "integration_opnsense_enabled"
+  | "integration_netbird_enabled"
+  | "integration_panos_enabled"
+  | "integration_fortinet_enabled"
+  | "integration_meraki_enabled"
+>;
+
 export interface PlatformSettings {
   app_title: string;
   app_base_url: string;
@@ -4502,6 +4537,9 @@ export const publicSettingsApi = {
 };
 
 export const settingsApi = {
+  /** The full row for a holder of `read:settings`; anyone else gets only
+   *  the `PlatformSettingsPublic` fields. Readers outside Settings must use
+   *  no others. */
   get: () => api.get<PlatformSettings>("/settings").then((r) => r.data),
   update: (data: Partial<PlatformSettings>) =>
     api.put<PlatformSettings>("/settings", data).then((r) => r.data),
