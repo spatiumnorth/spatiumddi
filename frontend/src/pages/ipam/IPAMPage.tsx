@@ -6203,7 +6203,10 @@ export function SubnetDetail({
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       {actionError && (
-        <div className="flex items-start justify-between gap-3 border-b border-destructive/40 bg-destructive/5 px-6 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="flex items-start justify-between gap-3 border-b border-destructive/40 bg-destructive/5 px-6 py-2 text-xs text-destructive"
+        >
           <span>{actionError}</span>
           <button
             type="button"
@@ -6757,7 +6760,10 @@ export function SubnetDetail({
                 </label>
               </div>
               {inlineEditError && (
-                <div className="mb-2 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+                <div
+                  role="alert"
+                  className="mb-2 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
+                >
                   <span className="flex-1">{inlineEditError}</span>
                   <button
                     type="button"
@@ -9735,7 +9741,10 @@ function DhcpSyncSummaryBody({
                   emphasis={s.result.ipam_revoked > 0}
                 />
                 {s.result.errors.length > 0 && (
-                  <div className="col-span-2 mt-1 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive">
+                  <div
+                    role="alert"
+                    className="col-span-2 mt-1 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive"
+                  >
                     {s.result.errors.length} error(s):
                     <ul className="ml-3 list-disc">
                       {s.result.errors.slice(0, 3).map((e, i) => (
@@ -9749,7 +9758,10 @@ function DhcpSyncSummaryBody({
               </dl>
             )}
             {s.status === "error" && (
-              <p className="mt-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive">
+              <p
+                role="alert"
+                className="mt-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive"
+              >
                 {s.error}
               </p>
             )}
@@ -17653,7 +17665,10 @@ export function SpaceSection({
       )}
 
       {dndError && (
-        <div className="mx-2 mt-2 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        <div
+          role="alert"
+          className="mx-2 mt-2 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
+        >
           <span className="flex-1">{dndError}</span>
           <button
             aria-label="Dismiss"

@@ -6365,7 +6365,10 @@ export function SyncResultModal({
     return (
       <Modal title="Sync with server — failed" onClose={onClose}>
         <div className="space-y-3">
-          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+          <div
+            role="alert"
+            className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive"
+          >
             {result.error}
           </div>
           <p className="text-xs text-muted-foreground">
@@ -6481,7 +6484,10 @@ export function SyncResultModal({
             />
           )}
           {push_errors.length > 0 && (
-            <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-3">
+            <div
+              role="alert"
+              className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-3"
+            >
               <div className="mb-1 text-xs font-medium text-destructive">
                 Push errors ({push_errors.length})
               </div>
@@ -6848,7 +6854,10 @@ export function ServersTab({ group }: { group: DNSServerGroup }) {
   return (
     <div>
       {resumeMut.isError && (
-        <div className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="mb-3 flex items-center justify-between rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
           <span>
             Resume failed: {formatApiError(resumeMut.error, "request failed")}
           </span>
@@ -13854,7 +13863,10 @@ export function SyncWithServersResultModal({
                         </div>
                       )}
                       {srv.result.zones_push_to_server_errors.length > 0 && (
-                        <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                        <div
+                          role="alert"
+                          className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs"
+                        >
                           <div className="font-medium text-destructive">
                             Zone push errors
                           </div>
