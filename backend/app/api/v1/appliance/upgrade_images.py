@@ -97,7 +97,7 @@ from app.core.responses import OctetStreamResponse
 from app.core.versions import is_installed_target
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
-from app.services.api_token_scopes import token_outbound
+from app.services.api_token_scopes import token_outbound, token_write
 from app.services.appliance import releases as releases_service
 from app.services.appliance import upgrade_image_catalog as catalog
 from app.services.appliance import upgrade_image_space, upgrade_media
@@ -1281,6 +1281,7 @@ async def list_upgrade_images_on_media(current_user: SuperAdmin) -> MediaImageLi
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Import an upgrade image from mounted removable media (USB stick)",
 )
+@token_write("stores an upgrade image from removable media in the appliance's image store")
 async def import_upgrade_image_from_media(
     body: ImportFromMediaRequest,
     current_user: SuperAdmin,
