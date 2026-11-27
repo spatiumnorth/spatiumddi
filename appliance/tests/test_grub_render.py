@@ -246,19 +246,30 @@ def test_uuid_b_not_in_slot_a_body() -> None:
     )
 
 
-def _resolve_active(out: str, default: str) -> dict[str, str]:
-    """Evaluate the #4961 active-slot block the way grub would, for ${default}.
+def _resolve_active(out: str, default: str, saved: str = "") -> dict[str, str]:
+    """Evaluate the #4961 active-slot block the way grub would.
 
-    Returns {entry id: "<title>\n<body>"} for verbose + rescue with the
-    sp_act_* variables substituted. Only the one if/else block is interpreted.
+    ``default`` is ${default} after the header folds next_entry/saved_entry into
+    it; ``saved`` is grubenv's saved_entry. Interprets the ``set sp_act`` lines
+    in order, then the if/else on ${sp_act}. Returns {entry id: "<title>\n<body>"}
+    for verbose + rescue with the sp_act_* variables substituted.
     """
     import re
 
+    env_vars = {"default": default, "saved_entry": saved}
+    m0 = re.search(r"^set sp_act=(\w+)$", out, re.M)
+    assert m0, "sp_act initialiser not found"
+    sp_act = m0.group(1)
+    for var, val, newv in re.findall(
+        r'^if \[ "\$\{(\w+)\}" = "(\w+)" \]; then set sp_act=(\w+); fi$', out, re.M
+    ):
+        if env_vars.get(var, "") == val:
+            sp_act = newv
     m = re.search(
-        r'if \[ "\$\{default\}" = "slot_b" \]; then\n(.*?)\nelse\n(.*?)\nfi', out, re.S
+        r'if \[ "\$\{sp_act\}" = "slot_b" \]; then\n(.*?)\nelse\n(.*?)\nfi', out, re.S
     )
     assert m, "active-slot block not found"
-    branch = m.group(1) if default == "slot_b" else m.group(2)
+    branch = m.group(1) if sp_act == "slot_b" else m.group(2)
     env = {k: v.strip('"') for k, v in re.findall(r"set (\w+)=(\S.*)", branch)}
 
     def sub(text: str) -> str:
@@ -271,6 +282,25 @@ def _resolve_active(out: str, default: str) -> dict[str, str]:
         end = out.find("\n}", start) + 2
         res[eid] = sub(out[line_start:end])
     return res
+
+
+@pytest.mark.parametrize(
+    "default,saved,expect",
+    [
+        ("rescue", "slot_b", UUID_B),  # grub-reboot rescue while slot B is active
+        ("verbose", "slot_b", UUID_B),  # grub-reboot verbose while slot B is active
+        ("rescue", "slot_a", UUID_A),
+        ("slot_b", "slot_a", UUID_B),  # trial boot into slot B
+        ("slot_a", "slot_b", UUID_A),  # one-shot back to slot A
+        ("verbose", "", UUID_A),  # no saved_entry: fail-safe slot A
+    ],
+)
+def test_oneshot_entry_follows_the_active_slot(default, saved, expect) -> None:
+    """#4961 walk finding: `grub-reboot verbose|rescue` must not fall to slot A."""
+    out = _render()
+    res = _resolve_active(out, default, saved)
+    for eid in ("verbose", "rescue"):
+        assert f"root=UUID={expect}" in res[eid], (default, saved, eid)
 
 
 @pytest.mark.parametrize(
