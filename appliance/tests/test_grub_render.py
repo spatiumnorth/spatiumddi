@@ -584,3 +584,12 @@ def test_machine_id_on_every_linux_line() -> None:
 def test_no_machine_id_when_absent_or_invalid() -> None:
     for extra in ([], ["--machine-id", "not-an-id"], ["--machine-id", "0" * 32]):
         assert "systemd.machine_id" not in _render(extra_args=extra)
+
+
+def test_host_patch_003_reruns_the_renderer() -> None:
+    """#4954: boxes that already ran 001 need a NEW patch to re-render."""
+    patch = RENDERER.parent.parent.parent / "lib" / "spatiumddi" / "host-patches" / "003-grub-machine-id.sh"
+    text = patch.read_text()
+    assert "exec /usr/local/bin/spatium-grub-render" in text
+    assert "set -eu" in text
+    assert patch.stat().st_mode & 0o111
