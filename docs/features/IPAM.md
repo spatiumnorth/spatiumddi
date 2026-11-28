@@ -2164,13 +2164,19 @@ already wires this up for every delete / allocate / create flow.
   *or* subnets returns `409` with a breakdown (*"Block 10.0.0.0/8
   still contains 3 child block(s) and 5 subnet(s)"*).
   `backend/app/api/v1/ipam/router.py`.
-- **Subnet delete refused when non-empty.** A subnet with user-owned
-  IPs (anything other than `network`, `broadcast`, `orphan`, or
-  DHCP-lease-mirrored `auto_from_lease` rows) or any DHCP scope
-  attached is rejected with `409`. Pass `?force=true` to cascade;
-  the same pre-delete cleanup (WinRM remove-scope, Kea bundle
-  rebuild) still runs so nothing is orphaned on a running server.
-  `backend/app/api/v1/ipam/router.py`.
+- **Subnet delete refused when non-empty — permanent delete only.**
+  The default `DELETE /api/v1/ipam/subnets/{id}` is a soft delete: it
+  moves the subnet and its DHCP scopes to the Trash, where they can be
+  restored, and never refuses, whatever the subnet holds. Only the
+  permanent delete (`?permanent=true`, super-admin only) checks for
+  contents: a subnet with user-owned IPs (anything other than
+  `network`, `broadcast`, `orphan`, or DHCP-lease-mirrored
+  `auto_from_lease` rows) or any DHCP scope attached is rejected with
+  `409`. Pass `?permanent=true&force=true` to cascade; the same
+  pre-delete cleanup (WinRM remove-scope, Kea bundle rebuild) still
+  runs so nothing is orphaned on a running server. See also
+  [Troubleshooting: Subnet delete is refused](../TROUBLESHOOTING.md#subnet-delete-is-refused).
+  `backend/app/services/ai/operations_risky.py` (`delete_subnet`).
 
 ### Block hierarchy
 
