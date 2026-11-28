@@ -41,6 +41,7 @@ _MANIFEST = _REPO_ROOT / ".github" / "scripts" / "ci-backend-must-run.txt"
 # declaring only one of them would leave the other manifest prefix looking
 # unnecessary, which is the drift this guard exists to prevent.
 _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
+    "test_grafana_dashboards.py": "charts/spatiumddi/dashboards/spatiumddi-overview.json",
     "test_spatium_console.py": "appliance/mkosi.extra/usr/local/bin/spatium-console",
     "test_appliance_join_auto_retry.py": (
         "appliance/mkosi.extra/usr/local/bin/spatium-cluster-join"
