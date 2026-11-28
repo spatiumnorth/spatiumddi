@@ -86,6 +86,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "migration.cutover": False,
     # ── IPAM ────────────────────────────────────────────────────────
     "ipam.import.netbox": True,
+    "ipam.import.phpipam": True,
     # #2100 — off on a FRESH install, but ``default_on_if_rows_in`` resolves
     # it on (without seeding a row) wherever ``nat_mapping`` already holds
     # data, so an upgraded install that uses NAT keeps it. This file pins

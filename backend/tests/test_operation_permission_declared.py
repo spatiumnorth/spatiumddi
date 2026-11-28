@@ -124,6 +124,7 @@ def test_gates_match_the_rest_endpoints() -> None:
         "commit_dns_import",
         "commit_dhcp_import",
         "commit_netbox_import",
+        "commit_phpipam_import",
         "create_alert_rule",
         "grant_temporary_access",
         "restart_service",

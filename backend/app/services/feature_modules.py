@@ -491,6 +491,18 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="IPAM",
         description="One-shot migration import of prefixes / IP addresses / VLANs / VRFs / tenants / sites from a NetBox instance into native IPAM rows. Run it from Administration → Import → NetBox; the connection and token are supplied per import and never stored.",
     ),
+    # IPAM — phpIPAM read-only one-shot migration importer (issue #4734).
+    # Sister to ``ipam.import.netbox``: same preview -> commit pipeline, same
+    # day-one-importer rationale for shipping default-ON (#1069) — a fresh
+    # install is exactly when a phpIPAM estate gets loaded, and the toggle has
+    # no blast radius (superadmin-only, nothing is stored or called until an
+    # operator runs a preview against a URL they type).
+    ModuleSpec(
+        id="ipam.import.phpipam",
+        label="phpIPAM import",
+        group="IPAM",
+        description="One-shot migration import of sections / subnets / addresses / VLANs / VRFs / custom fields from a phpIPAM instance into native IPAM rows, through its REST API. Run it through the API (POST /ipam/import/phpipam/preview, then /commit); the URL and credentials are supplied per import and never stored.",
+    ),
     # IPAM — NAT mappings (#2100). Operator-curated 1:1 / PAT / hide-NAT
     # cross-reference data: the NAT Mappings page, the /ipam/nat-mappings
     # routes, the Dashboard count and the NAT panels + badges on subnet / IP

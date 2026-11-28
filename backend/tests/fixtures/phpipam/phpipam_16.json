@@ -1,0 +1,89 @@
+{
+  "_doc": "Recorded-shape phpIPAM 1.6 API answers (the envelope's data), keyed by endpoint path. phpIPAM serialises every scalar as a string. Hand-written from the documented object shapes; no live instance was used.",
+  "lists": {
+    "/sections/": [
+      {"id": "1", "name": "Corp", "description": "Corporate", "masterSection": "0"},
+      {"id": "2", "name": "Lab", "description": "", "masterSection": "1"},
+      {"id": "3", "name": "Mixed", "description": "Overlapping CIDRs in and out of a VRF", "masterSection": "0"},
+      {"id": "4", "name": "Empty", "description": "", "masterSection": "0"}
+    ],
+    "/vrf/": [
+      {"vrfId": "1", "name": "RED", "rd": "65000:1", "description": "red vrf", "sections": "3"}
+    ],
+    "/vlan/": [
+      {"vlanId": "10", "domainId": "1", "name": "users", "number": "100", "description": "User LAN"},
+      {"vlanId": "11", "domainId": "2", "name": "users-lab", "number": "100", "description": "same VID, other domain"},
+      {"vlanId": "12", "domainId": "1", "name": "voice", "number": "200", "description": ""},
+      {"vlanId": "13", "domainId": "1", "name": "bogus", "number": "5000", "description": "VID out of range"}
+    ],
+    "/l2domains/": [
+      {"id": "1", "name": "default"},
+      {"id": "2", "name": "lab"}
+    ],
+    "/tools/tags/": [
+      {"id": "1", "type": "Offline"},
+      {"id": "2", "type": "Used"},
+      {"id": "3", "type": "Reserved"},
+      {"id": "4", "type": "DHCP"},
+      {"id": "5", "type": "Decommissioned"}
+    ],
+    "/sections/1/subnets/": [
+      {"id": "10", "subnet": "10.0.0.0", "mask": "16", "sectionId": "1", "description": "Corp supernet", "vrfId": "0", "masterSubnetId": "0", "vlanId": "0", "isFolder": "0", "isPool": "0", "isFull": "0", "custom_site_code": "HQ", "custom_tier": "gold"},
+      {"id": "11", "subnet": "10.0.1.0", "mask": "24", "sectionId": "1", "description": "Users", "vrfId": "0", "masterSubnetId": "10", "vlanId": "10", "isFolder": "0", "isPool": "1", "isFull": "0", "custom_site_code": "HQ", "custom_tier": ""},
+      {"id": "12", "subnet": "10.0.2.0", "mask": "24", "sectionId": "1", "description": "Voice", "vrfId": "0", "masterSubnetId": "10", "vlanId": "12", "isFolder": "0", "isPool": "0", "isFull": "0"},
+      {"id": "13", "subnet": "0", "mask": "0", "sectionId": "1", "description": "A folder", "vrfId": "0", "masterSubnetId": "0", "isFolder": "1"},
+      {"id": "14", "subnet": "239.1.1.0", "mask": "24", "sectionId": "1", "description": "Multicast", "vrfId": "0", "masterSubnetId": "0", "vlanId": "99", "isFolder": "0"}
+    ],
+    "/sections/2/subnets/": [
+      {"id": "20", "subnet": "10.0.1.0", "mask": "24", "sectionId": "2", "description": "Lab copy of Users", "vrfId": "0", "masterSubnetId": "0", "vlanId": "0", "isFolder": "0"},
+      {"id": "21", "subnet": "2001:db8:1::", "mask": "64", "sectionId": "2", "description": "Lab v6", "vrfId": "0", "masterSubnetId": "0", "vlanId": "0", "isFolder": "0"}
+    ],
+    "/sections/3/subnets/": [
+      {"id": "30", "subnet": "192.168.0.0", "mask": "24", "sectionId": "3", "description": "Plain", "vrfId": "0", "masterSubnetId": "0", "vlanId": "0", "isFolder": "0"},
+      {"id": "31", "subnet": "192.168.0.0", "mask": "24", "sectionId": "3", "description": "In RED", "vrfId": "1", "masterSubnetId": "0", "vlanId": "0", "isFolder": "0"},
+      {"id": "32", "subnet": "192.168.0.0", "mask": "24", "sectionId": "3", "description": "Duplicate of Plain", "vrfId": "0", "masterSubnetId": "0", "vlanId": "0", "isFolder": "0"}
+    ],
+    "/subnets/10/addresses/": [
+      {"id": "900", "subnetId": "10", "ip": "10.0.9.9", "hostname": "stray", "description": "in the container, in no leaf"}
+    ],
+    "/subnets/11/addresses/": [
+      {"id": "100", "subnetId": "11", "ip": "10.0.1.1", "is_gateway": "1", "description": "gw", "hostname": "gw.corp.example", "mac": "", "owner": "", "tag": "2"},
+      {"id": "101", "subnetId": "11", "ip": "10.0.1.5", "is_gateway": "0", "description": "web", "hostname": "web 01.corp.example", "mac": "00-11-22-33-44-55", "owner": "ops team", "tag": "2", "note": "rack 4", "deviceId": "7", "custom_notes": "hello"},
+      {"id": "102", "subnetId": "11", "ip": "10.0.1.9", "is_gateway": "0", "description": "held", "hostname": "", "mac": "not-a-mac", "owner": "", "tag": "3"},
+      {"id": "103", "subnetId": "11", "ip": "10.0.1.10", "is_gateway": "0", "description": "dhcp", "hostname": "", "mac": "", "owner": "", "tag": "4"},
+      {"id": "104", "subnetId": "11", "ip": "10.0.1.20", "is_gateway": "0", "description": "old", "hostname": "oldhost", "mac": "", "owner": "", "tag": "5"},
+      {"id": "105", "subnetId": "11", "ip": "not-an-ip", "description": "junk"}
+    ],
+    "/subnets/12/addresses/": [
+      {"id": "110", "subnetId": "12", "ip": "10.0.2.7", "description": "phone", "hostname": "phone7", "tag": "1"}
+    ],
+    "/subnets/14/addresses/": [
+      {"id": "140", "subnetId": "14", "ip": "239.1.1.5", "description": "stream"}
+    ],
+    "/subnets/20/addresses/": [
+      {"id": "200", "subnetId": "20", "ip": "10.0.1.5", "description": "lab web", "hostname": "labweb", "tag": "2"}
+    ],
+    "/subnets/21/addresses/": [
+      {"id": "210", "subnetId": "21", "ip": "2001:db8:1::10", "description": "v6 host", "tag": "2"}
+    ],
+    "/subnets/30/addresses/": [
+      {"id": "300", "subnetId": "30", "ip": "192.168.0.10", "description": "plain host", "tag": "2"}
+    ],
+    "/subnets/31/addresses/": [
+      {"id": "310", "subnetId": "31", "ip": "192.168.0.10", "description": "red host", "tag": "2"}
+    ]
+  },
+  "data": {
+    "/subnets/custom_fields/": {
+      "custom_site_code": {"name": "custom_site_code", "type": "varchar(64)", "Comment": "Site code", "Null": "YES", "Default": null},
+      "custom_tier": {"name": "custom_tier", "type": "enum('gold','silver')", "Comment": "", "Null": "YES", "Default": null}
+    },
+    "/addresses/custom_fields/": {
+      "custom_notes": {"name": "custom_notes", "type": "text", "Comment": "", "Null": "YES", "Default": null}
+    },
+    "/vlan/custom_fields/": {
+      "custom_vlan_owner": {"name": "custom_vlan_owner", "type": "varchar(32)", "Comment": "", "Null": "YES", "Default": null}
+    },
+    "/vrf/custom_fields/": {}
+  }
+}

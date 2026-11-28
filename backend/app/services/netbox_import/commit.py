@@ -1,5 +1,9 @@
 """Source-agnostic commit pipeline for the NetBox one-shot importer (issue #36 §4.3).
 
+Also the commit half of the phpIPAM importer (#4734): :func:`commit_import`
+stamps the plan's ``source`` (``netbox`` or ``phpipam``) on every row and audit
+row, so every ``"netbox"`` below reads as "the plan's source".
+
 Takes the canonical :class:`ImportPreview` the preview endpoint produced
 (round-tripped verbatim by the operator as ``CommitIn.plan``) and writes
 every chosen entity into native IPAM rows, stamping ``import_source=
@@ -51,6 +55,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -61,7 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.dns_names import sanitize_hostname
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import CustomFieldDefinition, IPAddress, IPBlock, IPSpace, Subnet
 from app.models.ownership import Customer, Site
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
@@ -73,6 +78,7 @@ from .canonical import (
     EntityConflict,
     ImportedAddress,
     ImportedBlock,
+    ImportedCustomField,
     ImportedSubnet,
     ImportPreview,
 )
@@ -80,6 +86,27 @@ from .canonical import (
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 _SOURCE = "netbox"
+
+# The source label stamped on every row, audit row and ledger of one run
+# (``import_source`` is String(20)). The pipeline is shared by the NetBox
+# (#36) and phpIPAM (#4734) importers, which differ only in how they build the
+# IR, so :func:`commit_import` sets this for the run instead of threading a
+# ``source`` argument through every per-entity committer. A ContextVar, not a
+# module global: two imports in one process never see each other's label.
+_source_var: ContextVar[str] = ContextVar("import_source", default=_SOURCE)
+
+
+def _src() -> str:
+    return _source_var.get()
+
+
+# Operator-facing name of each source, for the synthetic router / wrapper-block
+# descriptions and the router-name collision tag.
+_SOURCE_LABELS: dict[str, str] = {"netbox": "NetBox", "phpipam": "phpIPAM"}
+
+
+def _source_label() -> str:
+    return _SOURCE_LABELS.get(_src(), _src())
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +141,10 @@ class CommitResult:
         return sum(1 for e in self.entities if e.action_taken == action)
 
     # Per-kind created rollups (the Pydantic layer surfaces these).
+    @property
+    def custom_fields_created(self) -> int:
+        return self._count("custom_field", "created")
+
     @property
     def customers_created(self) -> int:
         return self._count("customer", "created")
@@ -237,6 +268,10 @@ def _vlan_key(vid: int) -> str:
     return f"vlan:{vid}"
 
 
+def _custom_field_key(resource_type: str, name: str) -> str:
+    return f"custom_field:{resource_type}:{name}"
+
+
 # --------------------------------------------------------------------------- #
 # DB lookups for conflict detection (re-used by preview + the commit re-detect).
 # --------------------------------------------------------------------------- #
@@ -248,6 +283,25 @@ async def _find_customer(db: AsyncSession, name: str) -> Customer | None:
             await db.execute(
                 select(Customer)
                 .where(Customer.name == name, Customer.deleted_at.is_(None))
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def _find_custom_field(
+    db: AsyncSession, resource_type: str, name: str
+) -> CustomFieldDefinition | None:
+    return (
+        (
+            await db.execute(
+                select(CustomFieldDefinition)
+                .where(
+                    CustomFieldDefinition.resource_type == resource_type,
+                    CustomFieldDefinition.name == name,
+                )
                 .limit(1)
             )
         )
@@ -387,6 +441,22 @@ async def detect_conflicts(
     Used by both the preview endpoint (advisory) and the commit endpoint
     (re-detected fresh so a stale plan honours up-to-date state)."""
     out: list[EntityConflict] = []
+
+    # Custom-field definitions — UNIQUE (resource_type, name).
+    for d in preview.custom_field_defs:
+        existing_def = await _find_custom_field(db, d.resource_type, d.name)
+        if existing_def is not None:
+            out.append(
+                EntityConflict(
+                    kind="custom_field",
+                    key=_custom_field_key(d.resource_type, d.name),
+                    existing_id=str(existing_def.id),
+                    reason=(
+                        f"Custom field {d.name!r} on {d.resource_type} already exists "
+                        "(kept as it is)"
+                    ),
+                )
+            )
 
     # Customers — UNIQUE name.
     for c in preview.customers:
@@ -612,9 +682,11 @@ def _audit(
     netbox_id: int | None,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    new_value: dict[str, Any] = {"import_source": _SOURCE}
+    new_value: dict[str, Any] = {"import_source": _src()}
     if netbox_id is not None:
-        new_value["netbox_id"] = netbox_id
+        # ``netbox_id`` is the IR field name (the #36 wire shape); the audit key
+        # names the source it really came from.
+        new_value[f"{_src()}_id"] = netbox_id
     if extra:
         new_value.update(extra)
     db.add(
@@ -643,6 +715,60 @@ def _audit(
 # --------------------------------------------------------------------------- #
 
 
+async def _commit_custom_field(
+    db: AsyncSession,
+    imported: ImportedCustomField,
+    *,
+    actor: _Actor,
+) -> CommitEntityResult:
+    """Create a custom-field definition when its name is free.
+
+    An existing definition is never changed, whatever the operator chose for
+    the conflict: reshaping a field the rest of the install already uses is not
+    something a one-shot import should do. Its values are still stored under
+    the name, and the ledger says when the existing type differs.
+    """
+    key = _custom_field_key(imported.resource_type, imported.name)
+    existing = await _find_custom_field(db, imported.resource_type, imported.name)
+    if existing is not None:
+        note = None
+        if existing.field_type != imported.field_type:
+            note = (
+                f"existing field is type {existing.field_type!r}, the source's is "
+                f"{imported.field_type!r}; imported values may not match it"
+            )
+        return CommitEntityResult(
+            kind="custom_field",
+            key=key,
+            action_taken="skipped",
+            entity_id=str(existing.id),
+            error=note,
+        )
+    row = CustomFieldDefinition(
+        resource_type=imported.resource_type,
+        name=imported.name,
+        label=imported.label,
+        field_type=imported.field_type,
+        options=list(imported.options) if imported.options else None,
+        description=f"Imported from {_source_label()} field {imported.source_name!r}",
+    )
+    db.add(row)
+    await db.flush()
+    _audit(
+        db,
+        actor=actor,
+        action="create",
+        resource_type="custom_field",
+        resource_id=str(row.id),
+        resource_display=f"{imported.resource_type}.{imported.name}",
+        netbox_id=None,
+    )
+    await db.commit()
+    return CommitEntityResult(
+        kind="custom_field", key=key, action_taken="created", entity_id=str(row.id)
+    )
+
+
 async def _commit_customer(
     db: AsyncSession,
     imported: Any,
@@ -666,7 +792,7 @@ async def _commit_customer(
             existing.tags = {**(existing.tags or {}), **imported.tags}
         if imported.custom_fields:
             existing.custom_fields = {**(existing.custom_fields or {}), **imported.custom_fields}
-        existing.import_source = _SOURCE
+        existing.import_source = _src()
         existing.imported_at = now
         _audit(
             db,
@@ -688,7 +814,7 @@ async def _commit_customer(
         notes=imported.notes or "",
         tags=dict(imported.tags or {}),
         custom_fields=dict(imported.custom_fields or {}),
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -731,7 +857,7 @@ async def _commit_site(
         existing.notes = imported.notes or existing.notes
         if imported.tags:
             existing.tags = {**(existing.tags or {}), **imported.tags}
-        existing.import_source = _SOURCE
+        existing.import_source = _src()
         existing.imported_at = now
         _audit(
             db,
@@ -755,7 +881,7 @@ async def _commit_site(
         parent_site_id=parent_id,
         notes=imported.notes or "",
         tags=dict(imported.tags or {}),
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -800,7 +926,7 @@ async def _commit_vrf(
             existing.custom_fields = {**(existing.custom_fields or {}), **imported.custom_fields}
         if customer_id is not None:
             existing.customer_id = customer_id
-        existing.import_source = _SOURCE
+        existing.import_source = _src()
         existing.imported_at = now
         _audit(
             db,
@@ -827,7 +953,7 @@ async def _commit_vrf(
         export_targets=list(imported.export_targets or []),
         customer_id=customer_id,
         custom_fields=dict(imported.custom_fields or {}),
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -873,7 +999,7 @@ async def _commit_space(
                 existing.customer_id = customer_id
                 changed = True
             if existing.import_source is None:
-                existing.import_source = _SOURCE
+                existing.import_source = _src()
                 existing.imported_at = existing.imported_at or now
                 changed = True
             if changed:
@@ -905,7 +1031,7 @@ async def _commit_space(
         vrf_id=vrf_id,
         customer_id=customer_id,
         tags=dict(imported.tags or {}),
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -988,7 +1114,7 @@ async def _commit_vlan(
         vlan_id=imported.vid,
         name=imported.name,
         description=imported.description or "",
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -1030,7 +1156,8 @@ async def _ensure_router(db: AsyncSession, name: str) -> Router:
     it. Its name is taken, so the new router gets a suffixed one (#2140).
     """
     seen: set[str] = set()
-    for candidate in (name, f"{name} (NetBox)", *_LEGACY_ROUTER_NAMES):
+    legacy = _LEGACY_ROUTER_NAMES if _src() == "netbox" else ()
+    for candidate in (name, f"{name} ({_source_label()})", *legacy):
         if candidate in seen:
             continue
         seen.add(candidate)
@@ -1049,8 +1176,8 @@ async def _ensure_router(db: AsyncSession, name: str) -> Router:
         if existing is not None:
             return existing
     row = Router(
-        name=await pick_unique_router_name(db, name, tag="NetBox"),
-        description="Synthetic router for NetBox-imported VLANs",
+        name=await pick_unique_router_name(db, name, tag=_source_label()),
+        description=f"Synthetic router for {_source_label()}-imported VLANs",
     )
     db.add(row)
     await db.flush()
@@ -1089,7 +1216,7 @@ async def _commit_block(
                 ),
                 existing.id,
             )
-        existing.import_source = _SOURCE
+        existing.import_source = _src()
         existing.imported_at = now
         if imported.custom_fields:
             existing.custom_fields = {**(existing.custom_fields or {}), **imported.custom_fields}
@@ -1126,7 +1253,7 @@ async def _commit_block(
         site_id=site_id,
         custom_fields=dict(imported.custom_fields or {}),
         tags=dict(imported.tags or {}),
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -1203,8 +1330,8 @@ async def _auto_wrapper_block(
         parent_block_id=parent_id,
         network=cidr,
         name=f"auto:{cidr}",
-        description="Auto-created wrapper block for a NetBox-imported subnet",
-        import_source=_SOURCE,
+        description=f"Auto-created wrapper block for a {_source_label()}-imported subnet",
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -1264,7 +1391,7 @@ async def _commit_subnet(
                 existing.id,
                 [],
             )
-        existing.import_source = _SOURCE
+        existing.import_source = _src()
         existing.imported_at = now
         if imported.custom_fields:
             existing.custom_fields = {**(existing.custom_fields or {}), **imported.custom_fields}
@@ -1324,7 +1451,7 @@ async def _commit_subnet(
         utilization_percent=0.0,
         custom_fields=dict(imported.custom_fields or {}),
         tags=dict(imported.tags or {}),
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -1416,9 +1543,11 @@ async def _commit_address(
             existing.fqdn = new_fqdn
         if imported.description:
             existing.description = imported.description
+        if _clean_mac(imported.mac_address) and existing.mac_address is None:
+            existing.mac_address = _clean_mac(imported.mac_address)
         if imported.custom_fields:
             existing.custom_fields = {**(existing.custom_fields or {}), **imported.custom_fields}
-        existing.import_source = _SOURCE
+        existing.import_source = _src()
         existing.imported_at = now
         _audit(
             db,
@@ -1447,10 +1576,11 @@ async def _commit_address(
         hostname=new_hostname,
         fqdn=new_fqdn,
         description=imported.description or "",
+        mac_address=_clean_mac(imported.mac_address),
         managed_by=managed_by,
         custom_fields=cf,
         tags=dict(imported.tags or {}),
-        import_source=_SOURCE,
+        import_source=_src(),
         imported_at=now,
     )
     db.add(row)
@@ -1468,6 +1598,23 @@ async def _commit_address(
     return CommitEntityResult(
         kind="ip_address", key=key, action_taken="created", entity_id=str(row.id)
     )
+
+
+_MAC_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _clean_mac(raw: str | None) -> str | None:
+    """Colon-form MAC from any 12-hex-digit spelling, else ``None``.
+
+    A source MAC column is free text; one that is not a MAC must not fail the
+    address row (the MACADDR column would reject it), so it is dropped here and
+    the caller keeps the raw text in ``custom_fields``.
+    """
+    digits = "".join(c for c in (raw or "") if c not in ":-. ")
+    if len(digits) != 12 or not set(digits) <= _MAC_HEX:
+        return None
+    digits = digits.lower()
+    return ":".join(digits[i : i + 2] for i in range(0, 12, 2))
 
 
 def _parse_addr(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -1518,6 +1665,38 @@ async def commit_import(
     default_router_name: str = "Imported VLANs (NetBox)",
     actor: User,
 ) -> CommitResult:
+    """Apply ``preview`` to the DB under the source the plan names.
+
+    The plan's ``source`` (``netbox`` / ``phpipam``) is the label stamped on
+    every row and audit row; an unknown one is refused before any write.
+    """
+    if preview.source not in _SOURCE_LABELS:
+        raise ValueError(f"unknown import source {preview.source!r}")
+    token = _source_var.set(preview.source)
+    try:
+        return await _commit_import(
+            db,
+            preview=preview,
+            conflict_actions=conflict_actions,
+            space_strategy=space_strategy,
+            target_space_id=target_space_id,
+            default_router_name=default_router_name,
+            actor=actor,
+        )
+    finally:
+        _source_var.reset(token)
+
+
+async def _commit_import(
+    db: AsyncSession,
+    *,
+    preview: ImportPreview,
+    conflict_actions: dict[str, ConflictAction],
+    space_strategy: str,
+    target_space_id: uuid.UUID | None,
+    default_router_name: str,
+    actor: User,
+) -> CommitResult:
     """Apply ``preview`` to the DB, one entity per savepoint.
 
     ``conflict_actions`` is keyed by each entity's stable conflict key
@@ -1531,7 +1710,7 @@ async def commit_import(
     aborts the whole commit with a 422 upstream; per-row failures land as
     ``failed`` ledger rows and never abort the batch.
     """
-    if space_strategy not in ("per_vrf", "single"):
+    if space_strategy not in ("per_vrf", "per_section", "single"):
         raise ValueError(f"unknown space_strategy {space_strategy!r}")
     if space_strategy == "single" and target_space_id is None:
         raise ValueError("space_strategy='single' requires target_space_id")
@@ -1548,10 +1727,22 @@ async def commit_import(
     # lazy-load the user outside the greenlet (#2816).
     snap = _Actor(id=actor.id, display_name=actor.display_name, auth_source=actor.auth_source)
     now = datetime.now(UTC)
-    result = CommitResult(source=_SOURCE, warnings=list(preview.warnings))
+    result = CommitResult(source=_src(), warnings=list(preview.warnings))
 
     def _action(key: str) -> ConflictAction:
         return conflict_actions.get(key, "skip")
+
+    # ── 0. Custom-field definitions (values on later rows reference them) ──
+    for d in preview.custom_field_defs:
+        key = _custom_field_key(d.resource_type, d.name)
+        try:
+            async with _entity_savepoint(db):
+                res = await _commit_custom_field(db, d, actor=snap)
+        except Exception as exc:  # noqa: BLE001 — per-row failure capture
+            res = CommitEntityResult(
+                kind="custom_field", key=key, action_taken="failed", error=str(exc)
+            )
+        result.entities.append(res)
 
     # ── 1. Customers ──────────────────────────────────────────────────
     customer_name_to_id: dict[str, uuid.UUID] = {}
@@ -1598,9 +1789,9 @@ async def commit_import(
             res = CommitEntityResult(kind="vrf", key=key, action_taken="failed", error=str(exc))
         result.entities.append(res)
 
-    # ── 4. IPSpaces (per_vrf only) ────────────────────────────────────
+    # ── 4. IPSpaces (every strategy but ``single``) ───────────────────
     space_name_to_id: dict[str, uuid.UUID] = {}
-    if space_strategy == "per_vrf":
+    if space_strategy != "single":
         for sp in preview.spaces:
             key = _space_key(sp.name)
             vrf_id = vrf_name_to_id.get(sp.vrf_name) if sp.vrf_name else None

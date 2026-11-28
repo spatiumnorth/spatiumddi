@@ -12,8 +12,8 @@ the preview rather than dropping it silently.
 
 Two deliberate narrowings vs the DNS IR (issue body §4.3):
 
-* :data:`ImportSource` is the single value ``"netbox"`` (the DNS IR is an
-  11-value Literal because cloud providers stamp their provider name).
+* :data:`ImportSource` is ``"netbox"`` or ``"phpipam"`` (#4734; the DNS IR is
+  an 11-value Literal because cloud providers stamp their provider name).
 * :data:`ConflictAction` is ``skip | overwrite`` with **no ``rename``** —
   NetBox entities are CIDR / rd / name-keyed and can't be renamed (the
   DHCP importer's IR makes the same narrowing for the same reason).
@@ -32,11 +32,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-# Stable enum the importer stamps on every row it creates. Single value —
-# the migration writes exactly ``"netbox"`` into the ``import_source``
-# String(20) column. Kept as a Literal (not a bare str) so the source
-# label stays type-honest with the DNS / DHCP importer convention.
-ImportSource = Literal["netbox"]
+# Stable enum the importer stamps on every row it creates; the value goes
+# into the ``import_source`` String(20) column. Kept as a Literal (not a bare
+# str) so the source label stays type-honest with the DNS / DHCP importer
+# convention. ``phpipam`` (#4734) builds the same IR from a different
+# source reader and commits through the same pipeline; the IR field named
+# ``netbox_id`` carries that source's primary key either way (the name is the
+# #36 wire shape and stays).
+ImportSource = Literal["netbox", "phpipam"]
 
 # Per-entity conflict resolution. NO ``rename`` — NetBox entities are
 # keyed by CIDR / rd / name and can't be renamed (mirrors the DHCP
@@ -216,9 +219,29 @@ class ImportedAddress:
     description: str = ""
     subnet_cidr: str | None = None
     space_name: str | None = None
+    mac_address: str | None = None
     custom_fields: dict[str, Any] = field(default_factory=dict)
     tags: dict[str, Any] = field(default_factory=dict)
     netbox_id: int | None = None
+
+
+@dataclass
+class ImportedCustomField:
+    """A source custom-field definition → ``CustomFieldDefinition``.
+
+    Created only when ``(resource_type, name)`` is free; an existing
+    definition is left as it is (conflict key ``custom_field:<type>:<name>``),
+    so the import never reshapes a field operators already use. ``name`` is
+    the sanitised key the row values are stored under; ``source_name`` is what
+    the source called it.
+    """
+
+    resource_type: str  # ip_block | subnet | ip_address
+    name: str
+    label: str
+    field_type: str = "text"
+    options: list[str] | None = None
+    source_name: str = ""
 
 
 @dataclass
@@ -263,6 +286,7 @@ class ImportPreview:
     blocks: list[ImportedBlock] = field(default_factory=list)
     subnets: list[ImportedSubnet] = field(default_factory=list)
     addresses: list[ImportedAddress] = field(default_factory=list)
+    custom_field_defs: list[ImportedCustomField] = field(default_factory=list)
     conflicts: list[EntityConflict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -278,5 +302,6 @@ class ImportPreview:
             "blocks": len(self.blocks),
             "subnets": len(self.subnets),
             "addresses": len(self.addresses),
+            "custom_fields": len(self.custom_field_defs),
             "conflicts": len(self.conflicts),
         }

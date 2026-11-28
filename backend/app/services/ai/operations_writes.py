@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from ipaddress import ip_network
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -2295,6 +2295,136 @@ register(
         args_model=CommitNetboxImportArgs,
         preview=_preview_commit_netbox_import,
         apply=_apply_commit_netbox_import,
+        category="ipam",
+        requires_superadmin=True,
+    )
+)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# phpIPAM IPAM import (commit) — live-pull one-shot migration (#4734)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Sister of the NetBox import above, the same pipeline behind it: the apply
+# pulls from the operator-typed phpIPAM URL and commits in one go; the preview
+# shows the would-import counts. Seeds IPAM rows only, so no agent wake.
+
+
+class CommitPhpipamImportArgs(BaseModel):
+    base_url: str = Field(description="phpIPAM base URL, e.g. https://ipam.example.com")
+    app_id: str = Field(description="The phpIPAM API application id.")
+    token: str | None = Field(default=None, description="App code (not persisted).")
+    username: str | None = Field(default=None, description="Alternative to token.")
+    password: str | None = Field(default=None, description="Alternative to token (not persisted).")
+    verify_tls: bool = True
+    space_strategy: Literal["per_section", "single"] = Field(
+        default="per_section",
+        description=(
+            "'per_section' makes one IPSpace per phpIPAM section; "
+            "'single' collapses everything into target_space_id."
+        ),
+    )
+    target_space_id: uuid.UUID | None = Field(
+        default=None, description="Target IP space when space_strategy='single'."
+    )
+    section_ids: list[int] | None = Field(
+        default=None, max_length=1000, description="Only these phpIPAM section ids."
+    )
+    family: Literal[4, 6] | None = Field(default=None, description="Address family filter.")
+    within_include: str | None = Field(
+        default=None, max_length=64, description="Only subnets within (and including) this CIDR."
+    )
+
+    @model_validator(mode="after")
+    def _one_credential(self) -> CommitPhpipamImportArgs:
+        if not self.token and not (self.username and self.password):
+            raise ValueError("provide an app-code token, or a username and password")
+        return self
+
+
+async def _phpipam_import_pull(db: AsyncSession, args: CommitPhpipamImportArgs) -> Any:
+    """Live-pull the phpIPAM install into an ImportPreview (conflicts attached
+    by the service's own preview). Raises ValueError with operator-facing text."""
+    from app.services.phpipam_import import (  # noqa: PLC0415
+        PhpipamClientError,
+        preview_phpipam_import,
+    )
+
+    try:
+        return await preview_phpipam_import(
+            db,
+            base_url=args.base_url,
+            app_id=args.app_id,
+            token=args.token,
+            username=args.username,
+            password=args.password,
+            verify_tls=args.verify_tls,
+            space_strategy=args.space_strategy,
+            target_space_id=args.target_space_id,
+            filters={
+                "section_ids": args.section_ids,
+                "family": args.family,
+                "within_include": args.within_include,
+            },
+        )
+    except PhpipamClientError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+async def _preview_commit_phpipam_import(
+    db: AsyncSession, user: User, args: CommitPhpipamImportArgs
+) -> PreviewResult:
+    if (block := _superadmin_preview_block(user)) is not None:
+        return block
+    if args.space_strategy == "single" and args.target_space_id is None:
+        return PreviewResult(ok=False, detail="space_strategy='single' requires target_space_id")
+    try:
+        preview = await _phpipam_import_pull(db, args)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    if not (preview.subnets or preview.addresses or preview.blocks):
+        return PreviewResult(ok=False, detail="No IPAM rows found to import from phpIPAM")
+    return PreviewResult(ok=True, detail="ready", preview_text=_netbox_preview_text(preview))
+
+
+async def _apply_commit_phpipam_import(
+    db: AsyncSession, user: User, args: CommitPhpipamImportArgs
+) -> dict[str, Any]:
+    _require_superadmin(user)
+    from app.services.netbox_import import commit_import  # noqa: PLC0415
+
+    preview = await _phpipam_import_pull(db, args)
+    if not (preview.subnets or preview.addresses or preview.blocks):
+        raise ValueError("No IPAM rows found to import from phpIPAM")
+    result = await commit_import(
+        db,
+        preview=preview,
+        conflict_actions={},
+        space_strategy=args.space_strategy,
+        target_space_id=args.target_space_id,
+        default_router_name="Imported VLANs (phpIPAM)",
+        actor=user,
+    )
+    return {
+        "custom_fields_created": result.custom_fields_created,
+        "vrfs_created": result.vrfs_created,
+        "spaces_created": result.spaces_created,
+        "vlans_created": result.vlans_created,
+        "blocks_created": result.blocks_created,
+        "subnets_created": result.subnets_created,
+        "addresses_created": result.addresses_created,
+        "total_skipped": result.total_skipped,
+        "total_failed": result.total_failed,
+    }
+
+
+register(
+    Operation(
+        name="commit_phpipam_import",
+        description="Live-pull + one-shot import of phpIPAM IPAM into native rows.",
+        args_model=CommitPhpipamImportArgs,
+        preview=_preview_commit_phpipam_import,
+        apply=_apply_commit_phpipam_import,
         category="ipam",
         requires_superadmin=True,
     )

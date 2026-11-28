@@ -100,6 +100,7 @@ EXPECTED_OUTBOUND_TOOLS: frozenset[str] = frozenset(
         "find_dns_import_preview",
         "find_dhcp_import_preview",
         "find_netbox_import_preview",
+        "find_phpipam_import_preview",
         # Off-prem lookups.
         "network_whois",
         "lookup_whois_ip",
@@ -156,6 +157,7 @@ _OUTBOUND_HELPERS: tuple[str, ...] = (
     "app.services.ai.operations_writes._dns_import_pull",
     "app.services.ai.operations_writes._dhcp_import_pull",
     "app.services.ai.operations_writes._netbox_import_pull",
+    "app.services.ai.operations_writes._phpipam_import_pull",
     "app.services.appliance.releases.list_available_upgrade_images",
     "app.drivers.",
 )
@@ -406,6 +408,7 @@ EXPECTED_OUTBOUND_SCOPES: dict[str, tuple[str, str]] = {
     "find_dns_import_preview": ("dns:write", "/api/v1/dns/import/cloud/preview"),
     "find_dhcp_import_preview": ("dhcp:write", "/api/v1/dhcp/import/windows/preview"),
     "find_netbox_import_preview": ("ipam:write", "/api/v1/ipam/import/netbox/preview"),
+    "find_phpipam_import_preview": ("ipam:write", "/api/v1/ipam/import/phpipam/preview"),
 }
 
 
