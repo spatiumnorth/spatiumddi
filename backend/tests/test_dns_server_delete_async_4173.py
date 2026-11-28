@@ -205,6 +205,30 @@ async def test_task_detaches_history_and_deletes_operational_rows_in_batches(
 
 
 @pytest.mark.asyncio
+async def test_the_detach_leaves_another_servers_rows_in_other_partitions(
+    db_session: AsyncSession,
+) -> None:
+    """The log tables are partitioned (#2185), so two rows in two partitions can
+    share a ctid: here each server's only row is the first in its partition."""
+    grp = await _group(db_session, "g4173p")
+    srv = await _server(db_session, grp, "retired-ns")
+    keep = await _server(db_session, grp, "kept-ns")
+    now = datetime.now(UTC)
+    for server, ts in ((srv, now), (keep, now - timedelta(days=1))):
+        db_session.add(DNSQueryLogEntry(server_id=server.id, ts=ts, qname="q.example.", raw="x"))
+    srv.removing_at = now
+    await db_session.commit()
+    sid, kid = srv.id, keep.id
+
+    result = await remove_server_with_session(db_session, sid)
+
+    assert result["rows"]["dns_query_log_entry"] == 1
+    db_session.expire_all()
+    assert await _count(db_session, DNSQueryLogEntry, DNSQueryLogEntry.server_id == kid) == 1
+    assert await _count(db_session, DNSQueryLogEntry, DNSQueryLogEntry.server_id.is_(None)) == 1
+
+
+@pytest.mark.asyncio
 async def test_logs_readers_cope_with_a_deleted_server(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

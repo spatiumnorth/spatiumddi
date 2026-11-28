@@ -42,7 +42,7 @@ from app.models.settings import PlatformSettings
 from app.services.agents.ingest_receipt import RECEIPT_RETENTION_DAYS, prune_receipts
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.alerts import _matching_agent_spool_trimmed_subjects
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS
+from app.services.logs.partitions import DEFAULT_RETENTION_HOURS
 
 _RULE = SimpleNamespace(severity="warning")
 

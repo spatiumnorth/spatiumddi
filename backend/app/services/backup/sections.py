@@ -403,7 +403,7 @@ SECTIONS: tuple[Section, ...] = (
         description=(
             "Short-retention diagnostic logs — DNS query log + "
             "DHCP Kea activity log. Volatile by design (24 h "
-            "retention via prune sweep). Excluded from default "
+            "retention via partition drops). Excluded from default "
             "backup; tick to include for a diagnostic snapshot."
         ),
         tables=("dns_query_log_entry", "dhcp_log_entry"),

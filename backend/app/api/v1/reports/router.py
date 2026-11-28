@@ -36,7 +36,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, Subnet
 from app.models.logs import DNSQueryLogEntry
 from app.models.ownership import Customer
-from app.tasks.prune_logs import DEFAULT_RETENTION_HOURS
+from app.services.logs.partitions import DEFAULT_RETENTION_HOURS
 
 router = APIRouter()
 
@@ -257,7 +257,7 @@ async def compute_top_dns_clients(db: AsyncSession, *, limit: int = TOP_N) -> li
     """DNS query-log clients ranked by query volume over the last 24 h.
 
     Groups the parsed BIND9 query-log rows by ``client_ip``, bounded to
-    the trailing :data:`prune_logs.DEFAULT_RETENTION_HOURS` (24 h)
+    the trailing :data:`app.services.logs.partitions.DEFAULT_RETENTION_HOURS` (24 h)
     window. The prune sweep only runs nightly, so between sweeps the
     table can hold ~48 h of rows — without the time predicate this would
     over-count *and* full-table-scan past the ``ix_dns_query_log_ts``

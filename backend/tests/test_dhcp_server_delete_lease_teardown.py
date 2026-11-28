@@ -21,6 +21,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer, DHCPServerGroup
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.logs import DHCPLogEntry
 
 
 async def _token(db: AsyncSession) -> dict[str, str]:
@@ -153,6 +154,31 @@ async def test_server_delete_spares_mirror_an_ha_peer_still_holds(
 
     assert await _addrs(db_session, sid) == {"10.77.1.20"}
     assert revoked == ["10.77.1.21"]
+
+
+@pytest.mark.asyncio
+async def test_server_delete_keeps_its_activity_log_detached(
+    client: AsyncClient, db_session: AsyncSession, revoked: list[str]
+) -> None:
+    """#4173 with no foreign key (#2185): the delete detaches the server's log
+    rows itself, and leaves another server's alone."""
+    _subnet, _scope, (a, b) = await _world(db_session, 2)
+    now = datetime.now(UTC)
+    for srv in (a, b):
+        db_session.add(DHCPLogEntry(server_id=srv.id, ts=now, raw="DHCP4_LEASE_ALLOC"))
+    a_id, a_name, b_id = a.id, a.name, b.id
+    headers = await _token(db_session)
+    await db_session.commit()
+
+    resp = await client.delete(f"/api/v1/dhcp/servers/{a_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
+
+    rows = (
+        await db_session.execute(select(DHCPLogEntry.server_id, DHCPLogEntry.server_name))
+    ).all()
+    assert sorted(rows, key=lambda r: str(r.server_id)) == sorted(
+        [(None, a_name), (b_id, None)], key=lambda r: str(r[0])
+    )
 
 
 @pytest.mark.asyncio

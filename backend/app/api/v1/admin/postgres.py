@@ -256,26 +256,29 @@ async def postgres_table_sizes(
     limit: int = Query(50, ge=1, le=500),
 ) -> TableSizesResponse:
     """Top tables by total size (table + indexes + TOAST). Useful for
-    catching unbounded growth in audit / metrics / log tables."""
+    catching unbounded growth in audit / metrics / log tables. A partitioned
+    table is one row, its partitions added up (#2185)."""
 
     res = await db.execute(
         text("""
             SELECT n.nspname,
-                   c.relname,
-                   pg_total_relation_size(c.oid) AS total_bytes,
-                   pg_relation_size(c.oid) AS table_bytes,
-                   pg_indexes_size(c.oid) AS index_bytes,
-                   COALESCE(pg_total_relation_size(c.reltoastrelid), 0) AS toast_bytes,
-                   COALESCE(s.n_live_tup, 0) AS live_rows,
-                   COALESCE(s.n_dead_tup, 0) AS dead_rows,
-                   s.last_autovacuum,
-                   s.last_autoanalyze
+                   root.relname,
+                   sum(pg_total_relation_size(c.oid)) AS total_bytes,
+                   sum(pg_relation_size(c.oid)) AS table_bytes,
+                   sum(pg_indexes_size(c.oid)) AS index_bytes,
+                   sum(COALESCE(pg_total_relation_size(c.reltoastrelid), 0)) AS toast_bytes,
+                   sum(COALESCE(s.n_live_tup, 0)) AS live_rows,
+                   sum(COALESCE(s.n_dead_tup, 0)) AS dead_rows,
+                   max(s.last_autovacuum),
+                   max(s.last_autoanalyze)
             FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_class root ON root.oid = COALESCE(pg_partition_root(c.oid), c.oid)
+            JOIN pg_namespace n ON n.oid = root.relnamespace
             LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
-            WHERE c.relkind = 'r'
+            WHERE c.relkind IN ('r', 'p')
               AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY pg_total_relation_size(c.oid) DESC
+            GROUP BY n.nspname, root.relname
+            ORDER BY total_bytes DESC
             LIMIT :lim
             """),
         {"lim": limit},
