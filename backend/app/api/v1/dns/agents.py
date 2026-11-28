@@ -864,6 +864,28 @@ def _bundle_response(
     )
 
 
+# #5025 — a poll header an agent sends only when it holds the body for the
+# ``If-None-Match`` it presents and can apply an ops page without a fresh copy
+# of it. Per request, not a feature flag: the agent withholds it whenever the
+# bundle it holds is not the live, cleanly applied one. An agent that never
+# sends it (every release before this one) is served exactly as before.
+OPS_ONLY_HEADER = "X-Spatium-Ops-Only"
+
+
+def _ops_only_response(
+    bundle: DNSAgentBundle, ops: list[dict[str, Any]], remaining: int
+) -> Response:
+    """The ops page alone (#5025): the head ``_bundle_prefix`` puts in front
+    of the stored body, closed, with no body behind it. Same keys and order,
+    so an agent that reads only the head of a reply treats it like a full one."""
+    head = _bundle_prefix(bundle.etag, ops, remaining)
+    return Response(
+        content=head + b'"ops_only":true}',
+        media_type="application/json",
+        headers={"ETag": format_etag(bundle.etag)},
+    )
+
+
 class _InlineRenderFailed(Exception):
     """The api's inline attempt raised; the poll falls back to the worker."""
 
@@ -1046,6 +1068,7 @@ async def agent_config_longpoll(
     response: Response,
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
+    ops_only: str | None = Header(default=None, alias=OPS_ONLY_HEADER),
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> Any:
     """Long-poll for config changes.
@@ -1073,6 +1096,14 @@ async def agent_config_longpoll(
     whole body. The agent never short-circuits on an unchanged ETag (it
     saves, compares ``structural_etag``, drains the ops), so nothing on its
     side changes.
+
+    #5025 — except for an agent that sends ``X-Spatium-Ops-Only: 1``: it says
+    it holds the body for the ``If-None-Match`` it presents. When that ETag is
+    the stored bundle's and ops are pending, the answer is the ops page alone
+    (``_ops_only_response``) and the body is neither loaded nor streamed: a
+    250 MB body re-sent, re-parsed and re-saved for every 5,000-op page was
+    most of the time a bulk load took to drain. A mismatched ETag, or no
+    pending ops, answers as before, and so does any agent without the header.
 
     The ops page is gated to what the stored bundle's snapshot covers: an
     op whose transaction had not committed when its render read rides with
@@ -1228,6 +1259,11 @@ async def agent_config_longpoll(
                     AGENT_BUNDLE_SERVED.labels(family="dns", outcome="client_gone").inc()
                     return Response(status_code=304)
                 # Early return if there are pending ops (fast-path per §3)
+                if ops and ops_only == "1" and etag_matches(if_none_match, bundle.etag):
+                    server.last_config_etag = bundle.etag
+                    await db.commit()
+                    AGENT_BUNDLE_SERVED.labels(family="dns", outcome="ops_only").inc()
+                    return _ops_only_response(bundle, ops, remaining_ops)
                 if not etag_matches(if_none_match, bundle.etag) or ops:
                     # The body before the commit, and never assumed: the
                     # worker keeps dns_agent_bundle_keep_versions rows per

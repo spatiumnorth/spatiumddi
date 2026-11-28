@@ -97,6 +97,24 @@ class DriverBase(ABC):
         already widened in practice.
         """
 
+    def plan_op_batches(self, ops: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Split ``ops`` into consecutive runs that :meth:`apply_record_op_batch`
+        may apply together (#5025).
+
+        Order is never changed: concatenating the runs gives ``ops`` back. The
+        default is one run per op, so a driver that cannot batch keeps the
+        per-op path."""
+        return [[op] for op in ops]
+
+    def apply_record_op_batch(self, ops: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+        """Apply one run from :meth:`plan_op_batches` as a unit; one result per
+        op, as :meth:`apply_record_op` returns it.
+
+        Raises when the run could not be applied; the caller then applies each
+        op on its own, so a driver must leave nothing half-applied that an op
+        by op replay would not set right (ops are idempotent)."""
+        return [self.apply_record_op(op) for op in ops]
+
     @abstractmethod
     def start_daemon(self) -> None:
         """Spawn the DNS daemon. Called once at startup."""
