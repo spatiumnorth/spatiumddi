@@ -1123,15 +1123,29 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
             return PreviewResult(ok=False, detail=str(exc.detail))
         # #3a: count the records this zone holds so a permanent delete of a
         # zone that grew records since request is caught by the drift check.
+        # #5005: the records in the Trash count too: the delete removes them
+        # through the foreign-key cascade, and the global soft-delete filter
+        # would hide them. The drift check compares the whole string, so a
+        # trashed record added after the request changes it too.
         from app.models.dns import DNSRecord  # noqa: PLC0415
 
         rec_count = (
             await db.execute(
-                select(func.count(DNSRecord.id)).where(DNSRecord.zone_id == args.zone_id)
+                select(func.count(DNSRecord.id))
+                .where(DNSRecord.zone_id == args.zone_id)
+                .execution_options(include_deleted=True)
             )
         ).scalar_one()
+        trashed_count = (
+            await db.execute(
+                select(func.count(DNSRecord.id))
+                .where(DNSRecord.zone_id == args.zone_id, DNSRecord.deleted_at.is_not(None))
+                .execution_options(include_deleted=True)
+            )
+        ).scalar_one()
+        in_trash = f" ({trashed_count} of them in the Trash)" if trashed_count else ""
         suffix = (
-            f" — cascades {rec_count} DNS record(s)"
+            f" — cascades {rec_count} DNS record(s){in_trash}"
             " (pushes a remove-zone write-through to agentless servers first)"
         )
     else:
