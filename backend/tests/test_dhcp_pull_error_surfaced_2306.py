@@ -60,7 +60,7 @@ async def test_failed_pull_is_persisted_then_cleared_by_success(
     sid = await _arm(db_session)
     outcome: dict[str, bool] = {"fail": True}
 
-    async def _pull(db, server, apply=True, recount=True, release_txn_for_wire=False):  # type: ignore[no-untyped-def]
+    async def _pull(db, server, apply=True, recount=True, release_txn_for_wire=False, **_kw):  # type: ignore[no-untyped-def]
         if outcome["fail"]:
             raise RuntimeError("Get-DhcpServerv4Lease: access denied")
         server.last_sync_error = None  # what the real success path does
@@ -205,7 +205,7 @@ async def test_busy_pull_leaves_the_error_untouched(
     hung the manual Sync's 409."""
     sid = await _arm(db_session)
 
-    async def _busy(db, server, apply=True, release_txn_for_wire=False):  # type: ignore[no-untyped-def]
+    async def _busy(db, server, apply=True, release_txn_for_wire=False, **_kw):  # type: ignore[no-untyped-def]
         return pl.PullLeasesResult(busy=True)
 
     monkeypatch.setattr(pl, "_pull_leases_core", _busy)

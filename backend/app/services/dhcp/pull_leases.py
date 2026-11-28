@@ -303,6 +303,106 @@ async def _release_pass(server_id: Any, token: str | None) -> None:
     await _release_key(_PASS_CLAIM_PREFIX + str(server_id), token)
 
 
+@dataclass
+class WireRead:
+    """What one server's driver answered, read with no database involved (#5008).
+
+    ``snapshot_at`` is the database clock taken BEFORE the reads (#620): the
+    reconcile must not act on a row an operator edited after it. ``error`` is
+    set when the read could not run at all (no such driver, or it timed out).
+    """
+
+    snapshot_at: datetime
+    read_driver: str
+    scopes: list[dict[str, Any]] = field(default_factory=list)
+    scopes_ok: bool = True
+    failover: dict[str, Any] | None = None
+    leases: list[dict[str, Any]] = field(default_factory=list)
+    lease_error: Exception | None = None
+    errors: list[str] = field(default_factory=list)
+    fatal: bool = False
+
+
+async def read_wire(server: DHCPServer, snapshot_at: datetime, *, apply: bool = True) -> WireRead:
+    """Every driver read for one server (scopes, failover, leases), no DB access.
+
+    Split out of the pull so the scheduled task can read all due servers
+    concurrently (#5008) and write the results one server at a time. Driver
+    failures are recorded on the result, never raised, exactly as the pull
+    always did.
+    """
+    out = WireRead(snapshot_at=snapshot_at, read_driver=server.driver)
+    try:
+        driver = get_driver(server.driver)
+    except ValueError as exc:
+        out.errors.append(str(exc))
+        out.fatal = True
+        return out
+    if hasattr(driver, "get_scopes"):
+        try:
+            out.scopes = await driver.get_scopes(server)
+        except Exception as exc:  # noqa: BLE001
+            out.scopes_ok = False
+            out.errors.append(f"get_scopes failed: {exc}")
+            logger.warning(
+                "dhcp_pull_scopes_driver_failed",
+                server=str(server.id),
+                driver=server.driver,
+                error=str(exc),
+            )
+        # Skipped when ``get_scopes`` itself failed: the server is almost
+        # certainly unreachable, and a third WinRM call to it would only add
+        # another full timeout to the poll (#1110).
+        if apply and out.scopes_ok and hasattr(driver, "get_failover_relationships"):
+            try:
+                out.failover = await driver.get_failover_relationships(server)
+            except Exception as exc:  # noqa: BLE001 — recorded, never fatal to the poll
+                out.failover = {"ok": False, "error": str(exc), "relationships": []}
+    try:
+        out.leases = await driver.get_leases(server)
+    except Exception as exc:  # noqa: BLE001 — surface any transport/PS error
+        out.lease_error = exc
+    return out
+
+
+async def read_wire_bounded(
+    server: DHCPServer,
+    snapshot_at: datetime,
+    sem: asyncio.Semaphore,
+    claim_token_out: dict[Any, str | None],
+    timeout_s: float,
+) -> WireRead | None:
+    """One server's reads under the pass claim, a concurrency cap and a deadline (#5008).
+
+    Returns ``None`` when a manual Sync or an earlier pass holds the server
+    (busy). The claim is kept on success (its token goes in
+    ``claim_token_out``) and released by ``pull_leases_from_server`` after the
+    write; it is released here on every other exit.
+    """
+    server_id = server.id
+    claimed, token = await _claim_pass(server_id)
+    if not claimed:
+        logger.info("dhcp_pull_leases_server_busy", server=str(server_id))
+        return None
+    try:
+        async with sem:
+            try:
+                wire = await asyncio.wait_for(read_wire(server, snapshot_at), timeout_s)
+            except TimeoutError:
+                # The worker thread under a WinRM call cannot be cancelled; it
+                # finishes on its own and its answer is dropped.
+                msg = f"read timed out after {timeout_s:g}s"
+                wire = WireRead(snapshot_at=snapshot_at, read_driver=server.driver)
+                wire.scopes_ok = False
+                wire.errors.append(msg)
+                wire.lease_error = TimeoutError(msg)
+    except BaseException:
+        await _release_pass(server_id, token)
+        raise
+    claim_token_out[server_id] = token
+    return wire
+
+
 # #4776 — the claim on the scheduled SCAN as a whole (the task that walks every
 # agentless server). The per-server claim bounds one server; two scans reading
 # different unreachable servers at once still held every worker process.
@@ -337,6 +437,8 @@ async def pull_leases_from_server(
     apply: bool = True,
     recount: bool = True,
     release_txn_for_wire: bool = False,
+    prefetched: WireRead | None = None,
+    claim_token: str | None = None,
 ) -> PullLeasesResult:
     """Pull leases, then record the outcome on the server row (#2306).
 
@@ -361,10 +463,14 @@ async def pull_leases_from_server(
     driver reads, so no transaction is open while a WinRM call waits on an
     unreachable host, and takes the pull lock again afterwards. It commits
     whatever the caller had pending, so only a caller that wants that sets it.
+
+    ``prefetched`` (#5008) is a ``WireRead`` the caller already took, under the
+    pass claim whose token it passes as ``claim_token``; the pull then does no
+    driver read and releases that claim when done. It needs
+    ``release_txn_for_wire`` (the write phase re-takes the pull lock).
     """
-    claim_token: str | None = None
     server_id = server.id
-    if apply and release_txn_for_wire:
+    if apply and release_txn_for_wire and prefetched is None:
         # #4776 — the reads run with no transaction, so the advisory lock does
         # not span them; claim the whole pass instead (one pull per server at
         # a time, reads included).
@@ -374,7 +480,11 @@ async def pull_leases_from_server(
             return PullLeasesResult(busy=True)
     try:
         result = await _pull_leases_core(
-            db, server, apply=apply, release_txn_for_wire=release_txn_for_wire
+            db,
+            server,
+            apply=apply,
+            release_txn_for_wire=release_txn_for_wire,
+            prefetched=prefetched,
         )
     finally:
         await _release_pass(server_id, claim_token)
@@ -397,6 +507,7 @@ async def _pull_leases_core(
     *,
     apply: bool = True,
     release_txn_for_wire: bool = False,
+    prefetched: WireRead | None = None,
 ) -> PullLeasesResult:
     """Poll ``server`` for active leases and reconcile into the DB.
 
@@ -430,7 +541,7 @@ async def _pull_leases_core(
     # advisory lock lasts one transaction: with ``release_txn_for_wire`` it
     # covers the write phase only, and the pass-wide claim
     # (``_claim_pass``, taken by the caller) covers the reads.
-    if apply and not await _try_lock_server(db, server):
+    if prefetched is None and apply and not await _try_lock_server(db, server):
         result.busy = True
         logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
         return result
@@ -460,40 +571,26 @@ async def _pull_leases_core(
     # earlier the longer this transaction runs.
     has_topology = hasattr(driver, "get_scopes")
     read_driver = server.driver
-    snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
-    if apply and release_txn_for_wire:
-        await db.commit()  # releases the pull lock; re-taken below
-
-    wire_scopes: list[dict[str, Any]] = []
-    scopes_ok = True
-    failover: dict[str, Any] | None = None
-    if has_topology:
-        try:
-            wire_scopes = await driver.get_scopes(server)
-        except Exception as exc:  # noqa: BLE001
-            scopes_ok = False
-            result.errors.append(f"get_scopes failed: {exc}")
-            logger.warning(
-                "dhcp_pull_scopes_driver_failed",
-                server=str(server.id),
-                driver=server.driver,
-                error=str(exc),
-            )
-        # Skipped when ``get_scopes`` itself failed: the server is almost
-        # certainly unreachable, and a third WinRM call to it would only add
-        # another full timeout to the poll (#1110).
-        if apply and scopes_ok and hasattr(driver, "get_failover_relationships"):
-            try:
-                failover = await driver.get_failover_relationships(server)
-            except Exception as exc:  # noqa: BLE001 — recorded, never fatal to the poll
-                failover = {"ok": False, "error": str(exc), "relationships": []}
-
-    wire: list[dict[str, Any]] = []
-    lease_error: Exception | None = None
-    try:
-        wire = await driver.get_leases(server)
-    except Exception as exc:  # noqa: BLE001 — surface any transport/PS error
-        lease_error = exc
+    if prefetched is not None:
+        # #5008 — read by the scheduled task, concurrently with the other
+        # servers; only the write phase runs here.
+        wire_read = prefetched
+        read_driver = prefetched.read_driver
+        snapshot_at = prefetched.snapshot_at
+        if wire_read.fatal:
+            result.errors.extend(wire_read.errors)
+            return result
+    else:
+        snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
+        if apply and release_txn_for_wire:
+            await db.commit()  # releases the pull lock; re-taken below
+        wire_read = await read_wire(server, snapshot_at, apply=apply)
+    wire_scopes = wire_read.scopes
+    scopes_ok = wire_read.scopes_ok
+    failover = wire_read.failover
+    result.errors.extend(wire_read.errors)
+    wire = wire_read.leases
+    lease_error = wire_read.lease_error
 
     if apply and release_txn_for_wire:
         if not await _try_lock_server(db, server):
