@@ -11,6 +11,11 @@
 > HA prototypes). Read those for the exhaustive option tables — this page
 > avoids duplicating them.
 
+> The chart is published as an OCI artifact at
+> `oci://ghcr.io/spatiumnorth/charts/spatiumddi` and listed on
+> [Artifact Hub](https://artifacthub.io/packages/search?repo=spatiumddi)
+> [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/spatiumddi)](https://artifacthub.io/packages/search?repo=spatiumddi).
+
 > **Picking a deployment shape?** See
 > [`TOPOLOGIES.md`](TOPOLOGIES.md) for reference production topologies with
 > sizing notes (single VM through HA cloud + on-prem hybrid). For the

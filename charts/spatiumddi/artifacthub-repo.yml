@@ -1,0 +1,12 @@
+# Artifact Hub repository metadata (#3858). Not part of the chart (.helmignore);
+# release.yml pushes it as the `artifacthub.io` tag of
+# ghcr.io/spatiumnorth/charts/spatiumddi, beside the chart versions.
+#
+# Uncomment repositoryID once a maintainer has registered the repository on
+# artifacthub.io (Control Panel -> Repositories -> Add, kind "Helm charts",
+# URL oci://ghcr.io/spatiumnorth/charts/spatiumddi) and copied the ID it shows.
+# Until then release.yml skips the push, so no placeholder reaches the registry.
+# repositoryID: 00000000-0000-0000-0000-000000000000
+# owners:
+#   - name: <maintainer name>
+#     email: <maintainer email>

@@ -50,6 +50,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - metrics-server (present in the k3s airgap bundle; disabled by config) —
   Apache 2.0 — https://github.com/kubernetes-sigs/metrics-server
 - Helm — Apache 2.0 — https://helm.sh
+- ORAS (release-workflow build tool only) — Apache 2.0 — https://oras.land
 - MetalLB (L2 load balancer / control-plane VIP) — Apache 2.0 — https://metallb.io
 - FRRouting (BGP daemon, via MetalLB's frr-k8s backend) — GPL v2 — https://frrouting.org
 - frr-k8s (MetalLB's BGP backend; only with BGP mode enabled) — Apache 2.0 —

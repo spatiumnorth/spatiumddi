@@ -134,6 +134,8 @@ K8S_VERSION="${K8S_VERSION:-1.36.0}"
 # we render today is postgresql.cnpg.io/Cluster.
 CRD_SCHEMAS='https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
 
+python3 "$ROOT/scripts/artifacthub.py" check   # #3858
+
 UMBRELLA="$ROOT/charts/spatiumddi"
 APPLIANCE="$ROOT/charts/spatiumddi-appliance"
 METALLB="$ROOT/charts/spatiumddi-metallb"

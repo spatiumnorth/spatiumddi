@@ -128,6 +128,15 @@
       "note": "Build-time tool only -- nothing ships it: this CLI lints, templates and PACKAGES the charts. On 4.x since #1098, which CLOSED a real divergence rather than creating one: bake-chart.sh packages the chart with THIS binary, then k3s's helm-controller spawns klipper-helm to install it -- and the pinned v0.13.3-build20260727 ships Helm 4.1.4 (verified: `helm version --short` in that image). So the appliance has been installing with 4 while CI validated with 3; the CLI major now matches what production runs. Keep it that way -- if the klipper-helm pin in appliance/mkosi.extra/usr/share/doc/k3s/k3s-images.txt moves to a different helm major, this pin should follow it. (3.x history: v3.22.0 was the terminal 3.x feature release, 2026-09-10; security-only to 2027-02-10.) Six copies, none of them Dependabot-visible -- the sixth is the CI-gate row in docs/DEVELOPMENT.md, pinned because it silently drifted to a stale major; this component is the reason the manifest exists."
     },
 
+    "oras": {
+      "version": "1.3.0",
+      "pinned_in": [
+        { "path": ".github/workflows/release.yml", "match": "version: {version}", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "oras-project/oras", "track": "^v1\\." },
+      "note": "Build-time tool only -- nothing ships it: release.yml uses it to push artifacthub-repo.yml as the `artifacthub.io` tag of the chart's OCI repository (#3858). Installed by oras-project/setup-oras."
+    },
+
     "kubeconform": {
       "version": "v0.8.0",
       "pinned_in": [
