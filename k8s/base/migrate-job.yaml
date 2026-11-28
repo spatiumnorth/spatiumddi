@@ -25,6 +25,14 @@ spec:
         - name: migrate
           image: ghcr.io/spatiumnorth/spatiumddi-api:latest
           imagePullPolicy: Always
+          # #1250 — full hardening: nothing here uses a file capability.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           command: ["alembic", "upgrade", "head"]
           env:
             - name: POSTGRES_PASSWORD
