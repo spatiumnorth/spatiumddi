@@ -11,6 +11,7 @@
     "dns_acl": "ACLs",
     "dns_pool": "DNS pools",
     "dns_record": "DNS records",
+    "dns_scheduled_change": "scheduled record changes",
     "dns_server_options": "server options",
     "dns_tsig_key": "TSIG keys",
     "dns_view": "views",
@@ -103,7 +104,8 @@
         "dns_pool",
         "dns_zone_update_acl",
         "dnssec_key",
-        "acme_account"
+        "acme_account",
+        "dns_scheduled_change"
       ],
       "extra": []
     },
