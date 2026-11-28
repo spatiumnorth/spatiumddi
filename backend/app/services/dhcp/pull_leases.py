@@ -56,7 +56,9 @@ second run over the same wire state is a no-op (the dedup key is
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -66,7 +68,9 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.core.dns_names import sanitize_hostname
+from app.core.redis_client import make_async_redis
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import (
     DHCPLease,
@@ -190,6 +194,130 @@ async def _try_lock_server(db: AsyncSession, server: DHCPServer) -> bool:
     )
 
 
+# #4776 — the pass-wide claim. The advisory lock above is transaction-scoped
+# and the scheduled pass commits before its WinRM reads, so it covers only the
+# write phase; this Redis key covers the whole pass, reads included, so a
+# second pass of a server still being read answers "busy" instead of tying up
+# another worker process for the length of an unreachable host's timeouts.
+_PASS_CLAIM_PREFIX = "dhcp:pull_leases:pass:"
+# A claim lives for _CLAIM_TTL_MS and its holder renews it every
+# _CLAIM_RENEW_S while the pass runs (the WinRM reads run in threads, so the
+# event loop stays free to renew). A worker killed mid-pass stops renewing, so
+# its claim lapses within a minute instead of wedging the pull for the whole
+# worst-case length of a pass.
+_CLAIM_TTL_MS = 60_000
+_CLAIM_RENEW_S = 20.0
+_PASS_CLAIM_CONNECT_TIMEOUT = 2.0
+_RELEASE_IF_OWNER = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
+)
+_RENEW_IF_OWNER = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('pexpire', KEYS[1], ARGV[2]) end return 0"
+)
+# token -> the task renewing that claim; cancelled by ``_release_key``.
+_RENEWERS: dict[str, asyncio.Task[None]] = {}
+
+
+async def _renew_loop(key: str, token: str) -> None:
+    while True:
+        await asyncio.sleep(_CLAIM_RENEW_S)
+        client: Any = None
+        try:
+            client = make_async_redis(
+                settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
+            )
+            kept = await client.eval(_RENEW_IF_OWNER, 1, key, token, _CLAIM_TTL_MS)
+            if not kept:
+                # Lapsed or taken over: nothing left to renew.
+                logger.warning("dhcp_pull_leases_claim_lost", key=key)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — retried next tick; the TTL bounds it
+            logger.warning("dhcp_pull_leases_claim_renew_failed", key=key, error=str(exc))
+        finally:
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001 — closing a client we are done with
+                    pass
+
+
+async def _claim_key(key: str) -> tuple[bool, str | None]:
+    """Take ``key``: ``(claimed, token)``, renewed until ``_release_key``.
+
+    ``claimed`` False means another holder has it. Redis unreachable returns
+    ``(True, None)``: the write-phase advisory lock still keeps the writes
+    serial, and a Redis outage must not stop the pull.
+    """
+    token = uuid.uuid4().hex
+    client: Any = None
+    try:
+        client = make_async_redis(
+            settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
+        )
+        got = await client.set(key, token, nx=True, px=_CLAIM_TTL_MS)
+    except Exception as exc:  # noqa: BLE001 — fail open, see the docstring
+        logger.warning("dhcp_pull_leases_claim_unavailable", error=str(exc))
+        return True, None
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 — closing a client we are done with
+                pass
+    if not got:
+        return False, None
+    _RENEWERS[token] = asyncio.create_task(_renew_loop(key, token))
+    return True, token
+
+
+async def _release_key(key: str, token: str | None) -> None:
+    if token is None:
+        return
+    renewer = _RENEWERS.pop(token, None)
+    if renewer is not None:
+        renewer.cancel()
+    client: Any = None
+    try:
+        client = make_async_redis(
+            settings.redis_url, socket_connect_timeout=_PASS_CLAIM_CONNECT_TIMEOUT
+        )
+        await client.eval(_RELEASE_IF_OWNER, 1, key, token)
+    except Exception as exc:  # noqa: BLE001 — the TTL expires it
+        logger.warning("dhcp_pull_leases_claim_release_failed", error=str(exc))
+    finally:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 — closing a client we are done with
+                pass
+
+
+async def _claim_pass(server_id: Any) -> tuple[bool, str | None]:
+    return await _claim_key(_PASS_CLAIM_PREFIX + str(server_id))
+
+
+async def _release_pass(server_id: Any, token: str | None) -> None:
+    await _release_key(_PASS_CLAIM_PREFIX + str(server_id), token)
+
+
+# #4776 — the claim on the scheduled SCAN as a whole (the task that walks every
+# agentless server). The per-server claim bounds one server; two scans reading
+# different unreachable servers at once still held every worker process.
+# Renewed like the per-server claim, so it lasts as long as the scan does.
+_SCAN_CLAIM_KEY = "dhcp:pull_leases:scan"
+
+
+async def claim_scan() -> tuple[bool, str | None]:
+    return await _claim_key(_SCAN_CLAIM_KEY)
+
+
+async def release_scan(token: str | None) -> None:
+    await _release_key(_SCAN_CLAIM_KEY, token)
+
+
 _SYNC_ERROR_MAX = 2000
 _SYNC_ERROR_SHOWN = 3
 
@@ -208,6 +336,7 @@ async def pull_leases_from_server(
     *,
     apply: bool = True,
     recount: bool = True,
+    release_txn_for_wire: bool = False,
 ) -> PullLeasesResult:
     """Pull leases, then record the outcome on the server row (#2306).
 
@@ -227,8 +356,28 @@ async def pull_leases_from_server(
     recounts ``result.touched_subnet_ids`` itself after the last pull: the
     recount takes the audit-chain lock and subnet / block row locks until
     commit, and must not hold them through the next server's driver call.
+
+    ``release_txn_for_wire`` (#4776, the scheduled task) commits before the
+    driver reads, so no transaction is open while a WinRM call waits on an
+    unreachable host, and takes the pull lock again afterwards. It commits
+    whatever the caller had pending, so only a caller that wants that sets it.
     """
-    result = await _pull_leases_core(db, server, apply=apply)
+    claim_token: str | None = None
+    server_id = server.id
+    if apply and release_txn_for_wire:
+        # #4776 — the reads run with no transaction, so the advisory lock does
+        # not span them; claim the whole pass instead (one pull per server at
+        # a time, reads included).
+        claimed, claim_token = await _claim_pass(server_id)
+        if not claimed:
+            logger.info("dhcp_pull_leases_server_busy", server=str(server_id))
+            return PullLeasesResult(busy=True)
+    try:
+        result = await _pull_leases_core(
+            db, server, apply=apply, release_txn_for_wire=release_txn_for_wire
+        )
+    finally:
+        await _release_pass(server_id, claim_token)
     if apply and not result.busy and is_agentless(server.driver):
         if result.errors:
             server.last_sync_error = _summarise_errors(result.errors)
@@ -247,6 +396,7 @@ async def _pull_leases_core(
     server: DHCPServer,
     *,
     apply: bool = True,
+    release_txn_for_wire: bool = False,
 ) -> PullLeasesResult:
     """Poll ``server`` for active leases and reconcile into the DB.
 
@@ -276,40 +426,48 @@ async def _pull_leases_core(
 
     # #2262 — one pull per server at a time. Two overlapping pulls both saw a
     # new lease as absent and both inserted it; every later pull then failed
-    # on that address. A dry run writes nothing and needs no lock.
+    # on that address. A dry run writes nothing and needs no lock. This
+    # advisory lock lasts one transaction: with ``release_txn_for_wire`` it
+    # covers the write phase only, and the pass-wide claim
+    # (``_claim_pass``, taken by the caller) covers the reads.
     if apply and not await _try_lock_server(db, server):
         result.busy = True
         logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
         return result
 
-    subnets = await _load_subnet_cache(db)
+    # #4776 — every driver read first, with no transaction open when asked
+    # (``release_txn_for_wire``): a WinRM host that answers nothing holds the
+    # call for its whole timeout, and an ``idle in transaction`` session keeps
+    # locks a migration's ALTER TABLE waits behind. The reads are no longer
+    # interleaved with the writes; the pass writes once they are all in hand.
+    #
+    # Stamped BEFORE the wire reads: everything the wire tells us is a
+    # snapshot of the server as of (at latest) this instant, so a DB row an
+    # operator created or edited *after* it is newer than our information
+    # and the merge must not act on it (#620). The WinRM round-trip is
+    # seconds long — long enough for a reservation created in the UI mid-poll
+    # to be absent from the wire we're holding, and absence means delete.
+    #
+    # Read from the DATABASE's clock, not this process's. The guard compares
+    # against ``created_at`` / ``modified_at``, which TimestampMixin fills
+    # with ``func.now()`` — i.e. Postgres's clock. Comparing those to a local
+    # ``datetime.now(UTC)`` is a cross-clock comparison, and on a multi-node
+    # appliance (CNPG on another node, chrony drifting) a DB clock running
+    # ahead by more than the poll interval would make EVERY row look newer
+    # than the snapshot: every reservation skipped, every stale one spared,
+    # the reconciler silently converging on nothing. ``clock_timestamp()``,
+    # not ``now()`` — the latter is transaction-start time and would drift
+    # earlier the longer this transaction runs.
+    has_topology = hasattr(driver, "get_scopes")
+    read_driver = server.driver
+    snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
+    if apply and release_txn_for_wire:
+        await db.commit()  # releases the pull lock; re-taken below
 
-    # Phase 1 — topology (scopes + pools + reservations). Optional: only
-    # runs for drivers that expose ``get_scopes``. For each scope whose
-    # CIDR matches a known IPAM subnet, upsert the scope, then diff-merge
-    # its pools and statics against what Windows reports. Scopes whose CIDR
-    # has no matching IPAM subnet are skipped — we intentionally do not
-    # auto-create subnets (that belongs in a separate workflow).
-    if hasattr(driver, "get_scopes"):
-        # Stamped BEFORE the wire read: everything the wire tells us is a
-        # snapshot of the server as of (at latest) this instant, so a DB row an
-        # operator created or edited *after* it is newer than our information
-        # and the merge must not act on it (#620). The WinRM round-trip is
-        # seconds long — long enough for a reservation created in the UI mid-poll
-        # to be absent from the wire we're holding, and absence means delete.
-        #
-        # Read from the DATABASE's clock, not this process's. The guard compares
-        # against ``created_at`` / ``modified_at``, which TimestampMixin fills
-        # with ``func.now()`` — i.e. Postgres's clock. Comparing those to a local
-        # ``datetime.now(UTC)`` is a cross-clock comparison, and on a multi-node
-        # appliance (CNPG on another node, chrony drifting) a DB clock running
-        # ahead by more than the poll interval would make EVERY row look newer
-        # than the snapshot: every reservation skipped, every stale one spared,
-        # the reconciler silently converging on nothing. ``clock_timestamp()``,
-        # not ``now()`` — the latter is transaction-start time and would drift
-        # earlier the longer this transaction runs.
-        snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
-        scopes_ok = True
+    wire_scopes: list[dict[str, Any]] = []
+    scopes_ok = True
+    failover: dict[str, Any] | None = None
+    if has_topology:
         try:
             wire_scopes = await driver.get_scopes(server)
         except Exception as exc:  # noqa: BLE001
@@ -321,9 +479,51 @@ async def _pull_leases_core(
                 driver=server.driver,
                 error=str(exc),
             )
-            wire_scopes = []
+        # Skipped when ``get_scopes`` itself failed: the server is almost
+        # certainly unreachable, and a third WinRM call to it would only add
+        # another full timeout to the poll (#1110).
+        if apply and scopes_ok and hasattr(driver, "get_failover_relationships"):
+            try:
+                failover = await driver.get_failover_relationships(server)
+            except Exception as exc:  # noqa: BLE001 — recorded, never fatal to the poll
+                failover = {"ok": False, "error": str(exc), "relationships": []}
+
+    wire: list[dict[str, Any]] = []
+    lease_error: Exception | None = None
+    try:
+        wire = await driver.get_leases(server)
+    except Exception as exc:  # noqa: BLE001 — surface any transport/PS error
+        lease_error = exc
+
+    if apply and release_txn_for_wire:
+        if not await _try_lock_server(db, server):
+            result.busy = True
+            logger.info("dhcp_pull_leases_server_busy", server=str(server.id))
+            return result
+        # The server may have been deleted while the reads ran.
+        fresh = await db.get(DHCPServer, server.id, populate_existing=True)
+        if fresh is None:
+            result.busy = True
+            logger.info("dhcp_pull_leases_server_gone", server=str(server.id))
+            return result
+        # Re-pointed at another driver (or an agent-based one) while the reads
+        # ran: what we hold came from the old one and must not be written.
+        if fresh.driver != read_driver or not is_agentless(fresh.driver):
+            result.busy = True
+            logger.info("dhcp_pull_leases_server_changed", server=str(server.id))
+            return result
+
+    subnets = await _load_subnet_cache(db)
+
+    # Phase 1 — topology (scopes + pools + reservations). Optional: only
+    # runs for drivers that expose ``get_scopes``. For each scope whose
+    # CIDR matches a known IPAM subnet, upsert the scope, then diff-merge
+    # its pools and statics against what Windows reports. Scopes whose CIDR
+    # has no matching IPAM subnet are skipped — we intentionally do not
+    # auto-create subnets (that belongs in a separate workflow).
+    if has_topology:
         observations = await _observe_topology(
-            db, server, driver, wire_scopes, result, apply=apply, scopes_ok=scopes_ok
+            db, server, wire_scopes, failover, result, apply=apply, scopes_ok=scopes_ok
         )
         for wscope in wire_scopes:
             if observations is not None and not _owns_scope(server, wscope, observations, result):
@@ -334,18 +534,16 @@ async def _pull_leases_core(
         # The reservation mirrors' subnets are in ``touched_subnet_ids`` and
         # recounted with the lease mirrors' after the pull, never here: the
         # recount holds the audit-chain lock and subnet / block row locks to
-        # commit, and the lease phase below is another driver call (#3354).
+        # commit (#3354).
 
     # Phase 2 — leases.
-    try:
-        wire = await driver.get_leases(server)
-    except Exception as exc:  # noqa: BLE001 — surface any transport/PS error
-        result.errors.append(f"get_leases failed: {exc}")
+    if lease_error is not None:
+        result.errors.append(f"get_leases failed: {lease_error}")
         logger.warning(
             "dhcp_pull_leases_driver_failed",
             server=str(server.id),
             driver=server.driver,
-            error=str(exc),
+            error=str(lease_error),
         )
         return result
 
@@ -787,8 +985,8 @@ class _Topology:
 async def _observe_topology(
     db: AsyncSession,
     server: DHCPServer,
-    driver: Any,
     wire_scopes: list[dict[str, Any]],
+    failover: dict[str, Any] | None,
     result: PullLeasesResult,
     *,
     apply: bool,
@@ -801,19 +999,16 @@ async def _observe_topology(
     server, or a group with a single Windows member — so the reconcile runs
     exactly as it always has.
 
-    The failover read is skipped when ``get_scopes`` itself failed: the
-    server is almost certainly unreachable, and a third WinRM call to it would
-    only add another full timeout to the poll. Its last-known relationships
-    stay in force.
+    ``failover`` is the driver's relationship read, taken with the other wire
+    reads (#4776); None when it was skipped, which it is when ``get_scopes``
+    itself failed: the server is almost certainly unreachable, and a third
+    WinRM call to it would only add another full timeout to the poll. Its
+    last-known relationships stay in force.
     """
     now = datetime.now(UTC)
     if apply and scopes_ok:
         await record_scope_observation(db, server, wire_scopes, now=now)
-    if apply and scopes_ok and hasattr(driver, "get_failover_relationships"):
-        try:
-            failover = await driver.get_failover_relationships(server)
-        except Exception as exc:  # noqa: BLE001 — recorded, never fatal to the poll
-            failover = {"ok": False, "error": str(exc), "relationships": []}
+    if failover is not None:
         if not failover.get("ok"):
             result.warnings.append(
                 f"could not read failover relationships: {failover.get('error')} — keeping "

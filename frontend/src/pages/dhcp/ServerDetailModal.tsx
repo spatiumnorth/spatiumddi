@@ -1065,7 +1065,10 @@ function ErrorBlock({ error, what }: { error?: unknown; what?: string }) {
     );
   }
   return (
-    <div className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive">
+    <div
+      role="alert"
+      className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive"
+    >
       <Activity className="h-4 w-4" />
       Failed to load — try again
     </div>

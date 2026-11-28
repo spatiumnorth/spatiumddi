@@ -775,10 +775,14 @@ function SiteEditorModal({
       <div className="space-y-3">
         {!existing && (
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="overlay-detail-site"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Site
             </label>
             <select
+              id="overlay-detail-site"
               className={inputCls}
               value={siteId}
               onChange={(e) => setSiteId(e.target.value)}
@@ -796,10 +800,14 @@ function SiteEditorModal({
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="overlay-detail-role"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Role
             </label>
             <select
+              id="overlay-detail-role"
               className={inputCls}
               value={role}
               onChange={(e) => setRole(e.target.value as OverlaySiteRole)}
@@ -812,10 +820,14 @@ function SiteEditorModal({
             </select>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="overlay-detail-edge-device-optional"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Edge device (optional)
             </label>
             <select
+              id="overlay-detail-edge-device-optional"
               className={inputCls}
               value={deviceId ?? ""}
               onChange={(e) => setDeviceId(e.target.value || null)}
@@ -829,10 +841,14 @@ function SiteEditorModal({
             </select>
           </div>
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="overlay-detail-loopback-tloc-subnet-optional"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Loopback / TLOC subnet (optional)
             </label>
             <select
+              id="overlay-detail-loopback-tloc-subnet-optional"
               className={inputCls}
               value={loopbackSubnetId ?? ""}
               onChange={(e) => setLoopbackSubnetId(e.target.value || null)}
@@ -848,7 +864,10 @@ function SiteEditorModal({
         </div>
 
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-add-circuit"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Preferred circuits (failover order)
           </label>
           <div className="mt-1 rounded-md border">
@@ -913,6 +932,7 @@ function SiteEditorModal({
             )}
           </div>
           <select
+            id="overlay-detail-add-circuit"
             className={cn(inputCls, "mt-2")}
             value=""
             onChange={(e) => {
@@ -931,10 +951,14 @@ function SiteEditorModal({
         </div>
 
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-notes"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Notes
           </label>
           <textarea
+            id="overlay-detail-notes"
             className={cn(inputCls, "min-h-[60px]")}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
@@ -1310,10 +1334,14 @@ function PolicyEditorModal({
     >
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="sm:col-span-2">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-name"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="overlay-detail-name"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -1322,10 +1350,14 @@ function PolicyEditorModal({
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-priority"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Priority
           </label>
           <input
+            id="overlay-detail-priority"
             type="number"
             min={0}
             max={10000}
@@ -1349,10 +1381,14 @@ function PolicyEditorModal({
           </label>
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-match-kind"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Match kind
           </label>
           <select
+            id="overlay-detail-match-kind"
             className={inputCls}
             value={matchKind}
             onChange={(e) => {
@@ -1368,11 +1404,15 @@ function PolicyEditorModal({
           </select>
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-match-value"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Match value
           </label>
           {matchKind === "application" ? (
             <select
+              id="overlay-detail-match-value"
               className={inputCls}
               value={matchValue}
               onChange={(e) => setMatchValue(e.target.value)}
@@ -1396,10 +1436,14 @@ function PolicyEditorModal({
           </p>
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-action"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Action
           </label>
           <select
+            id="overlay-detail-action"
             className={inputCls}
             value={action}
             onChange={(e) => {
@@ -1415,11 +1459,15 @@ function PolicyEditorModal({
           </select>
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-action-target"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Action target
           </label>
           {action === "steer_to_transport_class" ? (
             <select
+              id="overlay-detail-action-target"
               className={inputCls}
               value={actionTarget}
               onChange={(e) => setActionTarget(e.target.value)}
@@ -1456,10 +1504,14 @@ function PolicyEditorModal({
           </p>
         </div>
         <div className="sm:col-span-2">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlay-detail-notes-2"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Notes
           </label>
           <textarea
+            id="overlay-detail-notes-2"
             className={cn(inputCls, "min-h-[60px]")}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}

@@ -6,7 +6,10 @@ up, worker down) nothing refreshes ``last_check_at``, and a member last seen
 ``healthy`` keeps being rendered. Serving deliberately stays fail-open
 (``pool_apply``: dropping every member would be an outage of its own), so the
 protection is visibility: a verdict older than ``STALE_AFTER_INTERVALS`` x the
-interval is *stale*, shown with its age and alerted on.
+interval, plus the check's timeout, is *stale*, shown with its age and alerted
+on. The timeout is added because a cycle is the probe itself (the whole timeout
+when a member answers nothing) plus the interval, so a long timeout next to a
+short interval would otherwise read stale between on-time checks (#4824).
 """
 
 from __future__ import annotations
@@ -23,7 +26,8 @@ MIN_EFFECTIVE_INTERVAL_SECONDS = 30
 
 def stale_after_seconds(pool: DNSPool) -> int:
     interval = max(MIN_EFFECTIVE_INTERVAL_SECONDS, int(pool.hc_interval_seconds or 0))
-    return interval * STALE_AFTER_INTERVALS
+    timeout = max(0, int(pool.hc_timeout_seconds or 0))
+    return interval * STALE_AFTER_INTERVALS + timeout
 
 
 def member_check_age_seconds(member: DNSPoolMember, now: datetime | None = None) -> int | None:
@@ -44,7 +48,7 @@ def format_age(seconds: int) -> str:
 def is_member_check_stale(
     pool: DNSPool, member: DNSPoolMember, now: datetime | None = None
 ) -> bool:
-    """A checked member whose verdict is older than 3 intervals.
+    """A checked member whose verdict is older than 3 intervals plus the timeout.
 
     A disabled pool or member is not being checked on purpose, and a member
     never checked has no verdict to be stale (it reads ``unknown`` and is not

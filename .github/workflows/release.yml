@@ -3,7 +3,8 @@ name: Release
 # Publishes a release from a pushed tag. Nothing is tagged in a registry or
 # published on the Releases page until three gates pass (#1226):
 #
-#   1. The tag names a release and sits on main, and CI passed on it
+#   1. The tag names a release and sits on main (a pre-release may sit on a
+#      release/* branch instead), and CI passed on it
 #      (the ``meta`` job). Tags are not covered by any branch ruleset, so
 #      without the ancestry check anyone with write access could release
 #      any commit.
@@ -82,15 +83,28 @@ jobs:
 
           # Exactly a release tag: CalVer with its -N, or SemVer >= 1.0.0
           # with no build metadata. Prints prerelease=true|false.
-          python3 scripts/release_version.py check "$VERSION" >> "$GITHUB_OUTPUT"
+          CHECK=$(python3 scripts/release_version.py check "$VERSION")
+          echo "$CHECK" >> "$GITHUB_OUTPUT"
 
           # On main, or it is not a release. A tag on a feature branch, an
           # unmerged PR head or a local commit would otherwise publish.
+          #
+          # One exception: a SemVer PRE-release (1.0.1-soak.1) may sit on a
+          # release/* branch, so the QA soak can install what the branch
+          # holds before it is merged into main. A final tag never may.
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          ON_MAIN=true
           if ! git merge-base --is-ancestor "$SHA" origin/main; then
-            echo "::error::${VERSION} points at ${SHA}, which is not on main. Tag a commit on main."
-            exit 1
+            ON_MAIN=false
+            git fetch --no-tags --quiet origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+            BRANCHES=$(git branch -r --contains "$SHA" --list 'origin/release/*')
+            if [ "$CHECK" != "prerelease=true" ] || [ -z "$BRANCHES" ]; then
+              echo "::error::${VERSION} points at ${SHA}, which is not on main. Tag a commit on main (only a pre-release tag may sit on a release/* branch)."
+              exit 1
+            fi
+            echo "::notice::pre-release ${VERSION} is on release branch(es): $(printf '%s' "$BRANCHES" | tr -s ' \n' ' ')"
           fi
+          echo "on_main=${ON_MAIN}" >> "$GITHUB_OUTPUT"
 
           # Ranked only against tags on main that were actually released:
           # see release-tags.sh for why a stray tag must not count.
@@ -118,8 +132,19 @@ jobs:
       # publishes (``make changelog``). A fragment still in the tree means
       # the fold was skipped, so the notes below would silently miss those
       # entries. Refused before an hour of CI waiting and image builds.
+      #
+      # A pre-release on a release/* branch is exempt: the branch is folded
+      # only at real release prep, and the ``release`` job builds that
+      # pre-release's notes from the fragments in its own workspace.
       - name: Require the changelog fragments to be folded
-        run: python3 scripts/changelog_assemble.py --pending
+        env:
+          ON_MAIN: ${{ steps.ver.outputs.on_main }}
+        run: |
+          if [ "$ON_MAIN" != "true" ]; then
+            echo "::notice::release-branch pre-release: changelog fragments are not required to be folded"
+            exit 0
+          fi
+          python3 scripts/changelog_assemble.py --pending
 
       - name: Require CI to have passed on this commit
         env:
@@ -802,11 +827,26 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           PREV_TAG: ${{ needs.meta.outputs.prev_tag }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
           # The "## <VERSION>" section, matched exactly (#1182): a prefix
           # match took "## 1.0.10" when asked for "## 1.0.1".
           NOTES=$(python3 scripts/release_version.py notes "$VERSION" CHANGELOG.md)
+
+          # A pre-release tagged on a release/* branch still carries its
+          # changelog.d/ fragments (folded only at real release prep). Fold
+          # them in this runner's workspace, never committed, and use the
+          # resulting "## Unreleased" section as the notes. Best effort: a
+          # failed fold falls through to the commit shortlog below.
+          if [ "$PRERELEASE" = "true" ] && [ -z "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ] \
+             && ! python3 scripts/changelog_assemble.py --pending >/dev/null 2>&1; then
+            if python3 scripts/changelog_assemble.py; then
+              NOTES=$(python3 scripts/release_version.py notes Unreleased CHANGELOG.md)
+            else
+              echo "::warning::could not fold the changelog fragments for ${VERSION}"
+            fi
+          fi
 
           # Fall back to a commit shortlog if the CHANGELOG section is empty
           # or missing (e.g. forgot to update it before tagging).

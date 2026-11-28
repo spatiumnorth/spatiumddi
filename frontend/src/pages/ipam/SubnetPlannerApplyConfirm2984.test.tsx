@@ -75,3 +75,21 @@ describe("ApplyConfirmModal", () => {
     expect(screen.queryByText(/Operation failed/)).toBeNull();
   });
 });
+
+describe("ApplyConfirmModal announcement (#4745)", () => {
+  it("draws the refusal in an alert so a screen reader says it", () => {
+    show({
+      response: {
+        data: {
+          detail: {
+            message: "Plan validation failed",
+            conflicts: [{ message: "10.0.0.0/24 overlaps 10.0.0.0/16" }],
+          },
+        },
+      },
+    });
+    const box = screen.getByText("Plan validation failed").closest("[role]");
+    expect(box?.getAttribute("role")).toBe("alert");
+    expect(box?.textContent).toContain("overlaps");
+  });
+});

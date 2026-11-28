@@ -1,7 +1,7 @@
 """Root host runners never write through a name a pod could have planted.
 
 ``/var/lib/spatiumddi/release-state`` is mode 1770 root:2770. The api pod
-(uid 1000 plus gid 2770) and the supervisor (uid 100 plus gid 2770) can
+(uid 1000 plus gid 2770) and the supervisor (uid 10001 plus gid 2770) can
 create names in it, and the sticky bit only stops them replacing a name
 root already owns. Every runner under ``usr/local/bin`` runs as root, so a
 redirect, an ``exec 9>`` lock, a fixed temp name, a ``chmod``/``chgrp`` or a
@@ -703,9 +703,9 @@ def test_firstboot_re_modes_nothing_in_release_state_by_a_name_it_does_not_own()
     """firstboot runs while the pods do: its chown / chmod / chgrp on names in
     release-state follow a symlink planted at them."""
     text = (BIN / "spatiumddi-firstboot").read_text()
-    assert "chown 100:101 /var/lib/spatiumddi/release-state/pcap" not in text
+    assert "chown 10001:10001 /var/lib/spatiumddi/release-state/pcap" not in text
     assert "chmod 0755 /var/lib/spatiumddi/release-state/pcap" not in text
-    assert "&& chown 100:101 . && chmod 0755 . ); then" in text
+    assert "&& chown 10001:10001 . && chmod 0755 . ); then" in text
     assert '> /var/lib/spatiumddi/release-state/host-storage-type' not in text
     loop = text[text.index("for _sc in /var/lib/spatiumddi/release-state/slot-upgrade-pending.state"):]
     loop = loop[: loop.index("done\n")]

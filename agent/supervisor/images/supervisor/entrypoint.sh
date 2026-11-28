@@ -11,7 +11,9 @@
 # Two paths still need write access:
 #
 # * /var/lib/spatium-supervisor → identity key + cert + session token
-#   + role-compose.env + role-switch-state. Chowned below.
+#   + role-compose.env + role-switch-state. Chowned below, every start:
+#   that is also what re-owns state written by the old uid 100 / gid 101
+#   (ids that belong to host system accounts) to the dedicated 10001.
 # * /etc/nftables.d → spatium-role.nft drop-in (the only file the
 #   supervisor manages there). Chown the *directory* only; existing
 #   host-managed SNMP / NTP drop-ins keep their canonical ownership.
@@ -25,6 +27,40 @@ set -eu
 
 mkdir -p /var/lib/spatium-supervisor
 chown -R spatium:spatium /var/lib/spatium-supervisor || true
+
+# The trigger directory is shared with the host and with the api pod. Names
+# this supervisor created while it still ran as uid 100 / gid 101 (the old
+# ids, host system accounts) would otherwise stay un-writable for the new
+# uid: the directory is sticky, so it could neither replace nor remove them,
+# and the host trigger guard no longer accepts uid 100. Re-own them here,
+# as root, before the first write — a pod on the old image is gone by now.
+# Files and directories two levels deep only, nothing followed (-P / -h),
+# each chowned by bare name from inside its own directory (-execdir).
+if [ -d /var/lib/spatiumddi-host/release-state ]; then
+    find -P /var/lib/spatiumddi-host/release-state -xdev -maxdepth 2 \
+        \( -type f -o -type d \) -user 100 -group 101 \
+        -execdir chown -h 10001:10001 {} + 2>/dev/null || true
+fi
+
+# The storage-action request directory is written by whichever supervisor
+# is running: after a rollback that is the previous release's (uid 100), and
+# its start only re-owns its own state, not this directory. So it belongs to
+# the group both supervisors carry (spatium-host, 2770 -- the group
+# release-state itself uses), group-writable and setgid so names created in
+# it keep that group. No sticky bit: the supervisor removes the root-written
+# results, and with the bit it could not. Created here if missing and
+# corrected on every start. A symlink at the name is removed (rm does not
+# follow it) and chown / chmod run on "." from inside the directory after
+# checking it resolved to itself, so a swap after the check cannot redirect
+# them.
+if [ -d /var/lib/spatiumddi-host/release-state ]; then
+    _sd=/var/lib/spatiumddi-host/release-state/storage
+    [ -L "$_sd" ] && rm -f "$_sd"
+    mkdir -p "$_sd" 2>/dev/null || true
+    ( cd -P "$_sd" 2>/dev/null \
+        && [ "$(pwd -P)" = "$(cd -P /var/lib/spatiumddi-host/release-state && pwd -P)/storage" ] \
+        && chown 10001:2770 . && chmod 2770 . ) 2>/dev/null || true
+fi
 
 if [ -d /etc/nftables.d ]; then
     # Issue #239 — only the supervisor (spatium user) writes here.

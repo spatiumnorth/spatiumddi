@@ -59,7 +59,13 @@ from app.services.dhcp.option_validation import normalize_options
 
 router = APIRouter(
     tags=["dhcp"],
-    dependencies=[Depends(require_resource_permission("dhcp_client_class"))],
+    dependencies=[
+        Depends(
+            require_resource_permission(
+                "dhcp_client_class", audit_resource_type="dhcp_device_policy"
+            )
+        )
+    ],
 )
 
 # A manual override is interpolated verbatim into the Kea config, so an
