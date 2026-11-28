@@ -42,6 +42,11 @@ log = structlog.get_logger(__name__)
 
 # How long to listen for OFFERs after each DISCOVER, and how often to probe.
 COLLECT_WINDOW = 4.0
+# #5028 — how long to wait for the sniffer's sockets before sending the
+# DISCOVER anyway. AsyncSniffer.start() only starts a thread; the sockets open
+# later, and an OFFER that lands before they do is never seen (a server with no
+# ping check or reply delay answers in the same millisecond).
+SNIFFER_READY_TIMEOUT = 3.0
 DEFAULT_INTERVAL = 300.0
 DHCP_OFFER = 2
 
@@ -137,11 +142,24 @@ class RogueProbeShipper:
                 log.debug("rogue_probe_parse_error", error=str(exc))
 
         iface = None if self.iface == "any" else self.iface
+        ready = threading.Event()
         sniffer = AsyncSniffer(
-            iface=iface, filter="udp and (port 67 or port 68)", prn=_on_pkt, store=False
+            iface=iface,
+            filter="udp and (port 67 or port 68)",
+            prn=_on_pkt,
+            store=False,
+            started_callback=ready.set,
         )
         try:
             sniffer.start()
+            # #5028 — send only once the sniffer is capturing, or an instant
+            # OFFER is lost and the rogue server is reported one interval late.
+            if not ready.wait(timeout=SNIFFER_READY_TIMEOUT):
+                log.warning(
+                    "rogue_probe_sniffer_not_ready",
+                    iface=self.iface,
+                    waited_s=SNIFFER_READY_TIMEOUT,
+                )
             discover = (
                 Ether(src=src_mac, dst="ff:ff:ff:ff:ff:ff")
                 / IP(src="0.0.0.0", dst="255.255.255.255")
