@@ -1,15 +1,18 @@
-"""The GRUB recovery entry opens a shell for the admin account (#5027).
+"""The GRUB recovery entry and emergency mode open a shell for the admin account (#5027).
 
 rescue.target's stock shell is sulogin, which wants ROOT's password. Root is
 locked on a default install (#995 item 12), so the entry printed "Cannot open
 access to console, the root account is locked." and gave no shell.
 rescue.service is now overridden by a drop-in that runs
 spatium-recovery-login: a username + password prompt on each enabled console,
-PAM through login(1), root and `sudo` group members only.
+PAM through login(1), root and `sudo` group members only. emergency.service
+has the same drop-in; emergency.target mounts only the root filesystem, so the
+script mounts /var and a read-only /etc overlay for the session (never a
+password-free shell), and unmounts them before the boot continues.
 
     python3 -m pytest appliance/tests/test_recovery_login_5027.py -v
 
-login, id, setsid, pkill and systemctl are stubbed; no root, no console.
+login, id, setsid, pkill, mount, umount, mountpoint and systemctl are stubbed; no root, no console.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from __future__ import annotations
 import configparser
 import os
 import re
+import signal
 import subprocess
 from pathlib import Path
 
@@ -49,12 +53,32 @@ def test_dropin_replaces_the_sulogin_execstart() -> None:
     assert _dropin()["Service"]["StandardInput"] == "null"
 
 
-def test_only_rescue_service_is_overridden() -> None:
-    """Normal boots never run rescue.service; no other unit's login is touched."""
-    assert sorted(p.name for p in DROPIN_DIR.iterdir()) == ["spatium-recovery-login.conf"]
+EMERGENCY_DIR = SYSTEMD / "emergency.service.d"
+
+
+def test_emergency_dropin_runs_the_same_login() -> None:
+    text = (EMERGENCY_DIR / "spatium-recovery-login.conf").read_text()
+    execs = [ln.split("=", 1)[1] for ln in text.splitlines() if ln.startswith("ExecStart=")]
+    assert execs == ["", "-/usr/local/bin/spatium-recovery-login --emergency"]
+    assert "StandardInput=null" in text
+    assert "SYSTEMD_SULOGIN_FORCE" not in "\n".join(
+        ln for ln in text.splitlines() if not ln.startswith("#")
+    )
+
+
+def test_old_sulogin_dropin_sorts_before_ours() -> None:
+    """An install made before this change keeps 10-spatium-sulogin.conf; systemd
+    merges drop-ins by filename, so ours (the ExecStart reset) is applied last."""
+    assert "10-spatium-sulogin.conf" < "spatium-recovery-login.conf"
+
+
+def test_only_rescue_and_emergency_services_are_overridden() -> None:
+    """Normal boots never run either; no other unit's login is touched."""
+    for d in (DROPIN_DIR, EMERGENCY_DIR):
+        assert sorted(p.name for p in d.iterdir()) == ["spatium-recovery-login.conf"]
     for d in SYSTEMD.glob("*.d"):
         for f in d.glob("*.conf"):
-            if d.name != "rescue.service.d":
+            if d.name not in ("rescue.service.d", "emergency.service.d"):
                 assert "spatium-recovery-login" not in f.read_text(), f
 
 
@@ -82,8 +106,15 @@ def test_grub_rescue_entry_describes_the_login() -> None:
 # ── the script ────────────────────────────────────────────────────────────────
 
 def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str, int],
-         nologin: bool = True):
-    """Run the script. logins maps username -> exit status of the stubbed login."""
+         nologin: bool = True, args: tuple[str, ...] = (), etc_mounted: bool = True,
+         var_mounted: bool = False, mount_ok: bool = True, accounts: bool = True,
+         lower_exists: bool = True, timeout: int = 60):
+    """Run the script. logins maps username -> exit status of the stubbed login.
+
+    mountpoint/mount/umount are stubs recording to calls.log: /etc is a mount point
+    when etc_mounted (rescue: etc.mount ran), /var when var_mounted; mount fails
+    unless mount_ok. accounts: whether the bare /etc has someone who can log in.
+    """
     bindir = tmp_path / "bin"
     dev = tmp_path / "dev"
     bindir.mkdir()
@@ -106,6 +137,25 @@ def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str
     (bindir / "setsid").write_text('#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done\nexec "$@"\n')
     # never signal by tty on the machine running the tests
     (bindir / "pkill").write_text('#!/bin/sh\n[ "$1" = -t ] && exit 0\nexec /usr/bin/pkill "$@"\n')
+    state = tmp_path / "state"
+    state.mkdir()
+    for name, on in (("etc", etc_mounted), ("var", var_mounted)):
+        if on:
+            (state / name).touch()
+    if lower_exists:
+        (tmp_path / "lower").mkdir()
+    (tmp_path / "var" / "persist" / "etc").mkdir(parents=True)
+    # mountpoint -q DIR: "mounted" once its state file exists
+    (bindir / "mountpoint").write_text(
+        f'#!/bin/sh\ncase "$2" in {tmp_path}/etc) [ -e {state}/etc ];; *) [ -e {state}/var ];; esac\n')
+    (bindir / "mount").write_text(
+        f'#!/bin/sh\necho mount $* >>{log}\n' + ('' if mount_ok else 'echo boom >&2; exit 32\n')
+        + f'for a; do t=$a; done\ncase "$t" in {tmp_path}/etc) touch {state}/etc;; *) touch {state}/var;; esac\n')
+    (bindir / "umount").write_text(
+        f'#!/bin/sh\necho umount $* >>{log}\nfor a; do t=$a; done\n'
+        f'case "$t" in {tmp_path}/etc) rm -f {state}/etc;; *) rm -f {state}/var;; esac\n')
+    (bindir / "passwd").write_text(f'#!/bin/sh\necho "root {"P" if accounts else "L"} x"\n')
+    (bindir / "getent").write_text(f'#!/bin/sh\necho "sudo:x:27:{"alice" if accounts else ""}"\n')
     (bindir / "systemctl").write_text(f"#!/bin/sh\necho systemctl $* >>{log}\n")
     for f in bindir.iterdir():
         f.chmod(0o755)
@@ -117,9 +167,20 @@ def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str
         "SPATIUM_RECOVERY_DELAY": "0",
         "SPATIUM_RECOVERY_OUT_SUFFIX": ".out",
         "SPATIUM_RECOVERY_NOLOGIN": str(tmp_path / "nologin"),
+        "SPATIUM_RECOVERY_ETC": str(tmp_path / "etc"),
+        "SPATIUM_RECOVERY_VAR": str(tmp_path / "var"),
+        "SPATIUM_RECOVERY_ETC_LOWER": str(tmp_path / "lower"),
     }
-    r = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True,
-                       timeout=60)
+    # A new session, so a timeout can kill the console loops it leaves behind.
+    p = subprocess.Popen(["bash", str(SCRIPT), *args], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        raise
+    r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     calls = log.read_text().splitlines() if log.exists() else []
     return r, calls
 
@@ -195,13 +256,71 @@ def test_pkill_comes_from_procps_which_the_image_lists() -> None:
     assert "procps" in pkgs
 
 
-def test_installer_writes_no_rescue_service_drop_in() -> None:
-    """The installer's SYSTEMD_SULOGIN_FORCE drop-in reached only the slot it
-    wrote, and for rescue.service it is superseded by the image's own
-    spatium-recovery-login.conf on every slot. It must no longer be written for
-    rescue; emergency.service keeps it (emergency mode is not on any GRUB entry
-    and still runs sulogin)."""
+def test_installer_writes_no_sulogin_drop_in() -> None:
+    """The installer's SYSTEMD_SULOGIN_FORCE drop-in (a password-free root shell)
+    reached only the slot it wrote, because it lands in the /etc overlay that is
+    mounted after systemd loads its units. Both rescue and emergency now use the
+    image's own drop-ins; the installer writes neither."""
     installer = (APPLIANCE / "mkosi.extra/usr/local/bin/spatium-install").read_text()
-    assert "rescue.service.d" not in installer
-    assert "for _u in emergency; do" in installer
-    assert "Environment=SYSTEMD_SULOGIN_FORCE=1" in installer
+    assert "SYSTEMD_SULOGIN_FORCE=1" not in installer
+    assert "10-spatium-sulogin" not in installer
+    assert "$_u.service.d" not in installer
+    assert "mkdir -p \"$MOUNT/etc/systemd/system/emergency.service.d\"" not in installer
+
+
+# ── emergency mode: the account store ─────────────────────────────────────────
+
+def test_emergency_mounts_var_and_a_readonly_overlay_then_undoes_them(tmp_path) -> None:
+    r, calls = _run(tmp_path, TTY, {"tty1": "alice\n"}, {"alice": 0},
+                    args=("--emergency",), etc_mounted=False)
+    t = str(tmp_path)
+    assert calls == [
+        f"mount -o ro -L var {t}/var",
+        f"mount -t overlay overlay -o ro,lowerdir={t}/var/persist/etc:{t}/lower {t}/etc",
+        "login alice",
+        f"umount -- {t}/etc",
+        f"umount -- {t}/var",
+        "systemctl --no-block default",
+    ], r.stderr
+    assert "emergency mode" in (tmp_path / "dev" / "tty1.out").read_text()
+
+
+def test_nothing_is_mounted_when_etc_is_already_the_overlay(tmp_path) -> None:
+    """rescue.target, or emergency reached after etc.mount ran: no mounts, and
+    nothing of systemd's own is unmounted."""
+    r, calls = _run(tmp_path, TTY, {"tty1": "alice\n"}, {"alice": 0}, etc_mounted=True)
+    assert calls == ["login alice", "systemctl --no-block default"], r.stderr
+
+
+def test_an_already_mounted_var_is_left_alone(tmp_path) -> None:
+    r, calls = _run(tmp_path, TTY, {"tty1": "alice\n"}, {"alice": 0},
+                    etc_mounted=False, var_mounted=True)
+    t = str(tmp_path)
+    assert [c.split()[0] for c in calls] == ["mount", "login", "umount", "systemctl"], calls
+    assert calls[0].endswith(f"{t}/etc") and calls[2] == f"umount -- {t}/etc"
+
+
+def test_fallback_notice_names_the_reason_and_the_way_out(tmp_path) -> None:
+    out = _run_fallback(tmp_path, accounts=False)
+    assert "did not mount: boom" in out
+    assert "No account here can log in" in out
+    assert "Ctrl-Alt-Del" in out and 'labelled "var"' in out
+    assert "recovery login:" not in out
+
+
+def test_fallback_with_a_bare_etc_account_still_asks_for_a_password(tmp_path) -> None:
+    out = _run_fallback(tmp_path, accounts=True)
+    assert "did not mount: boom" in out
+    assert "recovery login:" in out
+    assert "No account here can log in" not in out
+
+
+def _run_fallback(tmp_path: Path, accounts: bool) -> str:
+    """Run in emergency mode with /var failing to mount; stop it after a moment
+    (with no account it waits for a reboot) and return what the console showed."""
+    try:
+        _run(tmp_path, TTY, {"tty1": "alice\n"}, {"alice": 0}, args=("--emergency",),
+             etc_mounted=False, mount_ok=False, accounts=accounts, timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+    return (tmp_path / "dev" / "tty1.out").read_text()

@@ -1797,7 +1797,15 @@ The boot menu's **recovery** entry (`--id=rescue`, `grub-reboot rescue` for a on
 - It asks `recovery login:` on **every enabled console** (`tty0` and `ttyS0`; the entry passes both) and authenticates through PAM via `login`. Log in as the admin account the installer created (it may not be called `admin`); `sudo -i` works from its shell.
 - Only **root** and members of the **`sudo`** group are accepted. A wrong password, or an account outside `sudo`, is refused. A root password set at install works at the same prompt; with root locked it simply fails the password check.
 - Leaving the shell (`exit`, Ctrl-D) continues to the default target, as `rescue.target` did before. The first console to finish wins and the other prompt is closed.
-- It is a `rescue.service` drop-in only: normal boots, the console dashboard and the tty1 / ttyS0 getty gates are unchanged. `emergency.service` (a failed root filesystem, not reachable from the menu) still uses `sulogin`.
+- It is a `rescue.service` drop-in only: normal boots, the console dashboard and the tty1 / ttyS0 getty gates are unchanged. `emergency.service` has the same drop-in (see below).
+
+#### Emergency mode (#5027)
+
+`emergency.target` (a root filesystem or `/var` that will not mount; to try it, add `systemd.unit=emergency.target` to the kernel command line in GRUB) gets the same `recovery login:` prompt on every slot, from `emergency.service.d/spatium-recovery-login.conf`. It is never password-free. Earlier installs gave a password-free root shell on the slot the installer wrote (`SYSTEMD_SULOGIN_FORCE`) and no shell on the other; the installer no longer writes that, and an old copy is inert.
+
+Emergency mode mounts only the root filesystem, so the admin account (kept in the `/etc` overlay on `/var`) is not visible yet. The login script mounts `/var` and a read-only `/etc` overlay for the session and unmounts both before the boot continues. So in that shell `/var` and `/etc` are read-only: `sudo mount -o remount,rw /var` for data, `sudo umount /etc` to reach the slot's own `/etc` (for example a bad `fstab`; `/` is already read-write), or edit the operator layer directly under `/var/persist/etc` after remounting `/var` read-write.
+
+If `/var` cannot be mounted (the usual reason for being there) the console says why, and offers the prompt only if the slot's bare `/etc` has an account that can log in (a root password, or a `sudo` member). Otherwise it prints how to recover (reboot with Ctrl-Alt-Del and pick the other slot in the boot menu, or repair the disk from the installer ISO) and waits: there is no shell without a password.
 
 
 ### Fleet UI updates

@@ -5910,31 +5910,16 @@ EOF
         if [ "$SET_ROOT_PASSWORD" != "yes" ]; then
             chroot "$MOUNT" passwd -l root >> "$INSTALL_LOG" 2>&1 || \
                 log "WARN: could not lock the root account"
-            # emergency.target runs sulogin, which loops "Login incorrect"
-            # forever on a locked account, so give emergency.service
-            # SYSTEMD_SULOGIN_FORCE. That is a PHYSICAL-console escalation
-            # only, the same threat model as "sshd refuses root either way":
-            # someone at the console can already boot from anything.
-            #
-            # rescue.service no longer gets it (#5027): the image ships its
-            # own rescue.service drop-in (spatium-recovery-login.conf) that
-            # replaces sulogin with a login for the admin account on every
-            # slot, so a force drop-in here would be dead config. It only
-            # ever reached the slot this installer writes anyway, since the
-            # /etc overlay is mounted after systemd loads the unit.
-            mkdir -p "$MOUNT/etc/systemd/system/emergency.service.d"
-            for _u in emergency; do
-                cat > "$MOUNT/etc/systemd/system/$_u.service.d/10-spatium-sulogin.conf" <<EOF
-# Written by spatium-install (issue #995 item 12).
-# Root has no password (passwd -l), and sulogin cannot authenticate a
-# locked account — so without this emergency mode drops to a prompt that
-# can never be satisfied. Physical-console only.
-[Service]
-Environment=SYSTEMD_SULOGIN_FORCE=1
-EOF
-            done
+            # rescue and emergency mode both ask for the admin account
+            # through spatium-recovery-login (#5027), via drop-ins the image
+            # ships in its own /etc (rescue.service.d, emergency.service.d).
+            # Nothing is written here for them: a drop-in written now would
+            # land in the /etc overlay, which is mounted after systemd has
+            # loaded its units, and so would reach only this slot. (This used
+            # to write a SYSTEMD_SULOGIN_FORCE drop-in for emergency.service:
+            # a password-free root shell, on this slot only.)
             log "Root account locked (no console password); use sudo from $ADMIN_USER"
-            log "  emergency target sets SYSTEMD_SULOGIN_FORCE=1; the recovery menu entry asks for the admin account"
+            log "  rescue and emergency mode ask for the admin account (spatium-recovery-login)"
         else
             log "Root account password set from the admin password (operator opted in)"
         fi
