@@ -94,10 +94,11 @@ fi
 # "2: eth0    inet 10.0.0.5/24 brd ... scope global eth0" -> "eth0 10.0.0.5"
 pick() {
     fam="$1"
-    ip -o "-$fam" addr show scope global 2>/dev/null | awk -v fam="$fam" -v want="$PREF" '
+    ip -o "-$fam" addr show scope global 2>/dev/null | awk -v fam="$fam" -v want="$PREF" -v skip=" $MANAGED " '
         want != "" && $2 != want { next }
         {
             dev = $2
+            if (index(skip, " " dev " ")) next
             if (dev ~ /^(lo|flannel|cni|veth|docker|br-|kube|cali|wg|tun)/) next
             for (i = 3; i < NF; i++) if ($i == "inet" || $i == "inet6") { a = $(i + 1); break }
             if (fam == "6" && $0 ~ /deprecated|tentative/) next
@@ -107,6 +108,11 @@ pick() {
 }
 
 PREF=$(sed -n 's/^interface-name=//p' "$NM_DIR"/10-spatium-*.nmconnection 2>/dev/null | head -1)
+# #4428: the extra interfaces SpatiumDDI manages (20-spatium-netif-*) are never
+# the management interface, by design. Skip them on every pass, including the
+# fallback below, so an extra NIC that happens to hold the only address at k3s
+# start is never pinned as the node IP.
+MANAGED=$(sed -n 's/^interface-name=//p' "$NM_DIR"/20-spatium-netif-*.nmconnection 2>/dev/null | tr '\n' ' ')
 found=$(pick 4)
 [ -n "$found" ] || found=$(pick 6)
 if [ -z "$found" ] && [ -n "$PREF" ]; then
