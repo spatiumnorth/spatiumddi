@@ -1,0 +1,55 @@
+name: Sign an OCI artifact
+description: >
+  Keyless cosign signature (Sigstore, GitHub OIDC), a signed SPDX SBOM
+  attestation, and a SLSA build-provenance attestation for one image (or
+  chart) digest already pushed to the registry (#1251). The caller logs in to
+  the registry first and grants id-token / attestations / packages: write.
+
+# Tool versions are pinned in versions.json (components cosign + syft); the
+# action SHAs below carry their version in the trailing comment.
+inputs:
+  name:
+    description: Repository without a tag, e.g. ghcr.io/spatiumnorth/spatiumddi-api
+    required: true
+  digest:
+    description: The sha256:... digest to sign. Never a tag.
+    required: true
+  sbom:
+    description: Attach an SPDX SBOM attestation (images yes, the Helm chart no).
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+      with:
+        cosign-release: 'v3.1.6'
+    - if: inputs.sbom == 'true'
+      uses: anchore/sbom-action/download-syft@dfcb83b97731532d72be422cbc51ee64adb6fd56 # v0.24.4
+      with:
+        syft-version: 'v1.57.2'
+    - name: Sign and attach the SBOM
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        DIGEST: ${{ inputs.digest }}
+        SBOM: ${{ inputs.sbom }}
+      run: |
+        set -euo pipefail
+        case "$DIGEST" in
+          sha256:????????????????????????????????????????????????????????????????) ;;
+          *) echo "::error::refusing to sign ${NAME}: '${DIGEST}' is not a sha256 digest"; exit 1 ;;
+        esac
+        ref="${NAME}@${DIGEST}"
+        cosign sign --yes "$ref"
+        if [ "$SBOM" = "true" ]; then
+          syft "$ref" -o spdx-json="${RUNNER_TEMP}/sbom.spdx.json"
+          cosign attest --yes --type spdxjson \
+            --predicate "${RUNNER_TEMP}/sbom.spdx.json" "$ref"
+        fi
+    - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-name: ${{ inputs.name }}
+        subject-digest: ${{ inputs.digest }}
+        push-to-registry: true

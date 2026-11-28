@@ -401,6 +401,8 @@ because CI gates depend on specific behaviour from several.
 | [Go](https://go.dev/) | BSD 3-Clause | Builds GoBGP from source in the Looking Glass image |
 | [skopeo](https://github.com/containers/skopeo) | Apache 2.0 | skopeo v1.20.0 in a container: registry-to-archive fallback in the appliance image bake (#2393) |
 | [Trivy](https://trivy.dev/) | Apache 2.0 | Image CVE gate (HIGH/CRITICAL, `--ignore-unfixed`). Trivy v0.70.0, installed in CI from the GitHub release archive by `.github/actions/install-trivy` (#3464) |
+| [cosign](https://github.com/sigstore/cosign) | Apache 2.0 | Keyless release signing and attestations (#1251). cosign v3.1.6, installed in CI by `.github/actions/sign-image` |
+| [Syft](https://github.com/anchore/syft) | Apache 2.0 | SPDX SBOM per release image (#1251). Syft v1.57.2, installed in CI by `.github/actions/sign-image` |
 | [pytest](https://pytest.org/) + pytest-asyncio / cov / xdist / split | MIT | Backend test suite |
 | [ruff](https://docs.astral.sh/ruff/) / [black](https://black.readthedocs.io/) / [mypy](https://mypy-lang.org/) | MIT | Backend lint + typecheck |
 | [ESLint](https://eslint.org/) / [Prettier](https://prettier.io/) / typescript-eslint | MIT | Frontend lint |

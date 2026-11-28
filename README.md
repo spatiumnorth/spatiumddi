@@ -939,6 +939,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | [BGP Looking Glass](docs/features/LOOKING_GLASS.md) | Receive-only GoBGP collector, Sessions + Routes grids, IPAM / ASN / VRF linkage, `bgp_lg_*` alerts |
 | [E911 dispatchable location](docs/features/E911.md) | SpatiumDDI as a Location Information Server — ERLs, bindings, HELD / PIDF-LO, DHCP options 99 / 123 |
 | [Operator Copilot](docs/features/COPILOT.md) | Provider failover, per-provider prompts and tool allowlists, the tool registry, MCP endpoint, chat surface, reliability guards, token caps |
+| [Verifying a release](docs/deployment/RELEASE_VERIFICATION.md) | `cosign verify` for images and the Helm chart, signed SBOMs, build provenance — keyless, with the exact certificate identity |
 | [Privacy](docs/PRIVACY.md) | The privacy statement, and the normative table of every outbound connection the software can make — its default and what it sends |
 
 ---
