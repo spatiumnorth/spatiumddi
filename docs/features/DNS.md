@@ -3421,6 +3421,39 @@ analytics roll up across the selection. The selection is always narrowed
 to the servers the caller may read. See
 [`OBSERVABILITY.md` §4½](../OBSERVABILITY.md).
 
+### 21.5 Filtering by view, and exporting the log (issues #4170, #4171)
+
+The DNS Queries tab's filter bar has a **View** select for split-horizon
+groups. It lists the selected server's (or group's) *configured* views, so a
+view can be picked before it has had traffic; the "By view" analytics card
+sets the same filter. While a view filter is on, a chip in the bar names it,
+and **Clear** resets it. With "All servers" selected the select is hidden
+(views belong to one group), but an active view still shows its chip. The
+Copilot's `query_dns_query_log` and `find_dns_queries` tools both take a
+`view`.
+
+**Export CSV / Export JSONL** downloads exactly the rows the current filters
+select (scope, search, QType, Client IP, View, Result, Since). The same is
+available by API, with the filters as query parameters and the same read
+permission as the query log:
+
+```
+GET /api/v1/logs/dns-queries/export.csv?server_id=…&view=external&rcode=NXDOMAIN
+GET /api/v1/logs/dns-queries/export.jsonl?group_id=…&since=2026-11-14T00:00:00Z
+```
+
+Columns: `ts` (UTC, ISO 8601), `server`, `client_ip`, `client_port`, `qname`,
+`qclass`, `qtype`, `flags`, `view`, `rcode`, `answer_count`, `raw`. A blank
+`rcode` means the outcome was never recorded, as in the grid. The file is
+streamed, newest first, capped at 100,000 rows; the response headers
+`X-Export-Rows`, `X-Export-Row-Cap` and `X-Export-Truncated` say what it
+holds, and the page shows a "narrow the filter" note when it was capped. CSV
+cells starting with `=`, `+`, `-` or `@` are prefixed with `'`. Every export
+writes an `audit_log` row (`action=export`, `resource_type=dns_query_log`)
+whose `new_value` holds the filter, format and row count. The filename is
+`dns-queries-<server or group>-<UTC YYYYMMDDTHHMMZ>.<csv|jsonl>`. The DHCP
+activity tab has no export yet.
+
 ---
 
 ## 22. Zone name scope — public, private, undelegated (issue #986)

@@ -72,6 +72,12 @@ class CsvResponse(Response):
     media_type = "text/csv"
 
 
+class JsonLinesResponse(Response):
+    """One JSON object per line (``application/x-ndjson``), for streamed exports."""
+
+    media_type = "application/x-ndjson"
+
+
 class IosConfigResponse(Response):
     """Generated switch-configuration text for an operator to review.
     ``text/plain`` rather than a made-up type, so a browser shows it."""
