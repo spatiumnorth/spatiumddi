@@ -29,6 +29,7 @@ from app.core.stored_secret_guard import (
 from app.models.audit import AuditLog
 from app.models.ipam import IPSpace
 from app.models.vsphere import VSphereTarget
+from app.services.api_token_scopes import token_write
 from app.services.integration_ownership import release_integration_rows
 from app.services.vsphere.client import VSphereClient, VSphereClientError
 
@@ -297,6 +298,7 @@ async def list_targets(db: DB, _: CurrentUser) -> list[TargetResponse]:
 
 
 @router.post("/targets", response_model=TargetResponse, status_code=status.HTTP_201_CREATED)
+@token_write("Registers a vCenter target and stores its credentials")
 async def create_target(body: TargetCreate, db: DB, user: SuperAdmin) -> TargetResponse:
     forbid_in_demo_mode("vSphere target registration is disabled")
     await _validate_space(db, body.ipam_space_id)
@@ -396,6 +398,7 @@ async def delete_target(target_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
 
 
 @router.post("/targets/{target_id}/sync", status_code=status.HTTP_202_ACCEPTED)
+@token_write("Queues a sync that writes mirrored hosts, VMs and guest IPs into IPAM")
 async def sync_target(target_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusResponse:
     t = await db.get(VSphereTarget, target_id)
     if t is None:
@@ -421,6 +424,7 @@ async def sync_target(target_id: uuid.UUID, db: DB, user: SuperAdmin) -> StatusR
 
 
 @router.post("/targets/test", response_model=TestConnectionResponse)
+@token_write("Connects to a vCenter with caller-supplied credentials (outbound)")
 async def test_connection(
     body: TestConnectionRequest, db: DB, _: SuperAdmin
 ) -> TestConnectionResponse:
