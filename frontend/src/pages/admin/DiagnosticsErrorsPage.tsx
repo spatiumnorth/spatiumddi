@@ -7,7 +7,6 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
-  Github,
   Loader2,
   RefreshCw,
   Trash2,
@@ -19,6 +18,7 @@ import {
   type InternalErrorListItem,
   formatApiError,
 } from "@/lib/api";
+import { GithubMark } from "@/components/ui/github-mark";
 import { copyToClipboard } from "@/lib/clipboard";
 import { SupportBundleSection } from "./SupportBundleSection";
 
@@ -553,7 +553,7 @@ ${JSON.stringify(detail.context_json, null, 2)}
           onClick={onSubmitBug}
           className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
         >
-          <Github className="h-3.5 w-3.5" />
+          <GithubMark className="h-3.5 w-3.5" />
           Submit bug
         </button>
         <button

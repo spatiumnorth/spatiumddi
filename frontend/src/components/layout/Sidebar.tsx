@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
-  Github,
   Info,
   ChevronsLeft,
   ChevronsRight,
@@ -25,6 +24,7 @@ import { safeLocalStorage } from "@/lib/safeStorage";
 import { BrandLogo } from "@/components/BrandLogo";
 import { captureSuccessors, returnFocus } from "@/components/ui/focus-return";
 import { hasOpenModal } from "@/components/ui/use-draggable-modal";
+import { GithubMark } from "@/components/ui/github-mark";
 import { UpdateCheckError } from "@/components/UpdateCheckError";
 import {
   usePublicSettings,
@@ -772,7 +772,7 @@ export function Sidebar({
               aria-label="GitHub (opens in a new tab)"
               className={FOOTER_ICON_CLS}
             >
-              <Github className="h-4 w-4" aria-hidden />
+              <GithubMark className="h-4 w-4" aria-hidden />
             </a>
 
             {/* Collapse toggle — desktop only; the mobile drawer has none. */}
