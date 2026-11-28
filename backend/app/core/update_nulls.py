@@ -76,6 +76,26 @@ def resolve_update_changes(
     return {k: v for k, v in changes.items() if v is not None or k in clearable_set}
 
 
+def apply_clear_list(body: BaseModel, clear: Collection[str]) -> None:
+    """Turn a ``clear`` list into explicit nulls on ``body`` (#1211).
+
+    A generated client cannot send ``null`` for an optional property (swift-
+    openapi-generator encodes a ``nil`` optional by omitting the key, which the
+    ``exclude_unset`` handlers read as "unchanged"), and #907 publishes the
+    nullable fields as plain scalars anyway. So an update schema offers
+    ``clear: ["ttl", ...]``, a plain string array. Called from the schema's
+    ``model_validator``: each named field becomes ``None`` and is marked as set,
+    exactly as if the client had sent the explicit null, so every handler's
+    existing null handling applies unchanged. Naming a field in ``clear`` AND
+    giving it a value is contradictory, a 422 rather than a guess.
+    """
+    both = sorted(k for k in clear if getattr(body, k) is not None)
+    if both:
+        raise ValueError(f"{', '.join(both)}: cannot both be given a value and listed in clear")
+    for k in clear:
+        setattr(body, k, None)
+
+
 class _Empty:
     """The one value an empty list and an empty mapping both normalise to."""
 
@@ -155,4 +175,4 @@ def changed_keys(
     ]
 
 
-__all__ = ["changed_keys", "resolve_update_changes", "snapshot"]
+__all__ = ["apply_clear_list", "changed_keys", "resolve_update_changes", "snapshot"]

@@ -213,6 +213,16 @@ wire for every existing client, and a validator complaint is loud where
 the generated-code failure is silent. Decoding loses nothing: an absent
 key and an explicit null both land as `nil` / `undefined`.
 
+**Clearing a field: the `clear` list (#1211).** Because the schema says
+nothing about `null` and generators encode a `nil` optional by omitting the
+key (which an update reads as "unchanged"), a generated client has no way to
+send an explicit null. The update bodies for the fields that matter therefore
+take `"clear": [...]`, a plain string array published with its allowed
+members: `IPAddressUpdate` (`mac_address`), `SubnetUpdate` (`gateway`) and
+`RecordUpdate` (`ttl` back to the zone default, `priority`, `weight`,
+`port`). It has the same effect as sending the field as `null`, which still
+works. Listing a field and giving it a value in the same request is a 422.
+
 **Timestamps are RFC 3339 with exactly three fractional digits.**
 
 ```
