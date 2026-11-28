@@ -12,7 +12,7 @@ import zipfile
 import zlib
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Literal, Self
 
@@ -110,6 +110,8 @@ from app.models.dns import (
     DEFAULT_ALLOW_RECURSION,
     DNS_TTL_MAX,
     DNSSEC_ALGORITHMS,
+    SCHEDULED_CHANGE_ACTIONS,
+    SCHEDULED_CHANGE_STATES,
     ZONE_DEFAULT_EXPIRE,
     ZONE_DEFAULT_MINIMUM,
     ZONE_DEFAULT_REFRESH,
@@ -120,6 +122,7 @@ from app.models.dns import (
     DNSKey,
     DNSPool,
     DNSRecord,
+    DNSScheduledChange,
     DNSSECPolicy,
     DNSServer,
     DNSServerGroup,
@@ -238,6 +241,8 @@ from app.services.dns.resolver_presets import (
     encrypted_only_presets,
     find_forwarder_conflict,
 )
+from app.services.dns.scheduled_changes import record_fingerprint
+from app.services.dns.scheduled_changes import record_label as scheduled_record_label
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import (
     CATALOG_UNSUPPORTED_DRIVERS,
@@ -448,6 +453,12 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "PUT /groups/{group_id}/zones/{zone_id}/records/{record_id}": _R,
     "DELETE /groups/{group_id}/zones/{zone_id}/records/{record_id}": _R,
     "POST /groups/{group_id}/zones/{zone_id}/records/bulk-delete": _R,
+    # record changes held until a set time (#4830)
+    "GET /groups/{group_id}/zones/{zone_id}/scheduled-changes": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/scheduled-changes": _R,
+    "GET /groups/{group_id}/zones/{zone_id}/scheduled-changes/{change_id}": _R,
+    "PUT /groups/{group_id}/zones/{zone_id}/scheduled-changes/{change_id}": _R,
+    "POST /groups/{group_id}/zones/{zone_id}/scheduled-changes/{change_id}/cancel": _R,
     "POST /groups/{group_id}/zones/{zone_id}/records/bulk-create": _R,
     "POST /groups/{group_id}/zones/{zone_id}/import/preview": _R,
     "POST /groups/{group_id}/zones/{zone_id}/import/commit": _R,
@@ -10926,6 +10937,419 @@ async def delete_record(
         )
     )
     await db.commit()
+
+
+# ── Scheduled record changes (#4830) ─────────────────────────────────────────
+#
+# A create / update / delete held until a set time. Nothing touches dns_record
+# until it runs: ``app.tasks.dns_scheduled_changes`` replays it through
+# ``create_record`` / ``update_record`` / ``delete_record`` above, so the record
+# rules, the op queue and the record's audit row are unchanged.
+
+# How far ahead a change may be scheduled.
+SCHEDULED_CHANGE_MAX_DAYS = 366
+
+
+def _utc_aware(v: datetime) -> datetime:
+    if v.tzinfo is None or v.utcoffset() is None:
+        raise ValueError("scheduled_at needs a UTC offset, e.g. 2026-12-01T02:00:00Z")
+    return v.astimezone(UTC)
+
+
+def _check_schedule_time(when: datetime) -> None:
+    now = datetime.now(UTC)
+    if when <= now:
+        raise HTTPException(status_code=422, detail="scheduled_at must be in the future")
+    if when > now + timedelta(days=SCHEDULED_CHANGE_MAX_DAYS):
+        raise HTTPException(
+            status_code=422,
+            detail=f"scheduled_at is more than {SCHEDULED_CHANGE_MAX_DAYS} days ahead",
+        )
+
+
+class ScheduledChangeCreate(BaseModel):
+    """What to change, and when (a UTC offset is required). ``create`` takes
+    ``record``; ``update`` takes ``record_id`` + ``changes`` (only the fields to
+    change); ``delete`` takes ``record_id``."""
+
+    action: Literal["create", "update", "delete"]
+    scheduled_at: datetime
+    record_id: uuid.UUID | None = None
+    record: RecordCreate | None = None
+    changes: RecordUpdate | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def _v_when(cls, v: datetime) -> datetime:
+        return _utc_aware(v)
+
+    @model_validator(mode="after")
+    def _v_shape(self) -> Self:
+        if self.action == "create":
+            if self.record is None or self.record_id is not None or self.changes is not None:
+                raise ValueError("a create takes 'record' only")
+        elif self.action == "update":
+            if self.record_id is None or self.changes is None or self.record is not None:
+                raise ValueError("an update takes 'record_id' and 'changes'")
+            if not self.changes.model_fields_set:
+                raise ValueError("'changes' names no field")
+        elif self.record_id is None or self.record is not None or self.changes is not None:
+            raise ValueError("a delete takes 'record_id' only")
+        return self
+
+
+class ScheduledChangeUpdate(BaseModel):
+    """Reschedule and/or replace the pending change's content."""
+
+    scheduled_at: datetime | None = None
+    record: RecordCreate | None = None
+    changes: RecordUpdate | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def _v_when(cls, v: datetime | None) -> datetime | None:
+        return None if v is None else _utc_aware(v)
+
+
+class ScheduledChangeResponse(BaseModel):
+    id: uuid.UUID
+    zone_id: uuid.UUID
+    record_id: uuid.UUID | None
+    action: str
+    payload: dict[str, Any]
+    record_label: str
+    scheduled_at: datetime
+    state: str
+    result_message: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_by_user_id: uuid.UUID | None
+    created_by_display: str
+    created_at: datetime
+    modified_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+async def _validate_scheduled_create(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, body: RecordCreate, user: Any
+) -> dict[str, Any]:
+    """The checks of ``create_record`` that need no existing row, so a bad
+    payload is refused now and not at 02:00. The rest (twin / CNAME conflicts)
+    are judged against the zone as it is when the change runs."""
+    await _require_superadmin_for_lua(db, user, [body.record_type], what="schedule a LUA record")
+    await _check_driver_gated_record_type(body.record_type, group_id, db)
+    await _check_driver_refusals([(body.record_type, body.value, body.ttl)], group_id, db)
+    await _enforce_views_in_zone_group(db, zone, [body.view_id])
+    body.priority, body.weight, body.port = _normalize_record_struct_fields(
+        body.record_type, body.priority, body.weight, body.port
+    )
+    _validate_address_record_value(
+        body.record_type,
+        body.value,
+        priority=body.priority,
+        weight=body.weight,
+        port=body.port,
+        origin=zone.name,
+    )
+    fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
+    _enforce_bind_check_names(body.record_type, fqdn, body.value, zone.name)
+    return body.model_dump(mode="json")
+
+
+async def _validate_scheduled_update(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, record: DNSRecord, body: RecordUpdate, user: Any
+) -> dict[str, Any]:
+    payload = body.model_dump(mode="json", exclude_unset=True)
+    for non_null in ("name", "value", "tags"):
+        if non_null in payload and payload[non_null] is None:
+            raise HTTPException(status_code=422, detail=f"{non_null} cannot be null")
+    if set(payload) - {"ttl"}:
+        await _require_superadmin_for_lua(
+            db, user, [record.record_type], what="schedule a change to a LUA record"
+        )
+    if payload.get("view_id") is not None:
+        await _enforce_views_in_zone_group(db, zone, [body.view_id])
+    if "value" in payload or "ttl" in payload:
+        await _check_driver_refusals(
+            [(record.record_type, payload.get("value"), payload.get("ttl"))], group_id, db
+        )
+    if "value" in payload:
+        _validate_address_record_value(
+            record.record_type,
+            payload["value"],
+            priority=payload.get("priority", record.priority),
+            weight=payload.get("weight", record.weight),
+            port=payload.get("port", record.port),
+            origin=zone.name,
+        )
+    return payload
+
+
+async def _scheduled_change_or_404(
+    db: DB,
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    change_id: uuid.UUID,
+    user: Any,
+    *,
+    lock: bool = False,
+) -> DNSScheduledChange:
+    await _require_zone(group_id, zone_id, db, user)
+    stmt = select(DNSScheduledChange).where(
+        DNSScheduledChange.id == change_id, DNSScheduledChange.zone_id == zone_id
+    )
+    if lock:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
+    change = (await db.execute(stmt)).scalar_one_or_none()
+    if change is None:
+        raise HTTPException(status_code=404, detail="Scheduled change not found")
+    return change
+
+
+def _scheduled_audit(
+    user: Any, change: DNSScheduledChange, action: str, new_value: dict[str, Any]
+) -> AuditLog:
+    return AuditLog(
+        user_id=user.id,
+        user_display_name=user.display_name,
+        auth_source=user.auth_source,
+        action=action,
+        resource_type="dns_scheduled_change",
+        resource_id=str(change.id),
+        resource_display=f"{change.action} {change.record_label}",
+        new_value=new_value,
+        result="success",
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/scheduled-changes",
+    response_model=ScheduledChangeResponse,
+    status_code=201,
+)
+@token_write("schedules a DNS record change that the worker applies later")
+async def create_scheduled_change(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ScheduledChangeCreate,
+    db: DB,
+    current_user: CurrentUser,
+) -> DNSScheduledChange:
+    """Hold a record create / update / delete until ``scheduled_at``."""
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    _reject_if_synthesised_zone(zone, "schedule record changes in")
+    _reject_if_unauthored_zone(zone, "schedule record changes in")
+    _check_schedule_time(body.scheduled_at)
+    record: DNSRecord | None = None
+    fingerprint: str | None = None
+    if body.action == "create":
+        assert body.record is not None
+        payload = await _validate_scheduled_create(db, group_id, zone, body.record, current_user)
+        label = scheduled_record_label(body.record.name, body.record.record_type, zone.name)
+    else:
+        assert body.record_id is not None
+        record = await _require_record(group_id, zone_id, body.record_id, db)
+        _reject_if_synthesised_record(record, "schedule a change to")
+        needed = "delete" if body.action == "delete" else "write"
+        if not user_has_permission(current_user, needed, "dns_record", record.id):
+            raise HTTPException(
+                status_code=403, detail=f"Permission denied: need '{needed}' on this record"
+            )
+        fingerprint = record_fingerprint(record)
+        label = scheduled_record_label(record.name, record.record_type, zone.name)
+        if body.action == "update":
+            assert body.changes is not None
+            payload = await _validate_scheduled_update(
+                db, group_id, zone, record, body.changes, current_user
+            )
+        else:
+            payload = {}
+    change = DNSScheduledChange(
+        zone_id=zone_id,
+        record_id=record.id if record is not None else None,
+        action=body.action,
+        payload=payload,
+        record_label=label,
+        base_fingerprint=fingerprint,
+        scheduled_at=body.scheduled_at,
+        state="pending",
+        created_by_user_id=current_user.id,
+        created_by_display=current_user.display_name,
+    )
+    db.add(change)
+    await db.flush()
+    db.add(
+        _scheduled_audit(
+            current_user,
+            change,
+            "schedule",
+            {
+                "action": change.action,
+                "scheduled_at": change.scheduled_at.isoformat(),
+                "zone_id": str(zone_id),
+                "record_id": str(change.record_id) if change.record_id else None,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(change)
+    return change
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/scheduled-changes",
+    response_model=Page[ScheduledChangeResponse],
+)
+async def list_scheduled_changes(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    state: str | None = Query(
+        None, description="pending | running | executed | failed | cancelled"
+    ),
+    action: str | None = Query(None, description="create | update | delete"),
+    record_id: uuid.UUID | None = Query(None, description="changes aimed at one record"),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+) -> Page[ScheduledChangeResponse]:
+    """A zone's scheduled changes, soonest first: pending, running and finished
+    alike; filter by ``state``."""
+    await _require_zone(group_id, zone_id, db, current_user)
+    if state is not None and state not in SCHEDULED_CHANGE_STATES:
+        raise HTTPException(
+            status_code=422, detail=f"state must be one of {list(SCHEDULED_CHANGE_STATES)}"
+        )
+    if action is not None and action not in SCHEDULED_CHANGE_ACTIONS:
+        raise HTTPException(
+            status_code=422, detail=f"action must be one of {list(SCHEDULED_CHANGE_ACTIONS)}"
+        )
+    stmt = select(DNSScheduledChange).where(DNSScheduledChange.zone_id == zone_id)
+    if state:
+        stmt = stmt.where(DNSScheduledChange.state == state)
+    if action:
+        stmt = stmt.where(DNSScheduledChange.action == action)
+    if record_id:
+        stmt = stmt.where(DNSScheduledChange.record_id == record_id)
+    stmt = stmt.order_by(DNSScheduledChange.scheduled_at)
+    rows, total = await paginate(db, stmt, page=page, page_size=page_size)
+    return Page[ScheduledChangeResponse](
+        items=[ScheduledChangeResponse.model_validate(r) for r in rows],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/scheduled-changes/{change_id}",
+    response_model=ScheduledChangeResponse,
+)
+async def get_scheduled_change(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    change_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+) -> DNSScheduledChange:
+    return await _scheduled_change_or_404(db, group_id, zone_id, change_id, current_user)
+
+
+@router.put(
+    "/groups/{group_id}/zones/{zone_id}/scheduled-changes/{change_id}",
+    response_model=ScheduledChangeResponse,
+)
+async def update_scheduled_change(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    change_id: uuid.UUID,
+    body: ScheduledChangeUpdate,
+    db: DB,
+    current_user: CurrentUser,
+) -> DNSScheduledChange:
+    """Reschedule a pending change, or replace what it will do."""
+    change = await _scheduled_change_or_404(
+        db, group_id, zone_id, change_id, current_user, lock=True
+    )
+    if change.state != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only a pending change can be edited (this one is {change.state})",
+        )
+    if not body.model_fields_set:
+        raise HTTPException(status_code=422, detail="Nothing to change")
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    if body.scheduled_at is not None:
+        _check_schedule_time(body.scheduled_at)
+        change.scheduled_at = body.scheduled_at
+    if body.record is not None or body.changes is not None:
+        if change.action == "create" and body.record is not None and body.changes is None:
+            change.payload = await _validate_scheduled_create(
+                db, group_id, zone, body.record, current_user
+            )
+            change.record_label = scheduled_record_label(
+                body.record.name, body.record.record_type, zone.name
+            )
+        elif change.action == "update" and body.changes is not None and body.record is None:
+            if not body.changes.model_fields_set:
+                raise HTTPException(status_code=422, detail="'changes' names no field")
+            record = (
+                await db.get(DNSRecord, change.record_id) if change.record_id is not None else None
+            )
+            if record is None:
+                raise HTTPException(status_code=409, detail="The record no longer exists")
+            change.payload = await _validate_scheduled_update(
+                db, group_id, zone, record, body.changes, current_user
+            )
+            change.base_fingerprint = record_fingerprint(record)
+        else:
+            takes = {"create": "'record'", "update": "'changes'", "delete": "no content"}
+            raise HTTPException(
+                status_code=422, detail=f"a {change.action} change takes {takes[change.action]}"
+            )
+    db.add(
+        _scheduled_audit(
+            current_user,
+            change,
+            "update",
+            {"scheduled_at": change.scheduled_at.isoformat(), "payload": change.payload},
+        )
+    )
+    await db.commit()
+    await db.refresh(change)
+    return change
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/scheduled-changes/{change_id}/cancel",
+    response_model=ScheduledChangeResponse,
+)
+@token_write("cancels a pending scheduled DNS record change")
+async def cancel_scheduled_change(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    change_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+) -> DNSScheduledChange:
+    """Cancel a change before it runs. One that has started or finished cannot
+    be cancelled (409)."""
+    change = await _scheduled_change_or_404(
+        db, group_id, zone_id, change_id, current_user, lock=True
+    )
+    if change.state != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only a pending change can be cancelled (this one is {change.state})",
+        )
+    change.state = "cancelled"
+    change.finished_at = datetime.now(UTC)
+    change.result_message = f"Cancelled by {current_user.display_name}."
+    db.add(_scheduled_audit(current_user, change, "scheduled_cancel", {"state": "cancelled"}))
+    await db.commit()
+    await db.refresh(change)
+    return change
 
 
 # Cap on ids per bulk-delete call — the bulk-create cap's twin. Each id costs

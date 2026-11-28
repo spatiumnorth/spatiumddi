@@ -77,6 +77,7 @@ import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DnsMemoryBanner } from "./DnsMemoryBanner";
 import { DelegationModal } from "./DelegationModal";
+import { ScheduleChangeModal, ScheduledChangesPanel } from "./ScheduledChanges";
 import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ZoneSpreadsheetImportModal } from "./ZoneSpreadsheetImportModal";
@@ -4648,6 +4649,10 @@ export function ZoneDetailView({
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [showAddRecord, setShowAddRecord] = useState(false);
+  // #4830 — a record change held until a set time: null = closed, {record:null} = activate.
+  const [scheduleFor, setScheduleFor] = useState<{
+    record: DNSRecord | null;
+  } | null>(null);
   const [editRecord, setEditRecord] = useState<DNSRecord | null>(null);
   const [propagationRecord, setPropagationRecord] = useState<DNSRecord | null>(
     null,
@@ -6112,6 +6117,15 @@ export function ZoneDetailView({
                               Edit…
                             </ContextMenuItem>
                             <ContextMenuItem
+                              onSelect={() => setScheduleFor({ record: r })}
+                              {...permissionGate(
+                                canWriteRecords,
+                                NEEDS_DNS_WRITE,
+                              )}
+                            >
+                              Schedule change…
+                            </ContextMenuItem>
+                            <ContextMenuItem
                               destructive
                               onSelect={() => setConfirmDeleteRecord(r)}
                               {...permissionGate(
@@ -6141,6 +6155,20 @@ export function ZoneDetailView({
         </div>
       )}
 
+      <ScheduledChangesPanel
+        groupId={group.id}
+        zoneId={zone.id}
+        canWrite={canWriteRecords}
+        onSchedule={() => setScheduleFor({ record: null })}
+      />
+      {scheduleFor && (
+        <ScheduleChangeModal
+          groupId={group.id}
+          zoneId={zone.id}
+          record={scheduleFor.record}
+          onClose={() => setScheduleFor(null)}
+        />
+      )}
       {showAddRecord && (
         <RecordModal
           groupId={group.id}

@@ -108,7 +108,7 @@ describe("DNS Delete Server Group", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Continue$/ }));
     expect(
       await screen.findByText(
-        /DNSSEC keys and ACME DNS-01 accounts\) and its views/,
+        /DNSSEC keys, ACME DNS-01 accounts and scheduled record changes\) and its views/,
       ),
     ).toBeTruthy();
   });

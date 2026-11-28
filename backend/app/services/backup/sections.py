@@ -274,6 +274,8 @@ SECTIONS: tuple[Section, ...] = (
             "dns_tsig_key",
             "dns_trust_anchor",
             "dns_record_op",
+            # #4830 — record changes held until a set time.
+            "dns_scheduled_change",
         ),
     ),
     Section(
