@@ -192,7 +192,8 @@ async def test_groups_with_other_drivers_refuse_view_forwarders(
     r = await _post(client, hdr, group.id, "guest", forwarders=["1.1.1.3"])
     assert r.status_code == 422
     assert "BIND9" in r.text
-    # A view without them is fine anywhere.
-    assert (await _post(client, hdr, group.id, "guest")).status_code == 201
+    # A view without them is refused here too, but for the group's own sake: a
+    # group holding a server that cannot serve views takes none (#4565).
+    assert (await _post(client, hdr, group.id, "guest")).status_code == 422
     pdns = await _group(db_session, "technitium")
     assert (await _post(client, hdr, pdns.id, "g", forwarders=["1.1.1.3"])).status_code == 422

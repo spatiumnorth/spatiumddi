@@ -69,6 +69,10 @@ class LifecycleResult:
     # node would never write its own chart once it is allowed to again (a
     # demoted node's fresh standalone cluster after ``left``).
     deferred: bool = False
+    # #4646 — assigned profiles the apply did not render because the control
+    # plane gave this node no agent key for them. Reported in the heartbeat so
+    # the Fleet row warns instead of looking healthy.
+    awaiting_key: tuple[str, ...] = ()
 
 
 # Service names the appliance can run. Match the chart's component
@@ -1053,7 +1057,11 @@ def apply_role_assignment(
     # idempotency means re-applying with the same set is cheap
     # (helm-controller short-circuits when the release hash hasn't
     # moved). Watchdog confirms each pod is healthy independently.
-    return LifecycleResult(state="ready", started=desired_services)
+    return LifecycleResult(
+        state="ready",
+        started=desired_services,
+        awaiting_key=tuple(sorted(held_back)),
+    )
 
 
 def reconcile_node_labels(

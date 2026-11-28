@@ -4,25 +4,11 @@
 {{- include "spatiumddi.agentNamesUnique" . -}}
 {{- /* #3913 — image.tagSuffix ("-ubi") picks the UBI build of the Kea image. */ -}}
 {{- $tag := printf "%s%s" (.Values.dhcpAgents.image.tag | default .Chart.AppVersion) (.Values.image.tagSuffix | default "") -}}
-{{- $secretName := .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) -}}
-{{- if and (not .Values.dhcpAgents.agentKey.existingSecret) .Values.dhcpAgents.agentKey.value }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $secretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") .) | nindent 4 }}
-type: Opaque
-stringData:
-  SPATIUM_AGENT_KEY: {{ .Values.dhcpAgents.agentKey.value | quote }}
-{{- "\n---\n" }}
-{{- end }}
+{{- $secretName := include "spatiumddi.dhcpAgentKeySecret" . -}}
 {{- range $server := .Values.dhcpAgents.servers }}
 {{- $flavor := $server.flavor | default "kea" -}}
 {{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dhcp-%s-%s" $flavor $server.name) "prefix" $root.Values.dhcpAgents.prefixWithFullname) -}}
 {{- $storageClass := $server.storageClass | default $root.Values.dhcpAgents.storageClass -}}
-{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

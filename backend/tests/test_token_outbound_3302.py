@@ -75,7 +75,7 @@ EXPECTED_OUTBOUND_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/v1/appliance/appliances/{appliance_id}/k8s/workloads"),
         ("GET", "/api/v1/appliance/appliances/{appliance_id}/k8s/pods"),
         ("GET", "/api/v1/appliance/appliances/{appliance_id}/k8s/logs"),
-        # The self-test resolves registry-1.docker.io through the host resolver.
+        # The self-test resolves the host's own name through the host resolver.
         ("GET", "/api/v1/appliance/diagnostics/bundle"),
     }
 )
@@ -112,7 +112,7 @@ EXPECTED_OUTBOUND_TOOLS: frozenset[str] = frozenset(
         "prefix_routing_history",
         "find_ct_log_entries",
         "find_available_upgrade_images",
-        # The self-test resolves registry-1.docker.io (appliance only).
+        # The self-test resolves the host's own name (appliance only).
         "get_support_bundle_preview",
     }
 )

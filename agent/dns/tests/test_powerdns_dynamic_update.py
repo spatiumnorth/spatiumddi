@@ -107,3 +107,66 @@ def test_apply_dynamic_update_empty_clears_both(tmp_path: Path) -> None:
     dels = [url for (m, url, _) in c.calls if m == "DELETE"]
     assert any("ALLOW-DNSUPDATE-FROM" in u for u in dels)
     assert any("TSIG-ALLOW-DNSUPDATE" in u for u in dels)
+
+
+def _metadata(c: _FakeClient, kind: str) -> list[Any]:
+    return [j for (m, url, j) in c.calls if m == "PUT" and url.endswith(kind)]
+
+
+def test_key_only_acl_opens_the_address_check(tmp_path: Path) -> None:
+    """A key-only grant must pass PowerDNS's address check from anywhere:
+    with no ALLOW-DNSUPDATE-FROM only loopback passes it and every signed
+    update is refused before the key is looked at (#4569)."""
+    d = PowerDNSDriver(state_dir=tmp_path)
+    c = _FakeClient()
+    zp = {
+        "name": "z.example.com.",
+        "update_acl": [
+            {"action": "grant", "match_kind": "tsig_key", "tsig_key_name": "dc01."},
+        ],
+        "update_tsig_keys": [
+            {"name": "dc01.", "algorithm": "hmac-sha256", "secret": "c2VjcmV0"}
+        ],
+    }
+    assert d._apply_dynamic_update(c, {}, zp) == []  # type: ignore[arg-type]
+
+    allow = _metadata(c, "ALLOW-DNSUPDATE-FROM")
+    assert allow and allow[0]["metadata"] == ["0.0.0.0/0", "::/0"]
+    tsig = _metadata(c, "TSIG-ALLOW-DNSUPDATE")
+    assert tsig and tsig[0]["metadata"] == ["dc01"]
+    # Never deleted: a DELETE would leave the loopback-only default.
+    assert not any(
+        m == "DELETE" and "ALLOW-DNSUPDATE-FROM" in url for (m, url, _) in c.calls
+    )
+
+
+def test_ip_only_acl_is_not_widened(tmp_path: Path) -> None:
+    d = PowerDNSDriver(state_dir=tmp_path)
+    c = _FakeClient()
+    zp = {
+        "name": "z.example.com.",
+        "update_acl": [
+            {"action": "grant", "match_kind": "ip", "ip_cidr": "10.0.0.0/24"},
+        ],
+        "update_tsig_keys": [],
+    }
+    d._apply_dynamic_update(c, {}, zp)  # type: ignore[arg-type]
+    assert _metadata(c, "ALLOW-DNSUPDATE-FROM")[0]["metadata"] == ["10.0.0.0/24"]
+    assert not _metadata(c, "TSIG-ALLOW-DNSUPDATE")
+
+
+def test_stored_mixed_acl_is_not_widened(tmp_path: Path) -> None:
+    """An ACL with both kinds (saved before the control plane refused it)
+    keeps its granted addresses; it is never opened to every address."""
+    d = PowerDNSDriver(state_dir=tmp_path)
+    c = _FakeClient()
+    zp = {
+        "name": "z.example.com.",
+        "update_acl": [
+            {"action": "grant", "match_kind": "ip", "ip_cidr": "10.0.0.0/24"},
+            {"action": "grant", "match_kind": "tsig_key", "tsig_key_name": "dc01."},
+        ],
+        "update_tsig_keys": [],
+    }
+    d._apply_dynamic_update(c, {}, zp)  # type: ignore[arg-type]
+    assert _metadata(c, "ALLOW-DNSUPDATE-FROM")[0]["metadata"] == ["10.0.0.0/24"]

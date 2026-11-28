@@ -24,7 +24,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
@@ -40,25 +40,59 @@ from app.tasks.module_gate import module_gated
 logger = structlog.get_logger(__name__)
 
 
+# Postgres advisory-lock namespace for the per-pool single-flight lock (#4808).
+# The second key is hashtext(pool_id); this int separates the keyspace from the
+# other two-int advisory locks in the app.
+_POOL_CHECK_LOCK_NS = 0x504F4F4C  # "POOL"
+
+
+def _hc_signature(pool: DNSPool) -> tuple[Any, ...]:
+    """The pool fields a probe's outcome depends on. A result is dropped when
+    any of them changed while the probes ran."""
+    return (
+        pool.hc_type,
+        pool.hc_target_port,
+        pool.hc_path,
+        pool.hc_method,
+        pool.hc_verify_tls,
+        tuple(pool.hc_expected_status_codes or ()),
+        pool.hc_timeout_seconds,
+    )
+
+
 async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
     )
     factory = async_sessionmaker(engine, expire_on_commit=False)
+    pool_id = UUID(pool_id_str)
     try:
+        # #4808 — read, commit, probe with no session open, write in a fresh
+        # one. The probes used to run under ``SELECT ... FOR UPDATE SKIP
+        # LOCKED``, so a member that answered slowly held a pooled connection
+        # ``idle in transaction`` and blocked every write to the pool row for
+        # up to the per-check timeout.
         async with factory() as db:
             # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
             # do no work (and open no driver connections) when it is.
             if not await is_module_enabled(db, "core.dns"):
                 return {"status": "disabled"}
-            row = await db.execute(
-                select(DNSPool)
-                .where(DNSPool.id == UUID(pool_id_str))
-                .with_for_update(skip_locked=True)
+            # Single-flight, so a manual "Check Now" racing the dispatcher does
+            # not double-poll. A SESSION-level advisory lock rather than the
+            # row lock: it holds no transaction and blocks no writer, it
+            # outlives the commits below, and Postgres drops it when the
+            # connection closes (``engine.dispose()`` in the ``finally``, or a
+            # worker killed mid-check), so it cannot wedge the pool. The
+            # discovery sweep (#515) takes its lock the same way.
+            locked = await db.scalar(
+                text("SELECT pg_try_advisory_lock(:ns, hashtext(:pid))"),
+                {"ns": _POOL_CHECK_LOCK_NS, "pid": pool_id_str},
             )
-            pool = row.scalar_one_or_none()
+            if not locked:
+                # Another run is checking it — the next beat tick will retry.
+                return {"status": "skipped", "reason": "locked_or_deleted"}
+            pool = await db.get(DNSPool, pool_id)
             if pool is None:
-                # Locked or deleted — give up; the next beat tick will retry.
                 return {"status": "skipped", "reason": "locked_or_deleted"}
 
             if not pool.enabled:
@@ -69,31 +103,50 @@ async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
                 await db.commit()
                 return {"status": "skipped", "reason": "pool_disabled"}
 
-            # Run all member checks concurrently.
-            check_tasks = [run_check(pool, m) for m in pool.members]
-            results = await asyncio.gather(*check_tasks, return_exceptions=False)
+            signature = _hc_signature(pool)
+            probed = [(m.id, m.address, m) for m in pool.members]
+            await db.commit()  # end the read transaction before any probe
+
+        # Run all member checks concurrently, with no session open. They read
+        # only the plain attributes loaded above (``expire_on_commit=False``).
+        results = await asyncio.gather(*(run_check(pool, m) for _id, _addr, m in probed))
+
+        async with factory() as db:
+            row = await db.execute(select(DNSPool).where(DNSPool.id == pool_id).with_for_update())
+            fresh = row.scalar_one_or_none()
+            # Deleted, disabled or re-tuned while the probes ran: the results
+            # describe a pool that no longer exists as probed.
+            if fresh is None or not fresh.enabled or _hc_signature(fresh) != signature:
+                return {"status": "skipped", "reason": "changed_during_check"}
+            by_id = {m.id: m for m in fresh.members}
 
             transitions = 0
-            for member, result in zip(pool.members, results, strict=True):
+            checked = 0
+            for (member_id, address, _m), result in zip(probed, results, strict=True):
+                member = by_id.get(member_id)
+                if member is None or member.address != address:
+                    continue  # removed or re-addressed meanwhile
                 change = apply_check_to_member(
                     member,
                     result,
-                    unhealthy_threshold=pool.hc_unhealthy_threshold,
-                    healthy_threshold=pool.hc_healthy_threshold,
+                    unhealthy_threshold=fresh.hc_unhealthy_threshold,
+                    healthy_threshold=fresh.hc_healthy_threshold,
                 )
                 member.last_check_at = datetime.now(UTC)
+                checked += 1
                 if change.transitioned:
                     transitions += 1
 
-            apply_summary = await apply_pool_state(db, pool)
+            apply_summary = await apply_pool_state(db, fresh)
 
-            pool.last_checked_at = datetime.now(UTC)
-            pool.next_check_at = datetime.now(UTC) + timedelta(
-                seconds=max(30, int(pool.hc_interval_seconds or 30))
+            fresh.last_checked_at = datetime.now(UTC)
+            fresh.next_check_at = datetime.now(UTC) + timedelta(
+                seconds=max(30, int(fresh.hc_interval_seconds or 30))
             )
 
             records_changed = bool(apply_summary.get("created") or apply_summary.get("deleted"))
-            group_id = pool.group_id
+            group_id = fresh.group_id
+            pool_name = fresh.name
 
             await db.commit()
 
@@ -106,8 +159,8 @@ async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
 
             return {
                 "status": "ok",
-                "pool": pool.name,
-                "members_checked": len(results),
+                "pool": pool_name,
+                "members_checked": checked,
                 "transitions": transitions,
                 "rendered": apply_summary,
             }
@@ -119,7 +172,7 @@ async def _run_pool_check_async(pool_id_str: str) -> dict[str, Any]:
 def run_pool_check(self: Any, pool_id_str: str) -> dict[str, Any]:  # noqa: ARG001
     """Check one pool's members + reconcile rendered records.
 
-    Idempotent — safe to retry. Acquires a per-pool row lock so
+    Idempotent — safe to retry. Takes a per-pool advisory lock so
     concurrent runs don't double-poll.
     """
     return asyncio.run(_run_pool_check_async(pool_id_str))

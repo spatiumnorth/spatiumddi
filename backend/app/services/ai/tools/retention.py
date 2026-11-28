@@ -28,7 +28,7 @@ class FindRetentionSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_retention_settings",
-    permission="authenticated",
+    permission=("read", "settings"),
     description=(
         "Return how long SpatiumDDI keeps the data it collects before the "
         "nightly prune deletes it: DNS query + DHCP activity logs "

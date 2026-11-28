@@ -112,6 +112,77 @@ class DNSDriver(ABC):
 
 ---
 
+## 1A. Group options each driver applies ([#4562](https://github.com/spatiumnorth/spatiumddi/issues/4562))
+
+The Options tab and `PUT /dns/groups/{id}/options` are driver-agnostic, and every driver applies only a subset of them. `backend/app/services/dns/option_support.py` is the one table of that subset: each (driver, option) pair is **applied**, **partial** (applied with the stated limit) or **not applied**. The Technitium column is built from `technitium_options.UNSUPPORTED_OPTIONS`.
+
+| Option | BIND9 | PowerDNS | Technitium (agent) |
+|---|---|---|---|
+| `forwarders` | yes | partial: PowerDNS uses forwarders only to expand ALIAS records; it does not forward client queries | yes |
+| `forward_policy` | yes | no | partial: Technitium resolves only through its forwarders ('only'); it never falls back to recursion |
+| `recursion_enabled` | yes | no | yes |
+| `allow_recursion` | yes | no | yes |
+| `dnssec_validation` | yes | no | yes |
+| `notify_enabled` | yes | yes | yes |
+| `also_notify` | yes | yes | partial: Technitium notifies bare IP addresses only |
+| `allow_notify` | yes | no | no |
+| `allow_query` | yes | no | partial: applied per zone, for the address-match grammar Technitium can express |
+| `allow_query_cache` | yes | no | no |
+| `allow_transfer` | yes | partial: PowerDNS applies addresses and keys; a negated element is dropped | partial: applied per zone, for the address-match grammar Technitium can express |
+| `blackhole` | yes | no | no |
+| `query_log_enabled` | yes | yes | no |
+| `query_log_channel` | no | no | no |
+| `query_log_file` | no | no | no |
+| `query_log_severity` | yes | no | no |
+| `query_log_print_category` | yes | no | no |
+| `query_log_print_severity` | yes | no | no |
+| `query_log_print_time` | no | no | no |
+| `response_log_enabled` | yes | no | no |
+| `rrl_enabled` | yes | no | yes |
+| `rrl_responses_per_second` | yes | no | yes |
+| `rrl_window` | yes | no | yes |
+| `rrl_slip` | yes | no | yes |
+| `rrl_qps_scale` | yes | no | no |
+| `rrl_exempt_clients` | yes | no | yes |
+| `rrl_log_only` | yes | no | no |
+| `minimal_responses` | yes | no | no |
+| `tcp_clients` | yes | no | no |
+| `clients_per_query` | yes | no | no |
+| `max_clients_per_query` | yes | no | no |
+| `dnsdist_enabled` | no | yes | no |
+| `dnsdist_max_qps_per_client` | no | yes | no |
+| `dnsdist_action` | no | yes | no |
+| `dnsdist_dynblock_qps` | no | yes | no |
+| `dnsdist_dynblock_seconds` | no | yes | no |
+| `dot_enabled` | yes | yes | yes |
+| `dot_port` | yes | yes | yes |
+| `doh_enabled` | yes | yes | yes |
+| `doh_port` | yes | yes | yes |
+| `doh_path` | yes | yes | yes |
+| `doq_enabled` | no | no | yes |
+| `doq_port` | no | no | yes |
+| `tls_certificate_id` | yes | yes | yes |
+| `forward_transport` | partial: BIND9 forwards over do53 or tls only (no https or quic) | partial: only plain-DNS (do53) forwarders feed PowerDNS ALIAS expansion | partial: an encrypted transport needs forward_tls_hostname on Technitium |
+| `forward_tls_hostname` | yes | no | yes |
+| `forward_tls_verify` | yes | no | no |
+| `is_recursive` (group field) | yes | no | yes |
+
+`query_log_channel`, `query_log_file` and `query_log_print_time` are fixed on every driver (#2265). Trust anchors are BIND9 only and have their own endpoints and refusal.
+
+**Windows DNS, the hosted providers (Cloudflare, Route 53, Azure DNS, Google Cloud DNS, DigitalOcean, Hetzner, Linode, Vultr) and the agentless `technitium_api` driver apply no group option**: SpatiumDDI writes zones and records to them, not server settings. The Options tab shows one line saying so in place of the form.
+
+What the table drives:
+
+- **The API refuses a change** to an option a driver in the group does not apply, with a 422 naming the option and the driver. This covers the options PUT and the group's `is_recursive` (which folds into `recursion_enabled`).
+- **Transition-only.** Re-saving the stored value passes, because the form posts every field on every save, and so does putting an option back to its default. A value stored before the gate therefore never blocks an unrelated save, and can always be cleared.
+- **`recursion_enabled` and `is_recursive` default to on.** On PowerDNS and the hosted providers, which never recurse, "off" is the value a change may set: a fresh group re-saves untouched, turning recursion off is accepted, turning it back on is refused. On Windows DNS and agentless Technitium the server keeps whatever recursion it is configured with, so neither value is true and any real change is refused.
+- **A mixed-driver group gets what every driver applies.** An empty group has no driver, so nothing is refused.
+- **A server joining a group that already stores a value** does not pass through the PUT. The options response lists such values in `unapplied_warnings` (`technitium_warnings` for Technitium).
+- **The Options tab reads the table from the options response** (`option_support`: per option the `state`, the `drivers`, a `note` and `locked`) and disables a locked control with the note. The group response carries the same shape for `is_recursive` in `unapplied_fields`. There is no copy of the table in the frontend.
+- **`backend/tests/test_dns_option_support_4562.py` fails** when an options column or a registered driver has no decision, so a new option or driver has to pick one. "Applied" is a named decision too (the `_*_APPLIED` sets), not what a column gets by being left out.
+
+---
+
 ## 2. BIND9 Driver
 
 ### Update Strategy: RFC 2136 + rndc (never named restart)
@@ -368,6 +439,25 @@ and can't break pdns. Default-off; deploy via the `dns-powerdns-with-dnsdist`
 compose profile. **docker-compose only for now** — the k8s/appliance front (a
 dnsdist Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
 
+**Real client address through the front (#4576).** By default pdns sees every
+query as coming from the front's address, so `ALLOW-AXFR-FROM`,
+`ALLOW-DNSUPDATE-FROM` and the query log all name the front. Opt in to PROXY
+protocol v2 by setting `PDNS_PROXY_PROTOCOL_FROM` in `.env` to the front's
+address or the compose network's CIDR (`docker network inspect
+<project>_spatiumddi`; a single IP is safest, a CIDR trusts every container on
+that network, and a hostname is resolved once, when pdns.conf is rendered).
+The one variable does both halves: the pdns agent writes
+`proxy-protocol-from=<value>` and the front's `newServer` gets
+`useProxyProtocol=true`. They must go together. A pdns trusting the front
+drops headerless queries from it, and a front sending headers to a pdns that
+is not expecting them is dropped as well, so recreate both containers after
+changing it. Clients not in the trusted list still reach pdns directly with
+plain DNS. Unset (the default) = unchanged behaviour. The front's own health
+check queries `spatium-healthcheck.invalid.` every 5 s
+(`DNSDIST_CHECK_NAME` / `DNSDIST_CHECK_INTERVAL`) instead of `. NS` every
+second, so it no longer fills the query log. Compose has no fixed address for
+the front, which is why this is not on by default.
+
 ---
 
 **Unparseable records are skipped, not fatal (#2510).** Each stored record is checked with dnspython before it is written to the zone file. A row whose rdata does not parse (for example a CAA without a tag, or an MX with extra tokens, stored before the API refused them) is left out, because one such line makes `named-checkzone` refuse the whole zone. The rest of the zone renders, and every skipped record is named (zone, owner, type, value) in a `partial apply:` config-apply error on the server and in the `zone_record_unparseable_skipped` log line. Editing the row to valid rdata clears it on the next apply.
@@ -525,6 +615,8 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 ## 4. PowerDNS Driver
 
+> **Known issues in 1.0.0:** the agent does not delete a zone from PowerDNS when it leaves the bundle ([#4564](https://github.com/spatiumnorth/spatiumddi/issues/4564)), so the "Delete zone" row in §4.1 does not hold yet, and views are merged into one zone ([#4565](https://github.com/spatiumnorth/spatiumddi/issues/4565)). See [DNS.md §0](../features/DNS.md) for the workarounds.
+
 Located at [`app/drivers/dns/powerdns.py`](https://github.com/spatiumnorth/spatiumddi/blob/main/backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
 
 PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
@@ -537,7 +629,7 @@ The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0.x` wit
 |---|---|---|
 | Add / update / delete record | `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch | Idempotent; one HTTP call per rrset. **The control plane owns the serial** (#1965): every op carries `target_serial`, and the agent REPLACEs the apex SOA in the same PATCH with that serial. PowerDNS must not edit it, so a zone has `SOA-EDIT-API` empty (see *Serial ownership* below). A secondary zone's SOA is the transfer's and is never written. After a change that moved the serial of a primary (kind Master) zone the agent also queues a NOTIFY (`PUT .../zones/<zone>/notify`, #1967). |
 | Create zone | `POST /api/v1/servers/localhost/zones` | LMDB row created; available to query immediately. A primary is created with `soa_edit_api: ""`; a new secondary is then asked to transfer at once (`PUT .../axfr-retrieve`) instead of at the next refresh cycle. |
-| Delete zone | `DELETE /api/v1/servers/localhost/zones/<zone>` | LMDB row removed; idempotent. |
+| Delete zone | `DELETE /api/v1/servers/localhost/zones/<zone>` | Sent for a zone the agent manages once the bundle no longer carries it (#4564): a zone deleted or moved to another group, a zone converted to `forward`, a secondary left without primaries, a switched-off catalog zone, and every zone of the group a moved server left. LMDB row removed, with the zone's records, keys and metadata; a 404 counts as done. See *Zone removal* below. |
 | Reconcile zone (full sync) | `GET .../zones/<zone>`, then one `PATCH` that `DELETE`s rrsets absent from the bundle and `REPLACE`s every rrset it carries (a `POST .../zones` for a zone PowerDNS does not have yet) | Runs on agent start and every structural change. Verdict is per zone: a zone whose data PowerDNS refuses (400/409/422) keeps what it held and is reported as a degraded apply (`reverted`, with PowerDNS's reason), every other zone is still served, and nothing is rolled back. Identical records in one rrset are sent once (#1379). The absent-rrset sweep never touches the apex SOA/NS or DNSSEC types, and skips zones with a dynamic-update ACL (#1380). A primary zone's apex NS is rendered like the SOA (#1985), by the BIND9 renderer's rule: the zone's own apex NS records, else its Primary NS when it can resolve, else the `ns1.<zone>` placeholder. PowerDNS makes no apex NS itself and a BIND9 secondary refuses a zone without one. The placeholder carries no loopback glue: a BIND9 secondary only warns about an in-zone NS with no address. A record op that deletes the zone's last apex NS sends a REPLACE with the default instead, so the zone never serves without one. |
 | Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. No `PRESIGNED` metadata (see §4.5). |
 | Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key | Same idempotent shape. |
@@ -549,9 +641,18 @@ The shipped image (`ghcr.io/spatiumnorth/dns-powerdns`) bundles `pdns 5.0.x` wit
 - *PowerDNS rewrites a serial unless told not to.* A zone created through the API without `soa_edit_api` gets `SOA-EDIT-API: DEFAULT`, which rewrites the serial of every change made through the API (below `YYYYMMDD01` it becomes `YYYYMMDD01`, otherwise serial + 1). The zone then never serves the control plane's serial, an SOA-only edit can be served under a serial a secondary already holds, and `GET .../server-state` never reads in sync. So the agent creates a primary with `soa_edit_api: ""` and, on a zone that still carries `DEFAULT`, clears it (`PUT .../zones/<zone>` with `{"soa_edit_api": ""}`, the metadata `DELETE` is refused with 422) before the first PATCH. PowerDNS then stores exactly the serial it is sent, **including a lower one**, so the floor below is the agent's job. The catalog zone keeps `DEFAULT`: its serial is the agent's own timestamp, not the control plane's.
 - *A serial is never sent lower than the one served (RFC 1982).* Before a reconcile REPLACEs a primary's SOA, the agent reads the served one. If the control plane's serial is later it is sent as is. If not, and the Primary NS / Admin Email / timers are unchanged, the served SOA stays (nothing to publish, so no serial creep per reconcile). If they differ, which is the first reconcile after the upgrade from a build that served PowerDNS's own default SOA, the served serial + 1 is sent so a secondary sees a change. A record op whose `target_serial` the zone already reached (an op made before the control plane adopted the served serial) moves the zone to the served serial + 1 and NOTIFYs, in the same PATCH: leaving the SOA alone would publish the change under a serial the secondaries already hold, and they would never transfer it. Only when PowerDNS already serves exactly the rrset the op asks for (a retried op, or one a reconcile beat) is the SOA left alone. The agent reports the serial it actually reached, and the control plane moves `last_serial` forward to a serial a **PowerDNS** server reports ahead of it (forward only, primary zones only, audited as `dns.zone.serial_adopted`; a zone created at 0 and first served at the agent's placeholder 1 is adopted without an audit row), so the next bump starts above what the server holds. The served serials are reported after every structural apply **and after the apply at agent start** (the cached bundle, as after a slot upgrade), retried at the top of each poll until a report lands (at most 10 polls), so the upgrade's floored serials are adopted within a poll or two rather than at the group's next structural change. The one-time effect of the upgrade is therefore a serial that moves forward by one past what PowerDNS served; it never goes backwards.
 - *`primary=yes` and `secondary=yes`* are rendered in `pdns.conf` (both the agent's and the control-plane mirror). With `primary=no`, the default, PowerDNS sends no NOTIFY at all, whatever a zone's kind and `ALSO-NOTIFY` say; with `secondary=no` it never refreshes or transfers a `Slave` zone, which answers REFUSED for everything in it. The file is read at start, so the upgrade restarts PowerDNS once. NOTIFY otherwise goes out on PowerDNS's own cycle (`xfr-cycle-interval`, 60 s); the explicit `/notify` and `/axfr-retrieve` calls make it seconds. Both are best-effort. A secondary's serial is its primary's, so `server-state` never compares it with `last_serial`: on PowerDNS (which reports what it serves) a secondary is in sync once it serves a transferred serial and not while it reports 0 (nothing transferred, REFUSED); on BIND9, which reports the bundle's serial, a secondary that has reported reads in sync, as it always has. After `PUT .../axfr-retrieve` PowerDNS transfers straight away with no SOA query first; its own SOA checks then come on the `xfr-cycle-interval` (60 s) tick once the primary SOA's refresh has elapsed since the last check, so the first one lands between `refresh` and `refresh` + 60 s after the transfer.
-- *Who may transfer.* PowerDNS answers an AXFR only to `allow-axfr-ips` (loopback, left at its default), a zone's `ALLOW-AXFR-FROM` subnets, a TSIG key named in its `TSIG-ALLOW-AXFR`, or an address it notified seconds earlier. So the agent writes both metadata kinds on every zone, from the source BIND9's `allow-transfer` is rendered from (#734): the zone's `allow_transfer` when set, else the server options'; `any` becomes `0.0.0.0/0` + `::/0`, and every TSIG key in the bundle is granted (imported into pdns first), as BIND9 grants them. `ALLOW-AXFR-FROM` has no negation and no named ACLs: a named ACL or an unknown key is dropped (narrower), and a negated entry drops **every** address grant for the zone (dropping only it would widen the rest) — both logged. Without this a secondary on another host was NOTIFY-ed and then REFUSED (`NOTAUTH`) at its transfer; verified against a BIND 9.20 secondary.
+- *Who may transfer.* PowerDNS answers an AXFR only to `allow-axfr-ips` (loopback, left at its default), a zone's `ALLOW-AXFR-FROM` subnets, a TSIG key named in its `TSIG-ALLOW-AXFR`, or an address it notified seconds earlier. So the agent writes both metadata kinds on every zone, from the source BIND9's `allow-transfer` is rendered from (#734): the zone's `allow_transfer` when set, else the server options'; `any` becomes `0.0.0.0/0` + `::/0`, and `key <name>` grants that TSIG key (imported into pdns first). A key the list does not name is **not** granted ([#4568](https://github.com/spatiumnorth/spatiumddi/issues/4568)), unlike on BIND9: PowerDNS signs every outgoing NOTIFY for a zone with the first key in its `TSIG-ALLOW-AXFR` (`send-signed-notify`, on by default), and a secondary that does not hold that key rejects the NOTIFY and catches up only at its SOA refresh. The control plane does not need the grant, since it never signs a transfer from a PowerDNS server. PowerDNS has one NOTIFY key per zone, not per target, so a zone that names a key is NOTIFY-ed signed to every target: give each of its secondaries the key, or grant them all by address. `ALLOW-AXFR-FROM` has no negation and no named ACLs: a named ACL or an unknown key is dropped (narrower), and a negated entry drops **every** address grant for the zone (dropping only it would widen the rest) — both logged. Without this a secondary on another host was NOTIFY-ed and then REFUSED (`NOTAUTH`) at its transfer; verified against a BIND 9.20 secondary.
+- *An address-only secondary is not NOTIFY-ed, on either engine* ([#4671](https://github.com/spatiumnorth/spatiumddi/issues/4671)). An address in `allow_transfer` grants a transfer and nothing else. NOTIFY goes to the zone's NS records and to its explicit `also_notify` list, and neither driver derives targets from `allow_transfer`: BIND9 renders `also-notify` from `also_notify` only, and the PowerDNS agent writes `ALSO-NOTIFY` metadata from the same list, on a zone it keeps kind `Master` so it notifies at all (#1523). A secondary allowed by address that is not an NS of the zone follows the SOA refresh timer unless its address is also listed in the zone's (or server options') **Also Notify**. Deriving targets from `allow_transfer` was rejected: it holds prefixes, `any`, negations and key grants that name no host, and a prefix would NOTIFY every address in it.
 - *What PowerDNS accepts as a secondary.* `secondary=yes` does not enable `autosecondary`: a NOTIFY for a zone this server does not hold is refused and creates nothing, and a NOTIFY for a `Slave` zone from anything but its primaries is refused (`which is not a primary`). Verified against pdns-auth 5.0.7.
 - *Adopting a served serial is bounded.* The control plane adopts a reported serial only up to one year of `YYYYMMDDNN` above the later of its own serial and today's `YYYYMMDD00`, and never into the last such stretch of the signed 32-bit `last_serial` column, so a wrong or compromised agent cannot push the zone to where the next bump overflows (`dns_zone_serial_adoption_refused` is logged instead).
+
+**Zone removal (#4564).** The reconcile creates and updates; removal is a separate pass with its own rules, because a deleted zone cannot be brought back from the agent's side.
+
+- *What may be deleted.* Only zones in the agent's ledger (`pdns-managed-zones.json` in the agent state dir, so it survives a restart): every zone the agent created or reconciled from a bundle. A zone made behind the agent (`pdnsutil create-zone`) after the ledger exists is never in it and is never touched. A ledger that exists but cannot be read or parsed is not a first run: it counts as empty, so nothing is deleted or adopted on its strength (a zone the bundle names is claimed again by the next reconcile).
+- *The first run adopts what is there.* A state dir with no ledger (an agent upgraded from a build without one) records every zone PowerDNS holds at that moment, so the zones orphaned before the upgrade are removed too. This is safe to assume because the daemon is the agent's own: its API listens on loopback inside the container behind a key only the agent holds, and writing zones with `pdnsutil` is unsupported (below). **The first run after the upgrade therefore removes every zone on the PowerDNS server that SpatiumDDI does not manage, including any created there by hand.** A zone that was nevertheless made by hand before the upgrade, and is not in SpatiumDDI, is removed with the orphans; create it in SpatiumDDI first to keep it.
+- *When.* Only after an apply whose reconcile attempted every zone of the bundle, and only once the control plane has confirmed that bundle is its current one in the same poll (a 200 that applied or matches the live structure, or a 304 for the live bundle). An agent serving its cached bundle while the control plane is unreachable deletes nothing, nor does one that reverted to the last-known-good, nor one whose bundle carries no zone list at all. An explicit empty zone list is a real answer (a group with no zones), but it is **held** like any pass that would delete every managed zone: nothing is deleted, the ledger is unchanged, the server row shows a warning (`holding deletion of all N managed zones; the bundle carries none`), and removal resumes once a later bundle carries a zone. A ledger holding one zone that the bundle drops counts as "all". Deleting only some zones is never held. `PDNS_ALLOW_EMPTY_RETIRE=1` in the agent env lets the pass empty the server.
+- *What is kept.* A zone PowerDNS refused data for is still in the bundle and stays. A delete PowerDNS refuses keeps the zone in the ledger and is retried on the next confirmation. Each removal is logged (`powerdns_zone_retired`).
+- *Nothing else to update.* The dnsdist front forwards every query to `pdns_server` and holds no per-zone state, and the catalog zone's member list comes from the same bundle, so a removed zone leaves both with the apply that dropped it.
 
 The agent never reads `pdns.conf` to figure out what to do — it queries PowerDNS over REST and reconciles against the `ConfigBundle` shipped from the control plane. This is the same conceptual loop as the BIND9 driver, but the wire protocol is HTTP+JSON instead of RFC 2136+rndc.
 
@@ -593,19 +694,26 @@ class PowerDNSDriver(DNSDriver):
     def capabilities(cls) -> dict[str, Any]:
         return {
             "alias_records": True,         # CNAME-at-apex via PATCH
-            "lua_records": True,           # ENABLE-LUA-RECORDS=1 zone metadata auto-set
+            "lua_records": True,           # global enable-lua-records=yes in pdns.conf
             "dnssec_inline_signing": True, # online sign / unsign / re-sign
             "catalog_zones": "producer-only",  # consumer not wired up in the agent
-            "views": False,                # tag-based; not surfaced as views in UI yet
+            "views": False,                # pdns-auth has no views; refused by the API (#4565)
             "rpz": False,                  # authoritative-only — RPZ is a recursor feature
         }
 ```
 
 `alias_records: True` and `lua_records: True` are PowerDNS-only: the `ALIAS` / `LUA` record types are gated server-side by the API's `_DRIVER_GATED_RECORD_TYPES` map to `{powerdns}`, so creating them against a non-PowerDNS group returns 422 with a remediation message ("move to a PowerDNS-only group"). Online DNSSEC sign/unsign is no longer PowerDNS-only — BIND9 ships inline-signing via `dnssec-policy` (§2.5), so `_DRIVER_GATED_OPERATIONS` allows `dnssec_sign`/`dnssec_unsign` on both `{powerdns, bind9}` (and `dnssec_rollover` on `{bind9}`); only the *mechanism* differs (PowerDNS signs online via REST, BIND9 via config-driven inline-signing).
 
+**Views (#4565).** `views: False` is enforced, not advisory: the API reads it for every driver and refuses a view, a view-scoped zone or record, and a server joining a group that has views (see [DNS.md §2](../features/DNS.md)). BIND9 is the only driver that returns `True`. A bundle can still carry views for a group that held them before the refusal, and the agent's rule for it is fixed (`_resolve_view_copies`): the bundle ships one copy of a zone per view it renders in, and PowerDNS holds one zone per name, so
+
+- copies that render the same payload are one zone, reconciled once and served to every client;
+- copies that differ are reduced to the rrsets identical (name, type, TTL, records) in every copy and sent as one zone, so no client is answered from another view's data and the reconcile sweeps what an earlier merged render left. The zone is named in `refused_zones()` as `"<zone> views: …"`, and the apply is reported as partial, like a zone PowerDNS itself refused. It is also left out of the zone-state report, so it never reads converged.
+
+`powerdns_views_unsupported` is logged on every render of such a bundle. Removing the views, or making the zone the same in each, clears it on the next render.
+
 ### 4.4 LUA records
 
-LUA records are PowerDNS's mechanism for computed responses — geo-routing, weighted answers, conditional `pickrandom` / `ifportup` / `createReverse` snippets. The frontend exposes a `<textarea>` for the LUA value when the operator selects record type `LUA`; the agent auto-sets `ENABLE-LUA-RECORDS=1` zone metadata via the PowerDNS REST API the first time a zone gains a LUA record (idempotent — the metadata stays harmless when no LUA records remain).
+LUA records are PowerDNS's mechanism for computed responses — geo-routing, weighted answers, conditional `pickrandom` / `ifportup` / `createReverse` snippets. The frontend exposes a `<textarea>` for the LUA value when the operator selects record type `LUA`; the agent renders the global `enable-lua-records=yes` into `pdns.conf` for every zone. The per-zone `ENABLE-LUA-RECORDS` metadata is not used: pdns refuses it over the REST API.
 
 **Security note.** LUA records execute server-side at query time. Treat them as code. The frontend's contextual banner explains this; restrict who can create LUA records via the existing RBAC `dns.record.create` permission scoped to PowerDNS groups only.
 
@@ -914,6 +1022,8 @@ The Options tab and `PUT /dns/groups/{id}/options` are driver-agnostic and the b
 | `forward_tls_verify` | **not supported** (#1764): Technitium always validates an encrypted upstream's certificate. The API refuses a change to `false` on a Technitium group; the default `true`, and a stored `false`, stay allowed. |
 
 A value stored before the gate, or before a Technitium server joined the group (agent registration, a server move, a Fleet role assignment), never passes through the PUT gate. `GET`/`PUT /dns/groups/{id}/options` return it in `technitium_warnings`, and the Options tab shows it as a banner.
+
+Not applied either, and refused the same way (#4562): `query_log_enabled`, `response_log_enabled` and the query-log channel settings (query logging is not collected from Technitium servers yet, #742), `rrl_log_only` and `rrl_qps_scale` (the rate limit has neither), and the `dnsdist_*` options (the dnsdist front is PowerDNS only). This section is the Technitium column of the table in §1A.
 
 The gate covers the agent-managed `technitium` driver; the agentless `technitium_api` driver applies no group option.
 
@@ -1301,6 +1411,20 @@ PowerDNS is coarse-only — no per-name / per-type / `deny`, so
    `TSIG-ALLOW-DNSUPDATE` ← grant key names. An empty ACL DELETEs both so a
    zone whose dynamic updates were turned off stops accepting them.
 
+**Address and key (#4569)** — PowerDNS checks the source address first
+(`ALLOW-DNSUPDATE-FROM` plus the global `allow-dnsupdate-from`, default
+loopback) and then, when `TSIG-ALLOW-DNSUPDATE` is set, the signature too.
+The two combine as "both", where BIND9's `allow-update` means "either". So:
+
+- a **key-only** ACL also writes `ALLOW-DNSUPDATE-FROM = 0.0.0.0/0, ::/0`, so
+  a signed update is accepted from any address and the key is the gate;
+- an **IP-only** ACL writes the granted ranges and no key;
+- an ACL with **both** kinds is refused by `validate_update_acl` (422). One
+  stored before that check keeps "address and key" on the agent, which logs
+  `powerdns_update_acl_address_and_key`; saving it again unchanged (or only
+  flipping `dynamic_update_enabled`) is accepted with a warning, and only a
+  change to the ACL is refused.
+
 **Drift** — in a zone with a dynamic-update ACL the pdns reconciler is
 additive per-rrset (`REPLACE` per managed `name+type`, never a blanket zone
 replace), so records RFC 2136 clients injected (new names) **survive** a
@@ -1423,7 +1547,7 @@ pdns Authoritative speaks neither protocol and doesn't recurse, so:
    mounts the agent's state dir at `/agent-state`, so the rendered rules
    reference `/agent-state/tls/listener.crt`, not the agent's own
    `state_dir`. Override with `DNSDIST_STATE_MOUNT` if that mount moves.
-2. **uid alignment.** Both images create `spatium` as uid 101, so the 0600
+2. **uid alignment.** Both images create `spatium` as uid 10002, so the 0600
    key the pdns agent writes is readable by dnsdist. If either image's
    user ever changes, the listeners break with a fatal TLS-load error.
 

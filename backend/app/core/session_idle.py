@@ -38,7 +38,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Final
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 IDLE_HEADER: Final[str] = "X-Spatium-Idle-Seconds"
@@ -132,3 +132,17 @@ def request_activity_at(headers: Any, now: datetime) -> datetime:
     if not math.isfinite(idle) or idle <= 0:
         return now
     return now - timedelta(seconds=min(idle, _MAX_REPORTED_IDLE_S))
+
+
+async def only_live_sessions(stmt: Any, db: AsyncSession, now: datetime) -> Any:
+    """Narrow a ``select`` over ``UserSession`` to the live sessions: not
+    revoked, not expired and not idle. The one definition Administration >
+    Sessions lists and the factory-reset preview counts (#4615), so the two
+    cannot drift."""
+    from app.models.auth import UserSession
+
+    stmt = stmt.where(UserSession.revoked.is_(False)).where(UserSession.expires_at > now)
+    cutoff = idle_cutoff(await get_session_timeout_minutes(db), now)
+    if cutoff is None:
+        return stmt
+    return stmt.where(func.coalesce(UserSession.last_seen_at, UserSession.created_at) > cutoff)
