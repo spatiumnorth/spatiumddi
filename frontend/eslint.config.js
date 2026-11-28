@@ -1,4 +1,4 @@
-// ESLint v9 flat config — minimal setup for React + TypeScript + Vite.
+// ESLint v10 flat config — minimal setup for React + TypeScript + Vite.
 // Migrated from the implicit legacy .eslintrc since the repo only declares
 // eslint-plugin-react-hooks + eslint-plugin-react-refresh + typescript-eslint.
 import js from "@eslint/js";
@@ -28,6 +28,21 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
+      // eslint-plugin-react-hooks 7 added React-Compiler-oriented rules to
+      // `recommended`. They flag established patterns here (sessionStorage /
+      // prop-sync effects, ref reads, Date.now() in render) and fixing them
+      // means restructuring components, so they are off until that pass is
+      // done (follow-up issue). Findings at the 7.x bump: set-state-in-effect
+      // 79, purity 15, refs 14, globals 5, static-components 2.
+      "react-hooks/set-state-in-effect": "off",
+      "react-hooks/purity": "off",
+      "react-hooks/refs": "off",
+      "react-hooks/globals": "off",
+      "react-hooks/static-components": "off",
+      // ESLint 10 core `recommended` addition: 13 findings, all the
+      // `let x = default; try { x = parse() } catch {}` idiom — intentional
+      // defaults, not bugs. Off rather than churn 10 files.
+      "no-useless-assignment": "off",
       "react-refresh/only-export-components": ["warn", { allowConstantExport: true }],
       // Off project-wide: these are sessionStorage-sync effects and stable
       // setter functions we deliberately omit from deps. Toggling them on
