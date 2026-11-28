@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI additional network interface config (issue #4428)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4428
+# Skip on the live ISO — the installer environment manages no extra
+# interfaces, and the release-state dir it would watch is the live tmpfs.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# Atomic-rename trigger, same as every other host-config plane: the
+# supervisor writes <name>.new then renames, so PathChanged fires once per
+# complete payload and never on a partial write.
+PathChanged=/var/lib/spatiumddi/release-state/netif-config-pending
+
+[Install]
+WantedBy=multi-user.target

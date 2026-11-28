@@ -27,6 +27,7 @@ def _run(
     cidrs: str = "",
     own4: str = "",
     own6: str = "",
+    managed: tuple = (),
     args: tuple = (),
 ):
     bindir = tmp_path / "bin"
@@ -51,6 +52,10 @@ def _run(
     if nm_iface:
         (nm / "10-spatium-dhcp.nmconnection").write_text(
             f"[connection]\ninterface-name={nm_iface}\n"
+        )
+    for name in managed:
+        (nm / f"20-spatium-netif-{name}.nmconnection").write_text(
+            f"[connection]\ninterface-name={name}\n"
         )
     env = {
         **os.environ,
@@ -144,6 +149,24 @@ def test_multi_nic_prefers_the_installer_bound_interface(tmp_path: Path) -> None
 def test_bound_interface_without_address_falls_back(tmp_path: Path) -> None:
     text = _run(tmp_path, a4=V4, nm_iface="ens9").read_text()
     assert "node-ip: 192.168.50.7\n" in text
+
+
+def test_fallback_never_pins_a_managed_extra_interface(tmp_path: Path) -> None:
+    """#4428: the bound NIC has no address yet and the only address is on an
+    extra interface SpatiumDDI manages; k3s must not be pinned to it."""
+    extra = "3: ens19    inet 172.30.5.4/24 scope global ens19\n"
+    _run(tmp_path, a4=extra, nm_iface="ens3", managed=("ens19",))
+    dropin = tmp_path / "spatium-node-ip.yaml"
+    assert not dropin.exists() or "ens19" not in dropin.read_text()
+
+
+def test_managed_extra_interface_skipped_when_others_have_addresses(tmp_path: Path) -> None:
+    two = (
+        "3: ens19    inet 172.30.5.4/24 scope global ens19\n"
+        "2: ens3    inet 192.168.50.7/24 scope global ens3\n"
+    )
+    text = _run(tmp_path, a4=two, managed=("ens19",)).read_text()
+    assert "node-ip: 192.168.50.7\n" in text and "flannel-iface: ens3\n" in text
 
 
 def _mutations() -> list[str]:

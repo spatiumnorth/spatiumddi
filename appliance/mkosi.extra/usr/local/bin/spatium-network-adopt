@@ -618,8 +618,12 @@ def _extra_profiles() -> list[str]:
     if not NM_DIR.is_dir():
         return []
     managed = {STATIC_KEYFILE.name, DHCP_KEYFILE.name}
+    # #4428 — profiles the control plane manages for ADDITIONAL interfaces
+    # (spatiumddi-netif-reload) are not an operator's stray nmtui edits.
     return sorted(
-        p.name for p in NM_DIR.glob("*.nmconnection") if p.name not in managed
+        p.name
+        for p in NM_DIR.glob("*.nmconnection")
+        if p.name not in managed and not p.name.startswith("20-spatium-netif-")
     )
 
 

@@ -31,6 +31,7 @@ from app.api.v1.appliance.acme import router as acme_router
 from app.api.v1.appliance.cluster import router as cluster_router
 from app.api.v1.appliance.containers import router as containers_router
 from app.api.v1.appliance.diagnostics import router as diagnostics_router
+from app.api.v1.appliance.netif import router as netif_router
 from app.api.v1.appliance.pairing import router as pairing_router
 from app.api.v1.appliance.releases import router as releases_router
 from app.api.v1.appliance.slot import router as slot_router
@@ -95,6 +96,8 @@ router.include_router(pairing_router)
 # URL is ``/api/v1/appliance/supervisor/register`` rather than
 # ``/api/v1/appliance/supervisor/supervisor/register``.
 router.include_router(supervisor_router)
+# #4428 — additional network interfaces (per-appliance desired state).
+router.include_router(netif_router)
 
 
 class RemoteDoor(BaseModel):

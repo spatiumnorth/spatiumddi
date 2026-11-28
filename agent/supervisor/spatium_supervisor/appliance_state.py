@@ -704,6 +704,43 @@ _REMOVABLE_HASH_SIDECAR = Path(
 _REMOVABLE_STATUS_SIDECAR = Path(
     "/var/lib/spatiumddi-host/release-state/removable-status"
 )
+# #4428 — additional network interfaces. PER-APPLIANCE like the removable
+# plane (a NIC and its VLANs exist on one box), so the trigger's line-3+
+# payload is the JSON interface list the runner renders to NetworkManager
+# keyfiles. Four more sidecars than its siblings because this is the one
+# plane that can cut the node off the control plane and so applies with a
+# rollback: the runner arms a DEADLINE, and the supervisor writes the
+# CONFIRM file once a heartbeat has round-tripped with the applied hash.
+_NETIF_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/netif-config-pending"
+)
+#: The last hash the runner SETTLED — applied, or rolled back. Settled, not
+#: "applied", on purpose: a rolled-back hash must not be re-fired every
+#: backoff window forever (each retry is a self-inflicted outage); the
+#: operator changes the config, which changes the hash, to try again. The
+#: status sidecar below says which of the two it was.
+_NETIF_HASH_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/netif-config-hash"
+)
+#: JSON ``{"state", "at", "hash", "error"?, "interfaces": {name: verdict}}``.
+_NETIF_STATUS_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/netif-status.json"
+)
+#: JSON inventory the host timer refreshes (``spatiumddi-netif-reload
+#: --tick``): the supervisor pod is not hostNetwork, so its own view of
+#: addresses and routes is the pod's.
+_NETIF_INVENTORY_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/netif-inventory.json"
+)
+_NETIF_DEADLINE_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/netif-revert-deadline"
+)
+_NETIF_CONFIRM_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/netif-confirm"
+)
+#: An inventory older than this is the timer being dead, not the network
+#: being quiet: reporting it would validate changes against a stale picture.
+_NETIF_INVENTORY_MAX_AGE_S = 180.0
 # Issue #154 — NTP / chrony equivalents. Same shape as SNMP.
 _NTP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ntp-config-pending")
 _NTP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-config-hash")
@@ -1321,6 +1358,9 @@ _HOST_CONFIG_PLANES: list[tuple[str, Path, Path]] = [
     # keeps failing to apply is exactly the case where the operator sees
     # a configured disk in the UI and a backup that never lands.
     ("removable", _REMOVABLE_TRIGGER_FILE, _REMOVABLE_HASH_SIDECAR),
+    # #4428 — the one plane that can cut the node off, so a stuck apply
+    # must be visible, not retried silently.
+    ("netif", _NETIF_TRIGGER_FILE, _NETIF_HASH_SIDECAR),
 ]
 
 
@@ -2291,6 +2331,116 @@ def maybe_fire_removable_reload(bundle_block: object) -> bool:
     return _fire_host_config(
         _REMOVABLE_TRIGGER_FILE, _REMOVABLE_HASH_SIDECAR, config_hash, payload
     )
+
+
+def maybe_fire_netif_reload(bundle_block: object) -> bool:
+    """#4428 — write the network-interface trigger when the control plane's
+    desired set differs from the last one this node settled.
+
+    Same appliance-only gate and no-instruction rules as the removable
+    plane, for the same reasons: an empty list is the teardown command, so
+    a null list (the control plane could not validate the stored set) and
+    an empty hash (a control plane too old to digest) both do NOTHING.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    interfaces = bundle_block.get("interfaces")
+    if not isinstance(interfaces, list) or not config_hash:
+        return False
+    revert_seconds = bundle_block.get("revert_seconds")
+    if not isinstance(revert_seconds, int) or isinstance(revert_seconds, bool):
+        revert_seconds = 180
+    payload = (
+        ("enabled\n" if interfaces else "disabled\n")
+        + (config_hash + "\n")
+        + json.dumps({"interfaces": interfaces, "revert_seconds": revert_seconds})
+        + "\n"
+    )
+    return _fire_host_config(
+        _NETIF_TRIGGER_FILE, _NETIF_HASH_SIDECAR, config_hash, payload
+    )
+
+
+def maybe_confirm_netif(bundle_block: object, sent_at: float | None = None) -> bool:
+    """#4428 — tell the host runner the control plane is still reachable.
+
+    Called only after a heartbeat RESPONSE was received and parsed, which
+    is the proof: the request left this node over the network the runner
+    just changed and the answer came back. The confirm is written only
+    while a revert deadline is armed and the hash the runner settled equals
+    the one the control plane is asking for now — a confirm for a config
+    the operator has since replaced would keep a change nobody reviewed.
+
+    ``sent_at`` is when the request this response answers was SENT. A
+    heartbeat is a long-poll, held up to the interval, so the one answering
+    right after the runner arms its deadline was normally sent BEFORE the
+    change and travelled the old network (or a connection that survived
+    it): it proves nothing about the new one. Only a request sent after the
+    deadline was armed counts. ``None`` never confirms.
+
+    A node that cannot heartbeat never reaches here, so the deadline passes
+    and the runner restores the previous profiles. That is the whole
+    rollback; nothing on the control plane has to notice anything.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    if not config_hash or sent_at is None:
+        return False
+    try:
+        armed_at = _NETIF_DEADLINE_FILE.stat().st_mtime
+    except OSError:
+        return False
+    if armed_at > sent_at:
+        return False
+    if _read_release_state_line(_NETIF_HASH_SIDECAR) != config_hash:
+        return False
+    if _NETIF_CONFIRM_FILE.exists():
+        return False
+    try:
+        tmp = _NETIF_CONFIRM_FILE.with_suffix(".new")
+        _write_owner_only(tmp, config_hash + "\n")
+        tmp.replace(_NETIF_CONFIRM_FILE)
+    except OSError:
+        return False
+    return True
+
+
+def read_netif_state() -> dict[str, object] | None:
+    """The ``netif`` block folded into ``cluster_health`` (#4428).
+
+    ``{"inventory": {...}, "apply_status": {...}}``. Either half may be
+    absent; ``None`` when neither exists (a slot too old to ship the
+    runner, or a non-appliance host), which the control plane reads as
+    UNKNOWN. A stale inventory is dropped rather than shipped — see
+    ``_NETIF_INVENTORY_MAX_AGE_S``.
+    """
+    out: dict[str, object] = {}
+    try:
+        inv = json.loads(_NETIF_INVENTORY_SIDECAR.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        inv = None
+    if isinstance(inv, dict):
+        at = inv.get("at_epoch")
+        fresh = (
+            isinstance(at, (int, float))
+            and not isinstance(at, bool)
+            and abs(time.time() - at) <= _NETIF_INVENTORY_MAX_AGE_S
+        )
+        if fresh:
+            out["inventory"] = inv
+    try:
+        status = json.loads(_NETIF_STATUS_SIDECAR.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        status = None
+    if isinstance(status, dict):
+        out["apply_status"] = status
+    return out or None
 
 
 # ── #272 Phase 7b — control-plane cluster join/leave ────────────────
@@ -4976,6 +5126,11 @@ def collect() -> dict[str, object]:
         _network = read_network_state()
         if _network is not None:
             _extra["network"] = _network
+        # #4428 — additional interfaces: live inventory + last apply
+        # verdict. Absent means UNKNOWN to the control plane.
+        _netif = read_netif_state()
+        if _netif is not None:
+            _extra["netif"] = _netif
         _not_converged = read_control_plane_not_converged()
         if _not_converged is not None:
             _extra["control_plane_not_converged"] = _not_converged

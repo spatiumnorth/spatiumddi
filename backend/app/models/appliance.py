@@ -726,6 +726,30 @@ class Appliance(Base):
         server_default=sa.text("'[]'::jsonb"),
     )
 
+    # #4428 — additional (non-primary) network interfaces this node should
+    # carry: static addresses, 802.1Q VLAN sub-interfaces, static routes,
+    # MTU and up/down. Shape: a list of
+    # ``{"name", "kind": "ethernet"|"vlan", "parent", "vlan_id",
+    # "addresses": ["10.9.0.2/24"], "mtu", "up",
+    # "routes": [{"destination", "gateway", "metric"}], "description"}``;
+    # ``[]`` means nothing is managed, which is also how a removal reaches
+    # the host.
+    #
+    # PER-APPLIANCE, like ``desired_removable_mounts``: a NIC, its VLANs and
+    # the route back to a DHCP relay exist on one box, so a fleet-wide
+    # setting would ask every other node to configure hardware it does not
+    # have. The PRIMARY connection is NOT in this list and cannot be added
+    # to it — it stays owned by the installer / STATE / ``spatium-etc-render``.
+    #
+    # The DESIRED set only. What the node actually runs, and how the last
+    # apply went, ride inside ``cluster_health["netif"]`` (#402 pattern).
+    desired_network_interfaces: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=sa.text("'[]'::jsonb"),
+    )
+
     # #593 — the supervisor refused a firewall drop-in that would have closed
     # etcd's peer port on this node while k3s still considers it an etcd member
     # (a stale/diverged appliance row). Shape:

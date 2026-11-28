@@ -149,6 +149,7 @@ from app.services.appliance.cluster_dns_group import (
 from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.group_names import group_name_problem
 from app.services.appliance.lldp import lldp_bundle
+from app.services.appliance.netif import netif_bundle_safe
 from app.services.appliance.network_mtu import (
     evaluate_node as evaluate_node_mtu,
 )
@@ -2337,6 +2338,12 @@ class SupervisorHeartbeatResponse(BaseModel):
     # mount a disk it cannot see. Empty-shape block still sent, because
     # an empty desired set is how an EJECT reaches the host.
     removable_settings: dict[str, Any] = Field(default_factory=dict)
+    # #4428 — additional network interfaces this node should carry.
+    # ``{enabled, config_hash, interfaces: [...]|None, revert_seconds}``.
+    # Per-appliance like ``removable_settings``; ``interfaces`` is null
+    # ("no instruction") when the stored set stops validating, because an
+    # empty list is this plane's teardown command.
+    netif_settings: dict[str, Any] = Field(default_factory=dict)
     # #1710 — a rolling upgrade holds the cluster's shared charts on the tag
     # it runs until every node reports ``target_version``: ``{"run_id",
     # "from_tag", "target_version"}`` while it does, for each node of the
@@ -3888,6 +3895,7 @@ async def _supervisor_heartbeat(
         apt_settings=apt_block,
         firewall_settings=firewall_block,
         removable_settings=removable_bundle_safe(row.desired_removable_mounts),
+        netif_settings=netif_bundle_safe(row.desired_network_interfaces),
         long_poll=long_poll,
         # Only a settled member shares the charts: a node demoted out of the
         # cluster after a failed run runs its own, and must not defer to a

@@ -233,7 +233,7 @@ Which profile depends on how the box was installed:
 | `network_mode=dhcp` **with** a pinned interface | `10-spatium-dhcp.nmconnection` | regenerated at the next boot |
 | `network_mode=dhcp`, no pinned interface | none | survives — it is NetworkManager's own auto profile |
 
-A *separate* profile you add — a VLAN, a bond, a bridge — is never deleted,
+Additional interfaces (a second NIC, a VLAN, static routes) are managed from the Fleet UI instead — see [Additional network interfaces](#additional-network-interfaces--issue-4428). A *separate* profile you add by hand — a bond, a bridge — is never deleted,
 since etc-render only rewrites its own two files. But it does not win
 either: both managed keyfiles carry `autoconnect-priority=100` and a fresh
 nmtui profile defaults to `0`, so re-pointing the appliance's primary
@@ -1925,6 +1925,106 @@ by somebody else, and refuse to re-mount it.
 routed: on an N-node control plane a run lands on the right node roughly 1 in N
 times, and the others refuse naming the node the disk is on. Routing is a
 tracked follow-up; on a cluster prefer `nfs` / `s3` / `smb`.
+
+### Additional network interfaces — issue #4428
+
+The install configures **one** connection: the primary interface (the
+[reconfiguration notes above](#reconfiguring-the-network-after-install) cover it).
+Anything else a deployment needs is now managed from **Appliance → Fleet → the
+node → Network interfaces**, or the API:
+
+- static IPv4 / IPv6 addresses on a physical port;
+- **802.1Q VLAN sub-interfaces** (on a port, a bond or a bridge);
+- **static routes**, for example back to a DHCP relay's `giaddr` subnet;
+- MTU, and whether the link is up.
+
+The reason it exists: Kea on the appliance runs with `hostNetwork`, so it answers
+broadcasts on **every** interface the node has. Serving DHCP or DNS on another
+VLAN needs that interface to exist with an address and the route back to the
+relay, which used to mean `nmcli` by hand. Note that the per-appliance
+[fleet firewall](#fleet-firewall--declarative-per-role-policy-285) is not scoped
+by interface: its rules are by port and source CIDR, and apply to every
+interface the node has, so a new interface inherits exactly the policy the
+primary one has — open the ports a relay needs through a firewall policy, not
+here.
+
+**How it is applied.** Same desired-state path as the other host planes, rendered
+from the **appliance row** (`appliance.desired_network_interfaces`, migration
+`f4a7d2c81e59`) because a NIC exists on one box: the REST call validates and
+audits, the heartbeat carries `netif_settings`, the supervisor writes
+`release-state/netif-config-pending`, and `spatiumddi-netif-reload.path` runs the
+host runner, which renders one NetworkManager keyfile per interface
+(`/etc/NetworkManager/system-connections/20-spatium-netif-<name>.nmconnection`,
+which persists across slot upgrades with the rest of `/etc`) and brings it up.
+Every profile is `never-default`: an additional interface can never become the
+node's way out. The primary profile (`10-spatium-static` / `10-spatium-dhcp`) is
+never touched, and the console's F4 / `spatium-network-adopt` do not report these
+files as stray nmtui edits.
+
+**It cannot cut the node off — three layers.**
+
+1. *The primary interface cannot be managed.* It is identified from three
+   independent signals (the interface STATE configured, the interface carrying the
+   default route, the interface carrying the node's k3s address) plus whatever it
+   is stacked on or made of (a bond's members, a VLAN's parent). The host runner
+   re-checks this itself and refuses regardless of what the control plane said,
+   and also refuses an address or route that overlaps a network the host already
+   uses (the management network, another unmanaged interface).
+2. *Nothing may overlap, shadow or hijack.* A 422 (with the reason) for: an address
+   overlapping another interface's subnet, the pod CIDR or the service CIDR; two
+   interfaces in one subnet; a VLAN on a parent that does not exist; a route
+   touching the node's own or a cluster peer's address, the control-plane virtual
+   address, the pod / service CIDR (the k3s defaults when the cluster has not
+   reported its own), any part of the management network (a more specific route
+   to the gateway or a peer included) or another connected subnet; a gateway that is not inside one of the
+   interface's own subnets; an MTU above the VLAN parent's; and **any default
+   route** — refused outright rather than reasoned about; add the specific networks
+   instead.
+3. *A rollback on the node itself.* After an apply the host keeps the previous
+   profiles and arms a deadline (`revert_seconds`, 180 s). The supervisor confirms
+   once a heartbeat that was **sent after** the deadline was armed round-trips with
+   the applied hash — the one answering at that moment left over the old network
+   and proves nothing — and the host keeps the change only if the default routes
+   and the primary's address it had before are still there, because the control
+   plane can be on this very node. No confirm by the deadline (a heartbeat that
+   cannot get through never reaches the confirm) and the previous profiles are
+   restored, the state is **`reverted`**, and the UI says the configuration shown
+   is *not* what the node is running. The deadline lives on `/var`, so a reboot
+   inside the window reverts too. A rolled-back hash is recorded as settled so it
+   is not re-applied every backoff window; edit the config to try again. If the
+   snapshot cannot be taken the change is refused (`failed`, nothing installed); if
+   the previous profiles cannot be restored the deadline stays armed and the next
+   30 s tick tries again. A clock that stepped back (boot before NTP) re-arms a
+   fresh window instead of leaving the net open for hours.
+
+A node that has not reported its interface inventory (offline, or an older
+supervisor) is **unknown**, never "no interfaces": a write is a `409` rather than
+being validated against nothing. Removing configuration (`interfaces: []`) needs
+no inventory.
+
+**Interface states.** `active`; `inactive` (applied, link down — usually no cable;
+NetworkManager raises it when a carrier arrives); `confirming` (applied, waiting
+for the control plane to be reachable); `pending` (not applied yet); `reverted`;
+`failed`; `unreported`.
+
+**API** (`/api/v1/appliance/appliances/{id}/network-interfaces`): `GET` (needs
+`read` on `appliance`) joins desired with the node's reported NICs and says why a
+NIC cannot be managed; `POST …/validate` dry-runs every check; `PUT` replaces the
+whole set (needs `admin` on `appliance`; audit action `appliance.network.update`);
+`DELETE …/{name}` removes one (`appliance.network.remove`). A revoked appliance is
+a 409. The runner logs to `/var/log/spatiumddi/netif-reload.log`, and a stuck
+apply shows as **Network interfaces** under the Fleet drilldown's host-config
+health.
+
+**Copilot.** `find_appliance_network_interfaces` (read, on by default) reports
+desired vs. actual, including `reverted`. `propose_appliance_network_interfaces`
+runs the same validation and returns a proposal for a human to apply; it never
+writes, and ships **off** (non-negotiable #13: it edits host networking).
+
+**Not in this phase:** DHCP-addressed extra interfaces, bonds and bridges,
+default routes through a second gateway (policy routing), and per-interface
+firewall scoping. Each needs a model for which interface owns the default path,
+which this feature deliberately does not have.
 
 ### Misc
 

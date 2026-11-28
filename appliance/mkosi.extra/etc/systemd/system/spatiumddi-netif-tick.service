@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the network inventory and enforce the interface rollback (issue #4428)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4428
+ConditionKernelCommandLine=!boot=live
+# Restoring the previous profiles writes into the /etc overlay.
+After=etc.mount local-fs.target
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-netif-reload --tick
+# Driven by spatiumddi-netif-tick.timer — no [Install].

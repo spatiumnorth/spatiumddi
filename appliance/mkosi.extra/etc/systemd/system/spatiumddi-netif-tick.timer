@@ -1,0 +1,14 @@
+[Unit]
+Description=Poll the network-interface rollback deadline + inventory (issue #4428)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4428
+ConditionKernelCommandLine=!boot=live
+
+[Timer]
+# Shortly after boot, so an apply armed before a reboot is enforced on the
+# way back up, then every 30 s: the supervisor reports the inventory this
+# writes, and the rollback deadline is measured in minutes, not seconds.
+OnBootSec=30s
+OnUnitActiveSec=30s
+
+[Install]
+WantedBy=timers.target
