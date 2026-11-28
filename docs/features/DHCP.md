@@ -860,6 +860,33 @@ restricted resolver" does not have to start from Kea syntax.
 
 ---
 
+### Option 43 vendor presets (#4490)
+
+Wireless controllers find their controller through DHCP option 43, and each
+vendor frames the payload differently. In a phone profile's editor, **Add
+vendor preset...** takes a vendor and the controller address(es), shows the
+encoded bytes, and on **Use this value** writes a `43` row into the option set
+(replacing any earlier `43` row) and, where the vendor documents one, fills the
+option 60 match so the option is offered to that vendor's devices only. The
+value is stored as the plain hex the option library already uses for a binary
+option, so Kea renders it as class-scoped `option-data` with the `binary`
+definition for code 43; Windows DHCP follows the same rules as any other phone
+profile option.
+
+| Preset | Bytes | Option 60 | Source |
+|---|---|---|---|
+| Ubiquiti UniFi | `01 04` + 4 address bytes | `ubnt` | Ubiquiti, "UniFi - Layer 3 methods for adoption" (`172.16.30.3` is `01:04:AC:10:1E:03`) |
+| Cisco lightweight APs (WLC) | `f1` + 4 x count + each address | none required | Cisco document 97066 (`f108c0a80a05c0a80a14` for two WLCs) |
+| Ruckus SmartZone / ZoneDirector | sub-option `06` / `03`, string length, the address as ASCII | none documented | Ruckus support article 000008703 (`060d3139322e3136382e312e313230`) |
+
+Only layouts confirmed against the vendor's own documentation are bundled. Aruba
+and other vendors are left out until their format can be confirmed, because a
+wrong option 43 fails silently. The catalogue ships in the repository and makes
+no outbound call. REST: `GET /api/v1/dhcp/vendor-presets` and
+`GET /api/v1/dhcp/vendor-presets/{id}/encode?controller=<ip>` (repeat
+`controller` for several); the Copilot tool `find_dhcp_vendor_presets` reads the
+same data.
+
 ## 4a. DHCP MAC Blocklist
 
 A group-level deny list. Any MAC address listed here is dropped on every scope served by every member of the group — no leases, no response packets at all.
