@@ -413,6 +413,44 @@ _SPECS: list[tuple[str, str, str, list[ParamSpec]]] = [
     (a.RULE_TYPE_DNS_BLOCKLIST_FEED_STALE, "DNS blocklist feed stale", "DNS", []),
     (a.RULE_TYPE_DNS_POOL_HEALTH_STALE, "DNS pool health checks stale", "DNS", []),
     (
+        a.RULE_TYPE_DNS_SECONDARY_TRANSFER_FAILED,
+        "DNS secondary zone transfer failing",
+        "DNS",
+        [
+            _count(
+                "Consecutive missed refreshes",
+                3,
+                "Fires once a secondary has missed this many refresh attempts in a "
+                "row, estimated from its own SOA refresh and retry timers (the "
+                "daemon names no count or reason). An expired copy always fires, "
+                "critical. Default 3.",
+                min_=1,
+                max_=1000,
+            )
+        ],
+    ),
+    (
+        a.RULE_TYPE_DNS_SECONDARY_ZONE_STALE,
+        "DNS secondary zone stale",
+        "DNS",
+        [
+            _count(
+                "Stale after (x SOA refresh)",
+                3,
+                "Fires when no refresh has succeeded within this many times the "
+                "zone's SOA refresh interval. Default 3.",
+                min_=1,
+                max_=1000,
+            ),
+            _days(
+                "Expiring within (days)",
+                1,
+                "Also fires, critical, when the copy expires within this many days "
+                "without a refresh. Default 1.",
+            ),
+        ],
+    ),
+    (
         a.RULE_TYPE_LOG_FORWARD_DROPPING,
         "Log stream forwarding dropping entries",
         "Infrastructure",

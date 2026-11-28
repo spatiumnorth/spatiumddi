@@ -49,6 +49,7 @@ from app.models.dns import (
     DNSKey,
     DNSPool,
     DNSRecord,
+    DNSSecondaryZoneState,
     DNSServer,
     DNSServerGroup,
     DNSServerZoneState,
@@ -1307,6 +1308,10 @@ async def commit_move(
 
     # ── Purge state belonging to the old group ────────────────────────
     await db.execute(sa_delete(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone.id))
+    # #4732 — and the old group's secondaries' refresh / expiry state for it.
+    await db.execute(
+        sa_delete(DNSSecondaryZoneState).where(DNSSecondaryZoneState.zone_id == zone.id)
+    )
     # #2654 — the old group's servers' DDNS ingest reports for this zone.
     await db.execute(sa_delete(DNSIngestSnapshot).where(DNSIngestSnapshot.zone_id == zone.id))
     await sweep_zone_ops(db, zone, old_group_id)

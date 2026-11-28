@@ -558,6 +558,57 @@ function ZonesTab({ serverId }: { serverId: string }) {
           </table>
         </div>
       )}
+      <SecondaryHealth serverId={serverId} />
+    </div>
+  );
+}
+
+// #4732 — what this server's own daemon says about the zones it receives by
+// transfer. Renders nothing until the agent has reported a secondary zone.
+function SecondaryHealth({ serverId }: { serverId: string }) {
+  const { data } = useQuery({
+    queryKey: ["dns-server-secondary-health", serverId],
+    queryFn: () => dnsApi.getServerSecondaryHealth(serverId),
+    refetchInterval: 60_000,
+  });
+  if (!data || data.items.length === 0) return null;
+  const bad = (s: string) => s !== "in_sync" && s !== "lagging";
+  return (
+    <div className="space-y-1">
+      <h3 className="text-xs font-medium text-muted-foreground">
+        Secondary health
+      </h3>
+      <div className="overflow-hidden rounded-md border">
+        <table className="w-full text-sm">
+          <thead className="border-b bg-muted/30 text-xs">
+            <tr>
+              <th className="px-3 py-2 text-left font-medium">Zone</th>
+              <th className="px-3 py-2 text-left font-medium">State</th>
+              <th className="px-3 py-2 text-right font-medium">Serial</th>
+              <th className="px-3 py-2 text-right font-medium">Expires</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.items.map((h) => (
+              <tr key={h.zone_id} className="border-b last:border-0">
+                <td className="px-3 py-1.5 font-medium">{h.zone_name}</td>
+                <td
+                  className={`px-3 py-1.5 text-xs ${bad(h.state) ? "text-red-500" : "text-muted-foreground"}`}
+                  title={h.detail}
+                >
+                  {h.state.replace("_", " ")}
+                </td>
+                <td className="px-3 py-1.5 text-right font-mono text-xs">
+                  {h.serial ?? "—"}
+                </td>
+                <td className="px-3 py-1.5 text-right text-xs text-muted-foreground">
+                  {h.expires_at ? new Date(h.expires_at).toLocaleString() : "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

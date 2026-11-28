@@ -85,6 +85,48 @@ class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class DNSSecondaryZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """What one secondary's own daemon says about one secondary zone (#4732).
+
+    ``DNSServerZoneState`` holds the serial a server serves; this holds the
+    rest of what the receiving side knows: when the zone expires and is next
+    due a refresh, and the SOA timers the secondary is running on. Every
+    time column is NULL until the agent reports it, and NULL means unknown,
+    never "fine" (a zone that has not transferred yet has no ``expires_at``).
+
+    One row per ``(server_id, zone_id)``, replaced by each report. The rows
+    cascade with the server and the zone, so purging either clears them.
+    """
+
+    __tablename__ = "dns_secondary_zone_state"
+    __table_args__ = (
+        UniqueConstraint("server_id", "zone_id", name="uq_dns_secondary_zone_state"),
+        Index("ix_dns_secondary_zone_state_zone", "zone_id"),
+    )
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    serial: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_refresh_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_loaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    soa_refresh: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    soa_retry: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    soa_expire: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class DNSIngestSnapshot(Base):
     """What one agent last reported for one dynamic zone's external records (#2654).
 

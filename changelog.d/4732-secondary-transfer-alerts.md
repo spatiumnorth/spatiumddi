@@ -1,0 +1,3 @@
+### Added
+
+- Per-secondary DNS zone health. A BIND9 agent now reports, for each secondary or stub zone it holds, when the copy expires and is next due a refresh, and the SOA timers it runs on. A new Secondary health list on the server detail Zones tab, two read endpoints and a `find_dns_secondary_health` Copilot tool show whether each secondary is in sync, lagging, stale, failing or expiring, and two alert rules, `dns_secondary_transfer_failed` and `dns_secondary_zone_stale` (off by default), name the failing server and zone. Missed refreshes are estimated from the secondary's own timers, since BIND reports no transfer error. (#4732)

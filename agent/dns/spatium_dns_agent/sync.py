@@ -102,6 +102,10 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # secondary's transfer is the same (#4065): named takes a newer serial, or a
 # first one, with no apply here.
 SERVED_REPORT_SECONDS = 60.0
+# #4732 — how often a secondary's refresh / expiry state is re-read and posted.
+# A full snapshot each time: the expiry moves on every refresh, and the control
+# plane reads a report older than a few of these as a silent agent.
+SECONDARY_REPORT_SECONDS = 120.0
 
 # #2309 — how often the key directory is re-checked between structural
 # applies, so a zone's key files go when its grace period ends.
@@ -286,6 +290,7 @@ class SyncLoop:
         # #2835 — the next periodic served-serial read; the first one waits a
         # full interval, since startup and every apply report on their own.
         self._served_report_at = time.monotonic() + SERVED_REPORT_SECONDS
+        self._secondary_report_at = time.monotonic() + SECONDARY_REPORT_SECONDS
         # #882 — last-known-good revert. ``quarantine`` remembers an etag
         # whose apply failed so we stop re-applying it every poll;
         # ``apply_status`` is what the heartbeat reports upward.
@@ -1836,6 +1841,38 @@ class SyncLoop:
             log.info("zone_state_served_serial_changed", zones=len(entries))
             self._post_zone_state(entries)
 
+    def _report_secondary_state(self) -> None:
+        """Post every secondary / stub zone's refresh and expiry state (#4732)
+        from the driver's own read of its daemon. Best-effort: a failed read
+        or post is retried at the next interval."""
+        self._secondary_report_at = time.monotonic() + SECONDARY_REPORT_SECONDS
+        hook = getattr(self.driver, "periodic_secondary_state", None)
+        if not callable(hook):
+            return
+        try:
+            entries = hook()
+        except Exception as e:  # noqa: BLE001 — reporting is best-effort
+            log.warning("secondary_state_read_failed", error=str(e))
+            return
+        if not entries:
+            return
+        headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        try:
+            with self._client() as c:
+                resp = c.post(
+                    "/api/v1/dns/agents/secondary-state",
+                    headers=headers,
+                    json={"zones": entries},
+                )
+            if resp.status_code != 200:
+                log.warning(
+                    "secondary_state_report_non200",
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+        except httpx.HTTPError as e:
+            log.warning("secondary_state_report_failed", error=str(e))
+
     def _post_zone_state(self, entries: list[dict[str, Any]]) -> bool:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
         try:
@@ -1956,3 +1993,5 @@ class SyncLoop:
                 self._prune_dnssec_keys()
             if time.monotonic() >= self._served_report_at:
                 self._report_served_serials()
+            if time.monotonic() >= self._secondary_report_at:
+                self._report_secondary_state()

@@ -252,6 +252,9 @@ SECTIONS: tuple[Section, ...] = (
             "dns_server_options",
             "dns_server_runtime_state",
             "dns_server_zone_state",
+            # #4732 — a secondary's own refresh / expiry state per zone;
+            # FKs into dns_server + dns_zone, so it restores with them.
+            "dns_secondary_zone_state",
             # #2654 — each agent's last ingest report per dynamic zone; FKs
             # into dns_server + dns_zone, so it restores with them.
             "dns_ingest_snapshot",

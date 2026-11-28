@@ -38,6 +38,7 @@
     "dns_record_op": "queued record operations for agents; transient",
     "dns_server": "the group delete is refused while it holds servers, so it never cascades",
     "dns_server_runtime_state": "per-server runtime status reported by an agent, not operator-entered",
+    "dns_secondary_zone_state": "per-secondary transfer status reported by an agent, not operator-entered",
     "dns_server_zone_state": "per-server zone sync status reported by an agent, not operator-entered",
     "dns_trust_anchor": "validation trust anchors held on the group's views; part of the view's configuration",
     "erl_binding": "the delete is refused while an E911 location binding names the row, so it never cascades",

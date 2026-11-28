@@ -6235,6 +6235,40 @@ export interface DNSZone {
   modified_at: string;
 }
 
+// ── Secondary zone health (#4732) ────────────────────────────────────────────
+
+export type DNSSecondaryHealthState =
+  | "in_sync"
+  | "lagging"
+  | "stale"
+  | "failing"
+  | "expiring"
+  | "expired"
+  | "never_transferred";
+
+export interface DNSSecondaryHealthEntry {
+  server_id: string;
+  server_name: string;
+  zone_id: string;
+  zone_name: string;
+  state: DNSSecondaryHealthState;
+  detail: string;
+  serial: number | null;
+  lag_serials: number | null;
+  last_refresh_at: string | null;
+  next_refresh_at: string | null;
+  expires_at: string | null;
+  expires_in_seconds: number | null;
+  failed_attempts: number;
+  soa_refresh: number | null;
+  reported_at: string;
+}
+
+export interface DNSSecondaryHealthResponse {
+  items: DNSSecondaryHealthEntry[];
+  summary: Record<string, number>;
+}
+
 // ── Zone server-state (per-server serial reporting) ──────────────────────────
 
 export interface ZoneServerStateEntry {
@@ -6811,6 +6845,12 @@ export const dnsApi = {
   getServerZoneState: (serverId: string) =>
     api
       .get<DNSPerServerZoneStateResponse>(`/dns/servers/${serverId}/zone-state`)
+      .then((r) => r.data),
+  getServerSecondaryHealth: (serverId: string) =>
+    api
+      .get<DNSSecondaryHealthResponse>(
+        `/dns/servers/${serverId}/secondary-health`,
+      )
       .then((r) => r.data),
   getServerPendingOps: (serverId: string, limit = 50) =>
     api
