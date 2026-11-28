@@ -60,6 +60,7 @@ ADDRESS_COLUMNS = [
     "fqdn",
     "mac_address",
     "description",
+    "icon",
     "last_seen_at",
 ]
 
@@ -197,6 +198,9 @@ async def _collect(
                     "fqdn": current_fqdn(a.hostname, a.fqdn),
                     "mac_address": str(a.mac_address) if a.mac_address else None,
                     "description": a.description,
+                    # #5022 — the explicit icon only; an automatic one is
+                    # derived on read and would pin on import.
+                    "icon": a.icon,
                     "last_seen_at": _dt(a.last_seen_at),
                     "custom_fields": a.custom_fields or {},
                 }

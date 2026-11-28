@@ -39,6 +39,7 @@ from app.services.dns.blocklist_feed_health import feed_sync_state
 from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.tld_registry import effective_registry
 from app.services.dns.zone_apex import served_apex_for_zones
+from app.services.icons import attach_record_icons, refresh_overrides
 
 _ZONE_NAME_SCOPES = frozenset({"public", "reserved", "undelegated", "reverse"})
 
@@ -271,6 +272,8 @@ async def query_dns_records(
         )
     stmt = stmt.order_by(DNSRecord.fqdn.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
+    await refresh_overrides(db)
+    await attach_record_icons(db, rows)
     return [
         {
             "id": str(r.id),
@@ -283,6 +286,9 @@ async def query_dns_records(
             "priority": r.priority,
             "weight": r.weight,
             "port": r.port,
+            # #5022 — what the UI draws, and the explicit choice behind it.
+            "icon": r.icon,
+            "effective_icon": r.effective_icon,
         }
         for r in rows
     ]

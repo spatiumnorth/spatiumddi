@@ -1006,6 +1006,21 @@ that already exist — made before this check, or by an import or the IPAM sync,
 which do not refuse — keep serving whichever copy is deleted. The wire never
 carries the same RR twice.
 
+### Record icons (#5022)
+
+A record can carry an optional built-in icon (`mdi:<name>`), drawn first in the record list; set
+it in the record create / edit dialog or send `icon` on the record create / update calls (null or
+`""` clears it). It is a display aid only: an icon-only edit changes no DNS data, so it bumps no
+zone serial and queues nothing for the agent or provider, and it is audited with the old and new
+value. Records have no bulk edit, so there is no bulk path.
+
+The record list returns `icon` (explicit), `effective_icon` and `icon_source` (`explicit`,
+`linked_ip` or `none`). With no explicit icon a record shows the effective icon of the IPAM
+address it is linked to, so a printer's A record shows the printer; there is no per-type default,
+the type badge already says it. An address in a trashed subnet does not feed a live record. The
+catalog and the editable default mappings are described under
+[IPAM icons](IPAM.md#icons-5022).
+
 ---
 
 ## 6. Incremental DNS Updates (No Restarts)

@@ -255,6 +255,7 @@ Runs in the **frontend image**. Authoritative list:
 | [axios](https://axios-http.com/) | MIT | HTTP client |
 | [Recharts](https://recharts.org/) | MIT | Charts |
 | [lucide-react](https://lucide.dev/) | ISC | Icons |
+| [Material Design Icons](https://pictogrammers.com/library/mdi/) (`@mdi/js` 7.4.47) | Pictogrammers Free License (icons Apache 2.0, code MIT) | Built-in device icons on IP addresses and DNS records (#5022): one SVG path per icon, rendered inline. Chosen over lucide for its hardware vocabulary (printer, cctv, access point, NAS, …); the full set loads only when the icon picker opens. Pinned exactly, because icon names are stored in the database. Brand-logo icons (deprecated in the set's metadata) are excluded |
 | [react-markdown](https://github.com/remarkjs/react-markdown) + remark-gfm | MIT | Copilot message rendering |
 | [dnd-kit](https://dndkit.com/) | MIT | Drag-and-drop |
 | clsx, tailwind-merge | MIT | Class composition |

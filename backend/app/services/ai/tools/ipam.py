@@ -41,6 +41,7 @@ from app.models.overlay import OverlayNetwork
 from app.models.vrf import VRF
 from app.services.ai.tools.base import register_tool, tool_permission_allows
 from app.services.ai.tools.scope import token_allows_subnet, token_subnet_ids, token_zone_ids
+from app.services.icons import refresh_overrides, resolve_ip_icon
 from app.services.integration_ownership import owning_integration
 from app.services.ipam.host_name import current_fqdn, fqdn_matches
 from app.services.ipam.live_address import live_subnet_clause
@@ -651,6 +652,14 @@ async def find_stale_ips(db: AsyncSession, user: User, args: FindStaleIPsArgs) -
 # ── find_ip ───────────────────────────────────────────────────────────
 
 
+def _effective_icon(ip: IPAddress) -> str | None:
+    """What the UI draws for this address (#5022): explicit, else the device
+    class / IP role default. The tools refresh the operator overrides first."""
+    return resolve_ip_icon(
+        icon=ip.icon, device_class=ip.device_class, device_type=ip.device_type, role=ip.role
+    ).icon
+
+
 class FindIPArgs(BaseModel):
     address: str = Field(
         description=(
@@ -693,6 +702,7 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
     ]
     if not rows:
         return {"matches": []}
+    await refresh_overrides(db)
     # OUI vendor enrichment — bulk_lookup_vendors short-circuits to {}
     # when the lookup feature is disabled, so this is a no-op cost on
     # deployments that haven't seeded the OUI table.
@@ -725,6 +735,8 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
                 "last_seen_at": ip.last_seen_at.isoformat() if ip.last_seen_at else None,
                 "last_seen_method": ip.last_seen_method,
                 "tags": ip.tags or {},
+                "icon": ip.icon,
+                "effective_icon": _effective_icon(ip),
             }
         )
     return {"matches": out}
@@ -830,6 +842,7 @@ async def find_ip_addresses(
     stmt = stmt.order_by(IPAddress.address).limit(args.limit)
 
     rows = (await db.execute(stmt)).all()
+    await refresh_overrides(db)
     ip_objs = [r[0] for r in rows]
     vendors = await bulk_lookup_vendors(
         db, [str(ip.mac_address) if ip.mac_address else None for ip in ip_objs]
@@ -855,6 +868,8 @@ async def find_ip_addresses(
                 "subnet_name": sub_name or None,
                 "space_name": sp_name or None,
                 "tags": ip.tags or {},
+                "icon": ip.icon,
+                "effective_icon": _effective_icon(ip),
             }
         )
     return {"matches": matches, "returned": len(matches), "capped": len(matches) >= args.limit}

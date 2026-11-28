@@ -117,6 +117,8 @@ SECTIONS: tuple[Section, ...] = (
             "custom_field_definition",
             "feature_module",
             "ipam_template",
+            # #5022 — operator overrides of the shipped default icons.
+            "icon_default",
             "alert_rule",
             "alert_event",
             "conformity_policy",

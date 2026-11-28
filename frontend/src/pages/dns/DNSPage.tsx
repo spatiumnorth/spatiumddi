@@ -104,6 +104,9 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { DeleteChoiceModal } from "@/components/ui/delete-choice-modal";
 import { Field } from "@/pages/dhcp/_shared";
+import { IconCell } from "@/components/icons/IconCell";
+import { IconField } from "@/components/icons/IconField";
+import { SHOW_ICONS_KEY, useLocalBoolPref } from "@/lib/useLocalPref";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { HeaderMenu } from "@/components/ui/header-menu";
@@ -3788,6 +3791,8 @@ function RecordModalForm({
   const [weight, setWeight] = useState(String(record?.weight ?? ""));
   const [port, setPort] = useState(String(record?.port ?? ""));
   const [viewId, setViewId] = useState<string>(record?.view_id ?? "");
+  // #5022 - the explicit icon; null = automatic (the linked IP's icon, if any).
+  const [icon, setIcon] = useState<string | null>(record?.icon ?? null);
   const [error, setError] = useState("");
   // #3637 — a LUA snippet runs inside pdns_server, so writing one is
   // superadmin-only on the server (create and change of its value).
@@ -3859,6 +3864,7 @@ function RecordModalForm({
       weight: isSrv && weight !== "" ? parseInt(weight, 10) : null,
       port: isSrv && port !== "" ? parseInt(port, 10) : null,
       view_id: viewId || null,
+      icon,
     };
     if (!record) {
       mut.mutate(body);
@@ -3876,6 +3882,7 @@ function RecordModalForm({
       weight: record.weight ?? null,
       port: record.port ?? null,
       view_id: record.view_id ?? null,
+      icon: record.icon ?? null,
     };
     const diff = changedFields(was, fields);
     if (Object.keys(diff).length === 0) {
@@ -4154,6 +4161,19 @@ function RecordModalForm({
               while no record is scoped does the zone serve in every view.
             </p>
           )}
+        </Field>
+        <Field
+          label="Icon"
+          hint="Optional. Automatic uses the icon of the IP address this record points at, if any."
+        >
+          <IconField
+            value={icon}
+            onChange={setIcon}
+            auto={{
+              icon: record?.automatic_icon ?? null,
+              source: record?.automatic_icon_source ?? "none",
+            }}
+          />
         </Field>
         {error && <FormError className="text-sm">{error}</FormError>}
         <Btns
@@ -4668,6 +4688,8 @@ export function ZoneDetailView({
   // name / fqdn / value / type on the server; the per-column recFilter below
   // stays a client-side refinement over the current page.
   const [recordSearch, setRecordSearch] = useState("");
+  // #5022 - per-user toggle for the icon column (remembered by the browser).
+  const [showIcons, setShowIcons] = useLocalBoolPref(SHOW_ICONS_KEY, true);
   // The box edits `recordSearch` at once; the query follows 300 ms later (#4077).
   const debouncedRecordSearch = useDebouncedValue(recordSearch);
   const [recordPage, setRecordPage] = useState(1);
@@ -5689,6 +5711,15 @@ export function ZoneDetailView({
                   " · searching…"}
               </span>
             )}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={showIcons}
+              onClick={() => setShowIcons(!showIcons)}
+              className="whitespace-nowrap rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-foreground aria-checked:bg-accent aria-checked:text-foreground"
+            >
+              Show icons
+            </button>
             <div className="ml-auto">
               <Pager
                 page={recordPage}
@@ -5762,6 +5793,11 @@ export function ZoneDetailView({
                         );
                       })()}
                     </th>
+                    {showIcons && (
+                      <th className="w-6 py-2">
+                        <span className="sr-only">Icon</span>
+                      </th>
+                    )}
                     {(["Name", "Type", "Value", "TTL", "Pri"] as const).map(
                       (col) => {
                         const filterKey =
@@ -5817,6 +5853,7 @@ export function ZoneDetailView({
                   {showRecFilters && (
                     <tr className="border-b bg-muted/10 text-xs">
                       <td />
+                      {showIcons && <td />}
                       <td className="px-2 py-1 pl-5">
                         <input
                           type="text"
@@ -5885,6 +5922,7 @@ export function ZoneDetailView({
                         viewName={a.view}
                         zoneName={zone.name}
                         onEditZone={() => setShowEditZone(true)}
+                        iconCol={showIcons}
                         editDisabledReason={
                           zone.tailscale_tenant_id
                             ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
@@ -5923,6 +5961,14 @@ export function ZoneDetailView({
                                 />
                               )}
                           </td>
+                          {showIcons && (
+                            <td className="w-6 py-1.5">
+                              <IconCell
+                                icon={r.effective_icon}
+                                source={r.icon_source}
+                              />
+                            </td>
+                          )}
                           <td className="py-1.5 pl-5 font-mono text-xs font-medium">
                             {r.auto_generated ||
                             isPoolManagedRecord(r) ||
@@ -6616,6 +6662,7 @@ function ServedApexRows({
   zoneName,
   onEditZone,
   editDisabledReason,
+  iconCol = false,
 }: {
   apex: Pick<
     ServedApex,
@@ -6631,6 +6678,8 @@ function ServedApexRows({
   zoneName: string;
   onEditZone: () => void;
   editDisabledReason: string | undefined;
+  /** The record list shows its icon column (#5022): keep the apex rows aligned. */
+  iconCol?: boolean;
 }) {
   const editButton = (
     <button
@@ -6692,6 +6741,7 @@ function ServedApexRows({
         aria-label="SOA served from zone settings"
       >
         <td className="w-8 py-1.5 pl-3" />
+        {iconCol && <td className="w-6" />}
         {nameCell}
         <td className="py-1.5">
           <span className="inline-flex items-center gap-1.5">
@@ -6716,7 +6766,8 @@ function ServedApexRows({
           data-testid="served-apex-declared-warning"
         >
           <td className="w-8 py-1.5 pl-3" />
-          <td colSpan={6} className="py-1.5 pr-3">
+          {iconCol && <td className="w-6" />}
+          <td colSpan={iconCol ? 7 : 6} className="py-1.5 pr-3">
             {declaredWarning.map((w) => (
               <div
                 key={w}
@@ -6739,6 +6790,7 @@ function ServedApexRows({
             aria-label="NS served from zone settings"
           >
             <td className="w-8 py-1.5 pl-3" />
+            {iconCol && <td className="w-6" />}
             {nameCell}
             <td className="py-1.5">
               <span className="inline-flex items-center gap-1.5">

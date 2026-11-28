@@ -43,6 +43,7 @@ from app.models.ipam import (
     IPSpace,
     Subnet,
 )
+from app.services.icons import validate_icon
 from app.services.ipam.address_create_rules import boundary_address_refusal
 from app.services.ipam.resize import _total_ips
 from app.services.ipam.subnet_placeholders import (
@@ -900,6 +901,14 @@ def _row_address_fields(
     if (d := row.get("description")) is not None:
         d = str(d).strip()
         fields["description"] = d
+    if (ic := row.get("icon")) is not None:
+        # #5022 — blank leaves the row's icon alone; a name outside the
+        # built-in catalog skips the row with a reason, like a bad hostname.
+        if isinstance(ic, str) and ic.strip():
+            try:
+                fields["icon"] = validate_icon(ic)
+            except ValueError as exc:
+                return None, {}, str(exc)
     if (t := row.get("tags")) is not None:
         if isinstance(t, dict):
             fields["tags"] = t
@@ -1273,6 +1282,7 @@ async def commit_address_import(
                         str(existing_ip.mac_address) if existing_ip.mac_address else None
                     ),
                     "description": existing_ip.description,
+                    "icon": existing_ip.icon,
                 }
                 had_hostname = bool(existing_ip.hostname)
                 for k, v in fields.items():
@@ -1357,6 +1367,7 @@ async def commit_address_import(
             hostname=fields.get("hostname"),
             mac_address=fields.get("mac_address"),
             description=fields.get("description") or "",
+            icon=fields.get("icon"),
             tags=fields.get("tags") or {},
             custom_fields=fields.get("custom_fields") or {},
         )

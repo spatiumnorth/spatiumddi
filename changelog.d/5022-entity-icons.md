@@ -1,0 +1,3 @@
+### Added
+
+- IP addresses and DNS records can carry an optional built-in icon (Material Design Icons), picked in the edit forms and in bulk edit, drawn first in the address table, the DNS record list and the IP detail header, with a per-user column toggle. With no explicit icon the server resolves one from the device class or IP role (addresses) or from the linked address (records); the shipped mapping is editable in Settings -> Icons. The API takes `icon` on the existing create, update and bulk-edit calls, returns `effective_icon` and `icon_source`, serves the names at `GET /api/v1/icons/catalog` and the mappings at `/api/v1/icons/defaults`, and the explicit icon round-trips through IPAM export and import. Copilot gains `find_icons` and `propose_set_icon`. (#5022)

@@ -70,6 +70,7 @@ _KNOWN_ADDRESS_COLUMNS = {
     "status",
     "tags",
     "subnet",
+    "icon",
 }
 
 

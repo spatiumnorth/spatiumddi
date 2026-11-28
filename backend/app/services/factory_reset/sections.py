@@ -129,6 +129,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "asn",
             "ipam_template",
             "custom_field_definition",
+            "icon_default",
             "ip_mac_history",
         ),
         cascade_dependents=(

@@ -178,6 +178,35 @@ IPAddress
 
 Returns the allocated IPAddress. Allocation is atomic (uses DB-level `SELECT ... FOR UPDATE` on the subnet row to prevent race conditions). The picker skips network/broadcast placeholders and any IP inside a dynamic DHCP pool.
 
+### Icons (#5022)
+
+An IP address can carry an optional built-in icon, drawn first in the address table, in the
+detail modal header and in the edit forms. It is a display aid only: an icon never carries meaning
+alone (the hostname, role and device class stay), it adds no DNS record, and choosing one does not
+stamp `user_modified_at`, so integration reconcilers still own the row's other fields.
+
+The API returns three fields on every address: `icon` (your explicit choice, `mdi:<name>` or
+null), `effective_icon` (what to draw) and `icon_source` (`explicit`, `device_class`, `ip_role`
+or `none`). With no explicit icon the server resolves, first match wins: the device-class default
+(the class, then the device type, matched case-insensitively), then the IP-role default (gateway,
+bmc, lb, ...). An ordinary host with an unknown class gets no icon rather than a placeholder.
+
+* Set it in the address create / edit forms, or for many rows in bulk edit (**Automatic** clears
+  it). Through the API, send `icon` on create, `PUT /ipam/addresses/{id}`, the next-IP allocator
+  or `POST /ipam/addresses/bulk-edit` (`""` or null clears on create and update; bulk edit
+  clears on `""` only, as for `role`, because null there means "leave this field alone"). Setting one needs the write
+  permission the row already takes.
+* `GET /api/v1/icons/catalog?q=&page=&page_size=` lists the names the API accepts (about 7,000
+  from the Material Design Icons community set, brand logos excluded); an unknown name is a 422.
+* The shipped device-class and IP-role defaults are editable in
+  **Settings -> Icons** (`GET|PUT|DELETE /api/v1/icons/defaults`). A row is stored only for an
+  entry you changed, so a later change to a shipped mapping still reaches entries you never
+  touched. Changing a mapping needs the `icon` permission (superadmin by default).
+* The explicit icon is in the IPAM CSV / JSON / XLSX export and import (`icon` column); an
+  unknown name skips that row with the reason. A column toggle hides the icon column per user.
+* Copilot: `find_icons` searches the catalog, `propose_set_icon` stages a change (you click
+  Apply), and `find_ip` / `find_ip_addresses` return `effective_icon`.
+
 ### Wake-on-LAN (#533)
 
 `POST /api/v1/ipam/addresses/{id}/wake`

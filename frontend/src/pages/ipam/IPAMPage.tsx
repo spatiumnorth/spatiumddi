@@ -13,6 +13,9 @@ import { FormError } from "@/components/ui/form-error";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
 import { Field } from "@/pages/dhcp/_shared";
+import { IconCell } from "@/components/icons/IconCell";
+import { IconField } from "@/components/icons/IconField";
+import { SHOW_ICONS_KEY, useLocalBoolPref } from "@/lib/useLocalPref";
 import {
   useQuery,
   useQueries,
@@ -3783,6 +3786,8 @@ export function AddAddressModal({
   const [description, setDescription] = useState("");
   const [ipStatus, setIpStatus] = useState("allocated");
   const [role, setRole] = useState<string>("");
+  // #5022 - optional built-in icon; null = automatic.
+  const [icon, setIcon] = useState<string | null>(null);
   const [reservedUntil, setReservedUntil] = useState<string>("");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [tagRows, setTagRows] = useState<TagRow[]>([]);
@@ -4017,6 +4022,7 @@ export function AddAddressModal({
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
               role: roleParam as IPRole | undefined,
               reserved_until: reservedIso,
+              icon: icon ?? undefined,
               force,
             })
           : await ipamApi.createAddress({
@@ -4033,6 +4039,7 @@ export function AddAddressModal({
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
               role: roleParam as IPRole | undefined,
               reserved_until: reservedIso,
+              icon: icon ?? undefined,
               force,
             });
       // #1628 — the backend now creates the DHCP reservation server-side
@@ -4408,6 +4415,9 @@ export function AddAddressModal({
                 for this IP.
               </p>
             ) : null}
+          </Field>
+          <Field label="Icon">
+            <IconField value={icon} onChange={setIcon} />
           </Field>
           {ipStatus === "reserved" ? (
             <Field label="Reserved until">
@@ -5590,6 +5600,8 @@ export function SubnetDetail({
   // "Hide free ranges" (#2137): a per-subnet session override of the subnet's
   // own setting / default rule. Keyed by subnet id so flipping it on one
   // subnet does not leak to the next; absent = follow the setting.
+  // #5022 - per-user toggle for the icon column (remembered by the browser).
+  const [showIcons, setShowIcons] = useLocalBoolPref(SHOW_ICONS_KEY, true);
   const [freeRangeOverride, setFreeRangeOverride] = useSessionState<
     Record<string, boolean>
   >("ipam-hide-free-ranges", {});
@@ -6758,6 +6770,15 @@ export function SubnetDetail({
                   />
                   Hide free ranges
                 </label>
+                <label className="flex flex-shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground hover:text-foreground">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5"
+                    checked={showIcons}
+                    onChange={(e) => setShowIcons(e.target.checked)}
+                  />
+                  Show icons
+                </label>
               </div>
               {inlineEditError && (
                 <div
@@ -6891,6 +6912,11 @@ export function SubnetDetail({
                           );
                         })()}
                       </th>
+                      {showIcons && (
+                        <th className="w-8 px-2 py-2">
+                          <span className="sr-only">Icon</span>
+                        </th>
+                      )}
                       {addressColumns(dhcpOn, dnsOn).map((col) => {
                         const label =
                           col === "mac"
@@ -6988,6 +7014,7 @@ export function SubnetDetail({
                     {showFilters && (
                       <tr className="border-b bg-muted/10 text-xs">
                         <td />
+                        {showIcons && <td />}
                         {addressColumns(dhcpOn, dnsOn).map((col) => (
                           <td key={col} className="px-2 py-1">
                             {col === "status" ? (
@@ -7280,6 +7307,14 @@ export function SubnetDetail({
                                   />
                                 )}
                               </td>
+                              {showIcons && (
+                                <td className="w-8 px-2 py-2 text-muted-foreground">
+                                  <IconCell
+                                    icon={addr.effective_icon}
+                                    source={addr.icon_source}
+                                  />
+                                </td>
+                              )}
                               <td className="px-4 py-2 font-mono font-medium">
                                 <span className="inline-flex items-center gap-0.5">
                                   {/* The keyboard path to the row's detail
@@ -9987,6 +10022,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const [macAddress, setMacAddress] = useState(address.mac_address ?? "");
   const [status, setStatus] = useState(address.status);
   const [role, setRole] = useState<string>(address.role ?? "");
+  // #5022 - the explicit icon; null = automatic (the row's effective icon is
+  // shown as the picker's first choice).
+  const [icon, setIcon] = useState<string | null>(address.icon ?? null);
   // datetime-local needs ``YYYY-MM-DDTHH:MM`` in *local* wall-clock (#500).
   const [reservedUntil, setReservedUntil] = useState<string>(
     address.reserved_until ? toLocalInputValue(address.reserved_until) : "",
@@ -10212,6 +10250,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
         tags: tagRowsToRecord(tagRows),
         role: (role || null) as IPRole | null,
         reserved_until: reservedIso,
+        icon,
       };
       // Send only what changed (#3091): the row was read fresh on open, but
       // another surface can still change it while the dialog is open, and a
@@ -10227,6 +10266,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
           custom_fields: address.custom_fields ?? {},
           tags: address.tags ?? {},
           role: address.role ?? null,
+          icon: address.icon ?? null,
           // Through the form's own round trip: the picker holds minutes, so a
           // stored instant with seconds would otherwise read as a change on
           // every Save, and a stray TTL on a row that is not reserved is what
@@ -10565,6 +10605,16 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
                 Shared-by-design role — MAC collision warnings are suppressed.
               </p>
             ) : null}
+          </Field>
+          <Field label="Icon">
+            <IconField
+              value={icon}
+              onChange={setIcon}
+              auto={{
+                icon: address.automatic_icon ?? null,
+                source: address.automatic_icon_source ?? "none",
+              }}
+            />
           </Field>
           {status === "reserved" ? (
             <Field label="Reserved until">
@@ -11645,6 +11695,9 @@ export function BulkEditAddressesModal({
   const [role, setRole] = useState<string>("");
   const [editReservedUntil, setEditReservedUntil] = useState(false);
   const [reservedUntil, setReservedUntil] = useState<string>("");
+  // #5022 - opt-in like the other fields; "Automatic" (null) clears.
+  const [editIcon, setEditIcon] = useState(false);
+  const [icon, setIcon] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const { data: cfDefs = [] } = useQuery({
@@ -11748,7 +11801,9 @@ export function BulkEditAddressesModal({
         dns_zone_id?: string;
         role?: IPRole | "" | null;
         reserved_until?: string | null;
+        icon?: string;
       } = {};
+      if (editIcon) changes.icon = icon ?? "";
       if (editStatus) changes.status = status;
       if (editDescription) changes.description = description;
       if (editRole) {
@@ -11837,6 +11892,7 @@ export function BulkEditAddressesModal({
     hasCfChanges ||
     dnsZoneEditing ||
     editRole ||
+    editIcon ||
     editReservedUntil;
 
   return (
@@ -11926,6 +11982,26 @@ export function BulkEditAddressesModal({
                 </option>
               ))}
             </select>
+          )}
+        </div>
+
+        <div className="rounded-md border p-3 space-y-2">
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={editIcon}
+              onChange={(e) => setEditIcon(e.target.checked)}
+            />
+            Icon
+          </label>
+          {editIcon && (
+            <>
+              <IconField value={icon} onChange={setIcon} />
+              <p className="text-[11px] text-muted-foreground">
+                Choose Automatic to clear the icon on every selected IP; the
+                device class or role default then applies.
+              </p>
+            </>
           )}
         </div>
 

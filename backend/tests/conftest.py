@@ -208,6 +208,11 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     # next test's after-commit publish and forward from running.
     from app.services import audit_forward, event_publisher, log_stream_forward
 
+    # #5022 — the operator icon overrides are held in process memory; the
+    # per-test TRUNCATE would leave a test's mapping behind for the next one.
+    from app.services import icons as icon_svc
+
+    icon_svc.reset_overrides()
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
     # #4545 — the log-stream forwarder keeps its target list, queues and
@@ -221,6 +226,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     shutdown.reset()
     yield
     shutdown.reset()
+    icon_svc.reset_overrides()
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
     log_stream_forward.reset()

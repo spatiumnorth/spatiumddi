@@ -34,6 +34,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     dnsbl,
     e911,
     firewall,
+    icons,
     imports,
     integrations,
     ipam,

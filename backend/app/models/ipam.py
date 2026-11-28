@@ -1235,6 +1235,11 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     device_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     device_class: Mapped[str | None] = mapped_column(String(50), nullable=True)
     device_manufacturer: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # #5022 — the operator's explicit icon (``mdi:<name>``). NULL = automatic:
+    # the effective icon resolves from the device class / role at read time.
+    # Never touches ``user_modified_at``: choosing an icon must not lock the
+    # row's soft fields against integration reconcilers.
+    icon: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     # Stamped by the API write path when an operator edits the row's
     # soft fields (hostname / description / status / mac_address).
