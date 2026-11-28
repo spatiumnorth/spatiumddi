@@ -254,6 +254,28 @@ async def plan_reverse_zones(
     return existing, missing
 
 
+async def lock_reverse_zones_for_cidr(db: AsyncSession, subnet: Subnet, names: list[str]) -> None:
+    """Row-lock the live reverse zones of ``names`` that the subnet's DNS group
+    already holds, in id order, without writing anything (#4995).
+
+    A caller that is about to write ``audit_log`` rows and then run
+    :func:`ensure_reverse_zones_for_subnet` (a resize: the new CIDR may keep one
+    zone and create the next) calls this FIRST. Locking a zone after the audit
+    row's flush takes the audit-chain lock breaks the order ``lock_order``
+    documents (#3503), so a concurrent record create holding the zone could
+    deadlock with it. Same opt-out and group resolution as the ensure; no-op
+    when the subnet has no group or opted out.
+    """
+    if getattr(subnet, "skip_reverse_zone", False):
+        return
+    group = await _resolve_reverse_group(db, subnet)
+    if group is None:
+        return
+    view_id = await _forward_view_id(db, subnet, None, group.id)
+    found = await _live_reverse_zones(db, group, names, view_id)
+    await lock_zone_rows(db, [z.id for z in found])
+
+
 async def ensure_reverse_zones_for_subnet(
     db: AsyncSession,
     subnet: Subnet,

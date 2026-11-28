@@ -1253,6 +1253,20 @@ async def commit_subnet_resize(
         found = await find_untouched_gateway_row(db, subnet)
         untouched_old_gateway_id = found.id if found is not None else None
 
+    # Lock the reverse zones the new CIDR keeps before anything below writes an
+    # audit row: the ensure in step 5 would otherwise lock a zone it finds only
+    # after that row's flush took the audit-chain lock (#4995, order of #3503).
+    # An address row comes before a zone row (#3691): the gateway move below
+    # locks the old gateway row, so that one is taken first.
+    from app.services.dns.reverse_zone import compute_reverse_zone_names as _rev_names
+    from app.services.dns.reverse_zone import lock_reverse_zones_for_cidr
+
+    if untouched_old_gateway_id is not None:
+        await db.execute(
+            select(IPAddress.id).where(IPAddress.id == untouched_old_gateway_id).with_for_update()
+        )
+    await lock_reverse_zones_for_cidr(db, subnet, _rev_names(canonical_new))
+
     # 1. Delete default-named placeholder rows at the old boundaries.
     # ``_load_boundary_placeholders`` routes any row with ``dns_record_id
     # IS NOT NULL`` into ``renamed`` (preserved), so ``default_named`` is
