@@ -227,3 +227,17 @@ describe("opened from Account (#2441)", () => {
     expect(screen.queryByRole("link", { name: /cancel/i })).toBeNull();
   });
 });
+
+describe("a refused change is announced (#4970)", () => {
+  it("draws the server's refusal in a role=alert region", async () => {
+    changePassword.mockRejectedValue({
+      isAxiosError: true,
+      response: { data: { detail: "Password was used recently" } },
+    });
+    const { submit, type } = setup();
+    fill(type, "old", "Abcdefghij12");
+    fireEvent.click(submit);
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Password was used recently");
+  });
+});

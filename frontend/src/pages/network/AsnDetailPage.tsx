@@ -364,12 +364,12 @@ export function AsnDetailPage() {
         </div>
 
         {refreshMut.isError && (
-          <div className="mt-2 text-xs text-destructive">
+          <div role="alert" className="mt-2 text-xs text-destructive">
             {errMsg(refreshMut.error, "WHOIS refresh failed")}
           </div>
         )}
         {refreshRpkiMut.isError && (
-          <div className="mt-2 text-xs text-destructive">
+          <div role="alert" className="mt-2 text-xs text-destructive">
             {errMsg(refreshRpkiMut.error, "RPKI refresh failed")}
           </div>
         )}

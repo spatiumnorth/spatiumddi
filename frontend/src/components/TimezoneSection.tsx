@@ -156,7 +156,10 @@ export function TimezoneSection({
         </p>
       )}
       {save.error && !savedNote && (
-        <p className="mt-2 text-xs text-rose-700 dark:text-rose-300">
+        <p
+          role="alert"
+          className="mt-2 text-xs text-rose-700 dark:text-rose-300"
+        >
           {formatApiError(save.error)}
         </p>
       )}

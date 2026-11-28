@@ -207,10 +207,12 @@ export function QueryTab({ collectors }: { collectors: BGPLGCollector[] }) {
       </div>
 
       {submitted?.kind === "error" && (
-        <p className="text-sm text-destructive">{submitted.message}</p>
+        <p role="alert" className="text-sm text-destructive">
+          {submitted.message}
+        </p>
       )}
       {queryQ.error && (
-        <p className="text-sm text-destructive">
+        <p role="alert" className="text-sm text-destructive">
           {errMsg(queryQ.error, "Query failed.")}
         </p>
       )}

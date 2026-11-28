@@ -38,7 +38,11 @@ function PodLogViewer({ name }: { name: string }) {
   return (
     <div className="space-y-1">
       <div className="text-xs font-medium">Logs: {name}</div>
-      {error && <div className="text-xs text-red-600">{error}</div>}
+      {error && (
+        <div role="alert" className="text-xs text-red-600">
+          {error}
+        </div>
+      )}
       <pre
         ref={boxRef}
         data-testid="pod-log-viewer"

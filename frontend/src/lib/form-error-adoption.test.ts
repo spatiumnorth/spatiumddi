@@ -125,39 +125,6 @@ const STANDING_STATE: Record<string, { names: string[]; why: string }> = {
   },
 };
 
-// Refusal boxes in files that hold no dialog, found once the scan stopped
-// skipping them (#4965). Each is the same defect as the ones fixed, not yet
-// converted: an entry goes when its box gets a role, and the last test below
-// fails on a stale one. A NEW box in these files, or any other, fails the scan.
-const NOT_YET_ANNOUNCED: Record<string, string[]> = {
-  "components/AptSection.tsx": ["saveErr"],
-  "components/KubePodsPanel.tsx": ["error"],
-  "components/LLDPSection.tsx": ["saveErr"],
-  "components/NTPSection.tsx": ["saveErr"],
-  "components/ResolverSection.tsx": ["overrideNeedsServers", "saveErr"],
-  "components/SNMPSection.tsx": ["revealMutation.isError", "saveErr"],
-  "components/SyslogSection.tsx": ["saveErr"],
-  "components/TimezoneSection.tsx": ["save.error && !savedNote"],
-  "pages/ChangePasswordPage.tsx": ["error"],
-  "pages/DashboardPage.tsx": ["pdfError", "e.error_detail"],
-  "pages/ReportsPage.tsx": ["!withheld && !isLoading && isError"],
-  "pages/admin/AuditPage.tsx": ["exportPdfMut.isError"],
-  "pages/admin/DiagnosticsErrorsPage.tsx": ["listQ.isError", "detailQ.isError"],
-  "pages/appliance/LogsTab.tsx": ["run.isError"],
-  "pages/appliance/SetupWizardPage.tsx": ["finish.isError"],
-  "pages/dns/DriftView.tsx": ["failed.length > 0", "error"],
-  "pages/network/AsnDetailPage.tsx": [
-    "refreshMut.isError",
-    "refreshRpkiMut.isError",
-  ],
-  "pages/network/MulticastReachabilityTab.tsx": ["error"],
-  "pages/network/looking-glass/QueryTab.tsx": [
-    'submitted?.kind === "error"',
-    "queryQ.error",
-  ],
-  "pages/nmap/NmapScanForm.tsx": ["error"],
-};
-
 const found = new Map<string, string[]>();
 const exempted = new Map<string, string[]>();
 for (const f of files(SRC)) {
@@ -168,10 +135,7 @@ for (const f of files(SRC)) {
     ...plainErrorComponents(text),
     ...plainTintedBoxes(text, rel),
   ];
-  const skip = [
-    ...(STANDING_STATE[rel]?.names ?? []),
-    ...(NOT_YET_ANNOUNCED[rel] ?? []),
-  ];
+  const skip = STANDING_STATE[rel]?.names ?? [];
   const hits = all.filter((h) => !skip.includes(h));
   if (hits.length) found.set(rel, hits);
   const ex = all.filter((h) => skip.includes(h));
@@ -239,15 +203,6 @@ describe("dialog refusals are announced (#3821)", () => {
 
   it("every standing-state exemption still matches a box", () => {
     for (const [file, { names }] of Object.entries(STANDING_STATE)) {
-      const mine = exempted.get(file) ?? [];
-      expect(mine.filter((n) => names.includes(n)).sort(), file).toEqual(
-        names.slice().sort(),
-      );
-    }
-  });
-
-  it("every not-yet-announced entry still matches a box", () => {
-    for (const [file, names] of Object.entries(NOT_YET_ANNOUNCED)) {
       const mine = exempted.get(file) ?? [];
       expect(mine.filter((n) => names.includes(n)).sort(), file).toEqual(
         names.slice().sort(),

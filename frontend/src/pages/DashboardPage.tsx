@@ -4912,7 +4912,10 @@ export function ConformityPanel() {
             </Link>
           </div>
           {pdfError && (
-            <p className="text-[11px] text-red-600 dark:text-red-400">
+            <p
+              role="alert"
+              className="text-[11px] text-red-600 dark:text-red-400"
+            >
               {pdfError}
             </p>
           )}
@@ -5574,7 +5577,10 @@ function IntegrationsDashboardTabPanel() {
               </span>
             </div>
             {e.error_detail && (
-              <p className="mt-0.5 truncate font-mono text-[10px] text-red-600 dark:text-red-400">
+              <p
+                role="alert"
+                className="mt-0.5 truncate font-mono text-[10px] text-red-600 dark:text-red-400"
+              >
                 {e.error_detail}
               </p>
             )}

@@ -238,7 +238,10 @@ export function AuditPage() {
         </div>
 
         {exportPdfMut.isError && (
-          <div className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-400">
+          <div
+            role="alert"
+            className="rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-400"
+          >
             PDF export failed:{" "}
             {(exportPdfMut.error as Error)?.message ?? "unknown error"}
           </div>
