@@ -362,8 +362,8 @@ def test_version_label_in_verbose_title() -> None:
 def test_version_label_in_rescue_title() -> None:
     """The recovery entry title carries each slot's version."""
     out = _render(ver_a="2026.06.11-1", ver_b="2026.06.12-1")
-    assert "SpatiumDDI Appliance 2026.06.11-1 (slot A, recovery)" in out
-    assert "SpatiumDDI Appliance 2026.06.12-1 (slot B, recovery)" in out
+    assert "SpatiumDDI Appliance 2026.06.11-1 (slot A, recovery login)" in out
+    assert "SpatiumDDI Appliance 2026.06.12-1 (slot B, recovery login)" in out
 
 
 def test_bare_title_when_no_version() -> None:

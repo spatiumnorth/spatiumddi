@@ -1790,6 +1790,16 @@ By default the appliance boots quietly (`loglevel=3` — only kernel errors reac
 - **`text_console` gets a real login.** `getty@tty1` is gated on `spatium-console=off` (the mirror of the dashboard's gate) and enabled into `getty.target.wants`, so the dashboard and getty are mutually exclusive by their opposite conditions and `text_console` lands a standard agetty login. (A unit-load-time `Conflicts=getty` leak that left `text_console` with *no* login was fixed in #393 / #394 — see CHANGELOG.)
 - **Anti-brick.** Only changes log verbosity + which process owns the TTY — never the slot / root UUID / kernel. A missing or corrupt grubenv makes the menuentry's conditional fail closed to `loglevel=3` + the dashboard. The always-present GRUB verbose-boot menuentry remains the zero-config one-shot fallback (drops the loglevel cap for a single boot, selectable from the boot menu with no reinstall).
 
+### GRUB recovery entry (#5027)
+
+The boot menu's **recovery** entry (`--id=rescue`, `grub-reboot rescue` for a one-shot) boots the active slot into `rescue.target`: no k3s, no appliance services, no dashboard. Root is locked on a default install, so systemd's stock `sulogin` shell could not open. `rescue.service` is overridden by a drop-in (`rescue.service.d/spatium-recovery-login.conf`) that runs `spatium-recovery-login`:
+
+- It asks `recovery login:` on **every enabled console** (`tty0` and `ttyS0`; the entry passes both) and authenticates through PAM via `login`. Log in as the admin account the installer created (it may not be called `admin`); `sudo -i` works from its shell.
+- Only **root** and members of the **`sudo`** group are accepted. A wrong password, or an account outside `sudo`, is refused. A root password set at install works at the same prompt; with root locked it simply fails the password check.
+- Leaving the shell (`exit`, Ctrl-D) continues to the default target, as `rescue.target` did before. The first console to finish wins and the other prompt is closed.
+- It is a `rescue.service` drop-in only: normal boots, the console dashboard and the tty1 / ttyS0 getty gates are unchanged. `emergency.service` (a failed root filesystem, not reachable from the menu) still uses `sulogin`.
+
+
 ### Fleet UI updates
 
 - File rename `frontend/src/pages/appliance/ApprovalsTab.tsx` → `FleetTab.tsx` (component + React-Query keys + URL hash all migrated from `approvals` → `fleet`). The original "Approvals" framing predates the full Fleet management surface that now lives in the tab.

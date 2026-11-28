@@ -1,0 +1,95 @@
+#!/bin/bash
+# spatium-recovery-login — the console login behind the GRUB recovery entry (#5027).
+#
+# rescue.target's stock shell is sulogin, which wants root's password; root is
+# locked on a default install (#995 item 12), so it gave no shell. This asks
+# for a username and password on every enabled console instead, and opens
+# that account's shell through login(1) (PAM: password check, sudo works from
+# the shell). Allowed: root and members of the `sudo` group. Whether root can
+# actually log in is PAM's call: a locked root fails the password check.
+#
+# One prompt per console in /proc/consoles (the entry passes console=tty0
+# console=ttyS0, and /dev/console is only the last of them). The first
+# session to end wins: the other prompts are killed and the boot continues
+# to the default target (what systemd-sulogin-shell does after sulogin).
+#
+# Overridable for tests: SPATIUM_RECOVERY_{PROC_CONSOLES,DEV,SUDO_GROUP,DELAY,OUT_SUFFIX}.
+set -u
+
+PROC_CONSOLES=${SPATIUM_RECOVERY_PROC_CONSOLES:-/proc/consoles}
+DEV=${SPATIUM_RECOVERY_DEV:-/dev}
+GROUP=${SPATIUM_RECOVERY_SUDO_GROUP:-sudo}
+DELAY=${SPATIUM_RECOVERY_DELAY:-2}
+OUT_SUFFIX=${SPATIUM_RECOVERY_OUT_SUFFIX:-} # tests: a regular file cannot be read and written as one
+
+# Enabled consoles (flag E), as device names. The virtual console tty0 is
+# "whichever VT is showing"; VT1 is free in rescue.target (no getty there).
+consoles() {
+    local name flags rest out=""
+    if [ -r "$PROC_CONSOLES" ]; then
+        while read -r name flags rest; do
+            case "$flags$rest" in *E*) ;; *) continue ;; esac
+            case "$name" in
+                tty0) name=tty1 ;;
+                *[!A-Za-z0-9]*) continue ;;
+            esac
+            out="$out $name"
+        done <"$PROC_CONSOLES"
+    fi
+    echo "${out:- console}"
+}
+
+# allowed USER: root, or a member of the sudo group.
+allowed() {
+    [ "$1" = root ] && return 0
+    local g
+    for g in $(id -nG -- "$1" 2>/dev/null); do
+        [ "$g" = "$GROUP" ] && return 0
+    done
+    return 1
+}
+
+# prompt_loop DEVICE — runs until a login session on DEVICE has ended.
+prompt_loop() {
+    local dev=$DEV/$1 user
+    exec <"$dev" >>"$dev$OUT_SUFFIX" 2>&1
+    printf '\r\nSpatiumDDI recovery console (rescue mode: the appliance services are not running).\r\n'
+    printf 'Log in as the admin account (or root, if it has a password). Leaving the shell continues the boot.\r\n\r\n'
+    while :; do
+        printf 'recovery login: '
+        IFS= read -r user || { sleep 5; continue; }
+        user=${user%$'\r'}
+        [ -n "$user" ] || continue
+        if ! allowed "$user"; then
+            sleep "$DELAY"
+            printf '\r\nLogin incorrect (not root or a member of the %s group)\r\n\r\n' "$GROUP"
+            continue
+        fi
+        # login(1) exits 0 once a session has ended, 1 on a failed login.
+        if setsid -w -c login -- "$user"; then
+            return 0
+        fi
+        sleep "$DELAY"
+    done
+}
+
+pids=()
+devs=()
+for c in $(consoles); do
+    # A console without a device node must not end the wait for the others.
+    [ -e "$DEV/$c" ] || continue
+    prompt_loop "$c" &
+    pids+=("$!")
+    devs+=("$c")
+done
+
+# Wait for the first loop to finish with a session, then stop the others.
+wait -n
+for i in "${!pids[@]}"; do
+    pkill -P "${pids[$i]}" 2>/dev/null
+    kill "${pids[$i]}" 2>/dev/null
+    pkill -t "${devs[$i]}" 2>/dev/null
+done
+wait
+
+systemctl --no-block default

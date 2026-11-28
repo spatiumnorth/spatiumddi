@@ -310,8 +310,8 @@ def render_text(uuid_a: str, uuid_b: str,
     # decision is therefore emitted as grub syntax (sp_act_*), not made here.
     title_verbose_a = _title(ver_a, "(slot A, verbose boot)")
     title_verbose_b = _title(ver_b, "(slot B, verbose boot)")
-    title_rescue_a = _title(ver_a, "(slot A, recovery)")
-    title_rescue_b = _title(ver_b, "(slot B, recovery)")
+    title_rescue_a = _title(ver_a, "(slot A, recovery login)")
+    title_rescue_b = _title(ver_b, "(slot B, recovery login)")
 
     lines = [
         "# SpatiumDDI A/B boot config (Phase 8c, issue #138).",
@@ -419,11 +419,13 @@ def render_text(uuid_a: str, uuid_b: str,
         "}",
         "",
         'menuentry "${sp_act_title_rescue}" --id=rescue {',
-        "    # Boots the ACTIVE slot (#4961) into rescue.target, no k3s, no getty@tty1.",
-        "    # Root is locked on the appliance, so rescue.target cannot open a shell:",
-        '    # it prints "Cannot open access to console, the root account is locked."',
-        "    # and carries on to the normal target. This is a minimal-services boot",
-        "    # that ends in a regular boot, not a root shell.",
+        "    # Boots the ACTIVE slot (#4961) into rescue.target: no k3s, no appliance",
+        "    # services, no getty@tty1. Root is locked on a default install, so the",
+        "    # stock sulogin shell cannot open (#5027); rescue.service is overridden",
+        "    # (rescue.service.d/spatium-recovery-login.conf) to ask for the admin",
+        "    # account's username + password on tty0 and ttyS0 and open that account's",
+        "    # shell, with sudo. A root password set at install works at the same",
+        "    # prompt. Leaving the shell continues to the default target.",
         "    search --no-floppy --fs-uuid --set=root ${sp_act_uuid}",
         f"    linux /boot/vmlinuz root=UUID=${{sp_act_uuid}} rw{mid} \\",
         "        console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target",
