@@ -2364,7 +2364,7 @@ def maybe_fire_netif_reload(bundle_block: object) -> bool:
     )
 
 
-def maybe_confirm_netif(bundle_block: object) -> bool:
+def maybe_confirm_netif(bundle_block: object, sent_at: float | None = None) -> bool:
     """#4428 — tell the host runner the control plane is still reachable.
 
     Called only after a heartbeat RESPONSE was received and parsed, which
@@ -2373,6 +2373,13 @@ def maybe_confirm_netif(bundle_block: object) -> bool:
     while a revert deadline is armed and the hash the runner settled equals
     the one the control plane is asking for now — a confirm for a config
     the operator has since replaced would keep a change nobody reviewed.
+
+    ``sent_at`` is when the request this response answers was SENT. A
+    heartbeat is a long-poll, held up to the interval, so the one answering
+    right after the runner arms its deadline was normally sent BEFORE the
+    change and travelled the old network (or a connection that survived
+    it): it proves nothing about the new one. Only a request sent after the
+    deadline was armed counts. ``None`` never confirms.
 
     A node that cannot heartbeat never reaches here, so the deadline passes
     and the runner restores the previous profiles. That is the whole
@@ -2383,7 +2390,13 @@ def maybe_confirm_netif(bundle_block: object) -> bool:
     if not isinstance(bundle_block, dict):
         return False
     config_hash = str(bundle_block.get("config_hash") or "")
-    if not config_hash or not _NETIF_DEADLINE_FILE.exists():
+    if not config_hash or sent_at is None:
+        return False
+    try:
+        armed_at = _NETIF_DEADLINE_FILE.stat().st_mtime
+    except OSError:
+        return False
+    if armed_at > sent_at:
         return False
     if _read_release_state_line(_NETIF_HASH_SIDECAR) != config_hash:
         return False

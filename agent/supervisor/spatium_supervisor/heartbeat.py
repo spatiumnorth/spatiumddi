@@ -1560,6 +1560,8 @@ def heartbeat_once(
 
     read_timeout = float(hold_s) + 10.0
     resp = None
+    # #4428 — when this request leaves; a netif confirm must postdate the apply.
+    request_sent_at = time.time()
     # Two attempts at most: the node-local Service, then (when that had no
     # answer) the fallback target, in the same call so a node whose api pod is
     # away loses one connect timeout, not a whole heartbeat interval.
@@ -1906,7 +1908,9 @@ def heartbeat_once(
     # proof the node still reaches the control plane, so it also confirms.
     if appliance_state.maybe_fire_netif_reload(body_out.get("netif_settings")):
         log.info("supervisor.heartbeat.netif_trigger_fired")
-    if appliance_state.maybe_confirm_netif(body_out.get("netif_settings")):
+    if appliance_state.maybe_confirm_netif(
+        body_out.get("netif_settings"), request_sent_at
+    ):
         log.info("supervisor.heartbeat.netif_confirmed")
 
     # #272 Phase 7b — control-plane promote/demote. The host-side runner

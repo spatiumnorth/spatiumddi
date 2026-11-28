@@ -471,7 +471,9 @@ def test_no_confirm_by_the_deadline_restores_the_previous_profiles(host):
     # supervisor does not retry the same outage every backoff window.
     assert (host["state"] / "netif-config-hash").read_text().strip() == "h2"
     assert not (host["state"] / "netif-revert-deadline").exists()
-    assert nm_calls(host)[0] == "nmcli connection reload"
+    # ens20 is released explicitly before its profile is deleted and reloaded.
+    assert nm_calls(host)[0] == "nmcli connection down id spatium-netif-ens20"
+    assert "nmcli connection reload" in nm_calls(host)
     assert any("up id spatium-netif-ens19" in c for c in nm_calls(host))
 
 
@@ -596,3 +598,157 @@ def test_the_console_adopt_tool_does_not_report_our_profiles_as_strays():
         mod.STATIC_KEYFILE = nm / "10-spatium-static.nmconnection"
         mod.DHCP_KEYFILE = nm / "10-spatium-dhcp.nmconnection"
         assert mod._extra_profiles() == ["stray-nmtui.nmconnection"]
+
+
+# ── review hardening (#4428) ─────────────────────────────────────────
+
+
+def _set_addr(host, extra=(), primary_over=None):
+    inv = json.loads(json.dumps(ADDR))
+    if primary_over:
+        for e in inv:
+            if e["ifname"] == "ens18":
+                e.update(primary_over)
+    inv.extend(extra)
+    (host["stub"] / "addr.json").write_text(json.dumps(inv))
+
+
+def test_a_name_with_a_trailing_newline_is_not_a_usable_interface_name(host):
+    """``$`` matches before a trailing newline: the keyfile would be named
+    ``20-spatium-netif-ens19\\n.nmconnection``."""
+    proc = apply(host, [eth("ens19\n")])
+    assert proc.returncode == 1
+    assert status(host)["state"] == "failed"
+    assert not list(host["nm"].glob("20-spatium-netif-*"))
+
+
+def test_what_the_primary_is_stacked_on_is_protected_too(host):
+    """The primary is a VLAN on ens17: rewriting ens17's profile takes it down."""
+    _set_addr(
+        host,
+        extra=[{"ifname": "ens17", "link_type": "ether", "flags": ["UP", "LOWER_UP"],
+                "operstate": "UP", "addr_info": []}],
+        primary_over={"link": "ens17", "linkinfo": {"info_kind": "vlan", "info_data": {"id": 5}}},
+    )
+    proc = apply(host, [eth("ens17")])
+    assert proc.returncode == 1
+    assert "primary interface" in status(host)["error"] or "default route" in status(host)["error"]
+    assert not list(host["nm"].glob("20-spatium-netif-*"))
+
+
+def test_the_interface_k3s_is_pinned_to_is_protected(host):
+    """No default route and no network-status: the k3s drop-in is the signal."""
+    (host["root"] / "etc/spatiumddi/network-status").write_text("MODE=dhcp\n")
+    (host["stub"] / "route4.json").write_text("[]")
+    drop = host["root"] / "etc/rancher/k3s/config.yaml.d"
+    drop.mkdir(parents=True)
+    (drop / "spatium-node-ip.yaml").write_text("node-ip: 192.168.1.10\nflannel-iface: ens18\n")
+    proc = apply(host, [eth("ens18")])
+    assert proc.returncode == 1
+    assert not list(host["nm"].glob("20-spatium-netif-*"))
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        eth(addresses=["192.168.1.77/24"]),  # inside the management subnet
+        eth(routes=[{"destination": "192.168.1.1/32", "gateway": "10.9.0.1"}]),
+        eth(routes=[{"destination": "192.168.1.0/25", "gateway": "10.9.0.1"}]),
+    ],
+)
+def test_the_host_refuses_to_overlap_or_reroute_the_management_network(host, bad):
+    proc = apply(host, [bad])
+    assert proc.returncode == 1
+    assert "already uses" in status(host)["error"] or "path this host" in status(host)["error"]
+    assert not list(host["nm"].glob("20-spatium-netif-*"))
+    assert nm_calls(host) == []
+
+
+def test_moving_a_subnet_between_two_managed_ports_is_not_an_overlap(host):
+    """ens19 holds 10.9.0.2/24 from OUR profile; handing it to ens20 is fine."""
+    apply(host, [eth()], hash_="h1")
+    _set_addr(host, primary_over=None)
+    ADDR_LIVE = [e for e in ADDR]
+    live = json.loads(json.dumps(ADDR_LIVE))
+    for e in live:
+        if e["ifname"] == "ens19":
+            e["addr_info"] = [{"local": "10.9.0.2", "prefixlen": 24, "scope": "global"}]
+    (host["stub"] / "addr.json").write_text(json.dumps(live))
+    proc = apply(host, [eth("ens20", addresses=["10.9.0.2/24"])], hash_="h2")
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_a_snapshot_that_cannot_be_taken_refuses_the_change_visibly(host):
+    """Disk full / unwritable: nothing may be installed without the safety net,
+    and the operator must see why instead of 'pending' for ever."""
+    (host["state"] / "netif-last-good.new").write_text("in the way")
+    proc = apply(host, [eth()])
+    assert proc.returncode == 1
+    st = status(host)
+    assert st["state"] == "failed" and "snapshot" in st["error"]
+    assert not list(host["nm"].glob("20-spatium-netif-*"))
+    assert nm_calls(host) == []
+    assert list(host["state"].glob("netif-config-pending.failed.*"))
+
+
+def test_a_failed_restore_keeps_the_deadline_armed_and_the_profiles_untouched(host):
+    apply(host, [eth()], hash_="h1", revert=600)
+    before = keyfile(host, "ens19").read_text()
+    import shutil
+
+    shutil.rmtree(host["state"] / "netif-last-good")  # snapshot gone
+    (host["state"] / "netif-revert-deadline").write_text(f"{int(time.time()) - 1}\n")
+    proc = run(host, "--tick")
+    assert proc.returncode == 1
+    # A missing snapshot is "cannot restore", never "restore to nothing".
+    assert keyfile(host, "ens19").read_text() == before
+    assert (host["state"] / "netif-revert-deadline").exists()
+    assert status(host)["state"] == "failed"
+
+
+def test_a_clock_that_stepped_back_does_not_leave_the_window_open_for_hours(host):
+    apply(host, [eth()], hash_="h1")
+    (host["state"] / "netif-revert-deadline").write_text(f"{int(time.time()) + 86400}\n")
+    run(host, "--tick")
+    left = int((host["state"] / "netif-revert-deadline").read_text()) - int(time.time())
+    assert 0 < left <= 180
+    assert keyfile(host, "ens19").exists()
+
+
+def test_a_confirm_does_not_keep_a_change_that_took_the_default_route_away(host):
+    """The control plane can be on this very node, so an answering heartbeat is
+    not proof that the node's own path survived."""
+    apply(host, [eth()], hash_="h1")
+    (host["stub"] / "route4.json").write_text("[]")  # the default route is gone
+    (host["state"] / "netif-confirm").write_text("h1\n")
+    run(host, "--tick")
+    assert (host["state"] / "netif-revert-deadline").exists()
+    assert status(host)["state"] == "pending-confirm"
+    # ...and the deadline still undoes it.
+    (host["state"] / "netif-revert-deadline").write_text(f"{int(time.time()) - 1}\n")
+    run(host, "--tick")
+    assert status(host)["state"] == "reverted"
+    assert not keyfile(host, "ens19").exists()
+
+
+def test_removing_an_interface_takes_its_link_down_before_the_profile_goes(host):
+    apply(host, [eth(), eth("ens20", addresses=["10.8.0.2/24"])], hash_="h1")
+    host["calls"].write_text("")
+    apply(host, [eth()], hash_="h2")
+    cmds = nm_calls(host)
+    down = [i for i, c in enumerate(cmds) if "connection down id spatium-netif-ens20" in c]
+    reload_ = [i for i, c in enumerate(cmds) if c == "nmcli connection reload"]
+    assert down and reload_ and down[0] < reload_[0]
+    assert not any("spatium-netif-ens19" in c and "down" in c for c in cmds)
+
+
+def test_a_second_apply_inside_the_window_keeps_the_first_ones_baseline(host):
+    """Two quick edits: the second must be judged against the path as it was
+    BEFORE the first, not against whatever the first left behind."""
+    apply(host, [eth()], hash_="h1")
+    (host["stub"] / "route4.json").write_text("[]")  # the first change broke it
+    apply(host, [eth(addresses=["10.9.0.3/24"])], hash_="h2")
+    (host["state"] / "netif-confirm").write_text("h2\n")
+    run(host, "--tick")
+    assert (host["state"] / "netif-revert-deadline").exists()
+    assert status(host)["state"] == "pending-confirm"

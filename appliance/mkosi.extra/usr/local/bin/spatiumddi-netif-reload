@@ -78,6 +78,8 @@ CONFIRM = STATE / "netif-confirm"
 LAST_GOOD = STATE / "netif-last-good"
 NM_DIR = _p("/etc/NetworkManager/system-connections")
 NET_STATUS = _p("/etc/spatiumddi/network-status")
+BASELINE = STATE / "netif-baseline.json"
+K3S_NODE_IP = _p("/etc/rancher/k3s/config.yaml.d/spatium-node-ip.yaml")
 LOG = _p("/var/log/spatiumddi/netif-reload.log")
 LOCK = _p("/run/spatiumddi-netif-reload.lock")
 
@@ -85,6 +87,8 @@ PREFIX = "20-spatium-netif-"
 NAMESPACE = uuid.UUID("5a71c0de-4428-4000-8000-000000000000")
 IFNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
 NMCLI_TIMEOUT = 30
+MAX_REVERT_SECONDS = 900
+DEFAULT_REVERT_SECONDS = 180
 
 
 def log(msg: str) -> None:
@@ -240,20 +244,94 @@ def inventory() -> dict:
 # ── validation (independent of the control plane's) ──────────────────
 
 
-def validate(interfaces: object) -> list[dict]:
-    if not isinstance(interfaces, list):
-        raise Refused("the interface list is not a list")
-    protected = {d for d in default_devs()}
+def k3s_pinned() -> tuple[str | None, str | None]:
+    """``(node-ip, flannel-iface)`` of the no-default-route drop-in, if any."""
+    ip = iface = None
+    try:
+        for line in K3S_NODE_IP.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition(":")
+            if sep and key.strip() == "node-ip":
+                ip = value.strip() or None
+            elif sep and key.strip() == "flannel-iface":
+                iface = value.strip() or None
+    except OSError:
+        pass
+    return ip, iface
+
+
+def _net(text: object):
+    try:
+        return ipaddress.ip_interface(str(text)).network
+    except ValueError:
+        try:
+            return ipaddress.ip_network(str(text), strict=False)
+        except ValueError:
+            return None
+
+
+def protected_set(inv: dict) -> set[str]:
+    """Interfaces this host will not rewrite: the primary, whatever carries
+    the default route or the k3s address, and everything they are stacked on
+    or made of. Any one signal can be absent on a node that is mid-change."""
+    nics = {n["name"]: n for n in inv.get("interfaces") or []}
+    protected = set(default_devs())
     primary = primary_interface()
     if primary:
         protected.add(primary)
+    k3s_ip, k3s_iface = k3s_pinned()
+    if k3s_iface:
+        protected.add(k3s_iface)
+    if k3s_ip:
+        for n in nics.values():
+            if any(a.split("/")[0] == k3s_ip for a in n["addresses"]):
+                protected.add(n["name"])
+    changed = True
+    while changed:
+        changed = False
+        for name in list(protected):
+            n = nics.get(name)
+            if not n:
+                continue
+            for dep in (n.get("parent"), n.get("master")):
+                if dep and dep not in protected:
+                    protected.add(dep)
+                    changed = True
+        for n in nics.values():
+            if n.get("master") in protected and n["name"] not in protected:
+                protected.add(n["name"])
+                changed = True
+    return protected
+
+
+def validate(interfaces: object) -> list[dict]:
+    if not isinstance(interfaces, list):
+        raise Refused("the interface list is not a list")
+    inv = inventory()
+    protected = protected_set(inv)
+    # Networks this host already uses: any interface this feature does not
+    # manage (a profile of ours on disk marks one it does), and every route
+    # on a protected interface. A payload may not overlap or reroute them.
+    ours = {n[len(PREFIX) : -len(".nmconnection")] for n in managed_files()}
+    ours |= {str(e.get("name")) for e in interfaces if isinstance(e, dict)}
+    used: list[tuple[object, str]] = []
+    for n in inv["interfaces"]:
+        if n["name"] in ours:
+            continue
+        for a in n["addresses"]:
+            net = _net(a)
+            if net is not None and not net.is_link_local:
+                used.append((net, n["name"]))
+    for r in inv["routes"]:
+        net = _net(r["dst"]) if r["dst"] not in ("", "default") else None
+        if net is not None and net.prefixlen > 0 and r["dev"] in protected:
+            used.append((net, str(r["dev"])))
     out = []
     seen: set[str] = set()
     for e in interfaces:
         if not isinstance(e, dict):
             raise Refused("an interface entry is not an object")
         name = str(e.get("name") or "")
-        if not IFNAME_RE.match(name):
+        if not IFNAME_RE.fullmatch(name):
             raise Refused(f"{name!r} is not a usable interface name")
         if name in seen:
             raise Refused(f"{name} appears twice")
@@ -270,7 +348,7 @@ def validate(interfaces: object) -> list[dict]:
             vid = e.get("vlan_id")
             if isinstance(vid, bool) or not isinstance(vid, int) or not 1 <= vid <= 4094:
                 raise Refused(f"{name}: bad VLAN id {vid!r}")
-            if not IFNAME_RE.match(str(e.get("parent") or "")):
+            if not IFNAME_RE.fullmatch(str(e.get("parent") or "")):
                 raise Refused(f"{name}: bad VLAN parent {e.get('parent')!r}")
         addrs = e.get("addresses") or []
         for a in addrs:
@@ -278,6 +356,10 @@ def validate(interfaces: object) -> list[dict]:
                 ipaddress.ip_interface(a)
             except ValueError as exc:
                 raise Refused(f"{name}: bad address {a!r}") from exc
+            net = ipaddress.ip_interface(a).network
+            for other, owner in used:
+                if net.version == other.version and net.overlaps(other):
+                    raise Refused(f"{name}: {net} overlaps {other} on {owner}, which this host already uses")
         mtu = e.get("mtu")
         if mtu is not None and (isinstance(mtu, bool) or not isinstance(mtu, int) or not 576 <= mtu <= 9216):
             raise Refused(f"{name}: bad MTU {mtu!r}")
@@ -289,6 +371,12 @@ def validate(interfaces: object) -> list[dict]:
                 raise Refused(f"{name}: bad route {r!r}") from exc
             if dest.prefixlen == 0:
                 raise Refused(f"{name}: a default route is not allowed on an additional interface")
+            for other, owner in used:
+                if dest.version == other.version and dest.overlaps(other):
+                    raise Refused(
+                        f"{name}: the route to {dest} overlaps {other} on {owner}, "
+                        "a path this host already uses"
+                    )
         out.append(e)
     return out
 
@@ -342,11 +430,23 @@ def managed_files() -> dict[str, Path]:
 
 
 def snapshot() -> None:
-    """Keep what is on disk now so a failed or unconfirmed apply can undo it."""
-    shutil.rmtree(LAST_GOOD, ignore_errors=True)
-    LAST_GOOD.mkdir(parents=True, exist_ok=True)
-    for name, path in managed_files().items():
-        shutil.copy2(path, LAST_GOOD / name)
+    """Keep what is on disk now so a failed or unconfirmed apply can undo it.
+
+    Built beside the old one and renamed over it, so a failure half way
+    (disk full) leaves either the previous snapshot or none, never a partial
+    one that a later restore would take for "nothing was configured".
+    """
+    fresh = LAST_GOOD.with_name(LAST_GOOD.name + ".new")
+    shutil.rmtree(fresh, ignore_errors=True)
+    fresh.mkdir(parents=True, exist_ok=True)
+    try:
+        for name, path in managed_files().items():
+            shutil.copy2(path, fresh / name)
+        shutil.rmtree(LAST_GOOD, ignore_errors=True)
+        fresh.rename(LAST_GOOD)
+    except OSError:
+        shutil.rmtree(fresh, ignore_errors=True)
+        raise
 
 
 def install_set(files: dict[str, str]) -> None:
@@ -384,15 +484,29 @@ def activate(entries: list[dict]) -> dict[str, str]:
     return verdicts
 
 
+def cid_of(filename: str) -> str:
+    return filename[: -len(".nmconnection")][len("20-") :]
+
+
+def bring_down(names: list[str]) -> None:
+    """Take profiles down by id BEFORE their keyfile goes, so the link is
+    released explicitly rather than depending on how NetworkManager treats a
+    deleted active profile on reload."""
+    for name in names:
+        run(["nmcli", "connection", "down", "id", cid_of(name)])
+
+
 def restore_last_good(why: str) -> None:
+    if not LAST_GOOD.is_dir():
+        raise RuntimeError("there is no snapshot of the previous profiles to restore")
     saved = {p.name: p.read_text(encoding="utf-8") for p in sorted(LAST_GOOD.glob(PREFIX + "*"))}
+    bring_down([n for n in managed_files() if n not in saved])
     install_set(saved)
     rc, out = run(["nmcli", "connection", "reload"])
     if rc != 0:
         log(f"  ! reload after restore failed: {out}")
     for name in saved:
-        cid = name[: -len(".nmconnection")][len("20-") :]
-        run(["nmcli", "-w", "20", "connection", "up", "id", cid])
+        run(["nmcli", "-w", "20", "connection", "up", "id", cid_of(name)])
     log(f"  restored {len(saved)} previous profile(s): {why}")
 
 
@@ -438,23 +552,55 @@ def apply_trigger() -> int:
         log("  already in place — nothing to change")
         state_write(HASH_SIDECAR, cfg_hash + "\n")
         prev = read_status()
-        write_status("applied", cfg_hash, interfaces=prev.get("interfaces") if prev.get("hash") == cfg_hash else {})
+        # A window armed by an earlier, still unconfirmed apply stays armed:
+        # reporting "applied" here would claim a safety net is gone that is not.
+        write_status(
+            "pending-confirm" if DEADLINE.exists() else "applied",
+            cfg_hash,
+            interfaces=prev.get("interfaces") if prev.get("hash") == cfg_hash else {},
+        )
         consume("done")
         return 0
 
-    if not DEADLINE.exists():
-        snapshot()  # an unconfirmed earlier apply keeps ITS snapshot
     try:
+        if not DEADLINE.exists():
+            snapshot()  # an unconfirmed earlier apply keeps ITS snapshot
+        baseline = None
+        if DEADLINE.exists():
+            # ...and its baseline: taken now it would describe a path the
+            # earlier, unconfirmed change may already have broken.
+            try:
+                baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                baseline = None
+        if not isinstance(baseline, dict):
+            baseline = path_facts()
+    except OSError as exc:
+        # Nothing has been changed yet, so there is nothing to undo — but the
+        # change must not go ahead without the safety net, and must not
+        # vanish silently either.
+        log(f"  could not snapshot the current profiles: {exc}")
+        write_status("failed", cfg_hash, f"could not snapshot the current profiles: {exc}")
+        consume("failed")
+        return 1
+    try:
+        bring_down([n for n in managed_files() if n not in wanted])
         install_set(wanted)
         verdicts = activate(entries) if entries else _reload_only()
     except (OSError, RuntimeError) as exc:
         log(f"  apply failed: {exc}")
-        restore_last_good("the apply failed")
-        write_status("failed", cfg_hash, str(exc))
+        error = str(exc)
+        try:
+            restore_last_good("the apply failed")
+        except (OSError, RuntimeError) as exc2:
+            error = f"{exc}; and restoring the previous profiles failed: {exc2}"
+            log(f"  ! {error}")
+        write_status("failed", cfg_hash, error)
         consume("failed")
         return 1
 
     CONFIRM.unlink(missing_ok=True)
+    state_write(BASELINE, json.dumps(baseline))
     state_write(DEADLINE, f"{int(time.time()) + revert_seconds}\n")
     state_write(HASH_SIDECAR, cfg_hash + "\n")
     write_status("pending-confirm", cfg_hash, interfaces=verdicts)
@@ -468,6 +614,44 @@ def _reload_only() -> dict[str, str]:
     if rc != 0:
         raise RuntimeError(f"nmcli connection reload failed: {out.splitlines()[0] if out else rc}")
     return {}
+
+
+def path_facts() -> dict:
+    """What the node's management path looks like right now: the default
+    routes, and whether each protected interface still holds an address."""
+    inv = inventory()
+    protected = protected_set(inv)
+    return {
+        "default": sorted(
+            [str(r["gateway"] or ""), str(r["dev"] or "")]
+            for r in inv["routes"]
+            if r["dst"] == "default"
+        ),
+        "addressed": sorted(
+            n["name"] for n in inv["interfaces"] if n["name"] in protected and n["addresses"]
+        ),
+    }
+
+
+def management_path_intact() -> bool:
+    """True unless the change visibly took the management path away.
+
+    A heartbeat that round-trips proves the control plane answered; it does
+    not prove the node's own path is whole (the api can be on this very node).
+    The default routes and the addresses the primary held before the apply
+    must all still be there.
+    """
+    try:
+        before = json.loads(BASELINE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(before, dict):
+        return True
+    now = path_facts()
+    for route in before.get("default") or []:
+        if route not in now["default"]:
+            return False
+    return all(name in now["addressed"] for name in before.get("addressed") or [])
 
 
 def own_file(path: Path) -> bool:
@@ -498,23 +682,44 @@ def tick() -> int:
             pass
         CONFIRM.unlink(missing_ok=True)
         if confirmed and confirmed == settled:
-            DEADLINE.unlink(missing_ok=True)
-            prev = read_status()
-            write_status("applied", settled, interfaces=prev.get("interfaces") or {})
-            log("apply confirmed — keeping the new configuration")
-            return 0
-        # A confirm for some OTHER hash (the operator replaced the config
-        # while one was in flight) keeps nothing: the deadline stands.
-        log("ignored a confirm that does not match the config in force")
+            if management_path_intact():
+                DEADLINE.unlink(missing_ok=True)
+                BASELINE.unlink(missing_ok=True)
+                prev = read_status()
+                write_status("applied", settled, interfaces=prev.get("interfaces") or {})
+                log("apply confirmed — keeping the new configuration")
+                return 0
+            # The control plane answered, but a default route or the primary's
+            # address is gone: the deadline stands and the change is undone.
+            log("a confirm arrived but the management path changed — not keeping the change")
+        else:
+            # A confirm for some OTHER hash (the operator replaced the config
+            # while one was in flight) keeps nothing: the deadline stands.
+            log("ignored a confirm that does not match the config in force")
     try:
         deadline = int(DEADLINE.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         deadline = 0
-    if time.time() < deadline:
+    now = time.time()
+    if deadline - now > MAX_REVERT_SECONDS:
+        # The clock stepped back (a boot before NTP, an RTC reset) after the
+        # deadline was written. Taken literally the safety net would stay
+        # open for hours, so it is re-armed for a normal window from here.
+        deadline = int(now) + DEFAULT_REVERT_SECONDS
+        state_write(DEADLINE, f"{deadline}\n")
+        log("the clock is behind the revert deadline — re-armed a fresh window")
+    if now < deadline:
         return 0
-    DEADLINE.unlink(missing_ok=True)
     log("apply NOT confirmed before the deadline — restoring the previous configuration")
-    restore_last_good("the control plane was not reachable after the change")
+    try:
+        restore_last_good("the control plane was not reachable after the change")
+    except (OSError, RuntimeError) as exc:
+        # The deadline stays armed so the next tick tries again.
+        log(f"  ! restore failed, will retry: {exc}")
+        write_status("failed", settled, f"could not restore the previous profiles: {exc}")
+        return 1
+    DEADLINE.unlink(missing_ok=True)
+    BASELINE.unlink(missing_ok=True)
     write_status(
         "reverted",
         settled,

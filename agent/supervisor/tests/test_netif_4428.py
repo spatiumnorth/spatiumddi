@@ -124,7 +124,7 @@ def test_a_garbage_revert_window_falls_back_to_the_default(host):
 def test_it_only_acts_on_an_appliance(host, monkeypatch):
     monkeypatch.setattr(st, "detect_deployment_kind", lambda: "docker")
     assert st.maybe_fire_netif_reload(block([IFACE])) is False
-    assert st.maybe_confirm_netif(block([IFACE])) is False
+    assert st.maybe_confirm_netif(block([IFACE]), sent_after()) is False
     assert not list(host.iterdir())
 
 
@@ -135,6 +135,11 @@ def test_the_plane_is_registered_with_the_stuck_apply_reporter():
 # ── confirming ───────────────────────────────────────────────────────
 
 
+def sent_after():
+    """A request sent after the runner armed its deadline."""
+    return time.time() + 1
+
+
 def arm(host, settled=H1):
     (host / "netif-revert-deadline").write_text(f"{int(time.time()) + 100}\n")
     (host / "netif-config-hash").write_text(settled + "\n")
@@ -142,13 +147,23 @@ def arm(host, settled=H1):
 
 def test_a_heartbeat_that_round_tripped_confirms_the_applied_config(host):
     arm(host)
-    assert st.maybe_confirm_netif(block([IFACE])) is True
+    assert st.maybe_confirm_netif(block([IFACE]), sent_after()) is True
     assert (host / "netif-confirm").read_text().strip() == H1
+
+
+def test_a_heartbeat_sent_before_the_deadline_was_armed_confirms_nothing(host):
+    """The long-poll answering right after an apply was sent BEFORE it, over
+    the old network: its response proves nothing about the new one (#4428)."""
+    sent = time.time() - 5
+    arm(host)
+    assert st.maybe_confirm_netif(block([IFACE]), sent) is False
+    assert st.maybe_confirm_netif(block([IFACE]), None) is False
+    assert not (host / "netif-confirm").exists()
 
 
 def test_nothing_is_confirmed_without_a_live_revert_window(host):
     (host / "netif-config-hash").write_text(H1 + "\n")
-    assert st.maybe_confirm_netif(block([IFACE])) is False
+    assert st.maybe_confirm_netif(block([IFACE]), sent_after()) is False
     assert not (host / "netif-confirm").exists()
 
 
@@ -156,20 +171,20 @@ def test_a_config_the_runner_did_not_settle_is_never_confirmed(host):
     """The operator replaced the config while one was in flight: confirming
     the NEW hash would keep a change nobody reviewed on the node."""
     arm(host, settled=H1)
-    assert st.maybe_confirm_netif(block([IFACE], config_hash=H2)) is False
+    assert st.maybe_confirm_netif(block([IFACE], config_hash=H2), sent_after()) is False
     assert not (host / "netif-confirm").exists()
 
 
 def test_confirm_is_not_rewritten_while_one_is_pending(host):
     arm(host)
-    assert st.maybe_confirm_netif(block([IFACE])) is True
-    assert st.maybe_confirm_netif(block([IFACE])) is False
+    assert st.maybe_confirm_netif(block([IFACE]), sent_after()) is True
+    assert st.maybe_confirm_netif(block([IFACE]), sent_after()) is False
 
 
 def test_a_block_with_no_hash_confirms_nothing(host):
     arm(host)
-    assert st.maybe_confirm_netif(block([IFACE], config_hash="")) is False
-    assert st.maybe_confirm_netif({}) is False
+    assert st.maybe_confirm_netif(block([IFACE], config_hash=""), sent_after()) is False
+    assert st.maybe_confirm_netif({}, sent_after()) is False
 
 
 # ── reporting ────────────────────────────────────────────────────────
@@ -210,7 +225,7 @@ def test_corrupt_sidecars_read_as_absent(host):
 def test_the_heartbeat_wires_fire_then_confirm_from_the_response_block():
     src = (Path(st.__file__).parent / "heartbeat.py").read_text()
     fire = src.index('maybe_fire_netif_reload(body_out.get("netif_settings"))')
-    confirm = src.index('maybe_confirm_netif(body_out.get("netif_settings"))')
+    confirm = src.index('maybe_confirm_netif(\n        body_out.get("netif_settings"), request_sent_at')
     assert fire < confirm
     # Folded into cluster_health so the control plane stores it verbatim.
     assert '_extra["netif"] = _netif' in Path(st.__file__).read_text()

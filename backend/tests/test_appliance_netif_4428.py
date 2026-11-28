@@ -984,3 +984,114 @@ async def test_propose_tool_validates_like_rest_and_never_writes(db_session: Asy
         .all()
     )
     assert audits == []
+
+
+# ── validator review (#4428): paths the first cut let through ─────────
+
+
+@pytest.mark.parametrize("dest", ["192.168.1.1/32", "192.168.1.200/32", "192.168.1.128/25"])
+def test_a_route_inside_the_management_network_is_refused_not_only_one_covering_it(
+    dest: str,
+) -> None:
+    """A /32 to the gateway or a peer is MORE specific than the connected
+    route, so it wins the lookup and sends that host out the wrong port."""
+    with pytest.raises(NetifError, match="management network"):
+        netif.validate_desired(
+            [_eth(routes=[{"destination": dest, "gateway": "10.9.0.1"}])], _ctx()
+        )
+
+
+def test_the_k3s_default_cidrs_are_reserved_when_nothing_reported_them() -> None:
+    """A worker's own row carries no pod / service CIDR; 'nothing known' must
+    not read as 'nothing to protect'."""
+    ctx = netif.build_context(_health(), node_ips=["192.168.1.10"])
+    for dest, why in (("10.42.8.0/24", "pod CIDR"), ("10.43.0.0/24", "service CIDR")):
+        with pytest.raises(NetifError, match=why):
+            netif.validate_desired(
+                [_eth(routes=[{"destination": dest, "gateway": "10.9.0.1"}])], ctx
+            )
+    # A customised cluster reserves ITS networks, not the defaults.
+    custom = netif.build_context(
+        _health(),
+        node_ips=["192.168.1.10"],
+        pod_cidr="10.200.0.0/16",
+        service_cidr="10.201.0.0/16",
+    )
+    with pytest.raises(NetifError, match="pod CIDR"):
+        netif.validate_desired(
+            [_eth(routes=[{"destination": "10.200.4.0/24", "gateway": "10.9.0.1"}])], custom
+        )
+
+
+def test_a_v6_link_local_gateway_needs_a_v6_address_to_be_rendered() -> None:
+    """The host renders a family's routes under that family's addresses; a
+    route with none would be applied as 'success' and silently not exist."""
+    with pytest.raises(NetifError, match="IPv6 address"):
+        netif.normalise_desired(
+            [
+                _eth(
+                    addresses=["10.9.0.2/24"],
+                    routes=[{"destination": "2001:db8:5::/64", "gateway": "fe80::1"}],
+                )
+            ]
+        )
+
+
+async def test_a_route_to_a_cluster_peer_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """etcd, kubelet and the apiserver run over the peers' addresses; a /32
+    to one through an extra port would split the cluster."""
+    peer = await _appliance(db_session)
+    peer.node_ips = ["172.30.0.7"]
+    row = await _appliance(db_session)
+    hdr = await _superadmin(db_session)
+    url = f"{BASE}/{row.id}/network-interfaces"
+    body = {"interfaces": [_eth(routes=[{"destination": "172.30.0.7/32", "gateway": "10.9.0.1"}])]}
+    r = await client.put(url, json=body, headers=hdr)
+    assert r.status_code == 422, r.text
+    assert "cluster peer" in r.json()["detail"]
+    # An address on the extra port may not be a peer's either.
+    body = {"interfaces": [_eth(addresses=["172.30.0.9/24"])]}
+    r = await client.put(url, json=body, headers=hdr)
+    assert r.status_code == 422 and "cluster peer" in r.json()["detail"]
+    db_session.expunge_all()
+    assert (await db_session.get(Appliance, row.id)).desired_network_interfaces == []
+
+
+async def test_a_route_to_the_control_plane_vip_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    from app.models.settings import PlatformSettings
+
+    cfg = (
+        await db_session.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    if cfg is None:
+        cfg = PlatformSettings(id=1)
+        db_session.add(cfg)
+    cfg.control_plane_vip = "172.20.0.5"
+    await db_session.flush()
+    row = await _appliance(db_session)
+    hdr = await _superadmin(db_session)
+    body = {"interfaces": [_eth(routes=[{"destination": "172.20.0.0/24", "gateway": "10.9.0.1"}])]}
+    r = await client.put(f"{BASE}/{row.id}/network-interfaces", json=body, headers=hdr)
+    assert r.status_code == 422, r.text
+    assert "virtual address" in r.json()["detail"]
+
+
+async def test_propose_tool_refuses_an_unapproved_appliance_like_rest(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.tools.appliance import (
+        ProposeApplianceNetworkInterfacesArgs,
+        propose_appliance_network_interfaces,
+    )
+
+    row = await _appliance(db_session, state="pending_approval")
+    out = await propose_appliance_network_interfaces(
+        db_session,
+        await _tool_user(db_session, superadmin=True),
+        ProposeApplianceNetworkInterfacesArgs(appliance_id=str(row.id), interfaces=[_vlan()]),
+    )
+    assert "not approved" in out["error"] and "kind" not in out

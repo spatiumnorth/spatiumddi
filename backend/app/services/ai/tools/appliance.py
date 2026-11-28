@@ -657,13 +657,18 @@ async def propose_appliance_network_interfaces(
     row = await db.get(Appliance, appliance_uuid)
     if row is None or row.revoked_at is not None:
         return {"error": f"No appliance with id {args.appliance_id}."}
+    if row.state != APPLIANCE_STATE_APPROVED:
+        # The REST endpoint answers 409 here; a proposal must not be easier.
+        return {
+            "error": f"{row.hostname} is not approved yet; approve it before managing its network."
+        }
     if args.interfaces and not netif_svc.has_inventory(row.cluster_health):
         return {
             "error": f"{row.hostname} has not reported its network interfaces yet; "
             "nothing can be validated against an unknown network."
         }
     try:
-        rows = validate_for(row, args.interfaces)
+        rows = await validate_for(db, row, args.interfaces)
     except netif_svc.NetifError as exc:
         return {"error": str(exc)}
     names = ", ".join(r["name"] for r in rows) or "none"

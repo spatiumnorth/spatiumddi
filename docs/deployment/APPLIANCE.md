@@ -1967,24 +1967,35 @@ files as stray nmtui edits.
    independent signals (the interface STATE configured, the interface carrying the
    default route, the interface carrying the node's k3s address) plus whatever it
    is stacked on or made of (a bond's members, a VLAN's parent). The host runner
-   re-checks this itself and refuses regardless of what the control plane said.
+   re-checks this itself and refuses regardless of what the control plane said,
+   and also refuses an address or route that overlaps a network the host already
+   uses (the management network, another unmanaged interface).
 2. *Nothing may overlap, shadow or hijack.* A 422 (with the reason) for: an address
    overlapping another interface's subnet, the pod CIDR or the service CIDR; two
    interfaces in one subnet; a VLAN on a parent that does not exist; a route
-   covering the node's own cluster address, the pod / service CIDR, the management
-   network or another connected subnet; a gateway that is not inside one of the
+   touching the node's own or a cluster peer's address, the control-plane virtual
+   address, the pod / service CIDR (the k3s defaults when the cluster has not
+   reported its own), any part of the management network (a more specific route
+   to the gateway or a peer included) or another connected subnet; a gateway that is not inside one of the
    interface's own subnets; an MTU above the VLAN parent's; and **any default
    route** — refused outright rather than reasoned about; add the specific networks
    instead.
 3. *A rollback on the node itself.* After an apply the host keeps the previous
    profiles and arms a deadline (`revert_seconds`, 180 s). The supervisor confirms
-   as soon as a heartbeat round-trips with the applied hash — the proof the node
-   still reaches the control plane. No confirm by the deadline (a heartbeat that
+   once a heartbeat that was **sent after** the deadline was armed round-trips with
+   the applied hash — the one answering at that moment left over the old network
+   and proves nothing — and the host keeps the change only if the default routes
+   and the primary's address it had before are still there, because the control
+   plane can be on this very node. No confirm by the deadline (a heartbeat that
    cannot get through never reaches the confirm) and the previous profiles are
    restored, the state is **`reverted`**, and the UI says the configuration shown
    is *not* what the node is running. The deadline lives on `/var`, so a reboot
    inside the window reverts too. A rolled-back hash is recorded as settled so it
-   is not re-applied every backoff window; edit the config to try again.
+   is not re-applied every backoff window; edit the config to try again. If the
+   snapshot cannot be taken the change is refused (`failed`, nothing installed); if
+   the previous profiles cannot be restored the deadline stays armed and the next
+   30 s tick tries again. A clock that stepped back (boot before NTP) re-arms a
+   fresh window instead of leaving the net open for hours.
 
 A node that has not reported its interface inventory (offline, or an older
 supervisor) is **unknown**, never "no interfaces": a write is a `409` rather than

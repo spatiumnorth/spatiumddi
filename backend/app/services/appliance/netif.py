@@ -56,6 +56,11 @@ from typing import Any
 #: enough that an operator staring at a dead node is not waiting minutes.
 REVERT_SECONDS = 180
 
+#: k3s's own defaults, reserved when neither this node nor any peer has
+#: reported the CIDRs the cluster was installed with.
+DEFAULT_POD_CIDR = "10.42.0.0/16"
+DEFAULT_SERVICE_CIDR = "10.43.0.0/16"
+
 MAX_INTERFACES = 16
 MAX_ADDRESSES = 8
 MAX_ROUTES = 32
@@ -206,12 +211,21 @@ def build_context(
     pod_cidr: str | None = None,
     service_cidr: str | None = None,
     managed_names: set[str] | None = None,
+    peer_ips: list[str] | None = None,
+    extra_cidrs: list[str] | None = None,
 ) -> NetifContext:
     """Derive the validation context from the node's last report.
 
     ``managed_names`` are the interfaces currently in the DESIRED set (or
     the one being written): their own addresses must not count as
     "foreign", or re-saving an unchanged config would refuse itself.
+
+    ``peer_ips`` are the cluster's OTHER nodes (etcd, kubelet and the
+    apiserver all run over those addresses) and ``extra_cidrs`` other
+    networks the cluster depends on (the control-plane VIP). A node's pod /
+    service CIDRs are only reported by the nodes that read them from k3s,
+    so the caller passes what the cluster knows; where nothing is known the
+    k3s defaults are reserved rather than nothing.
     """
     managed = managed_names or set()
     ctx = NetifContext()
@@ -297,9 +311,21 @@ def build_context(
         net = _net(raw)
         if net is not None:
             ctx.reserved.append((net, "the node's cluster address"))
-    for label, cidr in (("the pod CIDR", pod_cidr), ("the service CIDR", service_cidr)):
-        for part in (cidr or "").split(","):
-            net = _net(part.strip()) if part.strip() else None
+    for raw in peer_ips or []:
+        net = _net(raw)
+        if net is not None:
+            ctx.reserved.append((net, "a cluster peer's address"))
+    for raw in extra_cidrs or []:
+        net = _net(raw)
+        if net is not None:
+            ctx.reserved.append((net, "the control-plane virtual address"))
+    for label, cidr, default in (
+        ("the pod CIDR", pod_cidr, DEFAULT_POD_CIDR),
+        ("the service CIDR", service_cidr, DEFAULT_SERVICE_CIDR),
+    ):
+        parts = [p.strip() for p in (cidr or "").split(",") if p.strip()]
+        for part in parts or [default]:
+            net = _net(part)
             if net is not None:
                 ctx.reserved.append((net, label))
     return ctx
@@ -368,6 +394,12 @@ def _validate_route(raw: Any, where: str, addresses: list[str]) -> dict[str, Any
     # interface, or the kernel refuses the route and the apply half-fails.
     # A v6 link-local gateway is on-link by definition.
     connected = [ipaddress.ip_interface(a).network for a in addresses]
+    if not any(ipaddress.ip_interface(a).version == dest.version for a in addresses):
+        # The host renders a family's routes only under that family's
+        # addresses; without one the route would be silently dropped.
+        raise NetifError(
+            f"{where}: a route to {dest} needs an IPv{dest.version} address on this interface"
+        )
     if not (gw.is_link_local and gw.version == 6) and not any(
         gw in net for net in connected if net.version == gw.version
     ):
@@ -602,13 +634,12 @@ def validate_desired(entries: Any, ctx: NetifContext) -> list[dict[str, Any]]:
                         "redirect cluster traffic through this interface"
                     )
             for other, owner in ctx.foreign:
-                if (
-                    owner in ctx.protected
-                    and _overlaps(dest, other)
-                    and dest.prefixlen <= other.prefixlen
-                ):
+                # ANY overlap, not just a covering prefix: a /32 inside the
+                # management subnet (a peer, the gateway) is more specific
+                # than the connected route and wins the lookup.
+                if owner in ctx.protected and _overlaps(dest, other):
                     raise NetifError(
-                        f"{r['name']}: the route to {dest} would cover {other} on {owner}, "
+                        f"{r['name']}: the route to {dest} overlaps {other} on {owner}, "
                         "the node's management network"
                     )
             for other_row in rows:

@@ -25,12 +25,14 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import appliance_channel, publish_wake
 from app.core.permissions import require_permission
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
+from app.models.settings import PlatformSettings
 from app.services.appliance import netif as netif_svc
 from app.services.appliance.netif import NetifError
 
@@ -155,18 +157,46 @@ async def _load(db: DB, appliance_id: uuid.UUID, *, lock: bool = False) -> Appli
     return row
 
 
-def context_for(row: Appliance, names: set[str]) -> netif_svc.NetifContext:
+def _node_addrs(r: Appliance) -> list[str]:
+    return [*(r.node_ips or []), *([r.node_ip] if r.node_ip else [])]
+
+
+def context_for(
+    row: Appliance, names: set[str], peers: list[Appliance] | None = None, vip: str | None = None
+) -> netif_svc.NetifContext:
+    peers = peers or []
+    # The CIDRs only the nodes that read them from k3s report: a worker's own
+    # row is empty, and customised CIDRs are the cluster's, not the default.
+    pod = ",".join(c for c in [row.pod_cidr or "", *(p.pod_cidr or "" for p in peers)] if c)
+    svc = ",".join(c for c in [row.service_cidr or "", *(p.service_cidr or "" for p in peers)] if c)
     return netif_svc.build_context(
         row.cluster_health,
-        node_ips=[*(row.node_ips or []), *([row.node_ip] if row.node_ip else [])],
-        pod_cidr=row.pod_cidr,
-        service_cidr=row.service_cidr,
+        node_ips=_node_addrs(row),
+        pod_cidr=pod,
+        service_cidr=svc,
         managed_names=names,
+        peer_ips=[a for p in peers for a in _node_addrs(p)],
+        extra_cidrs=[vip] if vip else [],
     )
 
 
-def validate_for(row: Appliance, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def validate_for(
+    db: DB, row: Appliance, entries: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     """Shared by the routes and the copilot proposal tool."""
+    peers = list(
+        (
+            await db.execute(
+                select(Appliance).where(Appliance.id != row.id, Appliance.revoked_at.is_(None))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cfg = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    vip = (cfg.control_plane_vip or "").strip() if cfg is not None else ""
     names = {str(e.get("name") or "") for e in entries if isinstance(e, dict)}
     # A VLAN's derived name is not in the request; the DESIRED set's names
     # are, so include them too or re-saving would refuse its own addresses.
@@ -174,7 +204,7 @@ def validate_for(row: Appliance, entries: list[dict[str, Any]]) -> list[dict[str
     # Only interfaces the node reports as ours count as "managed" when
     # their addresses are compared: the live address of an interface we are
     # about to rewrite is not a conflict.
-    ctx = context_for(row, names)
+    ctx = context_for(row, names, peers, vip)
     return netif_svc.validate_desired(entries, ctx)
 
 
@@ -292,7 +322,7 @@ async def validate_network_interfaces(
     if entries:
         _require_inventory(row)
     try:
-        rows = validate_for(row, entries)
+        rows = await validate_for(db, row, entries)
     except NetifError as exc:
         raise _refuse(exc) from exc
     return ValidationResponse(interfaces=rows)
@@ -323,7 +353,7 @@ async def put_network_interfaces(
     if entries:
         _require_inventory(row)
     try:
-        rows = validate_for(row, entries)
+        rows = await validate_for(db, row, entries)
     except NetifError as exc:
         raise _refuse(exc) from exc
     before = list(row.desired_network_interfaces or [])

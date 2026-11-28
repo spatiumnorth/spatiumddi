@@ -427,6 +427,7 @@ _HOST_CONFIG_PLANES_DASH: tuple[tuple[str, str, str], ...] = (
     ("apt", "apt-config-pending", "apt-config-hash"),
     ("console_mode", "verbose-boot-pending", "verbose-boot-applied"),
     ("removable", "removable-config-pending", "removable-config-hash"),
+    ("netif", "netif-config-pending", "netif-config-hash"),
 )
 # At/above this many fires of the SAME hash → "failing" (apply keeps
 # missing); below → "retrying" (still backing off). Mirrors
