@@ -53,6 +53,7 @@ from app.models.auth import User
 from app.models.ipam import IP_STATUSES_CREATE_SETTABLE, IPAddress, IPBlock, Subnet
 from app.services.dns.name_targets import absolute_target_error
 from app.services.dns.new_object_defaults import default_zone_ttl
+from app.services.dns.server_move import powerdns_zone_type_refusal
 from app.services.dns.sync_check import ipam_authors_zone
 from app.services.dns.zone_synthesis import unauthored_zone_error
 from app.services.ipam.address_create_rules import (
@@ -130,6 +131,11 @@ class Operation:
     # inline too. ``tests/test_operation_permission_declared.py`` fails for any
     # operation that sets neither.
     requires_superadmin: bool = False
+    # A superadmin step INSIDE the operation (#4790): given the args, True when
+    # this request needs a superadmin approver (a permanent delete). ``apply``
+    # refuses with the same ``OperationPermissionError`` (so the request stays
+    # pending for a superadmin) and the queue's ``can_approve`` asks it too.
+    superadmin_when: Callable[[Any], bool] | None = None
     # Optional submit-time refusal, run ONLY by the request portal
     # (``submit_request``) after ``preview`` passes. It raises a 4xx
     # ``HTTPException`` for what the REST create would refuse (#2903). Kept
@@ -251,6 +257,33 @@ def enforce_operation_permission(user: User, op: Operation) -> None:
     if any(has_any_grant_for(user, action, rt) for rt in op.scoped_grant_types):
         return
     raise OperationPermissionError(action, resource_type)
+
+
+def superadmin_step_refusal(user: User, what: str) -> OperationPermissionError | None:
+    """Refusal for a superadmin-only step inside an operation (#4790).
+
+    An ``OperationPermissionError``, not the 403 ``ensure_superadmin`` raises:
+    the approvals spine ends a request ``failed`` on an ``HTTPException`` but
+    leaves it pending on this, because the refusal is about THIS approver and a
+    superadmin may still approve it. ``what`` names the step in the words.
+    """
+    from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
+
+    if is_effective_superadmin(user):
+        return None
+    return OperationPermissionError(
+        "superadmin",
+        "change_request",
+        f"{what} needs a superadmin approver; the approver is not a superadmin. "
+        "A superadmin can still approve this request.",
+    )
+
+
+def ensure_superadmin_step(user: User, what: str) -> None:
+    """Raise :func:`superadmin_step_refusal`'s error when it refuses."""
+    refusal = superadmin_step_refusal(user, what)
+    if refusal is not None:
+        raise refusal
 
 
 # ── Target resources: read visibility + per-resource apply gates ───────────
@@ -408,6 +441,29 @@ async def _require_address_writable(
         raise refusal
 
 
+def _static_dhcp_write_refusal(
+    user: User, args: CreateIPAddressArgs
+) -> OperationPermissionError | None:
+    """The reservation-write gate of a ``static_dhcp`` address request (#3646).
+
+    Shared by the apply and the portal's ``can_approve`` (#4789), so the queue
+    offers Approve to exactly the approvers whose press is not refused.
+    """
+    if args.status != "static_dhcp" or not args.mac_address:
+        return None
+    from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
+
+    if user_has_permission(user, "write", "dhcp_static"):
+        return None
+    return OperationPermissionError(
+        "write",
+        "dhcp_static",
+        "The approver has no 'write' permission on DHCP reservations "
+        f"(dhcp_static), so no reservation can be made for {args.address}. "
+        "Another approver who holds it can approve this request.",
+    )
+
+
 async def _address_target_refusal(
     db: AsyncSession, user: User, args: CreateIPAddressArgs
 ) -> OperationPermissionError | None:
@@ -419,7 +475,8 @@ async def _address_target_refusal(
         return None  # the apply refuses it as invalid, for every approver alike
     if subnet is None:
         return None
-    return await _address_write_refusal(db, user, subnet, addr)
+    refusal = await _address_write_refusal(db, user, subnet, addr)
+    return refusal or _static_dhcp_write_refusal(user, args)
 
 
 def expires_at_default() -> datetime:
@@ -868,17 +925,9 @@ async def _apply_create_ip_address(
     # permission error, which leaves the request pending for one who may. A
     # plain ValueError would end it ``failed`` for good over a refusal that is
     # about THIS approver, not the request.
-    if args.status == "static_dhcp" and args.mac_address:
-        from app.core.permissions import user_has_permission  # noqa: PLC0415 — avoid cycle
-
-        if not user_has_permission(user, "write", "dhcp_static"):
-            raise OperationPermissionError(
-                "write",
-                "dhcp_static",
-                "The approver has no 'write' permission on DHCP reservations "
-                f"(dhcp_static), so no reservation can be made for {args.address}. "
-                "Another approver who holds it can approve this request.",
-            )
+    reservation_refusal = _static_dhcp_write_refusal(user, args)
+    if reservation_refusal is not None:
+        raise reservation_refusal
 
     # #3250 — a static_dhcp request that can get no reservation fails here,
     # before anything is written, rather than ending provisioned without one.
@@ -3559,6 +3608,10 @@ async def _preview_create_dns_zone(
     )
     if conflict is not None:
         return PreviewResult(ok=False, detail=conflict)
+    # #4570 — the REST create's PowerDNS zone-type refusal.
+    conflict = powerdns_zone_type_refusal(drivers, args.zone_type)
+    if conflict is not None:
+        return PreviewResult(ok=False, detail=conflict)
     if args.dnssec_enabled:
         # #1762 — single-signer rule; read-only here, re-checked under lock
         # at apply.
@@ -3637,6 +3690,10 @@ async def _apply_create_dns_zone(
     conflict = _technitium_api_zone_arg_conflict(
         args, drivers, await _effective_zone_ttl(db, args, grp.id)
     )
+    if conflict is not None:
+        raise ValueError(conflict)
+    # #4570 — re-checked at apply, like the gates above.
+    conflict = powerdns_zone_type_refusal(drivers, args.zone_type)
     if conflict is not None:
         raise ValueError(conflict)
     # #1762 — the single-signer rule the REST create applies, re-checked at
@@ -3823,15 +3880,18 @@ async def _preview_create_dhcp_static(
     except ValueError:
         return PreviewResult(ok=False, detail=f"Invalid IP {args.ip_address!r}.")
 
+    # The scope's subnet is not a reference the caller named, so a reader of
+    # the scope alone may not be able to read it: the preview then words its
+    # refusals and its summary without the subnet's network.
+    shows_network = _can_read_target(user, "subnet", subnet.id)
     try:
         net = ipaddress.ip_network(str(subnet.network), strict=False)
     except ValueError:
-        return PreviewResult(ok=False, detail=f"Scope subnet {subnet.network!r} is unparseable.")
+        named = repr(subnet.network) if shows_network else "the scope's subnet"
+        return PreviewResult(ok=False, detail=f"Scope subnet {named} is unparseable.")
     if addr_obj not in net:
-        return PreviewResult(
-            ok=False,
-            detail=(f"IP {args.ip_address} is outside scope subnet {subnet.network}."),
-        )
+        named = f"scope subnet {subnet.network}" if shows_network else "the scope's subnet"
+        return PreviewResult(ok=False, detail=f"IP {args.ip_address} is outside {named}.")
 
     # Conflict probe — do NOT reject in preview; surface as a hint so
     # the operator can decide whether to abort or replace.
@@ -3850,8 +3910,9 @@ async def _preview_create_dhcp_static(
     if existing is not None:
         suffix = " — note: a static for this IP or MAC already exists; apply will fail"
 
+    scope_label = subnet.network if shows_network else scope.id
     parts = [
-        f"Create DHCP static reservation in scope `{scope.name or subnet.network}`",
+        f"Create DHCP static reservation in scope `{scope.name or scope_label}`",
         f"ip={args.ip_address}",
         f"mac={args.mac_address}",
     ]
@@ -3908,7 +3969,7 @@ async def _apply_create_dhcp_static(
     addr_obj = ipaddress.ip_address(args.ip_address)
     net = ipaddress.ip_network(str(subnet.network), strict=False)
     if addr_obj not in net:
-        raise ValueError(f"IP {args.ip_address} is outside scope subnet {subnet.network}.")
+        raise ValueError(f"IP {args.ip_address} is outside the scope's subnet.")
 
     # #2901 — the REST create's conflict check (a MAC already reserved in the
     # group, a malformed IP). Raises a 4xx HTTPException; both callers roll
@@ -4961,7 +5022,7 @@ async def _assign_role_dhcp_module_problem(
         return None
     return (
         "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
-        "disabled. Enable it under Administration > Features & "
+        "disabled. Enable it under Features & "
         "Integrations, or remove the role."
     )
 
@@ -4980,7 +5041,7 @@ async def _assign_role_dns_module_problem(
         return None
     return (
         f"Cannot assign the {added[0]!r} role: the DNS module (core.dns) is "
-        "disabled. Enable it under Administration > Features & "
+        "disabled. Enable it under Features & "
         "Integrations, or remove the role."
     )
 
@@ -5017,11 +5078,12 @@ async def _assign_role_catalog_problem(
 ) -> str | None:
     """#1858 — same refusal as the REST role-assign route: a Technitium
     appliance must not be pointed at a DNS group holding a TSIG key
-    Technitium cannot use (hmac-sha224). Only on a change, so a
+    Technitium cannot use (hmac-sha224); #4681 — nor a PowerDNS one at a
+    group holding a forward or stub zone. Only on a change, so a
     pre-existing assignment can still be re-saved."""
     from app.models.dns import DNSServerGroup  # noqa: PLC0415
 
-    if "dns-technitium" not in args.roles:
+    if "dns-technitium" not in args.roles and "dns-powerdns" not in args.roles:
         return None
     if "dns_group_id" in args.model_fields_set:
         try:
@@ -5032,10 +5094,21 @@ async def _assign_role_catalog_problem(
         group_id = row.assigned_dns_group_id
     if group_id is None:
         return None
-    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
-        return None
     group = await db.get(DNSServerGroup, group_id)
     if group is None:
+        return None
+    if "dns-powerdns" in args.roles:
+        # #4681 — an engine change to PowerDNS keeps the group; same refusal
+        # as the REST route (and as adding a PowerDNS server to the group).
+        from app.services.dns.server_move import group_powerdns_refusal  # noqa: PLC0415
+
+        if (
+            "dns-powerdns" not in (row.assigned_roles or [])
+            or group_id != row.assigned_dns_group_id
+        ):
+            return await group_powerdns_refusal(db, group)
+        return None
+    if "dns-technitium" in (row.assigned_roles or []) and group_id == row.assigned_dns_group_id:
         return None
     # #1858 — a key Technitium cannot use.
     from app.services.dns.tsig_algorithms import group_key_refusal  # noqa: PLC0415

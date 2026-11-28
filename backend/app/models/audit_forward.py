@@ -14,7 +14,9 @@ separate transformer.
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Integer, LargeBinary, String, Text
+from datetime import datetime
+
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, LargeBinary, String, Text
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -99,6 +101,36 @@ class AuditForwardTarget(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Optional allowlist of ``AuditLog.resource_type`` values. Null or
     # empty = forward everything.
     resource_types: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
+    # ── log streams (#4545) ────────────────────────────────────────
+    # Per-target opt-in for the DNS query log and the DHCP activity log the
+    # agents already ship to the control plane. Syslog targets only; both
+    # off on every existing and every new target, because a query log is
+    # high-volume and names clients.
+    stream_dns_query_log: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    stream_dhcp_activity_log: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # JSONB object, keys validated by the settings API (``log_stream_forward.
+    # FILTER_KEYS``): dns_server_group_ids, dns_server_ids, dns_rcodes,
+    # dns_qtypes, dhcp_server_group_ids, dhcp_server_ids, dhcp_codes. Absent
+    # or empty key = no filter on that dimension.
+    log_stream_filters: Mapped[dict[str, list[str]] | None] = mapped_column(JSONB, nullable=True)
+    # Forward this percentage (1-100) of DNS queries; 100 = all of them.
+    dns_query_sample_percent: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=100, server_default=sa_text("100")
+    )
+    # Entries dropped because the target could not keep up (queue cap hit or
+    # delivery kept failing). Cumulative, flushed by the api process every
+    # few seconds; the ``log_forward_dropping`` alert reads the timestamp.
+    log_stream_dropped_total: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=sa_text("0")
+    )
+    log_stream_last_drop_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 __all__ = ["AuditForwardTarget"]

@@ -152,27 +152,38 @@ spec:
       secret:
         name: {{ include "spatiumddi.postgresSecretName" . }}
 
-  {{- if .Values.postgresql.cnpg.appRoleCreateDb }}
-  # Restore-verification drills (#702) create a throwaway
+  {{- if or .Values.postgresql.cnpg.appRoleCreateDb .Values.postgresql.cnpg.appRoleMonitor }}
+  # ``managed.roles`` reconciles the application role's attributes and
+  # memberships on EXISTING clusters too (unlike ``initdb.postInitSQL``,
+  # which only fires on first bootstrap), so both grants below reach
+  # installs that predate them. CNPG also reverts a hand-run GRANT.
+  #
+  # createdb (#702): restore-verification drills create a throwaway
   # ``spatiumddi_drill_*`` database, replay the newest backup archive
   # into it, assert, and drop it again. ``initdb.owner`` is a plain
   # LOGIN role with no CREATEDB and ``enableSuperuserAccess`` is off,
-  # so without this grant every drill dies at "permission denied to
-  # create database" and the feature can never run on an appliance.
+  # so without it every drill dies at "permission denied to create
+  # database". Withhold with ``postgresql.cnpg.appRoleCreateDb: false``.
   #
-  # ``managed.roles`` reconciles attributes on EXISTING clusters too
-  # (unlike ``initdb.postInitSQL``, which only fires on first
-  # bootstrap), so this grant reaches installs that predate #702.
-  #
-  # Set ``postgresql.cnpg.appRoleCreateDb: false`` to withhold it —
-  # drills then report a clear "role lacks CREATEDB" error rather
-  # than failing obscurely.
+  # pg_monitor (#4610): the rolling-upgrade preflight and the Cluster
+  # screen read ``pg_stat_replication`` as this role, and Postgres hides
+  # each standby's state and LSNs from anyone outside pg_monitor, so
+  # replication state read as unverifiable. pg_monitor is the read-only
+  # monitoring role (no data access, no writes). Withhold with
+  # ``postgresql.cnpg.appRoleMonitor: false``; the preflight then says
+  # plainly that it could not verify.
   managed:
     roles:
       - name: {{ .Values.postgresql.auth.username | quote }}
         ensure: present
         login: true
+        {{- if .Values.postgresql.cnpg.appRoleCreateDb }}
         createdb: true
+        {{- end }}
+        {{- if .Values.postgresql.cnpg.appRoleMonitor }}
+        inRoles:
+          - pg_monitor
+        {{- end }}
   {{- end }}
 
   storage:

@@ -26,6 +26,10 @@ import {
   type BackupTargetUpdate,
 } from "@/lib/api";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
+import {
+  clearRestoreInFlight,
+  markRestoreInFlight,
+} from "@/lib/restoreInFlight";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
@@ -391,31 +395,26 @@ function TargetRow({
           </FormError>
         ) : null,
       )}
-      {testMut.data && (
+      {testMut.data && !testMut.data.ok && (
+        <FormError className="border-t bg-destructive/5 px-3 py-1.5">
+          <ServerCrash className="mr-1 inline h-3.5 w-3.5" />
+          {testMut.data.error || "failed"}
+        </FormError>
+      )}
+      {testMut.data?.ok && (
         <div
           className={`border-t px-3 py-1.5 text-xs ${
-            !testMut.data.ok
-              ? "bg-destructive/5 text-destructive"
-              : testMut.data.warning
-                ? "bg-amber-500/5 text-amber-700 dark:text-amber-300"
-                : "bg-emerald-500/5 text-emerald-700 dark:text-emerald-300"
+            testMut.data.warning
+              ? "bg-amber-500/5 text-amber-700 dark:text-amber-300"
+              : "bg-emerald-500/5 text-emerald-700 dark:text-emerald-300"
           }`}
         >
-          {testMut.data.ok ? (
-            <>
-              <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
-              {testMut.data.detail || "ok"}
-              {testMut.data.warning && (
-                <p className="mt-1">
-                  <strong>Warning:</strong> {testMut.data.warning}
-                </p>
-              )}
-            </>
-          ) : (
-            <>
-              <ServerCrash className="mr-1 inline h-3.5 w-3.5" />
-              {testMut.data.error || "failed"}
-            </>
+          <CheckCircle2 className="mr-1 inline h-3.5 w-3.5" />
+          {testMut.data.detail || "ok"}
+          {testMut.data.warning && (
+            <p className="mt-1">
+              <strong>Warning:</strong> {testMut.data.warning}
+            </p>
           )}
         </div>
       )}
@@ -671,14 +670,23 @@ function RestoreFromArchiveModal({
             : "not in a recognised format") +
           " — use Full restore.";
   const restoreMut = useMutation({
-    mutationFn: () =>
-      backupTargetsApi.restoreFromArchive(targetId, {
+    mutationFn: () => {
+      // A restore ends every session: leave the sign-in notice (#4676).
+      markRestoreInFlight();
+      return backupTargetsApi.restoreFromArchive(targetId, {
         filename,
         passphrase,
         confirmation_phrase: confirm,
         sections: mode === "selective" ? sections : null,
-      }),
+      });
+    },
     onSuccess: (data) => onSuccess(data.warnings ?? []),
+    onError: (err: unknown) => {
+      // As BackupPage: only a cut connection (no response) keeps the note.
+      const status = (err as { response?: { status?: number } })?.response
+        ?.status;
+      if (status) clearRestoreInFlight();
+    },
   });
   const restoreWarnings = restoreMut.data?.warnings ?? [];
 

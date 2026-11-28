@@ -1,0 +1,11 @@
+#!/bin/sh
+# Keep the k3s service-CIDR route in step with the network (#4801). With no
+# default route the host has no route to the service CIDR; see
+# /usr/local/bin/spatium-k3s-node-ip. Re-run on every event that can re-apply
+# a connection's routes.
+case "${2:-}" in
+    up | dhcp4-change | dhcp6-change | reapply)
+        /usr/local/bin/spatium-k3s-node-ip --routes-only || true
+        ;;
+esac
+exit 0

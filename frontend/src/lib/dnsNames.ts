@@ -272,3 +272,26 @@ export function reversePointerName(ip: string): string | null {
   }
   return `${octets.reverse().join(".")}.in-addr.arpa`;
 }
+
+// The view of the nearest registered zone above `domain`, for the tree's
+// "Create zone here" on a folder with no zone of its own. When that nearest
+// level holds the same name in more than one view (split horizon), there is no
+// single answer, so the dialog opens on "No view" and its hint says what that
+// serves.
+export function ancestorViewId(
+  domain: string,
+  zones: { name: string; view_id?: string | null }[],
+): string | null {
+  const labels = domain.replace(/\.$/, "").toLowerCase().split(".");
+  for (let i = 1; i < labels.length; i++) {
+    const suffix = labels.slice(i).join(".");
+    const hits = zones.filter(
+      (z) => z.name.replace(/\.$/, "").toLowerCase() === suffix,
+    );
+    if (hits.length) {
+      const ids = new Set(hits.map((z) => z.view_id ?? null));
+      return ids.size === 1 ? [...ids][0] : null;
+    }
+  }
+  return null;
+}

@@ -95,8 +95,10 @@ export function PXEProfilesPage() {
             <p className="mt-1 text-xs text-muted-foreground">
               Reusable PXE provisioning profiles for{" "}
               <strong>{group?.name ?? groupId}</strong>. Each profile bundles a
-              TFTP / HTTP boot server + per-arch matches; bind a profile to a
-              scope from the Scope edit modal.
+              TFTP / HTTP boot server + per-arch matches
+              {perms.can("write", "dhcp_scope") &&
+                "; bind a profile to a scope from the Scope edit modal"}
+              .
             </p>
           </div>
           <button

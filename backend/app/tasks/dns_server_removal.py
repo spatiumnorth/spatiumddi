@@ -26,7 +26,6 @@ already gone is a no-op.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Any
 
@@ -38,6 +37,7 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.db import task_session
 from app.models.dns import DNSServer
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -127,6 +127,6 @@ async def _run(server_id: uuid.UUID) -> dict[str, Any]:
 
 @celery_app.task(name="app.tasks.dns_server_removal.remove_dns_server")
 def remove_dns_server(server_id: str) -> dict[str, Any]:
-    result = asyncio.run(_run(uuid.UUID(server_id)))
+    result = run_task(_run(uuid.UUID(server_id)))
     logger.info("dns_server_removed", server_id=server_id, **result)
     return result

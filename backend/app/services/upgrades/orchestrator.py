@@ -1081,9 +1081,24 @@ async def drive_upgrade(
     acquire_started = _monotonic()
     if run.state == "planned":
         # First call — acquire the lease.
-        ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
+        # #4512 — the first read gets the Plan's transient-retry budget (a k3s
+        # restart answers 503 for a while), from a thread since it sleeps.
+        ok, err = await asyncio.to_thread(
+            mutex.acquire,
+            holder=me,
+            lease_duration_seconds=LEASE_DURATION_S,
+            retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S,
+        )
         if not ok:
-            raise OrchestratorError(f"could not acquire upgrade lease: {err}")
+            reason = f"could not acquire upgrade lease: {err}"
+            # Still unreadable / held after the retries: say so on the run,
+            # which stays ``planned`` so Start can be pressed again (#4512).
+            run.last_error = reason
+            await _record_event(db, run, "start_refused", reason=reason)
+            await db.commit()
+            logger.warning("upgrade_start_refused", run_id=str(run.id), reason=reason)
+            raise OrchestratorError(reason)
+        run.last_error = None
         try:
             run.lease_holder = me
             run.lease_acquired_at = _now()
@@ -1119,7 +1134,12 @@ async def drive_upgrade(
         # lease under its own identity, so this one is refused; it takes over
         # only once that lease expired (the previous worker died) or was
         # released (a halt).
-        ok, err = mutex.acquire(holder=me, lease_duration_seconds=LEASE_DURATION_S)
+        ok, err = await asyncio.to_thread(
+            mutex.acquire,
+            holder=me,
+            lease_duration_seconds=LEASE_DURATION_S,
+            retry_budget_s=kubeapi_retry.READ_RETRY_BUDGET_S,
+        )
         if not ok:
             raise OrchestratorError(f"can't take over upgrade lease for resume: {err}")
         run.lease_holder = me
