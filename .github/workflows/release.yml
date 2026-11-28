@@ -430,9 +430,9 @@ jobs:
       ARCH: ${{ matrix.arch }}
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -440,7 +440,7 @@ jobs:
 
       - id: build
         name: Build and push by digest
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.image_def.context }}
           file: ${{ matrix.image_def.file }}
@@ -468,7 +468,7 @@ jobs:
       - name: Install Trivy
         uses: ./.github/actions/install-trivy
       - name: Trivy
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           skip-setup-trivy: true
           image-ref: scan-target:${{ matrix.image_def.image }}-${{ matrix.arch }}
@@ -489,7 +489,7 @@ jobs:
           tag: ${{ needs.meta.outputs.version }}-ubi
 
       # Only a digest that passed its gates reaches the tagging job.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ubidigest-${{ matrix.image_def.image }}-${{ matrix.arch }}
           path: digests/${{ matrix.image_def.image }}-${{ matrix.arch }}
@@ -504,13 +504,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: ubidigest-*
           merge-multiple: true
@@ -578,7 +578,7 @@ jobs:
       - name: Skip when no Pyxis token is configured
         if: env.HAVE_TOKEN != 'true'
         run: echo "::notice::PYXIS_API_TOKEN is not set; preflight results for ${{ matrix.image_def.image }} ${{ matrix.arch }} are not submitted to Red Hat"
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: env.HAVE_TOKEN == 'true'
       - id: submit
         if: env.HAVE_TOKEN == 'true'
@@ -1163,11 +1163,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
