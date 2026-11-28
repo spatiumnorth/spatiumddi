@@ -164,7 +164,7 @@ def test_useradd_is_fatal():
 
 def _done_block() -> str:
     start = SRC.index("    local done_addr=")
-    return SRC[start:SRC.index('Press OK to reboot."', start)]
+    return SRC[start:SRC.index('Reboot to finish, or choose Other', start)]
 
 
 def test_done_screen_advertises_https():
@@ -203,7 +203,7 @@ def test_both_operator_data_screens_are_sized_to_their_content():
     # Confirm's review is a --yesno again since the menu split (#995
     # item 28's fix): the summary needs the full height, and the field
     # picker is a separate short screen that needs almost none.
-    for screen in ('--msgbox "$done_body"', '--yesno "$s"'):
+    for screen in ('--yesno "$done_body"', '--yesno "$s"'):
         i = SRC.index(screen)
         assert "_whiptail_height" in SRC[i:i + 120], screen
 
@@ -220,8 +220,10 @@ def test_the_done_msgbox_cannot_abort_a_successful_install():
     """whiptail returns 255 on ESC and `set -e` is still on, so without
     `|| true` an operator who dismisses the final screen with ESC aborts
     an install that already succeeded and never reaches the reboot."""
-    i = SRC.index('--msgbox "$done_body"')
-    assert "|| true" in SRC[i:i + 140]
+    i = SRC.index('--yesno "$done_body"')
+    assert "|| done_rc=$?" in SRC[i:i + 140]
+    # ESC (255) is not the "Other..." button (1): it still reboots.
+    assert '[ "$done_rc" -eq 1 ] || break' in SRC[i:i + 600]
 
 
 def test_the_other_boot_leg_failing_is_surfaced_not_just_logged():
