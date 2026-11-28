@@ -4182,6 +4182,42 @@ the image boots). Read the release notes.
 
 Same-minor bumps are unaffected — revert the slot and you are done.
 
+**Applying from a USB stick (no browser upload, #4727).** The same two
+files can travel on a stick and be imported on the appliance itself:
+
+1. Copy the versioned `spatiumddi-appliance-slot-<version>-<arch>.raw.xz`
+   and its `.sha256` to the top level of the stick, or into a
+   `spatiumddi-upgrade/` directory on it. Format the stick ext4 or exFAT
+   (the removable-storage plane does not mount FAT32).
+2. Plug it into the node you are signed in to, then mount it under Fleet →
+   the appliance → Removable storage (the backup-disk mount, #989). The host
+   mounts it `noexec,nosuid,nodev`; SpatiumDDI only reads from it.
+3. Fleet → Upgrade images → **From USB…** lists what is on the mounted
+   disks (`GET /api/v1/appliance/upgrade-images/media`) and **Import** stores
+   the image (`POST …/import-from-media`) through the same verified store as
+   an upload: size cap, fleet-architecture check, free-space check, and the
+   sha256 from the sidecar compared to the bytes as they are stored. Then
+   schedule it as usual (Schedule OS upgrade, or Rolling Upgrade with source
+   "Uploaded"); the host runner, the architecture gate (#1026), the
+   version-direction checks and the A/B rollback are unchanged.
+
+What it refuses, each with a message: a directory that is not a live mount,
+a symlink or non-regular file, a name that is not a versioned release asset
+name, a version that is not a release version, a file over the 4 GiB limit,
+a missing, unreadable or wrong-file `.sha256`, and an architecture no
+approved node runs. **Release slot images are not signed**: the release
+publishes only the `.sha256` sidecar, so that is the sole check; compare it
+with the one on the release page (over a channel you trust) before you
+carry the stick in. Nothing is removed from the stick, and the staged copy
+on the appliance is cleaned up by the usual upgrade-image retention.
+
+On a multi-node cluster, a removable disk is per node: import on the node the
+stick is in. The image mirror then serves it to every node, and the rolling
+upgrade applies it per node as for any uploaded image. Not covered yet: a
+console (TUI) screen that does the import, and verifying a release signature
+(none is published). The host runner still accepts a local path directly:
+`spatium-upgrade-slot apply /path/to/image.raw.xz --expected-sha256 <hex>`.
+
 **Air-gap operator workflow (TL;DR):**
 
 ```
