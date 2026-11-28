@@ -11128,6 +11128,7 @@ def _scheduled_audit(
     response_model=ScheduledChangeResponse,
     status_code=201,
 )
+@token_write("schedules a DNS record change that the worker applies later")
 async def create_scheduled_change(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
@@ -11324,6 +11325,7 @@ async def update_scheduled_change(
     "/groups/{group_id}/zones/{zone_id}/scheduled-changes/{change_id}/cancel",
     response_model=ScheduledChangeResponse,
 )
+@token_write("cancels a pending scheduled DNS record change")
 async def cancel_scheduled_change(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
