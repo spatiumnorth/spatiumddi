@@ -70,6 +70,7 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/ai/usage/me": _SELF,
     "/api/v1/api-tokens": f"{_SELF}; superadmin sees all (checked in the handler)",
     "/api/v1/api-tokens/{token_id}": f"{_SELF} (_require_owned)",
+    "/api/v1/api-tokens/{token_id}/usage": f"{_SELF} (_require_owned); superadmin reads all",
     "/api/v1/auth/me": _SELF,
     "/api/v1/auth/me/permissions": _SELF,
     "/api/v1/auth/mfa/status": _SELF,

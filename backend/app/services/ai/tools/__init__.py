@@ -10,6 +10,7 @@ side-effect imports below register every read-only tool.
 # import and populate ``REGISTRY``.
 from app.services.ai.tools import (  # noqa: F401, E402
     admin,
+    api_tokens,
     appliance,
     apt,
     auth_grants,

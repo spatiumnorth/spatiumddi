@@ -1,0 +1,3 @@
+### Added
+
+- API tokens now record how often they are used: calls per day (kept 90 days) and the address of the last call, shown on the API Tokens page with an "Idle only" filter and a per-token usage chart, in `GET /api/v1/api-tokens` (`calls_30d`, `last_client_ip`, `?idle_days=N`), a per-token `GET /api/v1/api-tokens/{id}/usage` series, and a new `find_api_tokens` Copilot tool. A new `api_token_unused` alert rule (create it to enable it; default 90 days) flags active tokens nobody has called, and the Security dashboard shows the idle-token count beside the expiring one. Calls are counted in Redis and written in batches every five minutes, so requests gain no database write.

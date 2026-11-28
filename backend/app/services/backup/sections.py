@@ -83,6 +83,7 @@ SECTIONS: tuple[Section, ...] = (
             "group_role",
             "user_session",
             "api_token",
+            "api_token_usage_daily",
             "auth_provider",
             "auth_group_mapping",
         ),

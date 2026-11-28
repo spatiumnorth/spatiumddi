@@ -245,3 +245,14 @@ describe("Security tab lists the summary withheld (#3235)", () => {
     expect(text).toContain("No failed logins in the last 24 h.");
   });
 });
+
+describe("Security tab idle API tokens (#4491)", () => {
+  it("shows the idle token count beside the expiring count", async () => {
+    calls["dashboardsApi.securitySummary"] = () =>
+      Promise.resolve(
+        summary({ api_tokens_idle_count: 7, api_tokens_idle_days: 90 }),
+      );
+    const text = await show("security");
+    expect(text).toContain("7 idle 90 d+");
+  });
+});
