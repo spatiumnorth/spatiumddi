@@ -302,6 +302,11 @@ def build_view_descriptors(ordered_views: list, geo: GeoSteering) -> list[dict[s
                 "order": order,
                 "allow_query": getattr(v, "allow_query", None),
                 "allow_query_cache": getattr(v, "allow_query_cache", None),
+                # #3523 — the view's own default forwarders (None = the group's).
+                "forwarders": getattr(v, "forwarders", None),
+                "forward_policy": getattr(v, "forward_policy", None),
+                "forward_transport": getattr(v, "forward_transport", None) or "do53",
+                "forward_tls_hostname": getattr(v, "forward_tls_hostname", None),
             }
         )
         order += 1
