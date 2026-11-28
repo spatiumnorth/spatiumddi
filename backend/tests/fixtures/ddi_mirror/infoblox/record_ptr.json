@@ -1,0 +1,12 @@
+{
+  "result": [
+    {
+      "_ref": "record:ptr/ZG5zLmJpbmRfcHRyJA:30.0.1.10.in-addr.arpa/default",
+      "name": "30.0.1.10.in-addr.arpa",
+      "ptrdname": "app.example.com",
+      "ipv4addr": "10.1.0.30",
+      "view": "default",
+      "zone": "1.10.in-addr.arpa"
+    }
+  ]
+}

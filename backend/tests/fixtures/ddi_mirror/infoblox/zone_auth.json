@@ -1,0 +1,20 @@
+{
+  "result": [
+    {
+      "_ref": "zone_auth/ZG5zLnpvbmUkLl9kZWZhdWx0LmNvbS5leGFtcGxl:example.com/default",
+      "fqdn": "example.com",
+      "view": "default",
+      "comment": "main zone",
+      "zone_format": "FORWARD",
+      "disable": false
+    },
+    {
+      "_ref": "zone_auth/ZG5zLnpvbmUkLl9kZWZhdWx0LmFycGE:1.10.in-addr.arpa/default",
+      "fqdn": "1.10.in-addr.arpa",
+      "view": "default",
+      "comment": "",
+      "zone_format": "IPV4",
+      "disable": false
+    }
+  ]
+}

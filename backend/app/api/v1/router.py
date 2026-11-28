@@ -33,6 +33,7 @@ from app.api.v1.conformity import router as conformity_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
 from app.api.v1.cutover import router as cutover_router
 from app.api.v1.dashboards import router as dashboards_router
+from app.api.v1.ddi_mirror import router as ddi_mirror_router
 from app.api.v1.dhcp import router as dhcp_router
 from app.api.v1.dhcp.agents import router as dhcp_agents_router
 from app.api.v1.dhcp.ra_routers import router as ra_routers_router
@@ -428,6 +429,14 @@ api_v1_router.include_router(
     # bundle ETag) and the switch flips DHCPScope.is_active — parked agents
     # should re-poll on commit rather than wait out the safety tick.
     dependencies=[Depends(require_module("migration.cutover")), Depends(wake_publishing)],
+)
+api_v1_router.include_router(
+    ddi_mirror_router,
+    prefix="/migration/ddi-mirror",
+    tags=["ddi-mirror"],
+    # 404 when the module is off. NO wake_publishing: the mirror writes only its
+    # own store and never touches an agent config bundle.
+    dependencies=[Depends(require_module("migration.ddi_mirror"))],
 )
 api_v1_router.include_router(
     netbox_import_router,

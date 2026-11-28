@@ -379,7 +379,14 @@ def test_every_integration_module_gates_a_sweep_on_itself() -> None:
 def test_every_integration_module_has_a_dashboard_panel() -> None:
     from app.api.v1.dashboards.integrations import _PANELS  # noqa: PLC0415
 
-    assert sorted(row[2] for row in _PANELS) == _INTEGRATION_MODULES
+    # #4729 — the commercial-DDI mirror is migration tooling (``migration.*``),
+    # not an ``integrations.*`` module, and has its own panel; every
+    # ``integrations.*`` module still needs exactly one.
+    assert (
+        sorted(row[2] for row in _PANELS if row[2].startswith("integrations."))
+        == _INTEGRATION_MODULES
+    )
+    assert "migration.ddi_mirror" in {row[2] for row in _PANELS}
 
 
 def test_nothing_in_the_app_gates_on_the_derived_columns() -> None:

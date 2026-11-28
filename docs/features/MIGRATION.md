@@ -362,6 +362,62 @@ discovery per non-negotiable #13/#14 — only continuous integration
 
 ---
 
+## Commercial DDI live mirror — rehearse a cutover (#4729)
+
+The importers above take a snapshot; a snapshot of a busy estate is out of date
+before the cutover is rehearsed on it. The **DDI mirror** keeps a read-only copy
+of a commercial DDI estate current, so the rehearsal runs against what the old
+system is serving *now*. It is migration tooling, behind the
+`migration.ddi_mirror` feature module (**ships disabled**), at **Configuration
+→ Import → DDI mirror** (`/api/v1/migration/ddi-mirror/…`). Writes are
+superadmin-only; reads need `read` on `ddi_mirror_target`.
+
+**Vendors.** **Infoblox NIOS (WAPI)** is built. BlueCat and EfficientIP are
+named in the API (`GET /vendors`) and refused with a clear 422 until they land:
+each is one provider module implementing `DDIProvider`
+(`backend/app/services/ddi_mirror/base.py`) plus one line in `registry.py`;
+the store, reconciler, rehearsal, API, UI and Copilot tools are vendor-neutral.
+
+**What is mirrored** (IPv4): network views' networks and containers, DHCP
+ranges, fixed addresses, host / A / PTR records, authoritative zones and DNS
+views. Not mirrored yet: IPv6 objects, CNAME / MX / TXT / SRV and other record
+types, DHCP options beyond the network's own, leases, members / grid topology.
+
+**Where it goes.** Into its own tables (`ddi_mirror_target`,
+`ddi_mirror_object`), keyed `(target, kind, source object ref)` so a repeated
+pull updates rather than duplicates and removes what vanished. It never writes
+live IPAM, DNS or DHCP, and never writes to the source (only `GET` is sent).
+Deleting a target deletes its mirror and nothing else.
+
+**Safe by default.** The password is Fernet-encrypted at rest and never
+returned; changing the URL or username requires re-entering it. TLS is verified
+(optionally against a pasted CA bundle); turning verification off is an explicit
+per-source setting. Pulls are paged (`page_size` 50–1000), one request at a
+time with a short pause between pages, a 30 s request timeout, a per-kind object
+cap, and `Retry-After` is honoured on HTTP 429. The sync interval defaults to
+15 minutes (minimum 60 s). The connection is to the one URL you enter and is
+listed in [PRIVACY](../PRIVACY.md).
+
+**Failure handling.** A bad credential stops the run (error shown on the source,
+an error audit row, and the Integrations dashboard). A single object type that
+cannot be read is reported and its mirrored rows are kept, never swept on the
+strength of an incomplete pull. Each run stores a report: per-kind counts and
+the objects that could not be mapped.
+
+**The rehearsal** (`GET …/targets/{id}/rehearsal`) compares the mirror with the
+live, non-Trashed rows and reports, per object, what an import would do:
+`create`, `exists` or `differs` (with the differences spelled out). Containers
+match IPAM blocks by CIDR, networks match subnets (a different name or
+description is a difference), ranges match DHCP pools, fixed addresses match IP
+addresses (MAC / hostname differences), zones and views match by name, and
+host / A / PTR records match DNS records. It is computed on request, changes
+nothing, and is the input to the parity and parallel-run checks of the Windows
+cutover flow when the source is another estate. It does **not** promote
+anything: promotion into live IPAM / DNS / DHCP is a deliberate later step, not
+part of this feature.
+
+---
+
 ## Windows → SpatiumDDI cutover (#756)
 
 The importers land a *copy* of the Windows estate. They prove nothing

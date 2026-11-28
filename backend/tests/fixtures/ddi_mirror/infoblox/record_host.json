@@ -1,0 +1,28 @@
+{
+  "result": [
+    {
+      "_ref": "record:host/ZG5zLmhvc3Qk:web1.example.com/default",
+      "name": "web1.example.com",
+      "view": "default",
+      "zone": "example.com",
+      "comment": "",
+      "ttl": 3600,
+      "ipv4addrs": [
+        {
+          "_ref": "record:host_ipv4addr/x",
+          "ipv4addr": "10.1.0.20",
+          "mac": "00:50:56:11:22:33",
+          "configure_for_dhcp": true,
+          "host": "web1.example.com"
+        }
+      ]
+    },
+    {
+      "_ref": "record:host/ZG5zLmhvc3Qk:v6only.example.com/default",
+      "name": "v6only.example.com",
+      "view": "default",
+      "zone": "example.com",
+      "ipv4addrs": []
+    }
+  ]
+}

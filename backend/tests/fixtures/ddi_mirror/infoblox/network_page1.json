@@ -1,0 +1,32 @@
+{
+  "result": [
+    {
+      "_ref": "network/ZG5zLm5ldHdvcmskMTAuMS4wLjAvMjQvMA:10.1.0.0/24/default",
+      "network": "10.1.0.0/24",
+      "network_view": "default",
+      "comment": "Servers",
+      "extattrs": {
+        "VLAN": {
+          "value": "110"
+        }
+      },
+      "disable": false,
+      "options": [
+        {
+          "name": "routers",
+          "num": 3,
+          "value": "10.1.0.1",
+          "vendor_class": "DHCP"
+        }
+      ]
+    },
+    {
+      "_ref": "network/ZG5zLm5ldHdvcmskMTAuMi4wLjAvMjQvMA:10.2.0.0/24/default",
+      "network": "10.2.0.0/24",
+      "network_view": "default",
+      "comment": "Phones",
+      "disable": true
+    }
+  ],
+  "next_page_id": "page-2"
+}

@@ -39,6 +39,7 @@ import {
   Route,
   Server,
   Bird,
+  Database,
   Shield,
   ShieldAlert,
   ShieldCheck,
@@ -62,6 +63,7 @@ import {
   merakiApi,
   cloudApi,
   netbirdApi,
+  ddiMirrorApi,
   tailscaleApi,
   unifiApi,
   platformHealthApi,
@@ -90,6 +92,7 @@ import {
   type MerakiOrg,
   type CloudEndpoint,
   type NetbirdInstance,
+  type DDIMirrorTarget,
   type TailscaleTenant,
   type UnifiController,
   type PlatformHealthResponse,
@@ -1684,6 +1687,9 @@ export function DashboardPage() {
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
   const netbirdEnabled = settings?.integration_netbird_enabled ?? false;
+  // #4729 — migration tooling, so its switch is the feature module, not an
+  // ``integration_*_enabled`` settings flag.
+  const ddiMirrorEnabled = useModuleOn("migration.ddi_mirror");
   const { data: k8sClusters = [], error: k8sClustersError } = useQuery<
     KubernetesCluster[]
   >({
@@ -1705,6 +1711,13 @@ export function DashboardPage() {
       queryKey: ["tailscale-tenants"],
       queryFn: tailscaleApi.listTenants,
       enabled: tailscaleEnabled,
+    });
+  const { data: ddiMirrorTargets = [], error: ddiMirrorTargetsError } =
+    useQuery<DDIMirrorTarget[]>({
+      queryKey: ["ddi-mirror-targets"],
+      queryFn: ddiMirrorApi.list,
+      enabled: ddiMirrorEnabled,
+      refetchInterval: pollUnlessRefused(30_000),
     });
   const { data: netbirdInstances = [], error: netbirdInstancesError } =
     useQuery<NetbirdInstance[]>({
@@ -2943,7 +2956,8 @@ export function DashboardPage() {
             cloudEnabled ||
             tailscaleEnabled ||
             unifiEnabled ||
-            netbirdEnabled) && (
+            netbirdEnabled ||
+            ddiMirrorEnabled) && (
             <div className="space-y-1.5">
               {ipamFilterActive && (
                 <p className="px-1 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -2974,6 +2988,8 @@ export function DashboardPage() {
                 unifiControllers={unifiControllers}
                 netbirdEnabled={netbirdEnabled}
                 netbirdInstances={netbirdInstances}
+                ddiMirrorEnabled={ddiMirrorEnabled}
+                ddiMirrorTargets={ddiMirrorTargets}
                 // A failed refetch over rows already read keeps the rows.
                 errors={{
                   k8s: k8sClusters.length ? null : k8sClustersError,
@@ -2995,6 +3011,9 @@ export function DashboardPage() {
                   meraki: merakiOrgs.length ? null : merakiOrgsError,
                   cloud: cloudEndpoints.length ? null : cloudEndpointsError,
                   unifi: unifiControllers.length ? null : unifiControllersError,
+                  ddiMirror: ddiMirrorTargets.length
+                    ? null
+                    : ddiMirrorTargetsError,
                 }}
               />
             </div>
@@ -3706,6 +3725,8 @@ function IntegrationsPanel({
   unifiControllers,
   netbirdEnabled,
   netbirdInstances,
+  ddiMirrorEnabled,
+  ddiMirrorTargets,
   errors = {},
 }: {
   kubernetesEnabled: boolean;
@@ -3730,6 +3751,8 @@ function IntegrationsPanel({
   unifiControllers: UnifiController[];
   netbirdEnabled: boolean;
   netbirdInstances: NetbirdInstance[];
+  ddiMirrorEnabled: boolean;
+  ddiMirrorTargets: DDIMirrorTarget[];
   /** Each list read's error, by column: a refused list is not an empty one (#4855). */
   errors?: Record<string, unknown>;
 }) {
@@ -3744,6 +3767,7 @@ function IntegrationsPanel({
   const hasTailscale = tailscaleEnabled;
   const hasUnifi = unifiEnabled;
   const hasNetbird = netbirdEnabled;
+  const hasDdiMirror = ddiMirrorEnabled;
   const cols = [
     hasK8s,
     hasDocker,
@@ -3756,6 +3780,7 @@ function IntegrationsPanel({
     hasTailscale,
     hasUnifi,
     hasNetbird,
+    hasDdiMirror,
   ].filter(Boolean).length;
   const totalTargets =
     clusters.length +
@@ -3768,7 +3793,8 @@ function IntegrationsPanel({
     cloudEndpoints.length +
     tailscaleTenants.length +
     unifiControllers.length +
-    netbirdInstances.length;
+    netbirdInstances.length +
+    ddiMirrorTargets.length;
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">
@@ -3797,6 +3823,7 @@ function IntegrationsPanel({
           cols === 9 && "md:grid-cols-9 md:divide-x md:divide-y-0",
           cols === 10 && "md:grid-cols-10 md:divide-x md:divide-y-0",
           cols === 11 && "md:grid-cols-11 md:divide-x md:divide-y-0",
+          cols === 12 && "md:grid-cols-12 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -4304,6 +4331,50 @@ function IntegrationsPanel({
                       }
                       lastSyncedAt={t.last_synced_at}
                       lastSyncError={t.last_sync_error}
+                      intervalSeconds={t.sync_interval_seconds}
+                      enabled={t.enabled}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {hasDdiMirror && (
+          <div className="min-w-0">
+            <Link
+              to="/admin/ddi-mirror"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Database className="h-3 w-3" />
+              DDI mirror ({errors.ddiMirror ? "–" : ddiMirrorTargets.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {ddiMirrorTargets.length === 0 || errors.ddiMirror ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                <ListEmpty error={errors.ddiMirror} what="mirror sources">
+                  No sources registered.
+                </ListEmpty>
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {ddiMirrorTargets.map((t) => (
+                    <IntegrationRow
+                      key={t.id}
+                      to={`/admin/ddi-mirror`}
+                      name={t.name}
+                      subtitle={t.base_url}
+                      meta={
+                        t.object_count != null
+                          ? countNoun(t.object_count, "object")
+                          : "—"
+                      }
+                      lastSyncedAt={t.last_synced_at}
+                      lastSyncError={t.last_sync_error}
+                      lastSyncWarning={t.last_sync_warning}
                       intervalSeconds={t.sync_interval_seconds}
                       enabled={t.enabled}
                     />

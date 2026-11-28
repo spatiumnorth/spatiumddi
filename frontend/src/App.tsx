@@ -266,6 +266,10 @@ export default function App() {
           path="admin/cutover"
           element={<ImportPage initialTab="cutover" />}
         />
+        <Route
+          path="admin/ddi-mirror"
+          element={<ImportPage initialTab="ddi_mirror" />}
+        />
         <Route path="admin/backup" element={<BackupPage />} />
         <Route
           path="admin/diagnostics/errors"

@@ -1,0 +1,16 @@
+{
+  "result": [
+    {
+      "_ref": "view/ZG5zLnZpZXckLl9kZWZhdWx0:default/true",
+      "name": "default",
+      "comment": "",
+      "is_default": true
+    },
+    {
+      "_ref": "view/ZG5zLnZpZXckLjE:internal/false",
+      "name": "internal",
+      "comment": "split-horizon inside",
+      "is_default": false
+    }
+  ]
+}

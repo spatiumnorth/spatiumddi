@@ -437,6 +437,7 @@ export const adminConfigurationNav: NavEntry[] = [
       "dns.import",
       "ipam.import.netbox",
       "migration.cutover",
+      "migration.ddi_mirror",
     ],
   },
   {
