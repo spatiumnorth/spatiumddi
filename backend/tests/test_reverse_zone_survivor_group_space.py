@@ -273,3 +273,83 @@ async def test_a_zone_linked_across_groups_is_not_picked(
         db_session, subnet_b, ipaddress.ip_address("172.24.2.130"), [e["g2"]]
     )
     assert picked is None
+
+
+# ── A subnet bound by its stored group alone, still inheriting (#5004 walk) ──
+#
+# POST /ipam/subnets with dns_group_id and no dns_zone_id stores
+# dns_group_ids=[G] and keeps dns_inherit_settings=true. With nothing on its
+# block or space its effective DNS is empty, yet subnet create made its reverse
+# zone in G from the stored group. The PTR pick and the hand-off must count
+# that stored group, or the subnet's own zone takes no PTR and is retired.
+
+
+async def _group_only_subnet(
+    client: AsyncClient, headers: dict[str, str], space: str, block: str, network: str, gid: str
+) -> str:
+    resp = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=headers,
+        json={"space_id": space, "block_id": block, "network": network, "dns_group_id": gid},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_group_only_subnet_picks_its_own_reverse_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    g1, _f1 = await _group(db_session, "lab.example.")
+    s1, b1 = await _space(db_session)
+    await db_session.commit()
+    a = await _group_only_subnet(client, headers, s1, b1, "172.24.2.0/24", g1)
+
+    zone = await _zone_row(db_session, g1, ZONE)
+    assert zone is not None and str(zone.linked_subnet_id) == a
+    subnet_a = await db_session.get(Subnet, uuid.UUID(a))
+    assert subnet_a is not None
+    assert subnet_a.dns_inherit_settings is True
+    # Its effective DNS is empty, so the caller passes no effective groups.
+    picked = await resolve_reverse_zone(
+        db_session, subnet_a, ipaddress.ip_address("172.24.2.10"), []
+    )
+    assert picked is not None and picked.id == zone.id
+
+
+@pytest.mark.asyncio
+async def test_group_only_subnet_address_gets_its_ptr(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    g1, f1 = await _group(db_session, "lab.example.")
+    s1, b1 = await _space(db_session)
+    await db_session.commit()
+    a = await _group_only_subnet(client, headers, s1, b1, "172.24.2.0/24", g1)
+
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{a}/addresses",
+        headers=headers,
+        json={"address": "172.24.2.10", "hostname": "h1", "status": "allocated", "dns_zone_id": f1},
+    )
+    assert resp.status_code == 201, resp.text
+    zone = await _zone_row(db_session, g1, ZONE)
+    assert zone is not None
+    assert zone.id in await _ptr_zones(db_session, "172.24.2.10")
+
+
+@pytest.mark.asyncio
+async def test_group_only_same_group_survivor_keeps_the_zone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    g1, _f1 = await _group(db_session, "lab.example.")
+    s1, b1 = await _space(db_session)
+    await db_session.commit()
+    a = await _group_only_subnet(client, headers, s1, b1, "172.24.2.0/25", g1)
+    b = await _group_only_subnet(client, headers, s1, b1, "172.24.2.128/25", g1)
+
+    assert (await client.delete(f"/api/v1/ipam/subnets/{a}", headers=headers)).status_code == 204
+    zone = await _zone_row(db_session, g1, ZONE)
+    assert zone is not None and zone.deleted_at is None and str(zone.linked_subnet_id) == b

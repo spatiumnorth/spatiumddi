@@ -29,12 +29,13 @@ from app.models.ipam import IPAddress, Subnet
 from app.services.dns.new_object_defaults import default_zone_ttl
 from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, reverse_zone_network re-exported
     _effective_dns,
+    bound_dns_groups,
     cidrs_overlap,
     ipam_authors_zone,
     reverse_zone_network,
     reverse_zone_pieces,
 )
-from app.services.ipam.zone_binding import prune_zone_ids, stored_uuid_list
+from app.services.ipam.zone_binding import prune_zone_ids
 from app.services.lock_order import lock_zone_rows
 
 if TYPE_CHECKING:
@@ -547,17 +548,14 @@ async def _would_resolve_to_zone(
 ) -> bool:
     """True when ``cand`` is a subnet that ``zone`` can be handed to: one the
     zone belongs to by the rules that place a subnet's PTRs. Its effective DNS
-    must name the zone's group (through its group list or its forward zone), a
+    must be bound to the zone's group (``bound_dns_groups``: its effective
+    groups and forward zone, or its own stored groups and zone), a
     view-pinned zone must match the view of its forward zone, and a subnet of
     another IP space whose network overlaps the one going away is never an heir
     (#844): the same reverse names there belong to another space's DNS."""
     if cand.space_id != going.space_id and cidrs_overlap(cand.network, going.network):
         return False
-    groups, forward_zone_id = await _effective_dns(db, cand)
-    allowed = set(stored_uuid_list(groups))
-    forward_zone = await db.get(DNSZone, forward_zone_id) if forward_zone_id else None
-    if forward_zone is not None:
-        allowed.add(forward_zone.group_id)
+    allowed, forward_zone = await bound_dns_groups(db, cand)
     if zone.group_id not in allowed:
         return False
     if (
