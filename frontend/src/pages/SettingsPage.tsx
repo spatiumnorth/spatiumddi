@@ -2476,13 +2476,13 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="RPKI ROA refresh interval"
-                  description="How often the global ROA dump is re-pulled and per-ASN rows are reconciled (INSERT / UPDATE / DELETE + state transitions). The source service caches the dump in-memory for 5 min, so values below 1 h still hit cache where possible. 1–24 h range."
+                  description="How often the global ROA dump is re-pulled and per-ASN rows are reconciled (INSERT / UPDATE / DELETE + state transitions). 1–168 h range."
                 >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={1}
-                      max={24}
+                      max={168}
                       value={values.rpki_roa_refresh_interval_hours ?? 4}
                       onChange={(e) =>
                         set(
