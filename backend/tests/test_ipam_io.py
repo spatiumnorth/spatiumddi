@@ -556,8 +556,17 @@ async def test_reimport_skips_computed_address_columns(db_session: AsyncSession,
 
         buf = io.StringIO()
         w = _csv.writer(buf)
+        # Keyed by column name, not position, so a column added to
+        # ADDRESS_COLUMNS (#5022 added ``icon``) does not shift the values.
+        values = {
+            "subnet": "10.7.1.0/24",
+            "address": "10.7.1.5",
+            "status": "allocated",
+            "hostname": "h",
+            "last_seen_at": "2026-01-01",
+        }
         w.writerow(ADDRESS_COLUMNS + ["rack"])
-        w.writerow(["10.7.1.0/24", "10.7.1.5", "allocated", "h", "", "", "", "2026-01-01", "r1"])
+        w.writerow([values.get(c, "") for c in ADDRESS_COLUMNS] + ["r1"])
         parsed = parse_payload(buf.getvalue().encode(), "a.csv", "text/csv")
     else:
         parsed = parse_payload(data, "rt.xlsx", None)
