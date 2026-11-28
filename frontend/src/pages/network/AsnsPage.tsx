@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -502,13 +503,18 @@ export function AsnsPage() {
             </button>
             <span className="h-4 w-px bg-border" />
             <button
-              onClick={() => setSelected(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelected(new Set());
+              }}
               className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
             >
               Clear
             </button>
             {bulkError && (
-              <span className="ml-2 text-xs text-red-600">{bulkError}</span>
+              <span role="alert" className="ml-2 text-xs text-red-600">
+                {bulkError}
+              </span>
             )}
           </div>
         )}
@@ -537,8 +543,10 @@ export function AsnsPage() {
                     setSearch("");
                     setTagFilters([]);
                   }}
+                  gate={writeGate}
+                  hint="Add one to start the registry."
                 >
-                  No ASNs tracked yet — add one to start the registry.
+                  No ASNs tracked yet.
                 </ListEmpty>
               </p>
               <button

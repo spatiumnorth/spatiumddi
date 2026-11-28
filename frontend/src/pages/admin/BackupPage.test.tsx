@@ -176,6 +176,8 @@ describe("Backup page", () => {
     await screen.findByText("Restore from file");
     fireEvent.click(screen.getByRole("button", { name: "Restore Drills" }));
     fireEvent.click(await screen.findByRole("button", { name: "Schedule" }));
+    // A Save with nothing changed sends nothing (#4271), so change something.
+    fireEvent.click(await screen.findByRole("checkbox"));
     fireEvent.click(await screen.findByRole("button", { name: "Save" }));
     await waitFor(() =>
       expect(screen.getByText("a drill is already running")).toBeTruthy(),

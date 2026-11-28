@@ -12,7 +12,7 @@ Per CLAUDE.md non-negotiable #13, these tools are
 **default-disabled** — operationally-sensitive surface that an
 operator should explicitly opt into. Superadmins who want to ask
 "what's been crashing?" through the chat flip them on in
-Settings → AI → Tool Catalog.
+Administration → AI Tool Catalog.
 
 No write proposals here. Acknowledge / suppress / delete are
 deliberate operator decisions; the chat is the wrong UX for them
@@ -43,7 +43,7 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
                 "This tool exposes uncaught exception tracebacks + "
                 "sanitised request context, so it's restricted to "
                 "superadmin users. Ask your platform admin to run the "
-                "query, or open Admin → Diagnostics → Errors directly."
+                "query, or open Administration → Diagnostics → Errors directly."
             )
         }
     return None

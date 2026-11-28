@@ -1137,7 +1137,8 @@ def cmd_apply(args) -> int:
     # imported tarballs don't carry. Mount the new slot, copy its
     # bake set across, unmount — k3s on next reboot scans /var, finds
     # the new tarballs, imports them, the chart's tags resolve.
-    _refresh_baked_images(target_dev)
+    if _refresh_baked_images(target_dev):
+        _unpack_new_images()
 
     # #999 Part C2 — grub.cfg was just re-rendered (or patched) on the
     # PRIMARY ESP. Mirror it before reporting success.
@@ -1155,6 +1156,41 @@ def cmd_apply(args) -> int:
     print(f"  spatium-upgrade-slot set-next-boot")
     print("  reboot")
     return 0
+
+
+# #3919 — k3s's import (above) leaves the new images packed in containerd's
+# content store, and the kubelet unpacks each one when it starts its first
+# container from it: 27 s of the role pods' first create after the reboot,
+# measured on a slot upgrade, against 1 s once unpacked. The running k3s imports
+# them now, on the OLD boot, so unpack them now too, where the time is not
+# service downtime. ``spatium-k3s-images unpack`` does it: it waits for the
+# import, takes only images of a workload this node already runs, and paces its
+# writes at the upgrade's own rate (#2090). Best effort and never fatal: it is
+# an optimisation, and whatever it leaves the kubelet (and the unpack unit after
+# the reboot) unpacks as before.
+_UNPACK_TOOL = "/usr/local/bin/spatium-k3s-images"
+_UNPACK_MAX_TIME_S = 900
+_UNPACK_WATCHER_DELAY_S = 5  # k3s's watcher imports 2 s after the file event
+
+
+def _unpack_new_images() -> None:
+    if not os.access(_UNPACK_TOOL, os.X_OK):
+        return
+    print("Unpacking the new slot's images while the old slot still serves ...")
+    time.sleep(_UNPACK_WATCHER_DELAY_S)
+    try:
+        proc = subprocess.run(
+            [_UNPACK_TOOL, "unpack", "--max-time", str(_UNPACK_MAX_TIME_S)],
+            timeout=_UNPACK_MAX_TIME_S + 60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"WARN: image unpack did not run ({exc}); the kubelet unpacks on first start.",
+              file=sys.stderr)
+        return
+    if proc.returncode != 0:
+        print("WARN: not every image was unpacked; the kubelet unpacks the rest on first start.",
+              file=sys.stderr)
 
 
 # #1630 — the suffix a tarball carries while it is being copied into the
@@ -2027,6 +2063,14 @@ def cmd_set_default(args) -> int:
 
 
 def main() -> int:
+    # The log file is not a tty, so stdout is block-buffered there and the
+    # upgrader's own lines landed after the unpack child's (#3919): keep the
+    # log in the order things happened.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass  # not a TextIOWrapper (a test capture); order is then moot
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 

@@ -309,10 +309,14 @@ function TemplateEditor({
         {tab === "general" && (
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipamtemplates-name"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Name
               </label>
               <input
+                id="ipamtemplates-name"
                 value={form.name}
                 onChange={(e) => set("name", e.target.value)}
                 className={inputCls}
@@ -320,10 +324,14 @@ function TemplateEditor({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipamtemplates-applies-to"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Applies To
               </label>
               <select
+                id="ipamtemplates-applies-to"
                 value={form.applies_to}
                 onChange={(e) =>
                   set("applies_to", e.target.value as IPAMTemplateAppliesTo)
@@ -342,10 +350,14 @@ function TemplateEditor({
               )}
             </div>
             <div className="col-span-2">
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipamtemplates-description"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Description
               </label>
               <input
+                id="ipamtemplates-description"
                 value={form.description}
                 onChange={(e) => set("description", e.target.value)}
                 className={inputCls}
@@ -357,10 +369,14 @@ function TemplateEditor({
         {tab === "stamp" && (
           <div className="space-y-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipamtemplates-tags-json-object"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Tags (JSON object)
               </label>
               <textarea
+                id="ipamtemplates-tags-json-object"
                 value={form.tagsJson}
                 onChange={(e) => set("tagsJson", e.target.value)}
                 rows={4}
@@ -368,10 +384,14 @@ function TemplateEditor({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipamtemplates-custom-fields-json-object"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Custom fields (JSON object)
               </label>
               <textarea
+                id="ipamtemplates-custom-fields-json-object"
                 value={form.cfsJson}
                 onChange={(e) => set("cfsJson", e.target.value)}
                 rows={4}
@@ -381,10 +401,14 @@ function TemplateEditor({
             <div className="grid grid-cols-2 gap-4">
               {dnsOn && (
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  <label
+                    htmlFor="ipamtemplates-dns-server-group"
+                    className="mb-1 block text-xs font-medium text-muted-foreground"
+                  >
                     DNS server group
                   </label>
                   <select
+                    id="ipamtemplates-dns-server-group"
                     value={form.dns_group_id}
                     onChange={(e) => set("dns_group_id", e.target.value)}
                     className={inputCls}
@@ -400,10 +424,14 @@ function TemplateEditor({
               )}
               {dhcpOn && (
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  <label
+                    htmlFor="ipamtemplates-dhcp-server-group"
+                    className="mb-1 block text-xs font-medium text-muted-foreground"
+                  >
                     DHCP server group
                   </label>
                   <select
+                    id="ipamtemplates-dhcp-server-group"
                     value={form.dhcp_group_id}
                     onChange={(e) => set("dhcp_group_id", e.target.value)}
                     className={inputCls}
@@ -420,10 +448,14 @@ function TemplateEditor({
             </div>
             {dnsOn && (
               <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                <label
+                  htmlFor="ipamtemplates-default-dns-zone-optional"
+                  className="mb-1 block text-xs font-medium text-muted-foreground"
+                >
                   Default DNS zone (optional)
                 </label>
                 <input
+                  id="ipamtemplates-default-dns-zone-optional"
                   value={form.dns_zone_id}
                   onChange={(e) => set("dns_zone_id", e.target.value)}
                   placeholder="zone UUID — operator can leave blank"
@@ -446,10 +478,14 @@ function TemplateEditor({
             </label>
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                <label
+                  htmlFor="ipamtemplates-hostname-policy"
+                  className="mb-1 block text-xs font-medium text-muted-foreground"
+                >
                   Hostname policy
                 </label>
                 <select
+                  id="ipamtemplates-hostname-policy"
                   value={form.ddns_hostname_policy}
                   onChange={(e) => set("ddns_hostname_policy", e.target.value)}
                   className={inputCls}
@@ -463,10 +499,14 @@ function TemplateEditor({
                 </select>
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                <label
+                  htmlFor="ipamtemplates-ttl-override-sec"
+                  className="mb-1 block text-xs font-medium text-muted-foreground"
+                >
                   TTL override (sec)
                 </label>
                 <input
+                  id="ipamtemplates-ttl-override-sec"
                   value={form.ddns_ttl}
                   onChange={(e) => set("ddns_ttl", e.target.value)}
                   placeholder="(zone default)"
@@ -474,10 +514,14 @@ function TemplateEditor({
                 />
               </div>
               <div className="col-span-2">
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                <label
+                  htmlFor="ipamtemplates-domain-override-optional"
+                  className="mb-1 block text-xs font-medium text-muted-foreground"
+                >
                   Domain override (optional)
                 </label>
                 <input
+                  id="ipamtemplates-domain-override-optional"
                   value={form.ddns_domain_override}
                   onChange={(e) => set("ddns_domain_override", e.target.value)}
                   placeholder="e.g. dev.example.com"
@@ -648,8 +692,10 @@ export function ReapplyConfirmModal({
         <p>
           This will stamp the template across every recorded instance with
           <code className="mx-1">force=True</code>, overwriting any operator
-          overrides. Capped at 200 instances per call. An instance whose child
-          layout cannot be carved is skipped and left as it was.
+          overrides of the template&apos;s fields. Tags and custom fields are
+          merged: the template&apos;s keys are set, and keys the template does
+          not hold are kept. Capped at 200 instances per call. An instance whose
+          child layout cannot be carved is skipped and left as it was.
         </p>
         <p>
           Type the template name to confirm:{" "}
@@ -869,6 +915,12 @@ export function IPAMTemplatesPage() {
           />
         </div>
 
+        <FormError className="text-sm">
+          {deleteMut.error
+            ? formatApiError(deleteMut.error, "Delete failed")
+            : null}
+        </FormError>
+
         <div className="overflow-x-auto rounded-lg border">
           <table className="w-full text-sm">
             <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
@@ -968,6 +1020,7 @@ export function IPAMTemplatesPage() {
                     </button>
                     <button
                       onClick={() => {
+                        deleteMut.reset();
                         if (
                           confirm(
                             `Delete template "${t.name}"? Applied instances are not removed; their applied_template_id is cleared.`,

@@ -433,10 +433,10 @@ def _rrset(*values: str, ttl: int | None = None) -> RRsetData:
 
 
 @pytest.mark.asyncio
-async def test_create_record_replaces_the_rrset_not_appends(
+async def test_update_record_replaces_the_rrset_not_appends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``overwrite=true`` on the first member is load-bearing.
+    """``overwrite=true`` on an update's first member is load-bearing.
 
     Technitium APPENDS at ``overwrite=false``, so editing www A 10.0.0.1 to
     10.0.0.2 would leave the zone answering BOTH, round-robin, forever —
@@ -444,11 +444,11 @@ async def test_create_record_replaces_the_rrset_not_appends(
     driver. Unlike the agent path there is no structural reload to
     eventually re-converge it, so this never self-heals.
     """
-    drv, fake = _driver(monkeypatch, [_ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
     await drv.apply_record_change(
-        _Server({"api_url": "https://x.test", "api_token": "t"}), _change("create")
+        _Server({"api_url": "https://x.test", "api_token": "t"}), _change("update")
     )
-    call = fake.calls[0]
+    call = fake.calls[1]
     assert call["path"] == "/api/zones/records/add"
     assert call["params"]["domain"] == "www.example.com"
     assert call["params"]["zone"] == "example.com"
@@ -468,7 +468,7 @@ async def test_rrset_write_clears_once_then_appends_the_rest(
     clear, first, is the only sequence this API can express that lands the
     complete set.
     """
-    drv, fake = _driver(monkeypatch, [_ok({}), _ok({}), _ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({}), _ok({}), _ok({})])
     await drv.apply_record_change(
         _Server({"api_url": "https://x.test", "api_token": "t"}),
         _change(
@@ -477,14 +477,14 @@ async def test_rrset_write_clears_once_then_appends_the_rest(
             rrset=_rrset("10.0.0.1", "10.0.0.2", "10.0.0.3", ttl=60),
         ),
     )
-    assert [c["params"]["overwrite"] for c in fake.calls] == ["true", "false", "false"]
-    assert [c["params"]["ipAddress"] for c in fake.calls] == [
+    assert [c["params"]["overwrite"] for c in fake.calls[1:]] == ["true", "false", "false"]
+    assert [c["params"]["ipAddress"] for c in fake.calls[1:]] == [
         "10.0.0.1",
         "10.0.0.2",
         "10.0.0.3",
     ]
     # The RRset's own TTL wins over the op record's.
-    assert {c["params"]["ttl"] for c in fake.calls} == {60}
+    assert {c["params"]["ttl"] for c in fake.calls[1:]} == {60}
 
 
 @pytest.mark.asyncio
@@ -496,12 +496,12 @@ async def test_empty_rrset_deletes_rather_than_writing_nothing(
     Writing nothing and reporting success would leave the old value served
     while the op reads as applied.
     """
-    drv, fake = _driver(monkeypatch, [_ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
     await drv.apply_record_change(
         _Server({"api_url": "https://x.test", "api_token": "t"}),
         _change("update", rrset=RRsetData(ttl=None, members=())),
     )
-    assert fake.calls[0]["path"] == "/api/zones/records/delete"
+    assert fake.calls[1]["path"] == "/api/zones/records/delete"
 
 
 @pytest.mark.asyncio
@@ -513,14 +513,14 @@ async def test_delete_stays_value_scoped_even_with_an_rrset(
     A wipe-and-rebuild would open a window where the name serves less than
     it should, to fix nothing.
     """
-    drv, fake = _driver(monkeypatch, [_ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
     await drv.apply_record_change(
         _Server({"api_url": "https://x.test", "api_token": "t"}),
         _change("delete", value="10.0.0.2", rrset=_rrset("10.0.0.1", "10.0.0.3")),
     )
-    assert len(fake.calls) == 1
-    assert fake.calls[0]["path"] == "/api/zones/records/delete"
-    assert fake.calls[0]["params"]["ipAddress"] == "10.0.0.2"
+    assert len(fake.calls) == 2
+    assert fake.calls[1]["path"] == "/api/zones/records/delete"
+    assert fake.calls[1]["params"]["ipAddress"] == "10.0.0.2"
 
 
 @pytest.mark.asyncio
@@ -547,6 +547,7 @@ async def test_replayed_op_is_an_idempotent_noop(
     drv, fake = _driver(
         monkeypatch,
         [
+            _ok({}),
             _FakeResponse({"status": "error", "errorMessage": message}),
             _ok({}),
         ],
@@ -556,7 +557,7 @@ async def test_replayed_op_is_an_idempotent_noop(
         _change("create", rrset=_rrset("10.0.0.1", "10.0.0.2")),
     )
     # Both members were attempted — the first not-a-failure didn't stop it.
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 3
 
 
 @pytest.mark.asyncio
@@ -598,12 +599,12 @@ async def test_delete_record_sends_the_value_params(
     The delete endpoint identifies the record by its value, exactly like
     add — that is the whole reason ``record_params`` is shared by both.
     """
-    drv, fake = _driver(monkeypatch, [_ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
     await drv.apply_record_change(
         _Server({"api_url": "https://x.test", "api_token": "t"}),
         _change("delete", value="10.0.0.2"),
     )
-    call = fake.calls[0]
+    call = fake.calls[1]
     assert call["path"] == "/api/zones/records/delete"
     assert call["params"]["ipAddress"] == "10.0.0.2"
 
@@ -612,12 +613,12 @@ async def test_delete_record_sends_the_value_params(
 async def test_apex_record_uses_the_bare_zone_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    drv, fake = _driver(monkeypatch, [_ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
     await drv.apply_record_change(
         _Server({"api_url": "https://x.test", "api_token": "t"}),
         _change("create", name="@", record_type="MX", value="mail.example.com.", priority=10),
     )
-    call = fake.calls[0]
+    call = fake.calls[1]
     assert call["params"]["domain"] == "example.com"
     assert call["params"]["exchange"] == "mail.example.com"
     assert call["params"]["preference"] == 10
@@ -630,12 +631,12 @@ async def test_mx_preference_zero_survives(monkeypatch: pytest.MonkeyPatch) -> N
     ``rec.priority or 10`` would silently rewrite it to 10 and quietly
     demote the operator's primary mail exchanger.
     """
-    drv, fake = _driver(monkeypatch, [_ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
     await drv.apply_record_change(
         _Server({"api_url": "https://x.test", "api_token": "t"}),
         _change("create", name="@", record_type="MX", value="mail.example.com.", priority=0),
     )
-    assert fake.calls[0]["params"]["preference"] == 0
+    assert fake.calls[1]["params"]["preference"] == 0
 
 
 @pytest.mark.asyncio
@@ -1115,10 +1116,10 @@ def _b64(*strings: bytes) -> str:
 async def test_txt_is_sent_as_character_strings(
     monkeypatch: pytest.MonkeyPatch, value: str, expected: list[bytes]
 ) -> None:
-    drv, fake = _driver(monkeypatch, [_ok({})])
+    drv, fake = _driver(monkeypatch, [_ok({}), _ok({})])
     change = _change("create", name="@", record_type="TXT", value=value)
     await drv.apply_record_change(_Server({"api_url": "https://x.test", "api_token": "t"}), change)
-    params = fake.calls[0]["params"]
+    params = fake.calls[1]["params"]
     assert params["characterStringsBase64"] == _b64(*expected)
     assert "text" not in params
 

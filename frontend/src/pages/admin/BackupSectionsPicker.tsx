@@ -5,6 +5,9 @@ import { AlertTriangle, Layers, Loader2 } from "lucide-react";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { backupApi, type BackupSection } from "@/lib/api";
 
+import { reachOutsideSelection } from "./backupSelectiveReach";
+import { countNoun } from "@/lib/count-noun";
+
 /**
  * Shared section-checklist for both restore flows (issue #117
  * Phase 2b). Reads the catalog from ``GET /backup/sections`` and
@@ -72,6 +75,8 @@ export function BackupSectionsPicker({
     }
   }
 
+  const reach = reachOutsideSelection(sectionsQ.data ?? [], selected);
+
   return (
     <div className="rounded-md border bg-muted/20 p-3">
       <div className="mb-2 flex items-center gap-2 text-xs">
@@ -107,7 +112,8 @@ export function BackupSectionsPicker({
           />
           <span className={selectiveDisabledReason ? "opacity-60" : undefined}>
             <strong>Selective restore</strong> — pick which sections to replace;
-            the rest stay untouched.
+            sections that reference a ticked one are replaced too (listed
+            below).
             {selectiveDisabledReason && (
               <span className="mt-0.5 block text-[11px]">
                 {selectiveDisabledReason}
@@ -123,9 +129,23 @@ export function BackupSectionsPicker({
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
             <div>
               Selective restore <strong>TRUNCATEs CASCADE</strong> the selected
-              sections. Rows in <em>other</em> sections that reference the wiped
-              data via foreign key are also removed. Use this for clean-slate
+              sections, and every table in another section that references them
+              via foreign key is emptied and then{" "}
+              <strong>reloaded from the archive</strong>, so edits made to that
+              data since the backup are lost too. Use this for clean-slate
               restores of one section, not for merging.
+              {reach.length > 0 && (
+                <ul
+                  className="mt-1 list-disc pl-4"
+                  data-testid="selective-reach"
+                >
+                  {reach.map((r) => (
+                    <li key={r.key}>
+                      <strong>{r.label}</strong>: {r.tables.join(", ")}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
           </div>
           {sectionsQ.isLoading ? (
@@ -163,7 +183,7 @@ export function BackupSectionsPicker({
                       <span className="flex items-center gap-2">
                         <strong>{s.label}</strong>
                         <span className="text-[10px] text-muted-foreground">
-                          {s.table_count} tables
+                          {countNoun(s.table_count, "table")}
                         </span>
                         {s.volatile && (
                           <span className="rounded bg-zinc-500/15 px-1.5 py-0.5 text-[10px] text-zinc-600 dark:text-zinc-400">

@@ -112,6 +112,17 @@ async def _assert_demo_mode_not_on_prod_data() -> None:
         )
 
 
+_BCRYPT_HASH_RE = re.compile(r"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
+
+
+def _initial_admin_hash(value: str) -> str:
+    """The configured initial admin hash when it is a well-formed bcrypt hash,
+    else ``""`` (the default account). A malformed value must not become an
+    account nobody can log into."""
+    value = (value or "").strip()
+    return value if _BCRYPT_HASH_RE.fullmatch(value) else ""
+
+
 async def _seed_default_admin() -> None:
     """Create the default admin user if no users exist yet."""
     from sqlalchemy import func, select
@@ -133,23 +144,41 @@ async def _seed_default_admin() -> None:
                 # sticks for the next visitor); skip the
                 # force-password-change flag so the demo lands on the
                 # dashboard instead of a redirect to a 403'd form.
+                # #4548 — an install that was handed a password hash (the
+                # appliance installer) starts on it, with no forced change.
+                # The hash is never logged.
+                preset = _initial_admin_hash(settings.initial_admin_password_hash)
+                if settings.initial_admin_password_hash.strip() and not preset:
+                    # Never the value itself.
+                    logger.warning(
+                        "initial_admin_password_hash_ignored",
+                        message="INITIAL_ADMIN_PASSWORD_HASH is not a bcrypt hash; "
+                        "using the default admin account",
+                    )
                 admin = User(
                     username="admin",
                     email="admin@localhost",
                     display_name="Administrator",
-                    hashed_password=hash_password("admin"),
+                    hashed_password=preset or hash_password("admin"),
                     is_superadmin=True,
                     is_active=True,
                     auth_source="local",
-                    force_password_change=not settings.demo_mode,
+                    force_password_change=False if preset else not settings.demo_mode,
                 )
                 session.add(admin)
                 await session.commit()
-                logger.warning(
-                    "default_admin_created",
-                    username="admin",
-                    message="Default admin created with password 'admin' — change it immediately",
-                )
+                if preset:
+                    logger.info(
+                        "default_admin_created",
+                        username="admin",
+                        message="Admin created with the password set at install",
+                    )
+                else:
+                    logger.warning(
+                        "default_admin_created",
+                        username="admin",
+                        message="Default admin created with password 'admin' — change it immediately",
+                    )
         except Exception as exc:
             # Table may not exist yet (pre-migration). Skip silently.
             logger.debug("default_admin_seed_skipped", reason=str(exc))
@@ -286,7 +315,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "(AV-over-IP flows, BACnet/IP devices, industrial-OT devices, "
         "DICOM application entities), and "
         "the logical ownership tags (customer / site / provider) those "
-        "entities reference.",
+        "entities reference; read IP spaces, subnets and addresses, which "
+        "those registries anchor to.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
@@ -311,6 +341,13 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "provider"},
             {"action": "admin", "resource_type": "tls_cert"},
             {"action": "admin", "resource_type": "dnsbl"},
+            # The IP space, subnet and address its multicast, AV range, OT and
+            # BACnet creates anchor to are chosen from the IPAM lists; without
+            # these reads every one of those dialogs offers an empty choice
+            # (#4635). Read only: no IPAM write comes with it.
+            {"action": "read", "resource_type": "ip_space"},
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "read", "resource_type": "ip_address"},
             {"action": "read", "resource_type": "alert"},
         ],
     ),
@@ -334,6 +371,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            # The pools a scope holds (#4637): the subnet's DHCP card read them
+            # as "0 pools" without it.
+            {"action": "read", "resource_type": "dhcp_pool"},
             {"action": "read", "resource_type": "tls_cert"},
             {"action": "read", "resource_type": "alert"},
         ],
@@ -341,7 +381,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     "Compliance Editor": (
         "Full CRUD on conformity policies (issue #106) plus read on the "
         "underlying resources (spaces / blocks / subnets / IPs / zones / "
-        "scopes) so the "
+        "scopes / pools) so the "
         "compliance team can author + tune policies without touching "
         "operational config.",
         [
@@ -359,6 +399,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "dns_zone"},
             {"action": "read", "resource_type": "dns_record"},
             {"action": "read", "resource_type": "dhcp_scope"},
+            # The pools a scope holds (#4637): the subnet's DHCP card read them
+            # as "0 pools" without it.
+            {"action": "read", "resource_type": "dhcp_pool"},
             {"action": "read", "resource_type": "alert"},
         ],
     ),
@@ -665,6 +708,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_pool_health_stale_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_pool_health_stale_alert_rule_seed_skipped", reason=str(exc))
+    # The ``log_forward_dropping`` rule (#4545) is NOT seeded here either: it is
+    # inserted once by migration e5a2c8d4f7b1, so deleting it is final.
     # The ``secret_expiring`` rule (#2138) is NOT seeded here: it is inserted
     # once by migration c8e2a5f71d39, so an operator who deletes it keeps it
     # deleted. A startup seed would re-create it on every restart.
@@ -987,6 +1032,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 wake_subscription,
             )
             from app.services.appliance.bootstrap import (  # noqa: PLC0415
+                retry_bootstrap_if_no_active_cert,
                 sync_active_cert_to_secret,
             )
 
@@ -997,7 +1043,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     if result is WakeResult.UNAVAILABLE:
                         await asyncio.sleep(30)  # Redis down: tick-only
                     out = await sync_active_cert_to_secret()
-                    if out.get("status") not in ("in-sync", "locked", "no-active-cert"):
+                    if out.get("status") == "no-active-cert":
+                        # The startup bootstrap lost the reconcile lock to a
+                        # sibling and nothing else issues the first cert (#4442).
+                        await retry_bootstrap_if_no_active_cert()
+                    elif out.get("status") not in ("in-sync", "locked", "no-active-cert"):
                         logger.info("appliance_cert_deploy_sync", **out)
                 except asyncio.CancelledError:
                     raise
@@ -1049,8 +1099,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pcap_orphan_task.cancel()
     with suppress(asyncio.CancelledError):
         await pcap_orphan_task
-    from app.services import after_commit_dispatch  # noqa: PLC0415
+    from app.services import after_commit_dispatch, log_stream_forward  # noqa: PLC0415
 
+    await log_stream_forward.shutdown()
     await after_commit_dispatch.shutdown()
     from app.db import dispose_probe_engine  # noqa: PLC0415
 

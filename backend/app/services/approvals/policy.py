@@ -104,12 +104,9 @@ async def match_policy(
 
     best: ApprovalPolicy | None = None
     for policy in rows:
-        # Threshold gate. NOTE (P1): no covered op threads a ``count`` —
-        # ``gate_or_execute`` always calls this with ``count=None`` for the
-        # six single-target deletes, so a policy carrying a numeric
-        # ``min_count`` never matches yet. The machinery stays for the P2
-        # bulk_* ops (which will pass a row count); the P1 migration seeds no
-        # min_count policies, so this branch is inert until then.
+        # Threshold gate. ``gate_or_execute`` passes ``count=1`` for the
+        # single-target deletes, so ``min_count`` 1 gates them and a higher
+        # threshold waits for a bulk op that passes a real row count (#4909).
         if policy.min_count is not None and (count is None or count < policy.min_count):
             continue
         if best is None or _is_stronger(policy, best, resource_type):

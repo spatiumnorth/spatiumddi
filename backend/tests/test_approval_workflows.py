@@ -564,3 +564,51 @@ async def test_router_404_when_module_off(client: AsyncClient, db_session: Async
     )
     r = await client.get("/api/v1/change-requests", headers=_auth(token))
     assert r.status_code == 404, r.text
+
+
+@pytest.mark.asyncio
+async def test_missing_policy_and_request_404_name_the_object(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4359 — a bare 404 rendered as "Not Found" in the console's refused-delete line."""
+    await _enable_module(db_session)
+    _, token = await _user(db_session, name="root", superadmin=True)
+    await db_session.commit()
+    missing = uuid.uuid4()
+    r = await client.delete(f"/api/v1/change-requests/policies/{missing}", headers=_auth(token))
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Approval policy not found"
+    r = await client.put(
+        f"/api/v1/change-requests/policies/{missing}", json={}, headers=_auth(token)
+    )
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Approval policy not found"
+    r = await client.get(f"/api/v1/change-requests/{missing}", headers=_auth(token))
+    assert r.status_code == 404
+    assert r.json()["detail"] == "Change request not found"
+
+
+@pytest.mark.asyncio
+async def test_threshold_one_gates_single_delete_4909(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4909: a single-target delete counts as one row, so ``min_count=1``
+    queues it (it used to run inline); a threshold of 5 does not."""
+    await _enable_module(db_session)
+    policy = await _enable_delete_subnet_policy(db_session)
+    policy.min_count = 1
+    await db_session.flush()
+    _, token = await _user(
+        db_session,
+        name="requester",
+        permissions=[{"action": "delete", "resource_type": "subnet"}],
+    )
+    subnet = await _subnet(db_session)
+    r = await client.delete(f"/api/v1/ipam/subnets/{subnet.id}", headers=_auth(token))
+    assert r.status_code == 202, r.text
+
+    policy.min_count = 5
+    await db_session.flush()
+    subnet2 = await _subnet(db_session, network="10.0.6.0/24")
+    r = await client.delete(f"/api/v1/ipam/subnets/{subnet2.id}", headers=_auth(token))
+    assert r.status_code == 204, r.text

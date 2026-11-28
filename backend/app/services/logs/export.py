@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.services.e911.exports import csv_safe
+from app.services.logs.agent_logs import log_row_server_name
 
 ExportFormat = Literal["csv", "jsonl"]
 
@@ -68,7 +69,7 @@ def _iso(ts: datetime) -> str:
 def dns_record(r: DNSQueryLogEntry, names: Mapping[uuid.UUID, str]) -> dict[str, Any]:
     return {
         "ts": _iso(r.ts),
-        "server": names.get(r.server_id, str(r.server_id)),
+        "server": log_row_server_name(r.server_id, r.server_name, names),
         "client_ip": str(r.client_ip) if r.client_ip is not None else None,
         "client_port": r.client_port,
         "qname": r.qname,
@@ -85,7 +86,7 @@ def dns_record(r: DNSQueryLogEntry, names: Mapping[uuid.UUID, str]) -> dict[str,
 def dhcp_record(r: DHCPLogEntry, names: Mapping[uuid.UUID, str]) -> dict[str, Any]:
     return {
         "ts": _iso(r.ts),
-        "server": names.get(r.server_id, str(r.server_id)),
+        "server": log_row_server_name(r.server_id, r.server_name, names),
         "severity": r.severity,
         "code": r.code,
         "mac_address": str(r.mac_address) if r.mac_address is not None else None,

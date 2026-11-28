@@ -23,6 +23,8 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { isRefused } from "@/lib/refusal";
+import { FreshRowError } from "@/components/FreshRowError";
+import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
 
 /**
  * Restore Drills section on the Backup admin page (issue #702).
@@ -269,9 +271,21 @@ export function RestoreDrillsSection() {
                       </td>
                       <td className="px-4 py-2">
                         {t.drill_enabled && t.drill_cron ? (
-                          <span className="font-mono text-xs">
-                            {t.drill_cron}
-                          </span>
+                          <>
+                            <span className="font-mono text-xs">
+                              {t.drill_cron}
+                            </span>
+                            {!t.enabled && (
+                              // The drill sweep only fires for enabled
+                              // destinations (#4403); Run drill still works.
+                              <div
+                                className="mt-0.5 text-xs text-amber-600 dark:text-amber-400"
+                                title="The scheduled drill sweep skips a disabled destination. Enable it on the Destinations tab, or use Run drill by hand."
+                              >
+                                paused: destination disabled
+                              </div>
+                            )}
+                          </>
                         ) : (
                           <span className="text-xs text-muted-foreground">
                             not scheduled
@@ -349,7 +363,10 @@ export function RestoreDrillsSection() {
         )}
 
         {runDrill.isError && (
-          <div className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
+          <div
+            role="alert"
+            className="border-t px-4 py-2 text-xs text-rose-600 dark:text-rose-400"
+          >
             {formatApiError(runDrill.error, "drill failed")}
           </div>
         )}
@@ -474,6 +491,10 @@ function DrillRow({
   );
 }
 
+const DEFAULT_DRILL_CRON = "0 5 * * 0";
+
+// Reads the destination when the dialog opens (#4271, #4236's class): the row
+// the list holds can be 30 s old and the form is seeded once.
 function ScheduleDrillModal({
   target,
   onClose,
@@ -482,15 +503,54 @@ function ScheduleDrillModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  const fresh = useFreshRow<BackupTarget>(target, () =>
+    refetchRow<BackupTarget>(qc, [["backup-targets"]], target.id),
+  );
+  if (fresh.error)
+    return (
+      <FreshRowError
+        title="Drill schedule"
+        error={fresh.error}
+        onRetry={fresh.retry}
+        onClose={onClose}
+      />
+    );
+  if (!fresh.ready || !fresh.row) return null;
+  return <ScheduleDrillForm target={fresh.row} onClose={onClose} />;
+}
+
+function ScheduleDrillForm({
+  target,
+  onClose,
+}: {
+  target: BackupTarget;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
   const [enabled, setEnabled] = useState(target.drill_enabled);
-  const [cron, setCron] = useState(target.drill_cron ?? "0 5 * * 0");
+  const [cron, setCron] = useState(target.drill_cron ?? DEFAULT_DRILL_CRON);
+
+  // An enabled drill with no schedule never fires (#4450); the server
+  // refuses it too, so stop it here with the reason.
+  const missingCron = enabled && cron.trim() === "";
 
   const save = useMutation({
-    mutationFn: () =>
-      backupTargetsApi.update(target.id, {
-        drill_enabled: enabled,
-        drill_cron: cron || null,
-      }),
+    mutationFn: async () => {
+      // Only what changed against what the dialog read. The cron is compared
+      // with what it was seeded to, so an untouched default is not "a change".
+      const body = changedFields(
+        {
+          drill_enabled: target.drill_enabled,
+          drill_cron: target.drill_cron ?? DEFAULT_DRILL_CRON,
+        },
+        { drill_enabled: enabled, drill_cron: cron || null },
+      );
+      // Turning drills on needs a stored cron; send the shown one if none is.
+      if (body.drill_enabled && !target.drill_cron && !("drill_cron" in body))
+        body.drill_cron = cron || null;
+      if (Object.keys(body).length === 0) return null;
+      return backupTargetsApi.update(target.id, body);
+    },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["backup-targets"] });
       onClose();
@@ -510,10 +570,14 @@ function ScheduleDrillModal({
         </label>
 
         <div>
-          <label className="mb-1 block text-xs font-medium">
+          <label
+            htmlFor="restore-drills-section-drill-schedule"
+            className="mb-1 block text-xs font-medium"
+          >
             Drill schedule
           </label>
           <select
+            id="restore-drills-section-drill-schedule"
             value={
               DRILL_CRON_PRESETS.find((p) => p.value === cron)?.value ??
               "__custom__"
@@ -538,6 +602,12 @@ function ScheduleDrillModal({
             placeholder="0 5 * * 0"
             className="mt-2 w-full rounded-md border bg-background px-2 py-1.5 font-mono text-sm"
           />
+          {missingCron && (
+            <p className="mt-1 text-xs text-rose-600 dark:text-rose-400">
+              Enter a schedule, or untick the switch above: an enabled drill
+              with no schedule never runs.
+            </p>
+          )}
           <p className="mt-1 text-xs text-muted-foreground">
             5-field UTC cron expression. Drills are far more expensive than
             backups — weekly against nightly backups is a sensible default.
@@ -545,7 +615,7 @@ function ScheduleDrillModal({
         </div>
 
         {save.isError && (
-          <p className="text-xs text-rose-600 dark:text-rose-400">
+          <p role="alert" className="text-xs text-rose-600 dark:text-rose-400">
             {formatApiError(save.error)}
           </p>
         )}
@@ -560,7 +630,7 @@ function ScheduleDrillModal({
           </button>
           <button
             type="button"
-            disabled={save.isPending}
+            disabled={save.isPending || missingCron}
             onClick={() => save.mutate()}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >

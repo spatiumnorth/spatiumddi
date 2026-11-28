@@ -250,12 +250,17 @@ async def _under_load(
     servers: list[Any],
     monkeypatch: pytest.MonkeyPatch,
     request: Any,
+    hold_until: asyncio.Event | None = None,
 ) -> tuple[Any, float, list[tuple[float, int]], float]:
     """Run ``request`` (a coroutine factory) while both agents post the
     scope's leases back to back, each batch holding the scope for ``_HOLD``
     after taking it, offset so a batch is always open: the reported shape.
     Returns its response, how long it took, every batch's (end time, status),
-    and when it was answered. Fails if it is not answered within ``_BUDGET``."""
+    and when it was answered. Fails if it is not answered within ``_BUDGET``.
+    With ``hold_until``, every batch holds the scope until that event is set
+    (the caller sets it once ``request`` has answered; it is always set on the
+    way out) instead of for ``_HOLD``: the batch is then provably still open
+    when the request answers, whatever the runner's speed."""
     from app.api.v1.dhcp import agents  # noqa: PLC0415
 
     for server in servers:  # both agents hold the leases, as an HA pair does
@@ -264,7 +269,10 @@ async def _under_load(
     real = agents.lock_zones_for_addresses
 
     async def _slow(db: AsyncSession, **kwargs: Any) -> Any:
-        await asyncio.sleep(_HOLD)
+        if hold_until is None:
+            await asyncio.sleep(_HOLD)
+        else:
+            await hold_until.wait()
         return await real(db, **kwargs)
 
     monkeypatch.setattr(agents, "lock_zones_for_addresses", _slow)
@@ -292,6 +300,8 @@ async def _under_load(
         await asyncio.sleep(_HOLD * 3)
     finally:
         stop.set()
+        if hold_until is not None:
+            hold_until.set()
         await asyncio.wait_for(asyncio.gather(*running, return_exceptions=True), 60)
         if task is not None and not task.done():
             await asyncio.wait_for(task, 60)
@@ -333,18 +343,25 @@ async def test_a_scope_edit_needs_no_gate_under_the_same_load(
 ) -> None:
     """A scope edit's UPDATE changes no key column, so it takes the row ``FOR
     NO KEY UPDATE``, which a ``FOR KEY SHARE`` does not block: under the load
-    that starved the delete it answers at once, and the batches carry on."""
+    that starved the delete it answers while the batches still hold the scope,
+    and they carry on."""
     servers, scope_id, _subnet, admin = await _pair_estate(db_session)
-    resp, took, answered, _at = await _under_load(
-        concurrent_client,
-        servers,
-        monkeypatch,
-        lambda: concurrent_client.put(
+    held = asyncio.Event()  # both agents' batches stay open until the edit answers
+
+    async def _edit() -> Any:
+        r = await concurrent_client.put(
             f"/api/v1/dhcp/scopes/{scope_id}", headers=admin, json={"description": "edited"}
-        ),
+        )
+        held.set()  # recorded the moment it answered; the batches are still open
+        return r
+
+    resp, _took, answered, _at = await _under_load(
+        concurrent_client, servers, monkeypatch, _edit, hold_until=held
     )
+    # Answered while the batches held the scope: no wall-clock bound, so a slow
+    # runner cannot fail it; an edit that waited for the batches would never
+    # have answered (they only end once it does) and _under_load fails on _BUDGET.
     assert resp.status_code == 200, resp.text
-    assert took < _HOLD, took
     assert answered and all(code == 200 for _t, code in answered), answered
 
 

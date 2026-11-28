@@ -12,15 +12,19 @@ either direction has a real cost:
 
 The rules, verbatim from the specification rather than from folklore:
 
-* maximum length **16 bytes** — bytes, not characters. Titles are
-  overwhelmingly ASCII in practice, but the ceiling is a byte count, so
-  it is measured as one.
-* the default character repertoire, **excluding backslash** (``0x5C``,
-  which is the DICOM multi-value delimiter) and **all control
-  characters**.
+* maximum length **16 characters**. The repertoire below is ASCII only,
+  so characters and bytes are the same count.
+* the default character repertoire — ISO-IR 6, printable ASCII
+  ``0x20``-``0x7E`` — **excluding backslash** (``0x5C``, which is the
+  DICOM multi-value delimiter). Everything else is refused, and the
+  message names it by code point: control characters (C0, DEL and the
+  C1 range ``U+0080``-``U+009F``), no-break and other Unicode spaces, and
+  look-alikes such as a Cyrillic ``А``. A look-alike is the dangerous
+  case: it is invisible in the UI and makes a title that cannot match
+  the device it was typed for.
 * **spaces are legal.** They are non-significant padding — a title is
   padded with trailing spaces to an even length on the wire — so leading
-  and trailing space is trimmed on the way in and internal spaces are
+  and trailing ASCII space is trimmed on the way in and internal spaces are
   kept.
 * an **all-space value is forbidden**, which after trimming is the same
   statement as "must not be empty".
@@ -59,9 +63,12 @@ def normalize_ae_title(raw: str) -> str:
     Spaces are non-significant padding per the VR, so trimming them is
     normalization, not mutation of operator intent. Nothing else is
     changed — in particular case is preserved, because peers match
-    titles exactly.
+    titles exactly. Only ``0x20`` is trimmed: ``str.strip()`` would also
+    eat a tab or a no-break space, silently repairing a value that
+    :func:`validate_ae_title` must refuse. This is the one form stored
+    and compared for uniqueness.
     """
-    return (raw or "").strip()
+    return (raw or "").strip(" ")
 
 
 def validate_ae_title(raw: str) -> str:
@@ -69,7 +76,7 @@ def validate_ae_title(raw: str) -> str:
 
     Checks are ordered so the message names the most specific problem:
     empty first (which also covers the forbidden all-space value), then
-    the character repertoire, then length. Length is checked last so a
+    backslash, then the rest of the repertoire, then length. Length is checked last so a
     title that is both too long *and* contains a backslash reports the
     backslash — the operator can shorten a name themselves, but a
     forbidden character usually means the value was mis-transcribed.
@@ -86,21 +93,20 @@ def validate_ae_title(raw: str) -> str:
             "multi-value delimiter and cannot appear inside a single value"
         )
 
-    control = [ch for ch in title if ord(ch) < 0x20 or ord(ch) == 0x7F]
-    if control:
+    bad = sorted({ch for ch in title if not 0x20 <= ord(ch) <= 0x7E})
+    if bad:
+        found = ", ".join(f"U+{ord(ch):04X}" for ch in bad)
         raise AETitleError(
-            "AE Title must not contain control characters "
-            f"(found {', '.join(f'0x{ord(ch):02X}' for ch in sorted(set(control)))}) — "
-            "this usually means the value was pasted out of a spreadsheet cell"
+            "AE Title may only contain printable ASCII characters "
+            f"(found {found}) — control characters, no-break spaces and "
+            "look-alike letters usually mean the value was pasted out of a "
+            "document or spreadsheet"
         )
 
-    encoded = len(title.encode("utf-8"))
-    if encoded > DICOM_AE_TITLE_MAX_BYTES:
-        # Report bytes, not characters, and say so: a 16-character title
-        # with a non-ASCII character in it is over the limit, and an
-        # operator counting characters will not see why.
+    if len(title) > DICOM_AE_TITLE_MAX_BYTES:
         raise AETitleError(
-            f"AE Title must be at most {DICOM_AE_TITLE_MAX_BYTES} bytes " f"(this one is {encoded})"
+            f"AE Title must be at most {DICOM_AE_TITLE_MAX_BYTES} characters "
+            f"(this one is {len(title)})"
         )
     return title
 

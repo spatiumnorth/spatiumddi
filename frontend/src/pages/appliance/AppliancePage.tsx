@@ -291,7 +291,7 @@ export function AppliancePage() {
           {deploymentIsAppliance === false && (
             <span
               className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
-              title="This control plane is running on Docker or Kubernetes. Host-level tabs (Cluster, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
+              title="This control plane is running on Docker or Kubernetes. Host-level tabs (Cluster, Logs, Network, Maintenance) are hidden — the Fleet tab still drives slot upgrades on any registered appliance agents."
             >
               docker/k8s
             </span>
@@ -309,9 +309,8 @@ export function AppliancePage() {
             <>
               This control plane is running on Docker / Kubernetes. Host-level
               tabs (Cluster, Logs, Network, Maintenance) only apply to an
-              appliance-hosted control plane and are hidden here. The OS
-              Versions tab still drives slot upgrades on any registered
-              appliance agents.
+              appliance-hosted control plane and are hidden here. The Fleet tab
+              still drives slot upgrades on any registered appliance agents.
             </>
           )}
         </p>

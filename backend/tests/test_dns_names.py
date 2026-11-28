@@ -419,3 +419,21 @@ def test_classless_owner_refuses_non_ascii_digits() -> None:
         )
         is not None
     )
+
+
+@pytest.mark.parametrize("rtype", ["NS", "TXT"])
+@pytest.mark.parametrize("origin", ["64/26.2.0.192.in-addr.arpa.", "64/26.2.0.192.in-addr.arpa"])
+def test_classless_zone_apex_records_are_accepted(rtype: str, origin: str) -> None:
+    """#4434 — the apex owner is the zone's own name, whose ``/`` is not the record's."""
+    owner = "64/26.2.0.192.in-addr.arpa."
+    assert classless_owner_error(rtype, owner, origin) is None
+    assert bind_check_names_error(rtype, owner, "ns1.example.net.", origin=origin) is None
+
+
+def test_classless_zone_still_refuses_a_slash_in_front_of_the_apex() -> None:
+    assert (
+        classless_owner_error(
+            "NS", "x/26.64/26.2.0.192.in-addr.arpa.", "64/26.2.0.192.in-addr.arpa."
+        )
+        is not None
+    )

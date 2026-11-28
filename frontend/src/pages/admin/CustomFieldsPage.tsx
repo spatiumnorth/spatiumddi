@@ -13,9 +13,19 @@ import { useFreshRow, changedFields } from "@/hooks/useFreshRow";
 import { FreshRowError } from "@/components/FreshRowError";
 import { useModalDialog } from "@/components/ui/use-draggable-modal";
 import { FormError } from "@/components/ui/form-error";
+import { hasOptions } from "@/lib/customFieldValues";
 
 const RESOURCE_TYPES = ["ip_space", "ip_block", "subnet", "ip_address"];
-const FIELD_TYPES = ["text", "number", "boolean", "select", "url", "email"];
+const FIELD_TYPES = [
+  "text",
+  "number",
+  "boolean",
+  "date",
+  "select",
+  "multi_select",
+  "url",
+  "email",
+];
 
 const RESOURCE_LABELS: Record<string, string> = {
   ip_space: "IP Space",
@@ -28,7 +38,9 @@ const FIELD_TYPE_LABELS: Record<string, string> = {
   text: "Text",
   number: "Number",
   boolean: "Boolean",
+  date: "Date",
   select: "Select (dropdown)",
+  multi_select: "Multi-select (several options)",
   url: "URL",
   email: "Email",
 };
@@ -140,10 +152,14 @@ function FieldModal({
           )}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-resource-type"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Resource Type
               </label>
               <select
+                id="custom-fields-resource-type"
                 value={form.resource_type}
                 onChange={(e) => set("resource_type", e.target.value)}
                 disabled={mode === "edit"}
@@ -157,10 +173,14 @@ function FieldModal({
               </select>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-field-type"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Field Type
               </label>
               <select
+                id="custom-fields-field-type"
                 value={form.field_type}
                 onChange={(e) => set("field_type", e.target.value)}
                 disabled={mode === "edit"}
@@ -177,13 +197,17 @@ function FieldModal({
 
           {mode === "create" && (
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-name"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Name{" "}
                 <span className="text-muted-foreground/60">
                   (lowercase, underscores)
                 </span>
               </label>
               <input
+                id="custom-fields-name"
                 value={form.name}
                 onChange={(e) =>
                   set(
@@ -198,10 +222,14 @@ function FieldModal({
           )}
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="custom-fields-label"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Label
             </label>
             <input
+              id="custom-fields-label"
               value={form.label}
               onChange={(e) => set("label", e.target.value)}
               placeholder="e.g. Location Code"
@@ -210,10 +238,14 @@ function FieldModal({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="custom-fields-description"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Description
             </label>
             <input
+              id="custom-fields-description"
               value={form.description}
               onChange={(e) => set("description", e.target.value)}
               placeholder="Optional description"
@@ -221,15 +253,19 @@ function FieldModal({
             />
           </div>
 
-          {form.field_type === "select" && (
+          {hasOptions(form.field_type) && (
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-options"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Options{" "}
                 <span className="text-muted-foreground/60">
                   (comma-separated)
                 </span>
               </label>
               <input
+                id="custom-fields-options"
                 value={form.options}
                 onChange={(e) => set("options", e.target.value)}
                 placeholder="Option A, Option B, Option C"
@@ -240,10 +276,14 @@ function FieldModal({
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-default-value"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Default Value
               </label>
               <input
+                id="custom-fields-default-value"
                 value={form.default_value}
                 onChange={(e) => set("default_value", e.target.value)}
                 placeholder="Optional"
@@ -251,10 +291,14 @@ function FieldModal({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="custom-fields-display-order"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Display Order
               </label>
               <input
+                id="custom-fields-display-order"
                 type="number"
                 value={form.display_order}
                 onChange={(e) => set("display_order", Number(e.target.value))}
@@ -325,11 +369,13 @@ function fieldToForm(field: CustomField): FieldForm {
 function DeleteFieldDialog({
   field,
   pending,
+  error,
   onConfirm,
   onClose,
 }: {
   field: CustomField;
   pending: boolean;
+  error?: string | null;
   onConfirm: () => void;
   onClose: () => void;
 }) {
@@ -349,6 +395,7 @@ function DeleteFieldDialog({
           from {RESOURCE_LABELS[field.resource_type]}? Existing data stored in
           this field will be lost.
         </p>
+        <FormError className="mt-2 text-sm">{error}</FormError>
         <div className="mt-4 flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -633,8 +680,16 @@ export function CustomFieldsPage() {
         <DeleteFieldDialog
           field={deleteConfirm}
           pending={deleteMutation.isPending}
+          error={
+            deleteMutation.error
+              ? formatApiError(deleteMutation.error, "Delete failed")
+              : null
+          }
           onConfirm={() => deleteMutation.mutate(deleteConfirm.id)}
-          onClose={() => setDeleteConfirm(null)}
+          onClose={() => {
+            setDeleteConfirm(null);
+            deleteMutation.reset();
+          }}
         />
       )}
     </div>

@@ -15,6 +15,8 @@ name: spatiumddi-agent-dns-technitium
 # Quickstart:
 #
 #   export CONTROL_PLANE_URL=https://spatium.example.com
+#   # Use the frontend URL (e.g. http://host:8077) or your reverse proxy,
+#   # never :8000: the Compose API listens on 127.0.0.1 only.
 #   export DNS_AGENT_KEY=$(openssl rand -hex 32)
 #   # Register the key on the control plane first (Settings → Agent
 #   # Keys) so the agent can bootstrap. Create the matching

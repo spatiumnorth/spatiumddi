@@ -1,0 +1,7 @@
+# Context is the repo root; Dockerfile.ubi reads only agent/dns/, LICENSE and
+# NOTICE from it. An allowlist, so a developer's .env and build output never
+# reach the builder (same reasoning as frontend/Dockerfile.dockerignore).
+*
+!agent/dns/
+!LICENSE
+!NOTICE

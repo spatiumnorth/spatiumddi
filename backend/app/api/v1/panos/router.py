@@ -26,7 +26,11 @@ from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
-from app.core.stored_secret_guard import require_secret_with_destination_change
+from app.core.stored_secret_guard import (
+    release_block_sync_credentials,
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace, Subnet
@@ -363,12 +367,20 @@ async def update_firewall(
         changes,
         destination=["host", "port"],
         secrets={"api_key": f.api_key_encrypted},
+        blank_keeps=("api_key",),
     )
     new_ipam = changes.get("ipam_space_id", f.ipam_space_id)
     new_dns = changes.get("dns_group_id", f.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
         await _validate_bindings(db, new_ipam, new_dns)
 
+    block_sync_cleared = release_block_sync_credentials(
+        f,
+        changes,
+        destination=["host", "port"],
+        credentials={"block_sync_api_key_encrypted": b""},
+        label="host",
+    )
     for k, v in changes.items():
         if k == "api_key":
             if v:
@@ -380,6 +392,9 @@ async def update_firewall(
         raise HTTPException(
             status_code=422, detail="device_group is required for a Panorama target"
         )
+
+    if block_sync_cleared:
+        changes["block_sync_credentials_cleared"] = True
 
     _audit(
         db,
@@ -574,6 +589,12 @@ async def test_connection(
         stored = await db.get(PANOSFirewall, body.firewall_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="Palo Alto firewall not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"host": body.host, "port": body.port, "api_key": body.api_key},
+            destination=("host", "port"),
+            secrets={"api_key": stored.api_key_encrypted},
+        )
         host = host or stored.host
         port = body.port or stored.port
         verify_tls = body.verify_tls if body.verify_tls is not None else stored.verify_tls

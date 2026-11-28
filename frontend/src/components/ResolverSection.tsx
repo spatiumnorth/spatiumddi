@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle } from "lucide-react";
+import { SettingsRow } from "@/components/SettingsRow";
 
 import {
   formatDialogError,
@@ -17,28 +18,6 @@ interface Props {
   isSuperadmin: boolean;
   applianceMode: boolean;
   inputCls: string;
-}
-
-function Field({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="flex items-start justify-between gap-8 py-3">
-      <div className="max-w-xl">
-        <div className="text-sm font-medium">{label}</div>
-        {description && (
-          <div className="text-xs text-muted-foreground">{description}</div>
-        )}
-      </div>
-      <div className="flex-shrink-0">{children}</div>
-    </div>
-  );
 }
 
 // Comma- or space-separated input → trimmed, de-blanked list.
@@ -143,7 +122,7 @@ export function ResolverSection({
         </div>
       )}
 
-      <Field
+      <SettingsRow
         label="Resolver mode"
         description="Automatic — leave systemd-resolved to pick upstream DNS from per-link NetworkManager / DHCP (the default; reverting to it removes the managed drop-in). Override — pin the global DNS servers below so they win over the per-link resolvers."
       >
@@ -156,11 +135,11 @@ export function ResolverSection({
           <option value="automatic">Automatic</option>
           <option value="override">Override</option>
         </select>
-      </Field>
+      </SettingsRow>
 
       {mode === "override" && (
         <>
-          <Field
+          <SettingsRow
             label="DNS servers"
             description="Comma- or space-separated resolver IPs (v4 or v6) rendered as systemd-resolved DNS=. A route-only ~. default domain is emitted automatically so these servers win over per-link resolvers. At least one server is required in override mode — override routes all host DNS here, so an empty list would leave the host with no working upstream DNS."
           >
@@ -176,9 +155,9 @@ export function ResolverSection({
                 overrideNeedsServers && "border-destructive",
               )}
             />
-          </Field>
+          </SettingsRow>
 
-          <Field
+          <SettingsRow
             label="Fallback DNS servers"
             description="Comma- or space-separated resolver IPs used only when every primary server is unreachable (rendered as FallbackDNS=). Optional."
           >
@@ -190,9 +169,9 @@ export function ResolverSection({
               disabled={!isSuperadmin}
               className={cn(inputCls, "w-96 max-w-full font-mono")}
             />
-          </Field>
+          </SettingsRow>
 
-          <Field
+          <SettingsRow
             label="Search domains"
             description="Comma- or space-separated DNS search domains (rendered after the route-only ~. default in Domains=). Optional — leave empty for none."
           >
@@ -204,9 +183,9 @@ export function ResolverSection({
               disabled={!isSuperadmin}
               className={cn(inputCls, "w-96 max-w-full font-mono")}
             />
-          </Field>
+          </SettingsRow>
 
-          <Field
+          <SettingsRow
             label="DNSSEC"
             description="systemd-resolved DNSSEC= validation. allow-downgrade (default) validates when the upstream supports it and falls back gracefully; yes enforces; no disables."
           >
@@ -220,9 +199,9 @@ export function ResolverSection({
               <option value="yes">yes</option>
               <option value="no">no</option>
             </select>
-          </Field>
+          </SettingsRow>
 
-          <Field
+          <SettingsRow
             label="DNS-over-TLS"
             description="systemd-resolved DNSOverTLS=. no (default) sends plaintext; opportunistic uses TLS when the server supports it; yes requires TLS (lookups fail if the server can't do it)."
           >
@@ -236,7 +215,7 @@ export function ResolverSection({
               <option value="opportunistic">opportunistic</option>
               <option value="yes">yes</option>
             </select>
-          </Field>
+          </SettingsRow>
         </>
       )}
 

@@ -1,8 +1,9 @@
+import { pluralize } from "./count-noun";
 /** #3551 — the text of the DNS group memory banner, apart from the
  *  component so it can be tested on its own. */
 import type { DNSMemoryEstimate } from "@/lib/api";
 
-function fmtBytes(n: number): string {
+export function fmtBytes(n: number): string {
   const mib = n / (1024 * 1024);
   return mib >= 1024
     ? `${(mib / 1024).toFixed(1)} GiB`
@@ -27,9 +28,39 @@ export function memoryBannerLines(est: DNSMemoryEstimate | null | undefined) {
       perView.size > 1
         ? `Blocklists take about ${fmtBytes(est.rpz_bytes)} of that: each view loads its own copy of the lists it applies (${Array.from(
             perView,
-            ([v, n]) => `${v}: ${n.toLocaleString()} entries`,
+            ([v, n]) =>
+              `${v}: ${n.toLocaleString()} ${pluralize(n, "entry", "entries")}`,
           ).join(", ")}), and BIND cannot share a blocklist between views.`
         : null,
     fix: "Have fewer views draw on the same lists, or raise the DNS pod's memory limit, before named is OOM-killed.",
   };
+}
+
+export interface ObservedMemoryRow {
+  name: string;
+  /** named's resident set, or null when the agent did not report it. */
+  daemon: string | null;
+  /** The container's usage / limit, or null when unreported. */
+  container: string | null;
+}
+
+/** #4193 — what each BIND9 server of the group actually reports using, to set
+ *  beside the estimate. Null when no server reported anything (all older
+ *  agents), so the estimate is not shown next to a column of dashes. */
+export function observedMemoryRows(
+  est: DNSMemoryEstimate | null | undefined,
+): ObservedMemoryRow[] | null {
+  const servers = est?.servers ?? [];
+  if (!servers.some((s) => s.daemon_rss_bytes != null || s.used_bytes != null))
+    return null;
+  return servers.map((s) => ({
+    name: s.name,
+    daemon: s.daemon_rss_bytes != null ? fmtBytes(s.daemon_rss_bytes) : null,
+    container:
+      s.used_bytes != null
+        ? s.limit_bytes
+          ? `${fmtBytes(s.used_bytes)} / ${fmtBytes(s.limit_bytes)}`
+          : fmtBytes(s.used_bytes)
+        : null,
+  }));
 }

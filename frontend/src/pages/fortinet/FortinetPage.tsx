@@ -1,4 +1,7 @@
 import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -359,7 +362,18 @@ export function FortinetPage() {
       </div>
 
       {showCreate && <FirewallModal onClose={() => setShowCreate(false)} />}
-      {edit && <FirewallModal firewall={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["fortinet-firewalls"]]}
+          title="Edit FortiGate Firewall"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <FirewallModal firewall={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       {objectsFor && (
         <ObjectsModal
           firewall={objectsFor}
@@ -627,7 +641,12 @@ function FirewallModal({
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (apiToken) update.api_token = apiToken;
-        return fortinetApi.update(firewall!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(firewall!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(firewall!);
+        return fortinetApi.update(firewall!.id, body);
       }
       const create: FortinetFirewallCreate = {
         name,
@@ -1013,26 +1032,6 @@ function DeleteFirewallModal({
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {

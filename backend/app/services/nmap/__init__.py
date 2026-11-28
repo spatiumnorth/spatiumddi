@@ -17,6 +17,7 @@ from app.services.nmap.runner import (
     NmapArgError,
     build_argv,
     parse_nmap_xml,
+    resolve_target,
     run_scan,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "NmapArgError",
     "build_argv",
     "parse_nmap_xml",
+    "resolve_target",
     "run_scan",
 ]

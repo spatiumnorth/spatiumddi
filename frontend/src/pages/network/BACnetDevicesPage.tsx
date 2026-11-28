@@ -1,4 +1,5 @@
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { Field } from "@/components/ui/field";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Building2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -14,6 +15,8 @@ import {
   type BACnetSegmentation,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Pager } from "@/components/ui/pager";
@@ -475,13 +478,29 @@ export function BACnetDevicesPage() {
         </section>
       </div>
 
-      {modal && (
-        <DeviceModal
-          mode={modal.mode}
-          device={modal.mode === "edit" ? modal.device : null}
-          onClose={() => setModal(null)}
-        />
-      )}
+      {modal &&
+        (modal.mode === "edit" ? (
+          <FreshEdit
+            row={modal.device}
+            queryKeys={[["bacnet-devices"]]}
+            title="Edit BACnet device"
+            onClose={() => setModal(null)}
+          >
+            {(fresh) => (
+              <DeviceModal
+                mode="edit"
+                device={fresh}
+                onClose={() => setModal(null)}
+              />
+            )}
+          </FreshEdit>
+        ) : (
+          <DeviceModal
+            mode="create"
+            device={null}
+            onClose={() => setModal(null)}
+          />
+        ))}
       <ConfirmModal
         open={del !== null}
         title="Delete BACnet device"
@@ -495,16 +514,16 @@ export function BACnetDevicesPage() {
               {del?.device_name ? ` (${del.device_name})` : ""}? The instance
               number is freed for re-use; the IPAM address itself is untouched.
             </>
-            {delMut.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(delMut.error, "Failed to delete BACnet device")}
-              </p>
-            )}
           </>
         }
         tone="destructive"
         confirmLabel="Delete"
         loading={delMut.isPending}
+        error={
+          delMut.isError
+            ? formatApiError(delMut.error, "Failed to delete BACnet device")
+            : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
         onClose={() => {
           setDel(null);
@@ -623,7 +642,11 @@ function DeviceModal({
           ip_address_id: ipAddressId ?? undefined,
           device_instance: Number(instance.trim()),
         };
-        return bacnetApi.updateDevice(device.id, body);
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(device, body);
+        if (Object.keys(diff).length === 0) return Promise.resolve(device);
+        return bacnetApi.updateDevice(device.id, diff);
       }
       const body: BACnetDeviceCreate = {
         ...shared,
@@ -673,30 +696,35 @@ function DeviceModal({
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="Device instance">
-            <div className="flex gap-2">
-              <input
-                className={`${inputCls} font-mono`}
-                inputMode="numeric"
-                value={instance}
-                onChange={(e) => setInstance(e.target.value)}
-                placeholder="0 – 4194302"
-                required
-              />
-              <button
-                type="button"
-                onClick={() => nextInstanceMut.mutate()}
-                disabled={nextInstanceMut.isPending}
-                className="flex-shrink-0 rounded-md border px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-                title="Suggest the lowest free instance number"
-              >
-                {nextInstanceMut.isPending ? "…" : "Suggest"}
-              </button>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              Unique across the whole internetwork. The suggestion is advisory —
-              it is not reserved, so a concurrent commissioning can still take
-              it first.
-            </p>
+            {(control) => (
+              <>
+                <div className="flex gap-2">
+                  <input
+                    {...control}
+                    className={`${inputCls} font-mono`}
+                    inputMode="numeric"
+                    value={instance}
+                    onChange={(e) => setInstance(e.target.value)}
+                    placeholder="0 – 4194302"
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => nextInstanceMut.mutate()}
+                    disabled={nextInstanceMut.isPending}
+                    className="flex-shrink-0 rounded-md border px-2 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                    title="Suggest the lowest free instance number"
+                  >
+                    {nextInstanceMut.isPending ? "…" : "Suggest"}
+                  </button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Unique across the whole internetwork. The suggestion is
+                  advisory — it is not reserved, so a concurrent commissioning
+                  can still take it first.
+                </p>
+              </>
+            )}
           </Field>
           <Field label="Device name">
             <input
@@ -878,20 +906,3 @@ const inputCls =
 
 const filterCls =
   "rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}

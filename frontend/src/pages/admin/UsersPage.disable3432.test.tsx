@@ -62,7 +62,7 @@ describe("Edit User, disabling", () => {
       </QueryClientProvider>,
     );
     fireEvent.click(await screen.findByTitle("Edit"));
-    expect(screen.getByText(/revokes its API tokens/)).toBeTruthy();
+    expect(await screen.findByText(/revokes its API tokens/)).toBeTruthy();
     expect(screen.getByText(/does not bring the tokens back/)).toBeTruthy();
   });
 });

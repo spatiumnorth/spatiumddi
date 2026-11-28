@@ -224,34 +224,36 @@ async def _fixture(db: AsyncSession, *, driver: str, views: bool) -> DNSServer:
 # the ETag and the structural ETag. The streamed render must store exactly
 # these. Pinned at 945f539d; the two BIND9 shapes re-pinned at 2935d758,
 # whose bundles carry #2157's ``rpz_sha256`` on their blocklist zone (the
-# fixture assigns one), so main's own render of the fixture moved.
+# fixture assigns one), so main's own render of the fixture moved. All four
+# re-pinned at RENDERER_REVISION 18 (#4594): every bundle's options gain
+# ``query_log_severity`` and the two ``query_log_print_*`` flags.
 PINNED_ON_MAIN: dict[str, dict[str, str]] = {
     "bind9-plain": {
-        "body_sha256": "d428928f453052f2be079128ffdd34af6d7a97b1a3630172279938aa5bdd59b0",
-        "etag": "sha256:af2ea15b4a15bd9f049f5576818273dded46a68e03741058314c34bbcfcaf624",
+        "body_sha256": "8f224983bd9d5f3c652350ccf885043569d2a208c0a38c9deff514a3d964c222",
+        "etag": "sha256:17d46d0ab62026e3119d6b66221a4b915df78f0ba8c7e9b529982a2fff71e348",
         "structural_etag": (
-            "sha256:43cd44203ba0f64c673533c43858c29b96f139e208b3474f326d893700f90d96"
+            "sha256:9863e8ace0c550ae5e0392afea250f12be3feb98c9fc2ee37430bc77280ed8ff"
         ),
     },
     "bind9-views": {
-        "body_sha256": "6773b252daeacad6a00dc6accddad346a3eca682c32e14f8aae0d1159171f591",
-        "etag": "sha256:5a77b7f714146b61fba00804b43b5efc9c61ba5fd3837a7c6feb41e6d6e5ecbd",
+        "body_sha256": "18a6f148a995d00bb04d8921c9b21e6e36db972ffe892624efc6c47c670fa713",
+        "etag": "sha256:836e374a1277c3afb0be1625a28bc2508fcb2cece709ea11155dae0628c769f5",
         "structural_etag": (
-            "sha256:b7a807264097c2f09589d7ebb21a55fb68d478ddaabc9ce2b73c49fc5e27c6d4"
+            "sha256:1238a3adfa360d2eae217470d2fb66e84bc7f54104595e790a72ad0accff3f20"
         ),
     },
     "technitium-plain": {
-        "body_sha256": "78787cb705bb73eda98541c8860a0bebc15a9b9534252981c3c542840f2e3a14",
-        "etag": "sha256:354015931e4c37fdf06577b5d7cbe3162eedea59f3cad685d046815576be0f27",
+        "body_sha256": "3950697d54383e5d8e6dfce0deabbbcf7f153efcb56c0641c830f0329dee0ca9",
+        "etag": "sha256:9052f39dbf9be0520ad95b177ef631fcb3ec992287da9f233b878994596ecd1a",
         "structural_etag": (
-            "sha256:91b2a4b14fd3eeff89c7ff6cfb63e3bf005f9aac6e50a435b2f275db51173c71"
+            "sha256:be9294b70dfb17e098d12adbb1c4b16e49d9351de55d69b24adb1a7d0dabc551"
         ),
     },
     "technitium-views": {
-        "body_sha256": "34c958e8ea8d669e61f2f17a39d5c24a187494820545f312667db28c714cbb76",
-        "etag": "sha256:a14d69ad8bf3b58b59eda2cd7908dc2f65db8e231bdb72e1dc532f64b3dcba09",
+        "body_sha256": "f9e704d577e902ea9329ab11d61bedabf5d0a0ef1db1b67d044bfeaca75d9d8a",
+        "etag": "sha256:d2c69f37b557363177673b4afb79a5aff3a8725fc412b5d3c25886172abbc9cc",
         "structural_etag": (
-            "sha256:83074d0d30c5e0b462c41519524998524d30c9c284aef11ba197b9360b64c33a"
+            "sha256:4a5bf5e110dbeffd4c04c00de26bd451837c3680aa194b9be5a827cd914223b9"
         ),
     },
 }

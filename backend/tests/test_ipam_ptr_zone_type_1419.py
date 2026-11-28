@@ -25,6 +25,7 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -314,6 +315,11 @@ async def test_a_reverse_zone_made_secondary_takes_no_more_ptrs(
         )
     ).scalar_one()
     assert ("10", "PTR", f"host.{fwd.name}") in await _ptrs(db_session, rev.id)
+
+    # #4257: a zone that holds records cannot change type, so the operator
+    # empties it first; the point below is what IPAM does once it is secondary.
+    await db_session.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == rev.id))
+    await db_session.commit()
 
     resp = await client.put(
         f"/api/v1/dns/groups/{grp.id}/zones/{rev.id}",

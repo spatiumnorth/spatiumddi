@@ -131,7 +131,15 @@ def test_valid_ae_titles_are_accepted(raw: str, expected: str) -> None:
         # 0x5C is the DICOM multi-value delimiter.
         ("CT\\1", "backslash"),
         ("CT\t1", "control characters"),
-        ("ABCDEFGHIJKLMNOPQ", "16 bytes"),
+        ("ABCDEFGHIJKLMNOPQ", "16 characters"),
+        # C1 control, NBSP, Cyrillic look-alike (U+0410) — all named by code point.
+        ("CT\u00851", "U+0085"),
+        ("CT\u00a01", "U+00A0"),
+        ("\u0410CT1", "U+0410"),
+        # An edge tab / NBSP is refused, not silently trimmed away.
+        ("CT1\t", "U+0009"),
+        ("CT1\u00a0", "U+00A0"),
+        ("\u00a0\u00a0", "U+00A0"),
     ],
 )
 def test_invalid_ae_titles_are_rejected(raw: str, fragment: str) -> None:
@@ -164,31 +172,50 @@ async def test_padded_16_byte_title_is_accepted_over_the_api(
     assert resp.json()["ae_title"] == "QRSTUVWXYZABCDEF"
 
 
-async def test_over_length_title_reports_bytes_over_the_api(
-    client: AsyncClient, db_session: AsyncSession
+@pytest.mark.parametrize(
+    "title,fragment",
+    [
+        ("CT\u00851", "U+0085"),
+        ("CT\u00a01", "U+00A0"),
+        ("\u0410CT1", "U+0410"),
+        ("CT\\1", "backslash"),
+        ("ABCDEFGHIJKLMNOPQ", "16 characters"),
+        ("   ", "empty"),
+        ("\u00c4\u00d6\u00dc", "U+00C4"),
+    ],
+)
+async def test_invalid_titles_are_422_on_create_and_update(
+    client: AsyncClient, db_session: AsyncSession, title: str, fragment: str
 ) -> None:
-    """The refusal has to come from the byte validator, so its message
-    says "bytes" — an operator counting characters on a multi-byte title
-    cannot otherwise see why 15 characters is too long."""
     _, token = await _make_superadmin(db_session)
     await db_session.commit()
-    resp = await client.post(
-        "/api/v1/dicom/aes",
-        headers=_auth(token),
-        json={"ae_title": "ÄÖÜÄÖÜÄÖÜÄÖÜÄÖÜ"},
-    )
+    resp = await client.post("/api/v1/dicom/aes", headers=_auth(token), json={"ae_title": title})
     assert resp.status_code == 422, resp.text
-    assert "bytes" in resp.text
+    assert fragment in resp.text
+    ok = await client.post(
+        "/api/v1/dicom/aes", headers=_auth(token), json={"ae_title": "MR SCAN 2"}
+    )
+    assert ok.status_code in (200, 201), ok.text
+    assert ok.json()["ae_title"] == "MR SCAN 2"
+    upd = await client.patch(
+        f"/api/v1/dicom/aes/{ok.json()['id']}", headers=_auth(token), json={"ae_title": title}
+    )
+    assert upd.status_code == 422, upd.text
+    assert fragment in upd.text
 
 
-def test_length_ceiling_is_bytes_not_characters() -> None:
-    """The VR caps at 16 *bytes*. A 16-character title with a non-ASCII
-    character in it is over the limit, and an operator counting
-    characters will not see why unless the message says bytes."""
-    fifteen_chars_seventeen_bytes = "ÄÖÜÄÖÜÄÖÜÄÖÜÄÖÜ"  # 15 chars, 30 bytes
-    with pytest.raises(AETitleError) as exc:
-        validate_ae_title(fifteen_chars_seventeen_bytes)
-    assert "bytes" in str(exc.value)
+async def test_import_skips_row_with_invalid_title(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_superadmin(db_session)
+    await db_session.commit()
+    csv = "AE Title\nGOOD1\nBAD\u00a01\n\u0410CT\n"
+    body = {"csv_text": csv, "column_map": {"ae_title": "AE Title"}}
+    commit = await client.post("/api/v1/dicom/aes/import/commit", headers=_auth(token), json=body)
+    assert commit.status_code == 201, commit.text
+    assert "U+00A0" in commit.text and "U+0410" in commit.text
+    listed = await client.get("/api/v1/dicom/aes", headers=_auth(token))
+    assert [r["ae_title"] for r in listed.json()["items"]] == ["GOOD1"]
 
 
 def test_vendor_default_detection_is_case_insensitive() -> None:
@@ -718,3 +745,38 @@ async def test_module_gate_404s_the_surface_when_disabled(
         )
         await db_session.commit()
         invalidate_cache()
+
+
+# ── Legacy rows stored before #4294 ──────────────────────────────────
+
+
+async def test_legacy_invalid_title_row_stays_editable(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A title stored before the stricter rules must not lock the row:
+    other fields save, re-sending the unchanged title is a no-op, and only
+    a *changed* title is validated."""
+    _, token = await _make_superadmin(db_session)
+    legacy = DICOMApplicationEntity(ae_title="CT LEGACY")
+    db_session.add(legacy)
+    await db_session.commit()
+    url = f"/api/v1/dicom/aes/{legacy.id}"
+
+    only_notes = await client.patch(url, headers=_auth(token), json={"notes": "n1"})
+    assert only_notes.status_code == 200, only_notes.text
+    assert only_notes.json()["notes"] == "n1"
+
+    same = await client.patch(
+        url, headers=_auth(token), json={"ae_title": "CT LEGACY", "notes": "n2"}
+    )
+    assert same.status_code == 200, same.text
+    assert same.json()["ae_title"] == "CT LEGACY"
+    assert same.json()["notes"] == "n2"
+
+    bad = await client.patch(url, headers=_auth(token), json={"ae_title": "CT OTHER"})
+    assert bad.status_code == 422, bad.text
+    assert "U+00A0" in bad.text
+
+    fixed = await client.patch(url, headers=_auth(token), json={"ae_title": "CT_LEGACY"})
+    assert fixed.status_code == 200, fixed.text
+    assert fixed.json()["ae_title"] == "CT_LEGACY"

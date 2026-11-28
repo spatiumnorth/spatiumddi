@@ -55,11 +55,13 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, SuperAdmin
 from app.api.stepup import require_operator_stepup
+from app.config import settings
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import require_permission
 from app.models.appliance import PairingClaim, PairingCode
 from app.models.audit import AuditLog
 from app.models.auth import User
+from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
 
@@ -139,6 +141,23 @@ class PairingCodeCreated(BaseModel):
     max_claims: int | None
     note: str | None
     created_at: datetime
+    warning: str | None = Field(
+        default=None,
+        description=(
+            "Set when the code was minted while appliance registration "
+            "(``supervisor_registration_enabled``) is off: an appliance "
+            "using it cannot register until that setting is turned on (#4659)."
+        ),
+    )
+
+
+# #4659 — the code is minted but cannot be claimed while the gate is off, and
+# the supervisor only idles; say so at the one place an operator is looking.
+REGISTRATION_OFF_WARNING = (
+    "Appliance registration is off, so an appliance using this code cannot "
+    "register yet. Turn on supervisor_registration_enabled (Appliance > Pairing > "
+    "Enable registration, or PUT /api/v1/settings) before pairing."
+)
 
 
 class PairingCodeRow(BaseModel):
@@ -307,6 +326,14 @@ async def create_pairing_code(
             },
         )
     )
+    ps = (
+        await db.execute(select(PlatformSettings).where(PlatformSettings.id == 1))
+    ).scalar_one_or_none()
+    registration_on = (
+        bool(ps.supervisor_registration_enabled)
+        if ps is not None
+        else bool(settings.initial_supervisor_registration)
+    )
     await db.commit()
     await db.refresh(row)
     logger.info(
@@ -325,6 +352,7 @@ async def create_pairing_code(
         max_claims=row.max_claims,
         note=body.note,
         created_at=row.created_at,
+        warning=None if registration_on else REGISTRATION_OFF_WARNING,
     )
 
 

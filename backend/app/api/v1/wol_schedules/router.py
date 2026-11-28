@@ -23,8 +23,9 @@ Surface:
   whose all-day event spans gate scheduled wakes. The CalDAV password is
   Fernet-encrypted at rest and never returned (only ``password_set``).
 
-Every mutation gates on ``use_network_tools`` (symmetry with the manual
-``POST /ipam/addresses/{id}/wake`` — no new role seed) and writes an
+Every route gates on the dedicated type (``wol_schedule`` for schedules and
+runs, ``wol_calendar`` for calendars) OR on ``use_network_tools`` (symmetry
+with the manual ``POST /ipam/addresses/{id}/wake``), and every mutation writes an
 append-only ``audit_log`` row BEFORE the response returns, in the same
 transaction as the mutation (non-negotiable #4). Async throughout.
 
@@ -51,7 +52,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_str
-from app.core.permissions import require_permission
+from app.core.permissions import require_any_resource_permission, user_has_permission
 from app.core.stored_secret_guard import require_secret_with_destination_change
 from app.models.auth import Group, User
 from app.models.ipam import Subnet
@@ -97,10 +98,20 @@ from .schemas import (
     WakeTargetRead,
 )
 
-# WoL is a network tool — reuse the tools permission already seeded into the
-# Network Editor built-in role (symmetry with POST /ipam/addresses/{id}/wake).
+# The role picker offers ``wol_schedule`` / ``wol_calendar`` (#4316), and the
+# Network Editor built-in role keeps ``use_network_tools`` (symmetry with
+# POST /ipam/addresses/{id}/wake), so a route admits EITHER: the dedicated
+# type, or the Network tools grant every caller held before #4316.
 PERMISSION = "use_network_tools"
 RESOURCE_TYPE = "wol_schedule"
+CALENDAR_TYPE = "wol_calendar"
+
+
+def _gate(*resource_types: str) -> Any:
+    """Route gate: the method's action (read / write / delete) on any of
+    ``resource_types`` or on ``PERMISSION``; a refusal names them all."""
+    return require_any_resource_permission(*resource_types, PERMISSION)
+
 
 # Cap on the number of sample rows a preview returns per bucket (the UI wants
 # a taste, not the whole fleet).
@@ -391,7 +402,7 @@ async def _resolve_for_preview(
 @router.get(
     "/schedules",
     response_model=list[WakeScheduleRead],
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def list_schedules(
     db: DB,
@@ -410,7 +421,7 @@ async def list_schedules(
     "/schedules",
     response_model=WakeScheduleRead,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_permission("write", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def create_schedule(
     body: WakeScheduleCreate, db: DB, current_user: CurrentUser
@@ -468,7 +479,7 @@ async def create_schedule(
 @router.get(
     "/schedules/{schedule_id}",
     response_model=WakeScheduleRead,
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def get_schedule(
     schedule_id: uuid.UUID, db: DB, current_user: CurrentUser  # noqa: ARG001
@@ -482,7 +493,7 @@ async def get_schedule(
 @router.patch(
     "/schedules/{schedule_id}",
     response_model=WakeScheduleRead,
-    dependencies=[Depends(require_permission("write", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def update_schedule(
     schedule_id: uuid.UUID,
@@ -551,7 +562,7 @@ async def update_schedule(
 @router.delete(
     "/schedules/{schedule_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_permission("delete", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def delete_schedule(schedule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> None:
     row = await db.get(WolSchedule, schedule_id)
@@ -578,7 +589,7 @@ async def delete_schedule(schedule_id: uuid.UUID, db: DB, current_user: CurrentU
 @router.post(
     "/schedules/{schedule_id}/run-now",
     response_model=WakeRunRead,
-    dependencies=[Depends(require_permission("write", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def run_now(schedule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> WakeRunRead:
     """Fire ``schedule_id`` immediately.
@@ -655,7 +666,7 @@ async def run_now(schedule_id: uuid.UUID, db: DB, current_user: CurrentUser) -> 
 @router.post(
     "/schedules/{schedule_id}/preview-targets",
     response_model=TargetPreviewRead,
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 @read_only_post
 async def preview_schedule_targets(
@@ -707,7 +718,7 @@ async def preview_schedule_targets(
 @router.post(
     "/preview-targets",
     response_model=TargetPreviewRead,
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 @read_only_post
 async def preview_selector(
@@ -729,7 +740,7 @@ async def preview_selector(
 @router.get(
     "/runs",
     response_model=list[WakeRunRead],
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def list_runs(
     db: DB,
@@ -751,7 +762,7 @@ async def list_runs(
 @router.get(
     "/runs/{run_id}",
     response_model=WakeRunDetailRead,
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(RESOURCE_TYPE))],
 )
 async def get_run(run_id: uuid.UUID, db: DB, current_user: CurrentUser) -> WakeRunDetailRead:
     """Return one run + its per-host target rows.
@@ -797,11 +808,13 @@ async def get_run(run_id: uuid.UUID, db: DB, current_user: CurrentUser) -> WakeR
 @router.get(
     "/calendars",
     response_model=list[WakeCalendarRead],
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    # Also ``wol_schedule``: the schedule editor's calendar picker lists them,
+    # without the address or username unless the caller can read calendars.
+    dependencies=[Depends(_gate(CALENDAR_TYPE, RESOURCE_TYPE))],
 )
 async def list_calendars(
     db: DB,
-    current_user: CurrentUser,  # noqa: ARG001
+    current_user: CurrentUser,
     enabled: bool | None = Query(None),
 ) -> list[WakeCalendarRead]:
     stmt = select(WolCalendar)
@@ -809,14 +822,23 @@ async def list_calendars(
         stmt = stmt.where(WolCalendar.enabled.is_(enabled))
     stmt = stmt.order_by(WolCalendar.name.asc())
     rows = list((await db.execute(stmt)).scalars().all())
-    return [_to_calendar_read(r) for r in rows]
+    out = [_to_calendar_read(r) for r in rows]
+    # A schedule editor only needs the picker fields. The address and username
+    # go to callers who could fetch the calendar by id: the same rule as
+    # ``get_calendar``'s gate (read on ``wol_calendar`` or on ``PERMISSION``),
+    # so the Network Editor's Edit dialog still opens filled in.
+    if not any(user_has_permission(current_user, "read", t) for t in (CALENDAR_TYPE, PERMISSION)):
+        for item in out:
+            item.url = ""
+            item.username = None
+    return out
 
 
 @router.post(
     "/calendars",
     response_model=WakeCalendarRead,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_permission("write", PERMISSION))],
+    dependencies=[Depends(_gate(CALENDAR_TYPE))],
 )
 async def create_calendar(
     body: WakeCalendarCreate, db: DB, current_user: CurrentUser
@@ -855,7 +877,7 @@ async def create_calendar(
 @router.get(
     "/calendars/{calendar_id}",
     response_model=WakeCalendarRead,
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(CALENDAR_TYPE))],
 )
 async def get_calendar(
     calendar_id: uuid.UUID, db: DB, current_user: CurrentUser  # noqa: ARG001
@@ -869,7 +891,7 @@ async def get_calendar(
 @router.patch(
     "/calendars/{calendar_id}",
     response_model=WakeCalendarRead,
-    dependencies=[Depends(require_permission("write", PERMISSION))],
+    dependencies=[Depends(_gate(CALENDAR_TYPE))],
 )
 async def update_calendar(
     calendar_id: uuid.UUID,
@@ -923,7 +945,7 @@ async def update_calendar(
 @router.delete(
     "/calendars/{calendar_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_permission("delete", PERMISSION))],
+    dependencies=[Depends(_gate(CALENDAR_TYPE))],
 )
 async def delete_calendar(calendar_id: uuid.UUID, db: DB, current_user: CurrentUser) -> None:
     row = await db.get(WolCalendar, calendar_id)
@@ -947,7 +969,7 @@ async def delete_calendar(calendar_id: uuid.UUID, db: DB, current_user: CurrentU
 @router.post(
     "/calendars/{calendar_id}/sync-now",
     response_model=CalendarSyncResult,
-    dependencies=[Depends(require_permission("write", PERMISSION))],
+    dependencies=[Depends(_gate(CALENDAR_TYPE))],
 )
 async def sync_calendar_now(
     calendar_id: uuid.UUID, db: DB, current_user: CurrentUser
@@ -1015,7 +1037,7 @@ async def sync_calendar_now(
 @router.get(
     "/calendars/{calendar_id}/upcoming-events",
     response_model=list[CalendarEventRead],
-    dependencies=[Depends(require_permission("read", PERMISSION))],
+    dependencies=[Depends(_gate(CALENDAR_TYPE))],
 )
 async def upcoming_calendar_events(
     calendar_id: uuid.UUID,

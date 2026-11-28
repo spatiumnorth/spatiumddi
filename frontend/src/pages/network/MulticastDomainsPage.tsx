@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -95,7 +97,12 @@ function MulticastDomainModal({
         ssm_range: ssmRange.trim() || null,
         notes,
       };
-      if (existing) return multicastApi.updateDomain(existing.id, body);
+      if (existing) {
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return multicastApi.updateDomain(existing.id, changed);
+      }
       return multicastApi.createDomain(body as MulticastDomainCreate);
     },
     onSuccess: () => {
@@ -116,10 +123,14 @@ function MulticastDomainModal({
       <div className="space-y-3">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-domains-name"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Name
             </label>
             <input
+              id="multicast-domains-name"
               className={inputCls}
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -128,10 +139,14 @@ function MulticastDomainModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-domains-pim-mode"
+              className="text-xs font-medium text-muted-foreground"
+            >
               PIM mode
             </label>
             <select
+              id="multicast-domains-pim-mode"
               className={inputCls}
               value={pimMode}
               onChange={(e) => setPimMode(e.target.value as MulticastPIMMode)}
@@ -144,11 +159,15 @@ function MulticastDomainModal({
             </select>
           </div>
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-domains-rendezvous-point-address"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Rendezvous-point address{" "}
               {needsRP && <span className="text-destructive">*</span>}
             </label>
             <input
+              id="multicast-domains-rendezvous-point-address"
               className={cn(inputCls, "font-mono")}
               value={rpAddress}
               onChange={(e) => setRpAddress(e.target.value)}
@@ -166,10 +185,14 @@ function MulticastDomainModal({
           </div>
           {pimMode === "ssm" && (
             <div className="sm:col-span-2">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="multicast-domains-ssm-range"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 SSM range
               </label>
               <input
+                id="multicast-domains-ssm-range"
                 className={cn(inputCls, "font-mono")}
                 value={ssmRange}
                 onChange={(e) => setSsmRange(e.target.value)}
@@ -178,10 +201,14 @@ function MulticastDomainModal({
             </div>
           )}
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-domains-description"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Description
             </label>
             <textarea
+              id="multicast-domains-description"
               className={cn(inputCls, "min-h-[80px]")}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -189,10 +216,14 @@ function MulticastDomainModal({
             />
           </div>
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-domains-notes"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Notes
             </label>
             <textarea
+              id="multicast-domains-notes"
               className={cn(inputCls, "min-h-[60px]")}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
@@ -402,14 +433,26 @@ export function MulticastDomainsTab() {
         </div>
       </div>
 
-      {(showNew || editing) && (
+      {showNew && (
         <MulticastDomainModal
-          existing={editing}
-          onClose={() => {
-            setShowNew(false);
-            setEditing(null);
-          }}
+          existing={null}
+          onClose={() => setShowNew(false)}
         />
+      )}
+      {editing && (
+        <FreshEdit
+          row={editing}
+          load={() => multicastApi.getDomain(editing.id)}
+          title="Edit multicast domain"
+          onClose={() => setEditing(null)}
+        >
+          {(fresh) => (
+            <MulticastDomainModal
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       <ConfirmModal
         open={confirm !== null}

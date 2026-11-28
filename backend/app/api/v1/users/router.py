@@ -471,6 +471,17 @@ async def update_user(
         )
 
     changes: dict[str, object] = {}
+    # An edit that changes nothing writes no audit row (#4452).
+    unchanged = all(
+        v is None or v == getattr(user, k)
+        for k, v in (
+            ("display_name", body.display_name),
+            ("email", body.email),
+            ("is_active", body.is_active),
+            ("is_superadmin", body.is_superadmin),
+            ("force_password_change", body.force_password_change),
+        )
+    )
     if method:
         changes.update(is_superadmin=True, stepup_method=method)
     if body.display_name is not None:
@@ -545,10 +556,11 @@ async def update_user(
     if body.force_password_change is not None:
         user.force_password_change = body.force_password_change
 
-    audit = _audit(current_user, "update", str(user.id), f"Updated user {user.username}")
-    if changes:
-        audit.new_value = changes
-    db.add(audit)
+    if not unchanged or changes:
+        audit = _audit(current_user, "update", str(user.id), f"Updated user {user.username}")
+        if changes:
+            audit.new_value = changes
+        db.add(audit)
     await db.commit()
     await db.refresh(user)
     return user

@@ -248,7 +248,12 @@ async def test_lock_timeout_logs_the_holder_retries_and_succeeds_once_it_goes(
         await holder.fetch("SELECT * FROM mg_target")
         holder_pid = await holder.fetchval("SELECT pg_backend_pid()")
         t, outcome = _start_upgrade(cfg)
-        await asyncio.sleep(3.5)  # at least two 1 s lock waits time out
+        # Release only once the guard has itself reported two timed-out waits
+        # (no wall-clock race against the 1 s lock_timeout, #4401).
+        deadline = asyncio.get_running_loop().time() + 60
+        while len(reports) < 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.1)
+        assert len(reports) >= 2, "a timed-out lock wait must be retried, not abandoned"
         assert t.is_alive() and "error" not in outcome
         await holder.execute("COMMIT")
         await asyncio.to_thread(t.join, 60)

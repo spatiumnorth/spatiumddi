@@ -3,13 +3,15 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Clock, Loader2 } from "lucide-react";
 
 import { settingsApi, formatApiError } from "@/lib/api";
+import { HOST_TZ_ALIASES, canonicalHostTimezone } from "@/lib/hostTimezones";
+import { isValidTimeZone, timeZoneSuggestions } from "@/lib/timezones";
 
 /**
  * Appliance timezone control (issue #165).
  *
  * Settings → NTP tab uses this. The picker is a text input backed by
- * a ``<datalist>`` of every IANA tz name the browser reports via
- * ``Intl.supportedValuesOf("timeZone")`` — gives auto-complete
+ * a ``<datalist>`` of the IANA tz names the browser reports via
+ * ``Intl.supportedValuesOf("timeZone")`` plus UTC — gives auto-complete
  * without committing to a long ``<select>`` UX.
  *
  * Empty string clears the operator-set override BUT does NOT revert
@@ -41,41 +43,7 @@ interface Props {
   applianceMode: boolean;
 }
 
-// Fallback IANA list for browsers that don't expose
-// ``Intl.supportedValuesOf`` (pre-2022). The full set is ~600 names;
-// this trims to common regions to keep bundle weight reasonable on
-// the unlikely-old-browser path. Modern browsers ignore this.
-const TZ_FALLBACK = [
-  "UTC",
-  "Africa/Cairo",
-  "Africa/Johannesburg",
-  "America/Anchorage",
-  "America/Chicago",
-  "America/Denver",
-  "America/Los_Angeles",
-  "America/New_York",
-  "America/Sao_Paulo",
-  "America/Toronto",
-  "America/Vancouver",
-  "Asia/Dubai",
-  "Asia/Hong_Kong",
-  "Asia/Kolkata",
-  "Asia/Seoul",
-  "Asia/Singapore",
-  "Asia/Tokyo",
-  "Australia/Sydney",
-  "Europe/Amsterdam",
-  "Europe/Berlin",
-  "Europe/London",
-  "Europe/Madrid",
-  "Europe/Paris",
-  "Europe/Rome",
-  "Europe/Stockholm",
-  "Europe/Warsaw",
-  "Europe/Zurich",
-  "Pacific/Auckland",
-  "Pacific/Honolulu",
-] as const;
+const CANONICAL_TARGETS = new Set(Object.values(HOST_TZ_ALIASES));
 
 export function TimezoneSection({
   currentValue,
@@ -86,31 +54,24 @@ export function TimezoneSection({
   const [tz, setTz] = useState(currentValue);
   const [savedNote, setSavedNote] = useState<string | null>(null);
 
-  // Resolve the IANA list once per mount. Modern browsers return the
-  // full set; older fallback to the curated subset above.
-  const ianaList = useMemo(() => {
-    type IntlWithList = typeof Intl & {
-      supportedValuesOf?: (key: "timeZone") => string[];
-    };
-    const I = Intl as IntlWithList;
-    if (typeof I.supportedValuesOf === "function") {
-      try {
-        return I.supportedValuesOf("timeZone");
-      } catch {
-        return [...TZ_FALLBACK];
-      }
-    }
-    return [...TZ_FALLBACK];
-  }, []);
+  // Suggestions only; validity is asked of Intl (see lib/timezones).
+  // Chromium spells some zones only by a legacy alias (Asia/Calcutta,
+  // Europe/Kiev ...) and the host has no tzdata-legacy, so map every
+  // entry to its canonical name rather than dropping it (#4416).
+  const ianaList = useMemo(
+    () => [...new Set(timeZoneSuggestions().map(canonicalHostTimezone))],
+    [],
+  );
 
   const save = useMutation({
     mutationFn: (value: string) => settingsApi.update({ timezone: value }),
-    onSuccess: () => {
+    onSuccess: (_data, value) => {
       qc.invalidateQueries({ queryKey: ["settings"] });
+      setTz(value);
       setSavedNote(
-        tz === ""
+        value === ""
           ? "Timezone override cleared — the host keeps its current value. Set the field to your desired tz to change it."
-          : `Timezone set to ${tz}. Applies on the host within one heartbeat cycle.`,
+          : `Timezone set to ${value}. Applies on the host within one heartbeat cycle.`,
       );
     },
     onError: () => setSavedNote(null),
@@ -118,8 +79,13 @@ export function TimezoneSection({
 
   const disabled = !isSuperadmin || !applianceMode || save.isPending;
   const trimmed = tz.trim();
-  const isValid = trimmed === "" || ianaList.includes(trimmed);
-  const dirty = trimmed !== currentValue.trim();
+  // An alias is saved as its canonical name (the API does the same).
+  const canonical = canonicalHostTimezone(trimmed);
+  const isValid =
+    trimmed === "" ||
+    isValidTimeZone(canonical) ||
+    CANONICAL_TARGETS.has(canonical);
+  const dirty = canonical !== currentValue.trim();
 
   return (
     <section className="rounded-lg border bg-card p-4">
@@ -163,7 +129,7 @@ export function TimezoneSection({
         <button
           type="button"
           disabled={disabled || !isValid || !dirty}
-          onClick={() => save.mutate(trimmed)}
+          onClick={() => save.mutate(canonical)}
           className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
         >
           {save.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
