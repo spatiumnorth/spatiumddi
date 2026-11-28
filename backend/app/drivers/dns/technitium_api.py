@@ -376,6 +376,28 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         """
         return value if isinstance(value, dict) else {}
 
+    @classmethod
+    def _assert_zone_resolved(cls, body: dict[str, Any], zone_bare: str) -> None:
+        """Refuse a response served by an enclosing zone (#1769).
+
+        Technitium resolves ``zone=`` with ``FindAuthZoneInfo``, which returns
+        the NEAREST ENCLOSING zone when the requested one does not exist, so
+        a zone deleted in the console reads (and writes) as its parent. The
+        response carries the zone it actually resolved; a different name
+        means the requested zone is missing. A response with no ``zone``
+        object cannot be checked and is let through.
+        """
+        resolved = cls._as_dict(body.get("zone"))
+        if "name" not in resolved:
+            return
+        got = str(resolved.get("name") or "").strip(".").lower()
+        if got != zone_bare.strip(".").lower():
+            raise CloudDNSError(
+                f"Technitium: zone {zone_bare!r} was not found on the server "
+                f"(the closest enclosing zone is {got!r}); refusing to touch it. "
+                "Create the zone on the server (Sync with servers) first."
+            )
+
     async def _list_zone_records(
         self, server: Any, creds: dict[str, Any], zone_name: str
     ) -> list[RecordData]:
@@ -392,6 +414,7 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                     {"domain": bare, "zone": bare, "listZone": "true"},
                 )
             )
+            self._assert_zone_resolved(body, bare)
             for rec in body.get("records") or []:
                 if not isinstance(rec, dict):
                     continue
@@ -434,9 +457,9 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         NEW value, so a value *change* cannot be said directly: there is no
         "replace THIS RR". ``overwrite=true`` on ``add`` is the nearest
         primitive — it clears the rrset at ``(domain, type)`` and writes the
-        given value.
+        given value. A create does not need it (see below).
 
-        **``overwrite=false`` on a create/update is a bug, not a style
+        **``overwrite=false`` on an update is a bug, not a style
         choice.** Technitium *appends* at that setting, so editing
         ``www A 10.0.0.1`` to ``10.0.0.2`` leaves the zone answering both,
         round-robin, forever — verified live against 15.4.0 and documented at
@@ -444,17 +467,23 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
         agent path there is no structural reload to eventually re-converge it.
 
         ``change.rrset`` (#783) carries the complete desired set, which is the
-        only place that knowledge exists. With it, create/update replays the
+        only place that knowledge exists. With it, an ``update`` replays the
         whole set: member 0 with ``overwrite=true`` to clear, the rest
         appended. That keeps a name with several values — round-robin A, a
-        backup MX, SPF beside a verification TXT — from collapsing to
-        whichever op landed last. Member 0 always lands first, so a
-        mid-sequence failure leaves a subset containing it rather than an
-        empty name, and the op is replayed.
+        backup MX — from collapsing to whichever op landed last. Member 0
+        always lands first, so a mid-sequence failure leaves a subset
+        containing it rather than an empty name, and the op is replayed.
 
-        ``rrset is None`` means the caller opted out (DNS pools, the cutover
-        pre-flight) or the op predates the field; per the ``RRsetData``
-        contract, fall back to single-value REPLACE semantics.
+        A ``create`` (#1769) never clears: it appends the values the set
+        holds, so a record the operator keeps at the same name and type
+        (a site-verification TXT beside the SPF one SpatiumDDI adds) survives.
+        A DNS pool's ``rrset_action="add"`` with no resolved set appends the
+        one value too. Before any write the zone is looked up and refused if
+        Technitium answers with an enclosing zone instead.
+
+        ``rrset is None`` without that action means the caller opted out (the
+        cutover pre-flight) or the op predates the field; per the
+        ``RRsetData`` contract, fall back to single-value REPLACE semantics.
 
         A ``delete`` stays value-scoped either way: the op's own params
         identify exactly the RR to remove, the survivors are already correct
@@ -487,6 +516,20 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
             )
 
         async with self._client(api_url, token, verify) as client:
+            # #1769 — every write names a zone Technitium may silently
+            # replace with an enclosing one. Writes (and delete, whose reply
+            # carries no zone) cannot be checked afterwards, so look first.
+            self._assert_zone_resolved(
+                self._as_dict(
+                    await self._call(
+                        client,
+                        "zones/records/get",
+                        f"zone check for {domain!r}",
+                        {"domain": domain, "zone": zone_bare},
+                    )
+                ),
+                zone_bare,
+            )
             if change.op == "delete":
                 # The value params are load-bearing on delete: they are how
                 # Technitium picks WHICH member of an rrset to remove.
@@ -514,6 +557,22 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                 )
                 return
 
+            # #1769 — what an op may clear. ``overwrite=true`` is
+            # ``SetRecord``: it deletes EVERY record of the type at the name,
+            # including ones the operator keeps there that SpatiumDDI never
+            # managed (a site-verification TXT) and ones disabled in the
+            # console. So only an ``update`` clears (it has to, to drop the
+            # old value; the op carries no old value to delete precisely, so
+            # an unmanaged value at the same name and type goes with it, as on
+            # Route 53). A ``create`` appends what is missing and leaves the
+            # rest. A pool's ``rrset_action="add"`` appends, always: pool
+            # members share one name and type, and a replace left the pool
+            # serving whichever member wrote last. A CNAME / DNAME is
+            # single-valued, so appending would be refused; it replaces.
+            append_only = change.rrset is None and change.rrset_action == "add"
+            single_valued = rtype in ("CNAME", "DNAME")
+            clears_first = (change.op == "update" or single_valued) and not append_only
+
             for index, member in enumerate(members):
                 ttl = 3600 if member.ttl is None else member.ttl
                 await self._call(
@@ -524,8 +583,9 @@ class TechnitiumAPIDriver(CloudDNSDriverBase):
                         **base,
                         **_params(member),
                         "ttl": ttl,
-                        # Member 0 clears the rrset; the rest append to it.
-                        "overwrite": "true" if index == 0 else "false",
+                        # The first member of a clearing write replaces the
+                        # RRset; every other write appends.
+                        "overwrite": "true" if clears_first and index == 0 else "false",
                     },
                 )
 

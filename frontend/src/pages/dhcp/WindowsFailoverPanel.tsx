@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { FreshEdit } from "@/components/FreshEdit";
 import {
   AlertTriangle,
   ArrowLeftRight,
@@ -462,13 +463,29 @@ export function WindowsFailoverPanel({ groupId }: { groupId: string }) {
         />
       )}
       {dialog?.kind === "edit" && (
-        <RelationshipModal
-          groupId={groupId}
-          report={report}
-          relationship={dialog.rel}
+        <FreshEdit
+          // The relationship is keyed by name; FreshEdit wants an id.
+          row={{ ...dialog.rel, id: dialog.rel.name }}
+          load={async () => {
+            const fresh = await dhcpApi.getGroupFailover(groupId);
+            const rel = fresh.relationships.find(
+              (r) => r.name === dialog.rel.name,
+            );
+            return rel && { ...rel, id: rel.name };
+          }}
+          title="Edit failover relationship"
           onClose={() => setDialog(null)}
-          onDone={setLastResult}
-        />
+        >
+          {(fresh) => (
+            <RelationshipModal
+              groupId={groupId}
+              report={report}
+              relationship={fresh}
+              onClose={() => setDialog(null)}
+              onDone={setLastResult}
+            />
+          )}
+        </FreshEdit>
       )}
       {dialog?.kind === "add" && (
         <AddScopesModal

@@ -18,15 +18,87 @@ record CRUD endpoints reject operator edits.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import bind_check_names_error
+from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSRecord, DNSZone
+from app.services.dns.cname_conflict import describe_cname_conflict, find_cname_conflict
 from app.services.dns.record_ops import enqueue_record_op
 from app.services.dns.serial import bump_zone_serial
+from app.services.dns.zone_synthesis import unauthored_zone_error
 
 logger = structlog.get_logger(__name__)
+
+# One audit row per pool per day for "the pool renders nothing": the health
+# check runs every tick and must not fill the log with the same refusal.
+_SKIP_AUDIT_ACTION = "dns.pool.render_skipped"
+_SKIP_AUDIT_WINDOW = timedelta(hours=24)
+
+
+async def pool_name_refusal(
+    db: AsyncSession, zone: DNSZone, record_name: str, record_type: str
+) -> tuple[int, str] | None:
+    """Why a pool may not own ``record_name`` in ``zone``, as ``(status, why)``.
+
+    The record API's own two rules for an A / AAAA row at that owner, reused
+    rather than copied (#4260): BIND's check-names (422: an underscore label)
+    and the CNAME-stands-alone rule (409). Both make BIND refuse the whole zone
+    and hold it on its last good copy, so a pool must not write such a row.
+    """
+    fqdn = zone.name if record_name == "@" else f"{record_name}.{zone.name}"
+    err = bind_check_names_error(record_type, fqdn, None, origin=zone.name, check_target=False)
+    if err is not None:
+        return 422, err
+    other = await find_cname_conflict(
+        db, zone.id, view_id=None, name=record_name, record_type=record_type
+    )
+    if other is not None:
+        return 409, describe_cname_conflict(record_type, fqdn, other)
+    return None
+
+
+async def _note_render_skipped(
+    db: AsyncSession, pool: DNSPool, zone: DNSZone, status_code: int, why: str
+) -> None:
+    logger.warning(
+        "dns_pool_render_skipped",
+        pool=pool.name,
+        zone=zone.name,
+        record_name=pool.record_name,
+        status=status_code,
+        reason=why,
+    )
+    since = datetime.now(UTC) - _SKIP_AUDIT_WINDOW
+    recent = await db.execute(
+        select(AuditLog.id)
+        .where(
+            AuditLog.action == _SKIP_AUDIT_ACTION,
+            AuditLog.resource_id == str(pool.id),
+            AuditLog.timestamp >= since,
+        )
+        .limit(1)
+    )
+    if recent.first() is not None:
+        return
+    db.add(
+        AuditLog(
+            user_display_name="system",
+            auth_source="system",
+            action=_SKIP_AUDIT_ACTION,
+            resource_type="dns_pool",
+            resource_id=str(pool.id),
+            resource_display=f"{pool.record_name}.{zone.name}",
+            # A background task skipping a write, not a request refused: "skipped",
+            # as other tasks record it ("denied" belongs to the denial-audit path).
+            result="skipped",
+            error_detail=f"Pool {pool.name!r} renders no record: {why}",
+        )
+    )
 
 
 async def apply_pool_state(
@@ -62,6 +134,24 @@ async def apply_pool_state(
     skipped = 0
     ttl_changed: DNSPoolMember | None = None
 
+    # #4260 — a name BIND would refuse (an underscore owner, or a CNAME added
+    # at the name after the pool) renders nothing; rows already written there
+    # are withdrawn, since the zone is held on its last good copy while they
+    # stand. Checked once per pass, without autoflush like the reads above.
+    # #4390 — likewise a zone that is no longer a primary (turned secondary,
+    # stub or forward while the pool held no row): the rows would be listed and
+    # served by nobody, the state #3838 refuses at every other writer.
+    blocked = None
+    if pool.enabled:
+        unauthored = unauthored_zone_error(zone, "add")
+        if unauthored is not None:
+            blocked = (409, unauthored)
+        else:
+            with db.no_autoflush:
+                blocked = await pool_name_refusal(db, zone, pool.record_name, pool.record_type)
+        if blocked is not None:
+            await _note_render_skipped(db, pool, zone, *blocked)
+
     if orphan_records:
         # Every orphan's row goes in ONE targeted flush, before any op is
         # enqueued: ``enqueue_record_op`` autoflushes, which would write the
@@ -86,6 +176,7 @@ async def apply_pool_state(
         # (#1974), and re-enabling restores the healthy + enabled members.
         should_render = (
             bool(pool.enabled)
+            and blocked is None
             and bool(member.enabled)
             and ((member.last_check_state or "unknown") == "healthy")
         )

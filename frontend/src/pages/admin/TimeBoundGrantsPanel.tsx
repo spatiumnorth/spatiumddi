@@ -2,7 +2,11 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Plus, XCircle } from "lucide-react";
 
-import { timeBoundGrantsApi, type TimeBoundGrant } from "@/lib/api";
+import {
+  formatApiError,
+  timeBoundGrantsApi,
+  type TimeBoundGrant,
+} from "@/lib/api";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { CreateTimeBoundGrantModal } from "./CreateTimeBoundGrantModal";
 
@@ -194,6 +198,11 @@ export function TimeBoundGrantsPanel({
         tone="destructive"
         confirmLabel="Revoke now"
         loading={revokeMutation.isPending}
+        error={
+          revokeMutation.error
+            ? formatApiError(revokeMutation.error, "Revoke failed")
+            : null
+        }
         message={
           revokeTarget ? (
             <>
@@ -209,7 +218,10 @@ export function TimeBoundGrantsPanel({
           )
         }
         onConfirm={() => revokeTarget && revokeMutation.mutate(revokeTarget.id)}
-        onClose={() => setRevokeTarget(null)}
+        onClose={() => {
+          setRevokeTarget(null);
+          revokeMutation.reset();
+        }}
       />
     </div>
   );

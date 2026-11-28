@@ -53,6 +53,7 @@ from reportlab.platypus import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.content_disposition import slugify_filename_part
+from app.services.custom_field_text import custom_field_text
 from app.services.ipam.utilization import utilization_percent
 
 # Same scope resolution + payload shaping the CSV/JSON/XLSX exporter uses,
@@ -173,7 +174,7 @@ def _cell(value: Any, limit: int = 40) -> str:
     """
     if value is None or value == "":
         return "—"
-    s = str(value)
+    s = custom_field_text(value)
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 

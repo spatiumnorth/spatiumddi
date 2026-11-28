@@ -57,7 +57,6 @@ CHECKED_INLINE: dict[str, str] = {
     "conformity": "conformity router, per handler (read / admin)",
     "change_request": "requests router, approve endpoint",
     "provisioning_request": "requests router, submit endpoint",
-    "routing_policy": "overlays router, routing-policy mutations re-check it",
 }
 
 _DNS = "/api/v1/dns"

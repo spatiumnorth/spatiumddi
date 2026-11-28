@@ -263,9 +263,13 @@ async def _resolve_users(db: DB, user_ids: list[uuid.UUID]) -> list[User]:
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
-@router.get("", response_model=list[GroupResponse])
+@router.get(
+    "",
+    response_model=list[GroupResponse],
+    dependencies=[Depends(require_permission("read", "group"))],
+)
 async def list_groups(db: DB, _: CurrentUser) -> list[GroupResponse]:
-    """Listing groups is available to any authenticated user.
+    """List groups; needs `read` on `group`.
 
     The Auth Providers admin page and the Groups admin page both rely on this
     to populate pickers. Mutations require `admin` on `group`.
@@ -346,7 +350,11 @@ async def create_group(
     return _to_response(g)
 
 
-@router.get("/{group_id}", response_model=GroupResponse)
+@router.get(
+    "/{group_id}",
+    response_model=GroupResponse,
+    dependencies=[Depends(require_permission("read", "group"))],
+)
 async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> GroupResponse:
     g = await _load_group(db, group_id)
     return _to_response(g)
@@ -447,6 +455,14 @@ async def update_group(
         resource_display=f"update group {g.name}",
     )
 
+    unchanged = (
+        (body.name is None or body.name == g.name)
+        and (body.description is None or body.description == g.description)
+        and (body.external_dn is None or body.external_dn == g.external_dn)
+        and (new_roles is None or {r.id for r in new_roles} == current_role_ids)
+        and (new_users is None or {u.id for u in new_users} == current_member_ids)
+    )
+
     if body.name is not None:
         g.name = body.name
     if body.description is not None:
@@ -458,7 +474,10 @@ async def update_group(
     if new_users is not None:
         g.users = new_users
 
-    db.add(_audit(current_user, "update", g, f"Updated group {g.name}", method, granted))
+    # An edit that changes nothing writes no audit row (#4452); a step-up
+    # that was verified is still recorded.
+    if not unchanged or method is not None:
+        db.add(_audit(current_user, "update", g, f"Updated group {g.name}", method, granted))
     await db.commit()
     g = await _load_group(db, g.id)
     return _to_response(g)

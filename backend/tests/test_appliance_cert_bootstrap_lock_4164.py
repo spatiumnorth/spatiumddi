@@ -24,6 +24,7 @@ from app.services.appliance.bootstrap import (
     _CERT_RECONCILE_LOCK_KEY,
     _generate_self_signed_cert,
     ensure_self_signed_cert,
+    retry_bootstrap_if_no_active_cert,
 )
 from app.services.appliance.tls import parse_pem_certificate
 
@@ -136,3 +137,36 @@ async def test_startup_restores_a_reverted_secret_and_leaves_a_matching_one(
     spies = _Spies(monkeypatch, deployed=("first-boot cert", "first-boot key"))
     await ensure_self_signed_cert()
     assert spies.patched == [(cert_pem, key_pem)]
+
+
+@pytest.mark.asyncio
+async def test_deferred_first_bootstrap_is_retried_until_a_cert_exists_4442(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup lost the lock on a fresh install: the loop's retry issues the cert."""
+    _settings(monkeypatch)
+    spies = _Spies(monkeypatch, deployed=None)
+    monkeypatch.setattr(bootstrap, "_adopt_deployed_cert", _no_adopt)
+
+    other = await _hold_reconcile_lock()
+    try:
+        await ensure_self_signed_cert()  # the single startup call: deferred
+        assert await retry_bootstrap_if_no_active_cert() is True  # still locked
+    finally:
+        await other.rollback()
+        await other.close()
+    rows = (await db_session.execute(select(ApplianceCertificate))).scalars().all()
+    assert rows == []
+
+    assert await retry_bootstrap_if_no_active_cert() is True
+    db_session.expire_all()
+    rows = (await db_session.execute(select(ApplianceCertificate))).scalars().all()
+    assert len(rows) == 1 and rows[0].is_active
+    assert len(spies.patched) == 1
+
+    # Converged: nothing further to retry.
+    assert await retry_bootstrap_if_no_active_cert() is False
+
+
+async def _no_adopt(_db: AsyncSession, _sans: list[str]) -> bool:
+    return False

@@ -26,7 +26,7 @@ from app.models.auth import User
 from app.models.dicom import DICOMApplicationEntity, DICOMPeer
 from app.models.ipam import IPAddress
 from app.services.ai.tools.base import register_tool
-from app.services.dicom.titles import is_vendor_default
+from app.services.dicom.titles import is_vendor_default, normalize_ae_title
 
 _MODULE = "network.dicom"
 
@@ -88,7 +88,7 @@ async def find_dicom_aes(
         IPAddress, IPAddress.id == DICOMApplicationEntity.ip_address_id
     )
     if args.ae_title:
-        stmt = stmt.where(DICOMApplicationEntity.ae_title == args.ae_title.strip())
+        stmt = stmt.where(DICOMApplicationEntity.ae_title == normalize_ae_title(args.ae_title))
     if args.device_class:
         stmt = stmt.where(DICOMApplicationEntity.device_class == args.device_class)
     if args.subnet_id is not None:

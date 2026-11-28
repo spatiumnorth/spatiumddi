@@ -115,7 +115,7 @@ async def get_proposal(
 ) -> ProposalResponse:
     row = await db.get(AIOperationProposal, proposal_id)
     if row is None or row.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proposal not found")
     return _to_response(row)
 
 
@@ -125,7 +125,7 @@ async def apply_proposal(
 ) -> ApplyResponse:
     row = await db.get(AIOperationProposal, proposal_id)
     if row is None or row.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proposal not found")
     terminal = _terminal_state(row)
     if terminal is not None:
         raise HTTPException(
@@ -285,7 +285,7 @@ async def discard_proposal(
 ) -> ProposalResponse:
     row = await db.get(AIOperationProposal, proposal_id)
     if row is None or row.user_id != current_user.id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proposal not found")
     if row.applied_at is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

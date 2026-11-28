@@ -34,6 +34,8 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useSessionState } from "@/lib/useSessionState";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
@@ -122,7 +124,11 @@ export function SiteEditorModal({
           parent_site_id: parentId || null,
           notes,
         };
-        return sitesApi.update(existing.id, body);
+        // Only what the operator changed, against the row read when the
+        // dialog opened (#4379).
+        const diff = changedFields(existing, body);
+        if (Object.keys(diff).length === 0) return existing;
+        return sitesApi.update(existing.id, diff);
       }
       const body: SiteCreate = {
         name,
@@ -148,10 +154,14 @@ export function SiteEditorModal({
       <div className="space-y-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div className="space-y-1 sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="sites-name"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Name
             </label>
             <input
+              id="sites-name"
               className={inputCls}
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -160,10 +170,14 @@ export function SiteEditorModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="sites-code"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Code
             </label>
             <input
+              id="sites-code"
               className={inputCls}
               value={code}
               onChange={(e) => setCode(e.target.value)}
@@ -174,10 +188,14 @@ export function SiteEditorModal({
             </p>
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="sites-kind"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Kind
             </label>
             <select
+              id="sites-kind"
               className={inputCls}
               value={kind}
               onChange={(e) => setKind(e.target.value as SiteKind)}
@@ -190,10 +208,14 @@ export function SiteEditorModal({
             </select>
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="sites-region"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Region
             </label>
             <input
+              id="sites-region"
               className={inputCls}
               value={region}
               onChange={(e) => setRegion(e.target.value)}
@@ -201,10 +223,14 @@ export function SiteEditorModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="sites-parent-site"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Parent site
             </label>
             <select
+              id="sites-parent-site"
               className={inputCls}
               value={parentId}
               onChange={(e) => setParentId(e.target.value)}
@@ -228,10 +254,14 @@ export function SiteEditorModal({
             </select>
           </div>
           <div className="space-y-1 sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="sites-notes"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Notes
             </label>
             <textarea
+              id="sites-notes"
               className={cn(inputCls, "min-h-[80px]")}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
@@ -906,7 +936,7 @@ export function SitesPage() {
                     ? "bg-muted font-medium"
                     : "text-muted-foreground hover:bg-muted/50",
                 )}
-                title="Hierarchy tree (drag to re-parent)"
+                title={`Hierarchy tree${writeGate.disabled ? "" : " (drag to re-parent)"}`}
               >
                 <ListTree className="h-3.5 w-3.5" />
                 Tree
@@ -1122,11 +1152,20 @@ export function SitesPage() {
           />
         )}
         {editing && (
-          <SiteEditorModal
-            existing={editing}
-            sites={allSites}
+          <FreshEdit
+            row={editing}
+            load={() => sitesApi.get(editing.id)}
+            title="Edit site"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <SiteEditorModal
+                existing={fresh}
+                sites={allSites}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         {moving && (
           <MoveSiteModal

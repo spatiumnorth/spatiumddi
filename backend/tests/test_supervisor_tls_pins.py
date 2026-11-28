@@ -110,6 +110,8 @@ async def test_the_list_names_the_active_certificate_and_is_ca_signed(
 
     data = json.loads(payload)
     assert data["certs_sha256"] == [_sha256(active)], "only what is served, not a retired cert"
+    # #4223: the PEM rides inside the signed payload, so a member can pin it.
+    assert [_sha256(p) for p in data["certs_pem"]] == data["certs_sha256"]
     issued = datetime.fromisoformat(data["issued_at"])
     assert abs(datetime.now(UTC) - issued) < timedelta(minutes=1)
 
@@ -129,6 +131,7 @@ async def test_the_certificate_in_the_tls_secret_is_listed_too(
 
     data = json.loads(base64.b64decode((await client.get(_URL)).json()["payload"]))
     assert sorted(data["certs_sha256"]) == sorted([_sha256(active), _sha256(firstboot)])
+    assert sorted(_sha256(p) for p in data["certs_pem"]) == sorted(data["certs_sha256"])
 
 
 async def test_a_signature_does_not_verify_after_the_list_is_edited(

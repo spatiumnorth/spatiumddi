@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import app.drivers.dns as dns_drivers
 from app.drivers.dns import get_driver, register_driver
 from app.drivers.dns.base import (
     AclData,
@@ -116,10 +117,13 @@ def test_registry_unknown_driver_raises() -> None:
         get_driver("djbdns")
 
 
-def test_registry_register_driver_override() -> None:
+def test_registry_register_driver_override(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeDriver(BIND9Driver):
         name = "fake"
 
+    # Restore the registry afterwards: a leftover "fake-bind" is a registered
+    # driver to every later test in the process (the #4562 option-table guard).
+    monkeypatch.setattr(dns_drivers, "_DRIVERS", dict(dns_drivers._DRIVERS))
     register_driver("fake-bind", FakeDriver)
     assert isinstance(get_driver("fake-bind"), FakeDriver)
 

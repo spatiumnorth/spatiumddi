@@ -20,6 +20,18 @@ def test_clean_user_agent_strips_control_chars() -> None:
     assert clean_user_agent("Mozilla/5.0\r\nInjected: evil") == "Mozilla/5.0Injected: evil"
 
 
+def test_clean_user_agent_strips_c1_controls() -> None:
+    # NEL (U+0085) and CSI (U+009B) are C1 controls: a line break to
+    # Unicode-aware readers and a terminal control-sequence introducer.
+    raw = "Mozilla/5.0 (X11\u0085Injected) \u009b31mAgent"
+    out = clean_user_agent(raw)
+    assert out == "Mozilla/5.0 (X11Injected) 31mAgent"
+    assert not any(0x80 <= ord(c) <= 0x9F for c in out)
+    # Every C1 code point is dropped; the first printable Latin-1 one is kept.
+    assert clean_user_agent("".join(chr(c) for c in range(0x80, 0xA0))) is None
+    assert clean_user_agent("caf\u00e9") == "caf\u00e9"
+
+
 def test_clean_user_agent_truncates() -> None:
     out = clean_user_agent("A" * 900)
     assert out is not None and len(out) == 500

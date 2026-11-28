@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { useFieldControl } from "@/components/ui/field";
 import { usePermissions } from "@/hooks/usePermissions";
 import { asnsApi } from "@/lib/api";
 
@@ -17,6 +18,7 @@ export function AsnPicker({
   className,
   disabled,
 }: AsnPickerProps) {
+  const fieldControl = useFieldControl();
   // The list route needs read on "manage_asns"; without it the list is never
   // asked (#3451) and the picker says why instead of offering only "None".
   const perms = usePermissions();
@@ -36,6 +38,7 @@ export function AsnPicker({
     if (perms.unanswered) {
       return (
         <select
+          {...fieldControl}
           className={className}
           value={value ? "linked" : ""}
           disabled
@@ -59,6 +62,7 @@ export function AsnPicker({
     // Disabled, so the form still sends the unchanged id (never a clear).
     return (
       <select
+        {...fieldControl}
         className={className}
         value={value ? "linked" : ""}
         disabled
@@ -74,6 +78,7 @@ export function AsnPicker({
 
   return (
     <select
+      {...fieldControl}
       className={className}
       value={value ?? ""}
       onChange={(e) => onChange(e.target.value || null)}

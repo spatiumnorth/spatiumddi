@@ -125,6 +125,7 @@ async def authenticate(db: AsyncSession, username: str, password: str) -> ACMEAc
         select(ACMEAccount)
         .where(ACMEAccount.username == username)
         .options(selectinload(ACMEAccount.zone))
+        .execution_options(include_deleted=True)  # a trashed zone loads, then is refused (#4335)
     )
     account = (await db.execute(stmt)).scalar_one_or_none()
     # Dummy hash to waste similar time on non-existent usernames. The

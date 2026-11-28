@@ -627,7 +627,8 @@ class FindControlPlaneVipArgs(BaseModel):
         "fronts that is still in direct (raw socket) mode — those lose "
         "relays landing on the announcing node. Read-only — changing a VIP "
         "is a high-blast-radius operation (it can sever Web UI / agent / "
-        "resolver reachability) and is done in Fleet → Control plane, "
+        "resolver reachability) and is done on Appliance → Network & Host "
+        "(Control-plane VIP card), "
         "not via the Copilot."
     ),
     args_model=FindControlPlaneVipArgs,
@@ -853,7 +854,7 @@ class FindClusterMetricsArgs(BaseModel):
         "not Ready or not streaming (#2856) — CNPG counts a Ready standby "
         "that is not replicating as healthy, so ready/total alone can read "
         "3/3 through a replication outage. Appliance control plane only; "
-        "read-only — the same data the Cluster → Overview dashboard renders."
+        "read-only — the same data the Appliance → Cluster → Overview dashboard renders."
     ),
     args_model=FindClusterMetricsArgs,
     category="admin",
@@ -970,7 +971,7 @@ class FindEtcdSnapshotsArgs(BaseModel):
         "in-flight restore state. Use to answer 'what etcd snapshots can "
         "we recover from?' or 'is a restore running?'. Read-only — a "
         "restore is a destructive single-node cluster-reset and is done "
-        "in Fleet → Control plane, never via the Copilot."
+        "on Appliance → Cluster → etcd snapshots, never via the Copilot."
     ),
     args_model=FindEtcdSnapshotsArgs,
     category="admin",
@@ -1058,7 +1059,7 @@ class FindUpgradeImagesArgs(BaseModel):
         "an image nobody labelled — that means UNKNOWN, never amd64 "
         "(#1026). Use to answer 'which upgrade images do we "
         "have staged?' or 'is 1.0.0 already uploaded?'. Read-only "
-        "— upload / import / delete happen in Fleet → Upgrade images."
+        "— upload / import / delete happen in Appliance → Fleet → Upgrade images."
     ),
     args_model=FindUpgradeImagesArgs,
     category="admin",
@@ -1138,7 +1139,7 @@ class FindAvailableUpgradeImagesArgs(BaseModel):
         "whether GitHub was reachable at all. A release that publishes "
         "both architectures appears ONCE PER ARCHITECTURE, so the same tag "
         "can be listed twice (#1026). Use to answer 'what upgrade images can I "
-        "import?' before pointing the operator at Fleet → Upgrade images "
+        "import?' before pointing the operator at Appliance → Fleet → Upgrade images "
         "to do the import. Read-only — and it makes an outbound call to "
         "github.com, so it's opt-in (disabled by default)."
     ),

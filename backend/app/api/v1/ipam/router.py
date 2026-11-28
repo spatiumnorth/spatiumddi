@@ -3,12 +3,14 @@
 import contextlib
 import contextvars
 import hashlib
+import heapq
 import ipaddress
 import itertools
 import re
+import secrets
 import string
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal, NamedTuple, cast
 
@@ -118,6 +120,8 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.custom_field_rules import (
     enforce_required_custom_fields,
     inherited_block_custom_fields,
+    is_empty_value,
+    validate_custom_field_values,
 )
 from app.services.ipam.gateway_rules import gateway_problem
 from app.services.ipam.host_name import current_fqdn, fqdn_matches
@@ -128,6 +132,7 @@ from app.services.ipam.hygiene import (
     build_hygiene_report,
 )
 from app.services.ipam.live_address import get_live_address, live_subnet_clause
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.orphan_aliases import orphan_alias_batch_id
 from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ipam.subnet_boundary import boundary_addresses
@@ -206,6 +211,7 @@ _SUBNET_INSTANCE_ROUTES = (
             "GET /subnets/{subnet_id}/addresses",
             "GET /subnets/{subnet_id}/aliases",
             "GET /subnets/{subnet_id}/domains",
+            "GET /subnets/{subnet_id}/effective-ddns",
             "GET /subnets/{subnet_id}/effective-dhcp",
             "GET /subnets/{subnet_id}/effective-dns",
             "GET /subnets/{subnet_id}/effective-fields",
@@ -214,6 +220,7 @@ _SUBNET_INSTANCE_ROUTES = (
             "GET /subnets/{subnet_id}/probe-policy",
             "GET /subnets/{subnet_id}/reconciliation",
             "GET /subnets/{subnet_id}/utilization-history",
+            "GET /subnets/{subnet_id}/writable-zones",
         }
     ),
     frozenset({"PUT /subnets/{subnet_id}", "POST /subnets/{subnet_id}/addresses"}),
@@ -330,6 +337,7 @@ _IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "GET /subnets/{subnet_id}/utilization-history": _SUBNET,
     "GET /subnets/{subnet_id}/probe-policy": _SUBNET,
     "GET /subnets/{subnet_id}/effective-dns": _SUBNET,
+    "GET /subnets/{subnet_id}/writable-zones": _SUBNET,
     "GET /subnets/{subnet_id}/effective-ddns": _SUBNET,
     "GET /subnets/{subnet_id}/effective-dhcp": _SUBNET,
     "GET /subnets/{subnet_id}/effective-fields": _SUBNET,
@@ -423,6 +431,11 @@ _IPAM_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /plans/{plan_id}/apply": _BLOCK,
 }
 
+# The plan routes are gated on ``ip_block`` but audit as ``subnet_plan``; the
+# parent gate refuses first, so it writes the refusal under the audited type
+# (#4718). The plans router's own gate is only reached by a caller this one admits.
+_IPAM_AUDIT_TYPES = {k: "subnet_plan" for k in _IPAM_ROUTE_TYPES if " /plans" in k}
+
 _IPAM_GATE = require_any_resource_or_scoped(
     # Recorded for the route walkers only: ``route_types`` below decides which
     # type-level grant a route takes.
@@ -447,6 +460,7 @@ _IPAM_GATE = require_any_resource_or_scoped(
     },
     # Type-level grants: the route's own type(s), never "any IPAM type" (#3058).
     route_types=_IPAM_ROUTE_TYPES,
+    audit_types=_IPAM_AUDIT_TYPES,
 )
 
 router = APIRouter(dependencies=[Depends(_IPAM_GATE)])
@@ -1107,7 +1121,10 @@ async def _check_ip_collisions(
         except ValueError:
             ip_obj = None
         if ip_obj is not None:
-            rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
+            fwd_zone = await db.get(DNSZone, forward_zone_id)
+            rev_zone = await _resolve_reverse_zone(
+                db, subnet, ip_obj, fwd_zone.view_id if fwd_zone else None
+            )
             if rev_zone is not None:
                 rev_pointer_full = ip_obj.reverse_pointer + "."
                 rev_zone_name = rev_zone.name.rstrip(".") + "."
@@ -1238,36 +1255,8 @@ async def _check_public_facing_warnings(
 
 
 async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None) -> None:
-    """Upsert ``(ip_id, mac)`` in ``ip_mac_history``, bumping ``last_seen``.
-
-    Called from create + update paths whenever the row carries a MAC.
-    The rule is "this IP currently has MAC X" → upsert with
-    ``last_seen = now()``. A MAC change leaves the prior row alone
-    with its earlier ``last_seen``, so the implicit history is the
-    set of distinct rows for the IP. Postgres's MACADDR type
-    normalises common formats so equality compares cleanly.
-
-    No-op when the MAC is missing or doesn't normalise — the IPAM
-    layer already validates MACs on the way in, so a malformed value
-    here would be defensive and we'd rather not poison the history
-    table with garbage.
-    """
-    if not mac_address:
-        return
-    if _normalize_mac(mac_address) is None:
-        return
-    # ``ON CONFLICT`` here is the cleanest path — Postgres-only, but
-    # the rest of the schema is too. Bump last_seen on conflict;
-    # first_seen sticks at its insert-time default.
-    await db.execute(
-        text("""
-            INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen, last_seen)
-            VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now())
-            ON CONFLICT (ip_address_id, mac_address)
-            DO UPDATE SET last_seen = now()
-            """),
-        {"ip_id": str(ip_id), "mac": mac_address},
-    )
+    """Thin alias of :func:`app.services.ipam.mac_history.record_mac_history`."""
+    await record_mac_history(db, ip_id, mac_address)
 
 
 def _enforce_token_scope(user: Any, resource_type: str, resource_id: uuid.UUID) -> None:
@@ -1457,6 +1446,8 @@ _SPACE_BINDING_FIELDS = (
     "ddns_hostname_policy",
     "ddns_ttl",
     "do_not_probe",
+    # Install-wide: which space is the default is not a property of one space.
+    "is_default",
 )
 _BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
     "parent_block_id",
@@ -1471,6 +1462,7 @@ _BLOCK_BINDING_FIELDS = _SPACE_BINDING_FIELDS + (
 # refused as a change.
 _SPACE_NULL_IS_NOOP = frozenset(
     {
+        "is_default",
         "dns_group_ids",
         "dns_additional_zone_ids",
         "ddns_enabled",
@@ -1853,6 +1845,63 @@ class _NextIPPick(NamedTuple):
     strategy: str
 
 
+# Most candidates the delegate walk looks at before it gives up (#4279). Bounds
+# the work done under the subnet lock when the caller's ranges are huge and
+# nearly all of them are taken or inside a dynamic pool.
+_MAX_DELEGATE_CANDIDATES: int = 1_000_000
+
+
+def _host_bounds(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> tuple[int, int]:
+    """First and last host of ``net``, as ``net.hosts()`` yields them."""
+    first = int(net.network_address)
+    last = int(net.broadcast_address)
+    if net.prefixlen < net.max_prefixlen:
+        first += 1
+        if isinstance(net, ipaddress.IPv4Network) and net.prefixlen < 31:
+            last -= 1
+    return first, last
+
+
+def _delegate_candidates(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    allowed: WritableSetRanges,
+) -> Iterator[int]:
+    """Yield, in ascending order, the hosts of ``net`` the caller's
+    address-set ranges cover (#4279): what ``net.hosts()`` offers, narrowed to
+    ``allowed`` without walking the rest of the subnet."""
+    first, last = _host_bounds(net)
+
+    def spans() -> Iterator[int]:
+        for lo, hi in allowed.intervals:
+            yield from range(max(lo, first), min(hi, last) + 1)
+
+    yield from heapq.merge(spans(), sorted(h for h in allowed.hosts if first <= h <= last))
+
+
+def _random_delegate_candidate(
+    net: ipaddress.IPv4Network | ipaddress.IPv6Network,
+    allowed: WritableSetRanges,
+) -> int | None:
+    """One uniformly drawn host inside the caller's ranges, or ``None`` when
+    they hold no host of ``net`` (#4279)."""
+    first, last = _host_bounds(net)
+    spans = [
+        (max(lo, first), min(hi, last))
+        for lo, hi in allowed.intervals
+        if max(lo, first) <= min(hi, last)
+    ]
+    spans += [(h, h) for h in allowed.hosts if first <= h <= last]
+    total = sum(hi - lo + 1 for lo, hi in spans)
+    if total == 0:
+        return None
+    pick = secrets.randbelow(total)
+    for lo, hi in spans:
+        if pick <= hi - lo:
+            return lo + pick
+        pick -= hi - lo + 1
+    return None  # pragma: no cover - pick < total always lands in a span
+
+
 async def _pick_next_available_ip(
     db: AsyncSession,
     subnet: Subnet,
@@ -1873,7 +1922,10 @@ async def _pick_next_available_ip(
     pass their resolved ranges here so the picker never hands out an address
     the per-IP gate would then 403 (and reports "no available IP" only when no
     free host inside *their* ranges exists). ``None`` = unconstrained (the
-    subnet-write-holder path).
+    subnet-write-holder path). A constrained pick draws (``random``) or walks
+    (everything else) inside the ranges themselves, not the whole subnet, so a
+    small set in a /64, or one past the subnet's first 65,536 hosts, is found
+    (#4279).
 
     For IPv6 the ``strategy`` argument is honoured but also falls back
     to ``Subnet.ipv6_allocation_policy`` when the caller doesn't know
@@ -1905,6 +1957,50 @@ async def _pick_next_available_ip(
         """#8: when the caller is address-set-delegated, the candidate must
         fall inside their writable ranges. ``None`` = unconstrained."""
         return allowed_ranges is None or allowed_ranges.contains(ip_int)
+
+    # ── Address-set delegate (#4279) ──────────────────────────────────
+    # A caller confined to its sets' ranges draws or walks INSIDE them. The
+    # whole-subnet walks below cap at 65,536 hosts and the v6 random draw
+    # tries 32 addresses of the whole subnet, so a set that is a small part
+    # of a /64 (or sits past the first 65,536 hosts) was answered "none free"
+    # while it held free hosts.
+    if allowed_ranges is not None:
+        is_v6 = isinstance(net, ipaddress.IPv6Network)
+        effective = strategy
+        if (
+            is_v6
+            and effective == "sequential"
+            and subnet.ipv6_allocation_policy in ("random", "eui64")
+        ):
+            effective = subnet.ipv6_allocation_policy
+        if effective == "eui64" and isinstance(net, ipaddress.IPv6Network):
+            candidate = _eui64_from_mac(net, mac_address or "")
+            if candidate is not None and str(candidate) not in used and _allowed(int(candidate)):
+                return _NextIPPick(candidate, "eui64")
+            effective = "random"
+        if not is_v6 and effective != "random":
+            effective = "sequential"
+        make = ipaddress.IPv6Address if is_v6 else ipaddress.IPv4Address
+
+        def _free(ip_int: int) -> bool:
+            return not (
+                str(make(ip_int)) in used
+                or (dynamic_ranges and _ip_int_in_dynamic_pool(ip_int, dynamic_ranges))
+            )
+
+        if effective == "random":
+            for _ in range(32):
+                drawn = _random_delegate_candidate(net, allowed_ranges)
+                if drawn is None:
+                    break
+                if _free(drawn):
+                    return _NextIPPick(make(drawn), "random")
+        for ip_int in itertools.islice(
+            _delegate_candidates(net, allowed_ranges), _MAX_DELEGATE_CANDIDATES
+        ):
+            if _free(ip_int):
+                return _NextIPPick(make(ip_int), effective)
+        return _NextIPPick(None, effective)
 
     # ── IPv6 ──────────────────────────────────────────────────────────
     if isinstance(net, ipaddress.IPv6Network):
@@ -1948,8 +2044,6 @@ async def _pick_next_available_ip(
         # At /64 the birthday collision probability is astronomical;
         # the loop exists to be correct under degenerate cases (tiny v6
         # subnets) rather than because we expect it to iterate.
-        import secrets  # noqa: PLC0415
-
         host_bits = net.max_prefixlen - net.prefixlen
         if host_bits <= 0:
             return _NextIPPick(None, "random")  # /128 — network IS the address
@@ -2001,7 +2095,10 @@ async def _pick_next_available_ip(
 
 
 async def _resolve_reverse_zone(
-    db: AsyncSession, subnet: Subnet, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address
+    db: AsyncSession,
+    subnet: Subnet,
+    ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    view_id: uuid.UUID | None = None,
 ) -> DNSZone | None:
     """Find the reverse zone covering this IP: a zone linked to the subnet
     that covers it, else the most specific reverse zone in the subnet's
@@ -2012,9 +2109,13 @@ async def _resolve_reverse_zone(
     most-specific-zone rule of #1419) is ``pick_reverse_zone``, shared with
     the drift check so the two cannot disagree about an address's zone. It is
     per ADDRESS: a subnet wider than a /24 spans more than one (#1840).
+
+    ``view_id`` is the view of the forward zone the A record goes into: the
+    PTR stays in that view's reverse zone, and no PTR is written when only
+    another view holds one (#4797).
     """
     effective_group_ids, _, _ = await _resolve_effective_dns(db, subnet)
-    return await resolve_reverse_zone(db, subnet, ip_addr, effective_group_ids)
+    return await resolve_reverse_zone(db, subnet, ip_addr, effective_group_ids, view_id)
 
 
 # When set (inside a ``_batched_dns_ops`` block), ``_enqueue_dns_op`` defers
@@ -2692,9 +2793,14 @@ async def _cname_at(
     rtype: str,
     *,
     exclude_id: uuid.UUID | None = None,
+    name: str | None = None,
 ) -> bool:
     """Whether a CNAME (or, for a CNAME, anything) already holds the name an
-    IP's forward record would be written at (#1441).
+    IP's record would be written at (#1441).
+
+    ``name`` defaults to the host name (the forward record); the PTR passes
+    its owner name in the reverse zone (#4796: RFC 2317's classless
+    delegation puts a CNAME at an address's label there).
 
     A name that holds a CNAME holds nothing else (RFC 1034 section 3.6.2,
     RFC 2181 section 10.1). #1381 made the record API refuse such a pair,
@@ -2707,17 +2813,18 @@ async def _cname_at(
     """
     from app.services.dns.cname_conflict import find_cname_conflict  # noqa: PLC0415
 
-    if not ip.hostname:
+    owner = name if name is not None else ip.hostname
+    if not owner:
         return False
     other = await find_cname_conflict(
-        db, zone.id, view_id=None, name=ip.hostname, record_type=rtype, exclude_id=exclude_id
+        db, zone.id, view_id=None, name=owner, record_type=rtype, exclude_id=exclude_id
     )
     if other is None:
         return False
     # #1493 — every DHCP renewal re-runs the sync for such a name, so the
     # warning is logged once per (address, hostname, zone) in this process
     # and at debug after that.
-    key = (str(ip.address), ip.hostname, zone.name)
+    key = (str(ip.address), owner, zone.name)
     log = logger.debug if key in _cname_skip_logged else logger.warning
     _cname_skip_logged[key] = None
     while len(_cname_skip_logged) > _CNAME_SKIP_LOG_MAX:
@@ -2729,7 +2836,7 @@ async def _cname_at(
         zone=zone.name,
         conflicting_record_id=str(other.id),
         conflicting_type=other.record_type,
-        detail=f"{ip.hostname} already holds a {other.record_type}; no {rtype} written",
+        detail=f"{owner} already holds a {other.record_type}; no {rtype} written",
     )
     return True
 
@@ -3706,7 +3813,9 @@ async def _sync_dns_record(
         ip_obj = ipaddress.ip_address(str(ip.address))
     except ValueError:
         return True
-    rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
+    rev_zone = await _resolve_reverse_zone(
+        db, subnet, ip_obj, zone.view_id if zone is not None else None
+    )
     if rev_zone is None:
         # No zone IPAM authors covers this IP — skip the PTR. A PTR in a
         # primary zone is left alone, as before; one a release before #1419
@@ -3754,6 +3863,34 @@ async def _sync_dns_record(
         )
     )
     existing_ptr = result.scalars().all()
+
+    # #4796 — a CNAME at the PTR's name (RFC 2317 puts one at an address's
+    # label in a /24's reverse zone) holds no PTR: the record API refuses
+    # the pair and BIND refuses the zone file. Skip the PTR, as the forward
+    # record is skipped (#1441), and retract one an earlier release wrote
+    # beside it, so a re-sync repairs the zone.
+    if await _cname_at(db, rev_zone, ip, "PTR", name=ptr_name):
+        for record in existing_ptr:
+            if record.id in skip_existing:
+                continue
+            old_zone = (
+                rev_zone if record.zone_id == rev_zone.id else await db.get(DNSZone, record.zone_id)
+            )
+            if old_zone is not None and ipam_authors_zone(old_zone):
+                await _enqueue_dns_op(
+                    db,
+                    old_zone,
+                    "delete",
+                    record.name,
+                    "PTR",
+                    record.value,
+                    record.ttl,
+                    record_id=record.id,
+                )
+            await db.delete(record)
+            if ip.reverse_zone_id == record.zone_id:
+                ip.reverse_zone_id = None
+        return True
 
     if not existing_ptr:
         ptr_twin = await _operator_record_twin(
@@ -4814,6 +4951,13 @@ class EffectiveDnsResponse(BaseModel):
     inherited_from_block_id: str | None
 
 
+class WritableZoneResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    group_id: uuid.UUID
+    zone_type: str
+
+
 class EffectiveDdnsResponse(BaseModel):
     """What a subnet's DDNS resolves to, and where it comes from (#2475).
 
@@ -5702,6 +5846,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 detail=f"{body.network} is not contained within parent block {parent.network}",
             )
 
+    await validate_custom_field_values(db, "ip_block", body.custom_fields)
     # A Required custom field needs a value (#2478), after any template
     # pre-fill above, counting what the parent chain already carries.
     await enforce_required_custom_fields(
@@ -5868,6 +6013,9 @@ async def update_block(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the block already holds.
     if body.custom_fields is not None:
+        await validate_custom_field_values(
+            db, "ip_block", body.custom_fields, stored=block.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "ip_block",
@@ -6218,8 +6366,8 @@ async def plan_block_allocation(
     """Pack requested subnet sizes into the block's free space.
 
     Largest-first heuristic — sorts requests by ascending prefix_len (= largest
-    network first) and best-fits each into the smallest free range that can hold
-    it. Returns the planned allocations plus anything that couldn't fit. This is
+    network first) and places each first-fit by address, in the lowest-addressed
+    free range that can hold it. Returns the planned allocations plus anything that couldn't fit. This is
     a preview only; nothing is written.
     """
     _refuse_container_scan_for_bound_token(current_user)
@@ -6840,6 +6988,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         # Override to enforce consistency
         body.vlan_id = vlan_obj.vlan_id
 
+    await validate_custom_field_values(db, "subnet", body.custom_fields)
     # A Required custom field needs a value (#2478), after any template
     # pre-fill above, counting what the block chain already carries.
     await enforce_required_custom_fields(
@@ -7764,6 +7913,37 @@ async def get_subnet_probe_policy(
     )
 
 
+@router.get("/subnets/{subnet_id}/writable-zones", response_model=list[WritableZoneResponse])
+async def list_subnet_writable_zones(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB, group_id: uuid.UUID | None = None
+) -> list[WritableZoneResponse]:
+    """DNS zones in the subnet's effective DNS groups that the caller may write (#4854).
+
+    A role scoped to one subnet and one zone cannot read ``GET /dns/groups/{id}/zones``
+    (a type-level DNS read), yet ``_assert_scoped_zones`` lets it name that zone. This
+    is the picker's source for such a caller: only zones it holds ``write`` on.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+    wanted = {str(g) for g in group_ids}
+    if group_id is not None:
+        wanted &= {str(group_id)}
+    if not wanted:
+        return []
+    rows = await db.execute(
+        select(DNSZone)
+        .where(DNSZone.group_id.in_([uuid.UUID(g) for g in wanted]))
+        .order_by(DNSZone.name)
+    )
+    return [
+        WritableZoneResponse(id=z.id, name=z.name, group_id=z.group_id, zone_type=z.zone_type)
+        for z in rows.scalars().all()
+        if user_has_permission(current_user, "write", "dns_zone", z.id)
+    ]
+
+
 @router.get("/subnets/{subnet_id}/effective-dns", response_model=EffectiveDnsResponse)
 async def get_effective_subnet_dns(
     subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
@@ -8032,6 +8212,9 @@ async def update_subnet(
     # Required custom fields (#2478): checked only when the request sends
     # custom_fields, and only for a field it sends or the subnet already holds.
     if body.custom_fields is not None:
+        await validate_custom_field_values(
+            db, "subnet", body.custom_fields, stored=subnet.custom_fields
+        )
         await enforce_required_custom_fields(
             db,
             "subnet",
@@ -10059,8 +10242,10 @@ async def _backfill_reverse_zones(
 
     resp = BackfillReverseZonesResponse()
     for s in subnets:
-        # Pre-check: does every reverse zone of the subnet's set already exist
-        # (in any group)? If so, it's not a candidate for backfill.
+        # The zones of the subnet's set that exist BEFORE the call, in any
+        # group or view: "created" is only what the call made. Whether the
+        # SUBNET's own group (and view) holds one is decided by the helper
+        # (#4941); a zone of the name elsewhere is not the subnet's.
         try:
             expected = compute_reverse_zone_names(str(s.network))
         except Exception:  # noqa: BLE001
@@ -10069,15 +10254,10 @@ async def _backfill_reverse_zones(
         have = set(
             (
                 await db.execute(
-                    select(DNSZone.name).where(
-                        DNSZone.name.in_(expected), DNSZone.kind == "reverse"
-                    )
+                    select(DNSZone.id).where(DNSZone.name.in_(expected), DNSZone.kind == "reverse")
                 )
             ).scalars()
         )
-        if have.issuperset(expected):
-            resp.skipped += 1
-            continue
         try:
             zones = await ensure_reverse_zones_for_subnet(
                 db, s, user, honour_opt_out=honour_opt_out
@@ -10087,12 +10267,12 @@ async def _backfill_reverse_zones(
             continue
         # Only zones this call made are "created"; one that already existed
         # is returned by the helper too.
-        made = [z for z in zones if z.name not in have]
+        made = [z for z in zones if z.id not in have]
         if made:
             for z in made:
                 resp.created.append({"subnet": str(s.network), "zone": z.name})
         else:
-            # Subnet has no effective DNS group → nothing to do.
+            # Subnet has no effective DNS group, or its zones all exist → nothing to do.
             resp.skipped += 1
     return resp
 
@@ -10530,6 +10710,7 @@ async def create_address(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     _enforce_subnet_token_scope(current_user, subnet_id)
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
 
     # Multicast subnets don't allocate per-IP endpoint rows. Use the
     # multicast group registry under ``/multicast/groups`` instead —
@@ -11072,6 +11253,9 @@ async def update_address(
     # ``reserved_until`` by sending an explicit null. ``dns_zone_id`` /
     # ``force`` are routing fields, not row attrs.
     changes = body.model_dump(exclude_unset=True, exclude={"dns_zone_id", "force"})
+    await validate_custom_field_values(
+        db, "ip_address", changes.get("custom_fields"), stored=ip.custom_fields
+    )
     changes_for_audit = body.model_dump(
         mode="json", exclude_unset=True, exclude={"dns_zone_id", "force"}
     )
@@ -12291,6 +12475,7 @@ async def bulk_allocate_commit(
             },
         )
 
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
     explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     created_addrs: list[str] = []
     # Every allocated IP lands in the same subnet → same zone(s); batch the
@@ -12480,6 +12665,7 @@ async def allocate_next_ip(
     subnet_id: uuid.UUID, body: NextIPRequest, current_user: CurrentUser, db: DB
 ) -> IPAddress:
     """Atomically allocate the next available IP in the subnet."""
+    await validate_custom_field_values(db, "ip_address", body.custom_fields)
     # Lock the subnet row to serialise concurrent allocations. `of=Subnet`
     # restricts the FOR UPDATE to the base table; Subnet has joined-eager
     # relationships (vlan, etc.) and Postgres rejects FOR UPDATE on the
@@ -12872,11 +13058,24 @@ async def remove_subnet_domain(
 _BULK_ALLOWED_STATUSES = {"active", "deprecated", "reserved", "quarantine"}
 
 
+def _merge_dict_patch(existing: dict[str, Any] | None, patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``patch`` into ``existing`` per key; a ``None`` value removes the key."""
+    merged = dict(existing or {})
+    for k, v in patch.items():
+        if v is None:
+            merged.pop(k, None)
+        else:
+            merged[k] = v
+    return merged
+
+
 class SubnetBulkChanges(BaseModel):
     name: str | None = None
     description: str | None = None
     status: str | None = None
     vlan_id: int | None = None
+    # Merged into the existing dicts per key (set a key to null to remove it),
+    # like the address bulk edit (#4304).
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
 
@@ -12907,6 +13106,11 @@ async def bulk_edit_subnets(
 ) -> SubnetBulkEditResponse:
     """Apply the same set of changes to multiple subnets atomically.
 
+    ``name`` / ``description`` / ``status`` / ``vlan_id`` replace the existing
+    value. ``tags`` and ``custom_fields`` are **merged** into each subnet's
+    existing dict per key; a key set to ``null`` is removed (same as the
+    address bulk edit). Before #4304 they replaced the whole dict.
+
     All mutations happen in a single transaction; one audit row per
     successfully-updated subnet shares a `batch_id` in `new_value`.
     """
@@ -12929,6 +13133,8 @@ async def bulk_edit_subnets(
     for sid in body.subnet_ids:
         _enforce_subnet_token_scope(current_user, sid)
 
+    await validate_custom_field_values(db, "subnet", changes.get("custom_fields"))
+
     batch_id = uuid.uuid4()
     updated = 0
     not_found: list[uuid.UUID] = []
@@ -12941,6 +13147,8 @@ async def bulk_edit_subnets(
 
         old = {k: getattr(subnet, k, None) for k in changes.keys()}
         for field, value in changes.items():
+            if field in ("tags", "custom_fields"):
+                value = _merge_dict_patch(getattr(subnet, field, None), value)
             setattr(subnet, field, value)
 
         db.add(
@@ -13026,6 +13234,11 @@ async def get_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if is_empty_value(v):
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 
@@ -13091,6 +13304,11 @@ async def get_block_effective_fields(
             tags[k] = v
             tag_sources[k] = src
         for k, v in cmap.items():
+            # ``""`` / null is "no value of its own" (#4558): the console's
+            # spelling of a cleared field, and what the Required rule already
+            # reads as empty. It must not hide an ancestor's value.
+            if is_empty_value(v):
+                continue
             custom_fields[k] = v
             custom_field_sources[k] = src
 
@@ -13511,6 +13729,7 @@ async def bulk_edit_addresses(
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
+    await validate_custom_field_values(db, "ip_address", cf_patch)
     # Per-field opt-in: the change set carries ONLY the fields the
     # client explicitly set. ``role`` and ``reserved_until`` flow
     # through as scalars; an empty string on ``role`` clears.
@@ -13633,21 +13852,11 @@ async def bulk_edit_addresses(
                 touched_subnets.add(ip.subnet_id)
 
             if tags_patch is not None:
-                merged = dict(ip.tags or {})
-                for k, v in tags_patch.items():
-                    if v is None:
-                        merged.pop(k, None)
-                    else:
-                        merged[k] = v
+                merged = _merge_dict_patch(ip.tags, tags_patch)
                 old["tags"] = ip.tags or {}
                 ip.tags = merged
             if cf_patch is not None:
-                merged_cf = dict(ip.custom_fields or {})
-                for k, v in cf_patch.items():
-                    if v is None:
-                        merged_cf.pop(k, None)
-                    else:
-                        merged_cf[k] = v
+                merged_cf = _merge_dict_patch(ip.custom_fields, cf_patch)
                 old["custom_fields"] = ip.custom_fields or {}
                 ip.custom_fields = merged_cf
 

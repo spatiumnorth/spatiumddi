@@ -602,7 +602,8 @@ async def primary_candidate(
     ``exclude_id`` names a server still in the group in this session that is
     on its way out (see ``elect_primary``).
     """
-    conditions = [DNSServer.group_id == group_id]
+    # A server being deleted (#4173) is never the stand-in or the new primary.
+    conditions = [DNSServer.group_id == group_id, DNSServer.removing_at.is_(None)]
     if exclude_id is not None:
         conditions.append(DNSServer.id != exclude_id)
     base = select(DNSServer).where(*conditions).order_by(DNSServer.created_at, DNSServer.id)
@@ -1268,9 +1269,12 @@ AGENTLESS_INLINE_ZONE_CREATES = 16
 AGENTLESS_SWEEP_ZONE_CREATES = 32
 
 
-async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> str | None:
-    """Create ``zone`` on one agentless server. Returns None when the zone is
-    there afterwards, else the error. Never raises: callers are past a commit.
+async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> tuple[str | None, bool]:
+    """Create ``zone`` on one agentless server. Returns ``(error, created)``:
+    ``error`` is None when the zone is there afterwards; ``created`` is True
+    only when this call made it (the driver reported a change), so it is the
+    "SpatiumDDI created it here" fact (#1771) that a later retire needs.
+    Never raises: callers are past a commit.
 
     A provider that already holds a zone of this name counts as present —
     whether the driver adopts it (an empty Technitium zone, a Route 53 zone
@@ -1282,8 +1286,8 @@ async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> str | No
     try:
         driver = get_driver(server.driver)
         if not hasattr(driver, "apply_zone_change"):
-            return None
-        await driver.apply_zone_change(server, zone, "create")
+            return None, False
+        changed = await driver.apply_zone_change(server, zone, "create")
     except CloudDNSConflictError as exc:
         logger.info(
             "dns.zone.provision_agentless_exists",
@@ -1291,7 +1295,7 @@ async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> str | No
             zone=zone.name,
             detail=str(exc)[:500],
         )
-        return None
+        return None, False
     except Exception as exc:  # noqa: BLE001 — post-commit; retried
         logger.warning(
             "dns.zone.provision_agentless_failed",
@@ -1299,8 +1303,10 @@ async def _create_zone_at_provider(server: DNSServer, zone: DNSZone) -> str | No
             zone=zone.name,
             error=str(exc)[:500],
         )
-        return str(exc)[:500] or exc.__class__.__name__
-    return None
+        return str(exc)[:500] or exc.__class__.__name__, False
+    # A driver that reports nothing (None) counts as having changed the
+    # provider, as ``_push_zone_to_agentless_servers`` reads it (#1537).
+    return None, changed is not False
 
 
 async def _agentless_zone_targets(s: AsyncSession, group_id: uuid.UUID) -> list[DNSServer]:
@@ -1336,9 +1342,12 @@ async def _ensure_zone_at_provider(bind: Any, zone_id: uuid.UUID) -> dict[uuid.U
         group_id = zone.group_id
         servers = await _agentless_zone_targets(s, group_id)
     outcomes: dict[uuid.UUID, str | None] = {}
+    created: list[str] = []
     for server in servers:
         if server.is_enabled:
-            outcomes[server.id] = await _create_zone_at_provider(server, zone)
+            outcomes[server.id], made = await _create_zone_at_provider(server, zone)
+            if made:
+                created.append(str(server.id))
     done = len(outcomes) == len(servers) and all(e is None for e in outcomes.values())
     async with AsyncSession(bind) as s:
         await s.execute(
@@ -1355,8 +1364,36 @@ async def _ensure_zone_at_provider(bind: Any, zone_id: uuid.UUID) -> dict[uuid.U
             )
             .execution_options(synchronize_session=False)
         )
+        if created:
+            # Durable "SpatiumDDI created it here" (#1771); a retry after a
+            # partial failure keeps what an earlier attempt recorded.
+            row = (
+                await s.execute(
+                    select(DNSZone)
+                    .where(DNSZone.id == zone_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                row.agentless_created_server_ids = sorted(
+                    set(row.agentless_created_server_ids or []) | set(created)
+                )
         await s.commit()
     return outcomes
+
+
+async def servers_not_created_by_us(db: AsyncSession, zone: DNSZone) -> set[uuid.UUID]:
+    """The group's agentless servers a retire must NOT send ``delete`` to
+    (#1771): every one where SpatiumDDI did not create ``zone``.
+
+    ``agentless_created_server_ids`` is written only when the provider create
+    reported a change, so a same-named zone the operator already had there
+    (adopted, or refused as foreign) is left alone, and so is every zone that
+    pre-dates the column (NULL reads as "not ours"). A delete the operator asks
+    for explicitly does not use this."""
+    ours = {uuid.UUID(x) for x in (zone.agentless_created_server_ids or [])}
+    return {s.id for s in await _agentless_zone_targets(db, zone.group_id)} - ours
 
 
 async def provision_zone_at_agentless_servers(db: AsyncSession, zone: DNSZone) -> bool:
@@ -1879,6 +1916,8 @@ async def enqueue_record_op(
                 .where(
                     DNSServer.group_id == zone.group_id,
                     DNSServer.is_enabled.is_(True),
+                    # A server being deleted (#4173) takes no new ops.
+                    DNSServer.removing_at.is_(None),
                 )
                 .order_by(DNSServer.is_primary.desc(), DNSServer.created_at)
             )
@@ -2042,6 +2081,8 @@ async def _fanout_agent_ops(
                 .where(
                     DNSServer.group_id == zone.group_id,
                     DNSServer.is_enabled.is_(True),
+                    # A server being deleted (#4173) takes no new ops.
+                    DNSServer.removing_at.is_(None),
                 )
                 .order_by(DNSServer.is_primary.desc(), DNSServer.created_at)
             )
@@ -2608,6 +2649,7 @@ def _change_from_op_row(op_row: DNSRecordOp) -> RecordChange | None:
         ),
         target_serial=op_row.target_serial or 0,
         rrset=rrset_from_payload(record),
+        rrset_action=record.get("rrset_action") or None,
     )
 
 

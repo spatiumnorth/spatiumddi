@@ -1,4 +1,5 @@
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -32,6 +33,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { FormError } from "@/components/ui/form-error";
+import { countNoun } from "@/lib/count-noun";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -439,7 +441,7 @@ function VRFEditorForm({
 
 // ── Bulk-delete confirmation ──────────────────────────────────────────────────
 
-function BulkDeleteModal({
+export function BulkDeleteModal({
   rows,
   onClose,
 }: {
@@ -477,7 +479,11 @@ function BulkDeleteModal({
   });
 
   return (
-    <Modal title={`Delete ${rows.length} VRFs?`} onClose={onClose} wide>
+    <Modal
+      title={`Delete ${countNoun(rows.length, "VRF")}?`}
+      onClose={onClose}
+      wide
+    >
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">
           You are about to delete the following VRFs:
@@ -488,7 +494,8 @@ function BulkDeleteModal({
               <span>{r.name}</span>
               {(r.space_count || r.block_count) > 0 && (
                 <span className="text-muted-foreground">
-                  {r.space_count} spaces · {r.block_count} blocks
+                  {countNoun(r.space_count, "space")} ·{" "}
+                  {countNoun(r.block_count, "block")}
                 </span>
               )}
             </div>
@@ -658,7 +665,10 @@ export function VRFsPage() {
               <Trash2 className="h-3 w-3" /> Delete {selected.size}
             </button>
             <button
-              onClick={() => setSelected(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelected(new Set());
+              }}
               className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
             >
               Clear

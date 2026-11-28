@@ -21,8 +21,13 @@
  * + backend ``require_module`` both gate it).
  */
 
-import { useMemo, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { AxiosResponse } from "axios";
 import {
   Ban,
@@ -37,7 +42,6 @@ import {
   XCircle,
 } from "lucide-react";
 import {
-  APPROVAL_POLICY_ACTIONS,
   type ApprovalPolicy,
   type ApprovalPolicyWrite,
   type ChangeRequest,
@@ -56,10 +60,13 @@ import { featureModulesApi } from "@/lib/api";
 import { usePermissions } from "@/hooks/usePermissions";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ShieldAlert, AlertTriangle } from "lucide-react";
 import { BreakGlassModal } from "./BreakGlassModal";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { FormError } from "@/components/ui/form-error";
 
 const inputCls =
@@ -169,14 +176,23 @@ function fmtTime(iso: string | null): string {
 // it so an over-long note is never sent and refused as "decision_note: ..." (#3835).
 const DECISION_NOTE_MAX = 2000;
 
+// The 409 an Approve gets when the change's scope grew since it was requested
+// (#4381). The row cannot be approved again, so the page remembers it and
+// stops offering Approve; Reject (the approver's decision) stays.
+const SCOPE_CHANGED_PREFIX = "The change's scope changed";
+const SCOPE_CHANGED_NOTE =
+  "The change's scope changed since it was requested, so it can no longer be approved. Reject it; the requester can cancel it and submit it again.";
+
 function DecisionModal({
   cr,
   mode,
   onClose,
+  onScopeChanged,
 }: {
   cr: ChangeRequest;
   mode: "approve" | "reject";
   onClose: () => void;
+  onScopeChanged?: (id: string) => void;
 }) {
   const qc = useQueryClient();
   const [note, setNote] = useState("");
@@ -192,8 +208,13 @@ function DecisionModal({
       qc.invalidateQueries({ queryKey: ["change-requests"] });
       onClose();
     },
-    onError: (err) =>
-      setError(formatApiError(err, `Failed to ${mode} the request.`)),
+    onError: (err) => {
+      const message = formatApiError(err, `Failed to ${mode} the request.`);
+      if (mode === "approve" && message.startsWith(SCOPE_CHANGED_PREFIX)) {
+        onScopeChanged?.(cr.id);
+      }
+      setError(message);
+    },
   });
 
   const title =
@@ -225,10 +246,14 @@ function DecisionModal({
         )}
 
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="change-requests-decision-note"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Decision note {mode === "reject" ? "" : "(optional)"}
           </label>
           <textarea
+            id="change-requests-decision-note"
             className={cn(inputCls, "min-h-[64px] resize-y")}
             maxLength={DECISION_NOTE_MAX}
             value={note}
@@ -289,12 +314,14 @@ function RequestRow({
   cr,
   canApprove,
   canCancel,
+  scopeChanged,
   onDecide,
   onCancel,
 }: {
   cr: ChangeRequest;
   canApprove: boolean;
   canCancel: boolean;
+  scopeChanged: boolean;
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
 }) {
@@ -313,6 +340,11 @@ function RequestRow({
         {cr.error && (
           <div className="mt-1 text-[11px] text-destructive break-words">
             {cr.error}
+          </div>
+        )}
+        {isPending && scopeChanged && (
+          <div className="mt-1 text-[11px] text-amber-600 dark:text-amber-400 break-words">
+            {SCOPE_CHANGED_NOTE}
           </div>
         )}
       </td>
@@ -346,11 +378,14 @@ function RequestRow({
                 <HeaderButton
                   variant="primary"
                   icon={Check}
-                  disabled={!cr.can_approve}
+                  disabled={!cr.can_approve || scopeChanged}
                   title={
-                    cr.can_approve
-                      ? undefined
-                      : (cr.approve_blocked_reason ?? "You cannot approve this")
+                    scopeChanged
+                      ? SCOPE_CHANGED_NOTE
+                      : cr.can_approve
+                        ? undefined
+                        : (cr.approve_blocked_reason ??
+                          "You cannot approve this")
                   }
                   onClick={() => onDecide(cr, "approve")}
                 >
@@ -386,22 +421,28 @@ function RequestTable({
   canApprove,
   isRequester,
   isSuperadmin,
+  scopeChanged,
   onDecide,
   onCancel,
   emptyText,
+  error,
 }: {
   rows: ChangeRequest[];
   canApprove: boolean;
   isRequester: (cr: ChangeRequest) => boolean;
   isSuperadmin: boolean;
+  scopeChanged: ReadonlySet<string>;
   onDecide: (cr: ChangeRequest, mode: "approve" | "reject") => void;
   onCancel: (cr: ChangeRequest) => void;
   emptyText: string;
+  error?: unknown;
 }) {
   if (rows.length === 0) {
     return (
       <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-        {emptyText}
+        <ListEmpty error={error} what="change requests">
+          {emptyText}
+        </ListEmpty>
       </div>
     );
   }
@@ -426,6 +467,7 @@ function RequestTable({
               // request (#3834); only Cancel is offered on it.
               canApprove={canApprove && !isRequester(cr)}
               canCancel={isRequester(cr) || isSuperadmin}
+              scopeChanged={scopeChanged.has(cr.id)}
               onDecide={onDecide}
               onCancel={onCancel}
             />
@@ -435,6 +477,13 @@ function RequestTable({
     </div>
   );
 }
+
+// The server's own bounds for ``ttl_hours``.
+const TTL_HOURS_MAX = 8760;
+const ttlInBounds = (t: string) => {
+  const n = Number(t.trim());
+  return Number.isInteger(n) && n >= 1 && n <= TTL_HOURS_MAX;
+};
 
 // ── Policy editor ───────────────────────────────────────────────────────────
 
@@ -468,6 +517,22 @@ function PolicyEditor({
   );
   const [error, setError] = useState<string | null>(null);
 
+  // Offer only what the server gates (#4910). A policy already saved with an
+  // action outside the list (or the list not loaded yet) still shows its own.
+  const gateable = useQuery({
+    queryKey: ["change-requests", "policies", "gateable"],
+    queryFn: () => changeRequestsApi.gateablePairs(),
+  });
+  const actionOptions = [
+    ...new Set([
+      ...(gateable.data ?? []).map((p) => p.action),
+      ...(existing ? [existing.action] : ["delete"]),
+    ]),
+  ];
+  const resourceTypeHint = [
+    ...new Set((gateable.data ?? []).map((p) => p.resource_type)),
+  ].join(" / ");
+
   const mutation = useMutation<
     // createPolicy returns the unwrapped row; updatePolicy returns the full
     // axios response so the #62 lock's 202 envelope is observable. Both shapes
@@ -485,15 +550,19 @@ function PolicyEditor({
         min_count: minCount.trim() === "" ? null : Number(minCount),
         enabled,
         applies_to_superadmin: appliesToSuperadmin,
-        ttl_hours: Number(ttlHours) || 168,
+        ttl_hours: Number(ttlHours),
       };
       // createPolicy already returns the unwrapped row; updatePolicy returns
       // the full axios response so the #62 self-governance lock's 202
       // approval-queue envelope (weakening a policy while the lock is on) is
       // observable.
-      return existing
-        ? changeRequestsApi.updatePolicy(existing.id, body)
-        : changeRequestsApi.createPolicy(body);
+      if (!existing) return changeRequestsApi.createPolicy(body);
+      // Only what the operator changed against the row read when the dialog
+      // opened (#4379); nothing changed sends nothing (an unwrapped row reads
+      // as "executed inline" below).
+      const changed = changedFields(existing, body);
+      if (Object.keys(changed).length === 0) return Promise.resolve(existing);
+      return changeRequestsApi.updatePolicy(existing.id, changed);
     },
     onSuccess: (resp) => {
       // #62: a weakening edit (disable / lower applies_to_superadmin) returns
@@ -525,10 +594,14 @@ function PolicyEditor({
           </p>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="change-requests-name"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="change-requests-name"
             className={inputCls}
             value={name}
             disabled={locked}
@@ -537,28 +610,36 @@ function PolicyEditor({
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-resource-type"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Resource type
             </label>
             <input
+              id="change-requests-resource-type"
               className={inputCls}
               value={resourceType}
               disabled={locked}
-              placeholder="subnet / dns_zone / *"
+              placeholder={resourceTypeHint || "subnet / dns_zone"}
               onChange={(e) => setResourceType(e.target.value)}
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Action
             </label>
             <select
+              id="change-requests-action"
               className={inputCls}
               value={action}
               disabled={locked}
               onChange={(e) => setAction(e.target.value)}
             >
-              {APPROVAL_POLICY_ACTIONS.map((a) => (
+              {actionOptions.map((a) => (
                 <option key={a} value={a}>
                   {a}
                 </option>
@@ -568,10 +649,14 @@ function PolicyEditor({
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-threshold-min-rows"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Threshold (min rows)
             </label>
             <input
+              id="change-requests-threshold-min-rows"
               className={inputCls}
               type="number"
               min={1}
@@ -580,20 +665,30 @@ function PolicyEditor({
               onChange={(e) => setMinCount(e.target.value)}
             />
             <p className="text-[11px] text-muted-foreground/80">
-              Blank = require approval regardless of count.
+              Blank = require approval regardless of count. A single delete
+              counts as 1 row, so a threshold above 1 only applies to bulk
+              operations.
             </p>
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="change-requests-ttl-hours"
+              className="text-xs font-medium text-muted-foreground"
+            >
               TTL (hours)
             </label>
             <input
+              id="change-requests-ttl-hours"
               className={inputCls}
               type="number"
               min={1}
+              max={TTL_HOURS_MAX}
               value={ttlHours}
               onChange={(e) => setTtlHours(e.target.value)}
             />
+            <p className="text-[11px] text-muted-foreground/80">
+              How long a queued request stays open, 1 to {TTL_HOURS_MAX} hours.
+            </p>
           </div>
         </div>
         <label className="flex items-center gap-2 text-sm">
@@ -627,6 +722,13 @@ function PolicyEditor({
             disabled={mutation.isPending}
             onClick={() => {
               setError(null);
+              // Never swap a TTL the server would refuse for a default (#4911).
+              if (!/^\d+$/.test(ttlHours.trim()) || !ttlInBounds(ttlHours)) {
+                setError(
+                  `TTL must be a whole number of hours from 1 to ${TTL_HOURS_MAX}.`,
+                );
+                return;
+              }
               mutation.mutate();
             }}
           >
@@ -640,7 +742,11 @@ function PolicyEditor({
 
 function PoliciesTab() {
   const qc = useQueryClient();
-  const { data: policies = [], isLoading } = useQuery({
+  const {
+    data: policies = [],
+    isLoading,
+    error: policiesError,
+  } = useQuery({
     queryKey: ["change-requests", "policies"],
     queryFn: changeRequestsApi.listPolicies,
   });
@@ -711,7 +817,9 @@ function PoliciesTab() {
         <p className="text-xs text-muted-foreground">Loading…</p>
       ) : policies.length === 0 ? (
         <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
-          No approval policies yet.
+          <ListEmpty error={policiesError} what="approval policies">
+            No approval policies yet.
+          </ListEmpty>
         </div>
       ) : (
         <div className="overflow-x-auto rounded-md border">
@@ -792,15 +900,28 @@ function PoliciesTab() {
         </div>
       )}
 
-      {(creating || editing) && (
+      {creating && (
         <PolicyEditor
-          existing={editing}
-          onClose={() => {
-            setCreating(false);
-            setEditing(null);
-          }}
+          existing={null}
+          onClose={() => setCreating(false)}
           onQueued={() => setQueuedNotice(APPROVAL_QUEUED_MESSAGE)}
         />
+      )}
+      {editing && (
+        <FreshEdit
+          row={editing}
+          queryKeys={[["change-requests", "policies"]]}
+          title="Edit approval policy"
+          onClose={() => setEditing(null)}
+        >
+          {(fresh) => (
+            <PolicyEditor
+              existing={fresh}
+              onClose={() => setEditing(null)}
+              onQueued={() => setQueuedNotice(APPROVAL_QUEUED_MESSAGE)}
+            />
+          )}
+        </FreshEdit>
       )}
 
       <ConfirmModal
@@ -809,6 +930,11 @@ function PoliciesTab() {
         tone="destructive"
         confirmLabel={lockOn ? "Submit for approval" : "Delete"}
         loading={deleteMutation.isPending}
+        error={
+          deleteMutation.error
+            ? formatApiError(deleteMutation.error, "Delete failed")
+            : null
+        }
         message={
           <span>
             Delete the policy <strong>{deleting?.name}</strong>? Operations it
@@ -822,7 +948,10 @@ function PoliciesTab() {
           </span>
         }
         onConfirm={() => deleting && deleteMutation.mutate(deleting.id)}
-        onClose={() => setDeleting(null)}
+        onClose={() => {
+          setDeleting(null);
+          deleteMutation.reset();
+        }}
       />
 
       {breakGlass && (
@@ -842,6 +971,63 @@ function PoliciesTab() {
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 
+const PAGE_SIZE = 100;
+
+type PagedRequests = ReturnType<typeof usePagedRequests>;
+
+// A paged read of the gate queue for the given states, newest first.
+function usePagedRequests(
+  states: ChangeRequestState[],
+  opts: { enabled?: boolean; refetchInterval?: (rows: number) => number } = {},
+) {
+  const q = useInfiniteQuery({
+    queryKey: ["change-requests", "list", states.join(",")],
+    queryFn: ({ pageParam }) =>
+      changeRequestsApi.listPage({
+        states,
+        limit: PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    getNextPageParam: (last, all) => {
+      const loaded = all.reduce((n, p) => n + p.items.length, 0);
+      return last.items.length > 0 && loaded < last.total ? loaded : undefined;
+    },
+    enabled: opts.enabled,
+    refetchInterval: opts.refetchInterval
+      ? (query) =>
+          opts.refetchInterval!(
+            (query.state.data?.pages ?? []).reduce(
+              (n, p) => n + p.items.length,
+              0,
+            ),
+          )
+      : undefined,
+  });
+  const rows = (q.data?.pages ?? []).flatMap((p) => p.items);
+  const total = q.data?.pages[q.data.pages.length - 1]?.total ?? rows.length;
+  return { ...q, rows, total };
+}
+
+// "Showing the newest N of M" + Load more, so a cut list is never silent.
+function LoadMore({ q, noun }: { q: PagedRequests; noun: string }) {
+  if (!q.hasNextPage) return null;
+  return (
+    <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
+      <span>
+        Showing the newest {q.rows.length} of {q.total} {noun} requests.
+      </span>
+      <HeaderButton
+        variant="secondary"
+        disabled={q.isFetchingNextPage}
+        onClick={() => void q.fetchNextPage()}
+      >
+        {q.isFetchingNextPage ? "Loading…" : "Load more"}
+      </HeaderButton>
+    </div>
+  );
+}
+
 export function ChangeRequestsPage() {
   const { can, isSuperadmin } = usePermissions();
   const canApprove = can("approve", "change_request");
@@ -853,29 +1039,24 @@ export function ChangeRequestsPage() {
     mode: "approve" | "reject";
   } | null>(null);
   const [cancelTarget, setCancelTarget] = useState<ChangeRequest | null>(null);
+  // Requests whose Approve the server refused for a grown scope (#4381).
+  const [scopeChanged, setScopeChanged] = useState<ReadonlySet<string>>(
+    new Set(),
+  );
 
   const qc = useQueryClient();
 
-  const queueQuery = useQuery({
-    queryKey: ["change-requests", "pending"],
-    queryFn: () => changeRequestsApi.list({ state: "pending", limit: 500 }),
+  // Both tabs page the list with ``offset`` and read the total from
+  // X-Total-Count (#4383), as the Requests page does (#3937): a fixed window
+  // dropped the older requests with no word that they existed.
+  const queueQuery = usePagedRequests(["pending"], {
     // Adaptive poll (FleetTab pattern): tighter while anything is pending.
-    refetchInterval: (q) => ((q.state.data?.length ?? 0) > 0 ? 5000 : 20000),
+    refetchInterval: (rows) => (rows > 0 ? 5000 : 20000),
   });
 
-  const historyQuery = useQuery({
-    queryKey: ["change-requests", "history"],
-    queryFn: () => changeRequestsApi.list({ limit: 200 }),
+  const historyQuery = usePagedRequests(TERMINAL_STATES, {
     enabled: tab === "history",
   });
-
-  const historyRows = useMemo(
-    () =>
-      (historyQuery.data ?? []).filter((r) =>
-        TERMINAL_STATES.includes(r.state),
-      ),
-    [historyQuery.data],
-  );
 
   const cancelMutation = useMutation({
     mutationFn: (id: string) => changeRequestsApi.cancel(id),
@@ -897,9 +1078,9 @@ export function ChangeRequestsPage() {
               <GitPullRequest className="h-5 w-5" /> Change Requests
             </h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
-              Risky operations (deletes, bulk changes, factory reset) that a
-              policy queued for a second eligible operator. A requester can't
-              approve their own request — a different operator holding{" "}
+              Risky operations (deletes and block sync) that a policy queued for
+              a second eligible operator. A requester can't approve their own
+              request — a different operator holding{" "}
               <span className="font-mono">approve,change_request</span> plus the
               operation's own permission approves, and it executes under the
               approver's identity after a stale-state re-check.
@@ -923,9 +1104,9 @@ export function ChangeRequestsPage() {
                 )}
               >
                 {t}
-                {t === "queue" && (queueQuery.data?.length ?? 0) > 0 && (
+                {t === "queue" && queueQuery.total > 0 && (
                   <span className="ml-1.5 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
-                    {queueQuery.data?.length}
+                    {queueQuery.total}
                   </span>
                 )}
               </button>
@@ -937,30 +1118,36 @@ export function ChangeRequestsPage() {
             <p className="text-xs text-muted-foreground">Loading…</p>
           ) : (
             <RequestTable
-              rows={queueQuery.data ?? []}
+              rows={queueQuery.rows}
               canApprove={canApprove}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
+              scopeChanged={scopeChanged}
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="Nothing waiting for approval."
+              error={queueQuery.error}
             />
           ))}
+        {tab === "queue" && <LoadMore q={queueQuery} noun="pending" />}
 
         {tab === "history" &&
           (historyQuery.isLoading ? (
             <p className="text-xs text-muted-foreground">Loading…</p>
           ) : (
             <RequestTable
-              rows={historyRows}
+              rows={historyQuery.rows}
               canApprove={false}
               isRequester={isRequester}
               isSuperadmin={isSuperadmin}
+              scopeChanged={scopeChanged}
               onDecide={(cr, mode) => setDecision({ cr, mode })}
               onCancel={setCancelTarget}
               emptyText="No decided requests yet."
+              error={historyQuery.error}
             />
           ))}
+        {tab === "history" && <LoadMore q={historyQuery} noun="decided" />}
 
         {tab === "policies" && isSuperadmin && <PoliciesTab />}
       </div>
@@ -970,6 +1157,9 @@ export function ChangeRequestsPage() {
           cr={decision.cr}
           mode={decision.mode}
           onClose={() => setDecision(null)}
+          onScopeChanged={(id) =>
+            setScopeChanged((prev) => new Set(prev).add(id))
+          }
         />
       )}
 
@@ -985,8 +1175,16 @@ export function ChangeRequestsPage() {
             operation will not run.
           </span>
         }
+        error={
+          cancelMutation.error
+            ? formatApiError(cancelMutation.error, "Cancel failed")
+            : null
+        }
         onConfirm={() => cancelTarget && cancelMutation.mutate(cancelTarget.id)}
-        onClose={() => setCancelTarget(null)}
+        onClose={() => {
+          setCancelTarget(null);
+          cancelMutation.reset();
+        }}
       />
     </div>
   );

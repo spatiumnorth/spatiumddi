@@ -23,7 +23,7 @@ a TSIG-signed AXFR (#734), the rest over their own authenticated API.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -917,6 +917,7 @@ async def _additive_push(
     apply: bool,
     skip_apex_ns: bool = False,
     inline_only: bool = False,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> PushResult:
     """For every DB row whose key isn't on the wire, send a create op via
     the driver. Errors are collected, not raised, so one bad record
@@ -927,6 +928,10 @@ async def _additive_push(
     instead of one per record. The ABC default falls back to a
     sequential loop for agent-based drivers (BIND9) where the control
     plane never calls the record writer anyway.
+
+    ``before_send`` (#4808) is awaited right before the batch goes to the
+    driver, once the serial bump and everything above it is written: the
+    scheduled sync commits there, so the provider call holds no transaction.
     """
     rel = targets_are_relative(primary)
     on_wire_keys = {_key(r, zone.name, relative_targets=rel) for r in on_wire}
@@ -1049,6 +1054,8 @@ async def _additive_push(
     ]
 
     try:
+        if before_send is not None:
+            await before_send()
         results = await driver.apply_record_changes(primary, changes)
     except Exception as exc:  # noqa: BLE001 — whole-batch failure, surface once
         logger.warning(
@@ -1146,14 +1153,67 @@ async def restore_zone_records_to_server(
     )
 
 
+@dataclass
+class WireRead:
+    """A zone read from its server: everything :func:`fetch_wire` needs, then
+    what it returned. Built by :func:`prepare_wire_read` (database work) so the
+    read itself (:func:`fetch_wire`) touches no session (#4808)."""
+
+    primary: Any
+    driver: Any
+    keys: list[TsigKey | None]
+    view_name: str | None
+    zone_name: str
+    fallback: dict[str, Any]
+    on_wire: list[RecordData] | None = None
+
+
+async def prepare_wire_read(db: AsyncSession, zone: DNSZone, server: Any | None = None) -> WireRead:
+    """The database half of reading ``zone`` from its server: primary, driver,
+    TSIG key(s) and the fallback address. Raises ``ValueError`` as
+    :func:`_resolve_primary_and_driver` does."""
+    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone, server)
+    return WireRead(
+        primary=primary,
+        driver=driver,
+        keys=keys,
+        view_name=view_name,
+        zone_name=zone.name,
+        fallback=await _fallback_kwargs(db, primary),
+    )
+
+
+async def fetch_wire(wire: WireRead) -> None:
+    """The network half: transfer the zone. Uses no session, so the caller can
+    (and the scheduled task does) run it with none open."""
+    wire.on_wire, _key_used = await pull_zone_records_signed(
+        wire.driver,
+        wire.primary,
+        wire.zone_name,
+        wire.keys,
+        view_name=wire.view_name,
+        **wire.fallback,
+    )
+
+
 async def sync_zone_with_server(
     db: AsyncSession,
     zone: DNSZone,
     *,
     apply: bool = True,
     server: Any | None = None,
+    wire: WireRead | None = None,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> SyncResult:
     """Bi-directional additive sync between DB and the zone's primary server.
+
+    ``wire`` (#4808) is a read already made with :func:`prepare_wire_read` +
+    :func:`fetch_wire`, so the caller could make the network call with no
+    session open and hand the result to a fresh one. Its ``primary`` must be
+    bound to ``db``. Without it the read happens here, on ``db``'s own
+    transaction (the request-scoped callers). ``before_send`` is awaited just
+    before the push phase's batch goes to the driver; the scheduled sync passes
+    ``db.commit`` so that call holds no transaction either (#4808).
 
     ``server`` (#1697) syncs with that server instead of the primary, so a
     group-level Sync walks each server's own copy rather than the primary's
@@ -1166,16 +1226,11 @@ async def sync_zone_with_server(
     Never deletes. Returns counts for both phases so the UI can surface
     them in one pass.
     """
-    primary, driver, keys, view_name = await _resolve_primary_and_driver(db, zone, server)
-
-    on_wire, _key_used = await pull_zone_records_signed(
-        driver,
-        primary,
-        zone.name,
-        keys,
-        view_name=view_name,
-        **await _fallback_kwargs(db, primary),
-    )
+    if wire is None:
+        wire = await prepare_wire_read(db, zone, server)
+        await fetch_wire(wire)
+    assert wire.on_wire is not None
+    primary, driver, on_wire = wire.primary, wire.driver, wire.on_wire
 
     # Snapshot DB state BEFORE the pull so we can compute the push set
     # against the "old" DB. We still import new rows from the pull into
@@ -1225,6 +1280,7 @@ async def sync_zone_with_server(
         db_rows,
         apply=apply,
         skip_apex_ns=not read_sees_apex_ns,
+        before_send=before_send,
     )
 
     logger.info(

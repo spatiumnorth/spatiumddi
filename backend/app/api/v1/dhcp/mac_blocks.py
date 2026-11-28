@@ -38,7 +38,8 @@ def _kick_windows_sync() -> None:
     ETag long-poll, so it doesn't need this kick. Windows does — its
     deny filter list only changes when the beat task (or this on-demand
     trigger) runs. We fire-and-forget via Celery so the HTTP response
-    doesn't wait on WinRM round-trips, and the periodic 60 s beat still
+    doesn't wait on WinRM round-trips (``force`` skips the #4759 interval
+    gate so an operator's change is pushed now), and the periodic beat still
     acts as a safety net for any trigger that's lost (worker restart,
     broker blip). Task is idempotent — safe to call after every write.
     """
@@ -49,7 +50,7 @@ def _kick_windows_sync() -> None:
     )
 
     try:
-        sync_dhcp_mac_blocks.delay()
+        sync_dhcp_mac_blocks.delay(force=True)
     except Exception:  # noqa: BLE001
         # Broker down shouldn't break the API write — beat will catch up.
         pass

@@ -70,7 +70,11 @@ export function TldRegistrySection({
       // undelegated — the one moment the answer is most likely to matter.
       qc.invalidateQueries({ queryKey: ["dns-name-scope"] });
     },
-    onError: (e: unknown) => setError(formatApiError(e)),
+    // Close the confirm modal: its overlay hid the section's error banner.
+    onError: (e: unknown) => {
+      setConfirm(false);
+      setError(formatApiError(e));
+    },
   });
 
   return (
@@ -203,8 +207,15 @@ export function TldRegistrySection({
         }
         confirmLabel="Refresh"
         loading={refresh.isPending}
-        onClose={() => setConfirm(false)}
-        onConfirm={() => refresh.mutate()}
+        error={null}
+        onClose={() => {
+          setConfirm(false);
+          setError("");
+        }}
+        onConfirm={() => {
+          setError("");
+          refresh.mutate();
+        }}
       />
     </>
   );

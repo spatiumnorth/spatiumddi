@@ -52,6 +52,8 @@ from app.services.ai.tools.base import register_tool, tool_permission_allows
 from app.services.logs.agent_logs import (
     InvalidLogFilter,
     LogScopeError,
+    include_orphaned_logs,
+    log_row_server_name,
     resolve_dhcp_log_servers,
     resolve_dns_log_servers,
     search_dhcp_activity,
@@ -140,6 +142,9 @@ async def query_dns_query_log(
             client_ip=args.client_ip,
             view=args.view,
             limit=args.limit,
+            include_orphans=include_orphaned_logs(
+                user, server_id=args.server_id, group_id=args.group_id
+            ),
         )
     except InvalidLogFilter as exc:
         return [{"result": exc.detail}]
@@ -147,7 +152,7 @@ async def query_dns_query_log(
         {
             "ts": r.ts.isoformat() if r.ts else None,
             "server_id": str(r.server_id) if r.server_id else None,
-            "server_name": names.get(r.server_id),
+            "server_name": log_row_server_name(r.server_id, r.server_name, names),
             "client_ip": str(r.client_ip) if r.client_ip else None,
             "client_port": r.client_port,
             "qname": r.qname,
@@ -225,6 +230,9 @@ async def query_dhcp_activity_log(
             mac_address=args.mac_address,
             ip_address=args.ip_address,
             limit=args.limit,
+            include_orphans=include_orphaned_logs(
+                user, server_id=args.server_id, group_id=args.group_id
+            ),
         )
     except InvalidLogFilter as exc:
         return [{"result": exc.detail}]
@@ -232,7 +240,7 @@ async def query_dhcp_activity_log(
         {
             "ts": r.ts.isoformat() if r.ts else None,
             "server_id": str(r.server_id) if r.server_id else None,
-            "server_name": names.get(r.server_id),
+            "server_name": log_row_server_name(r.server_id, r.server_name, names),
             "severity": r.severity,
             "code": r.code,
             "mac_address": str(r.mac_address) if r.mac_address else None,

@@ -189,7 +189,9 @@ def test_done_screen_is_role_aware():
 
 
 def test_done_screen_offers_the_live_address_in_dhcp_mode():
-    assert "ip -4 -br addr" in _done_block()
+    # #4546 — read from the chosen port by a helper rather than inline
+    assert "_done_screen_address" in _done_block()
+    assert "ip -4 -br addr" in _fn("_done_screen_address")
 
 
 def test_both_operator_data_screens_are_sized_to_their_content():

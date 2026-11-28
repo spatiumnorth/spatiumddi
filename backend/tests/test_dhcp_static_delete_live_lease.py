@@ -391,3 +391,33 @@ async def test_handback_honours_hostname_to_ipam_sync(
     assert row.status == "dhcp"
     assert row.auto_from_lease is True
     assert row.hostname == expect
+
+
+@pytest.mark.asyncio
+async def test_reservation_mirror_records_mac_history(db_session: AsyncSession) -> None:
+    """#4848 — a reservation's MAC, and a changed MAC, reach ip_mac_history."""
+    from app.models.ipam import IpMacHistory
+
+    grp, _ = await _group(db_session)
+    subnet, scope = await _scope(db_session, grp)
+    st = await _reservation(db_session, scope)
+    st.mac_address = "aa:bb:cc:dd:ee:21"
+    await upsert_ipam_for_static(db_session, scope, st, action="update")
+    await db_session.flush()
+
+    row = (
+        await db_session.execute(
+            select(IPAddress).where(IPAddress.subnet_id == subnet.id, IPAddress.address == IP)
+        )
+    ).scalar_one()
+    macs = {
+        str(m)
+        for m in (
+            await db_session.execute(
+                select(IpMacHistory.mac_address).where(IpMacHistory.ip_address_id == row.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert macs == {MAC, "aa:bb:cc:dd:ee:21"}

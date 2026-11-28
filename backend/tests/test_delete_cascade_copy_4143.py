@@ -9,8 +9,9 @@ neither named by that dialog (or one it ``includes``) nor listed under
 ``exempt`` with a reason. So a new child table of an address, subnet, block,
 space or multicast group cannot ship until its dialog says so.
 
-Not covered: the other delete dialogs (zones, scopes, servers, ...) are not in
-the registry yet; add one under ``dialogs`` and it is guarded the same way.
+The DNS Delete Server Group dialog (#4332) is covered through ``dns_zone`` (what
+its trashed zones take with them) and ``dns_server_group``. Not covered: the
+other delete dialogs (zone, scopes, servers, ...) are not in the registry yet; add one under ``dialogs`` and it is guarded the same way.
 
 Skipped rather than failed when the frontend tree is absent: the api image
 ships only ``backend/``. CI checks out the whole repo.
@@ -98,3 +99,16 @@ def test_the_reported_rows_are_named() -> None:
     assert {"ot_device", "bacnet_device"} <= set(reg["dialogs"]["ip_address"]["tables"])  # #4145
     _, named = _scope(reg, "ip_space")
     assert {"address_set", "ot_zone"} <= named  # #4143
+
+
+def test_group_delete_names_what_its_trashed_zones_take() -> None:
+    """#4332: grants, ACME accounts and DNSSEC keys go with the group's zones."""
+    reg = _registry()
+    _, named = _scope(reg, "dns_server_group")
+    assert {
+        "dns_record",
+        "dns_pool",
+        "dns_zone_update_acl",
+        "acme_account",
+        "dnssec_key",
+    } <= named
