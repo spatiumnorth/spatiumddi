@@ -95,7 +95,7 @@ ARG PGDG_PG_BUILD_AARCH64=16.16-2PGDG.rhel9.9
 RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
     && microdnf -y upgrade \
     && microdnf -y --setopt=install_weak_deps=0 --nodocs install \
-        python3.12 libxml2 xmlsec1-openssl nmap tcpdump iputils mtr bind-utils \
+        python3.12 libxml2 xmlsec1-openssl nmap tcpdump iputils mtr bind-utils git-core openssh-clients \
         libcap shadow-utils ca-certificates tzdata \
     && curl -fsSL -o /tmp/pgdg.key https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL \
     && echo "${PGDG_KEY_DIGEST}  /tmp/pgdg.key" | sha256sum -c - \

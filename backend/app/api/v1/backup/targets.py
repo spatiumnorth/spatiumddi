@@ -518,7 +518,7 @@ def _transport_level(kind: str, config: dict[str, Any]) -> int:
 # Settings that decide who the credential is trusted to reach, per kind; one
 # edited to a different value counts as a change of destination, as a new
 # host does, even when it is not weaker on its face (a replaced known_hosts).
-_TRUST_KEYS = {"scp": ("known_hosts",)}
+_TRUST_KEYS = {"scp": ("known_hosts",), "git": ("known_hosts",)}
 
 
 def _weakened_transport_keys(

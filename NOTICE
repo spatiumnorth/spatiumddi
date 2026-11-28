@@ -110,6 +110,9 @@ Where the two disagree about a license, THIS file is authoritative.
   Dynamically linked at runtime through ctypes; not modified, not statically
   linked, and not redistributed in source form. The Debian package 'libnfs14'
   is installed unmodified into the API image.
+- Git + OpenSSH client (git backup destination, #3211) — GPL v2 / BSD-style —
+  https://git-scm.com — Debian packages 'git' and 'openssh-client', installed
+  unmodified and run as separate subprocesses, never linked.
 
 ── Backend (Python) ───────────────────────────────────────────────────────
 - Python — PSF License — https://python.org

@@ -73,6 +73,7 @@ _CONFIGS: dict[str, dict[str, Any]] = {
     "gcs": {"bucket": "b", "service_account_json": "{}"},
     "webdav": {"url": "https://192.0.2.1/dav/backups", "username": "u", "password": "p"},
     "nfs": {"server": "192.0.2.1", "export": "/e"},
+    "git": {"url": "https://192.0.2.1/backups.git", "branch": "main", "token": "t"},
 }
 
 

@@ -5,7 +5,7 @@ Each destination is a thin driver that knows how to ``write``,
 storage backend. Phase 1b ships ``local_volume``; Phase 1c/1d
 add ``s3`` / ``scp`` / ``azure_blob``; Phase 2 Tier 2 adds
 ``smb`` / ``ftp`` / ``gcs``; Phase 3 adds ``webdav``; #971 adds
-``nfs``. Every driver is mounted on the same
+``nfs``; #3211 adds ``git``. Every driver is mounted on the same
 :class:`BackupDestination` ABC + module-level registry.
 """
 
@@ -31,6 +31,7 @@ from app.services.backup.targets.base import (
 )
 from app.services.backup.targets.ftp import FtpDestination
 from app.services.backup.targets.gcs import GcsDestination
+from app.services.backup.targets.git_repo import GitRepoDestination
 from app.services.backup.targets.https_put import HttpsPutDestination
 from app.services.backup.targets.local_volume import LocalVolumeDestination
 from app.services.backup.targets.nfs import NfsDestination
@@ -61,6 +62,7 @@ DESTINATIONS["gcs"] = GcsDestination()
 DESTINATIONS["webdav"] = WebDAVDestination()
 DESTINATIONS["nfs"] = NfsDestination()
 DESTINATIONS["https_put"] = HttpsPutDestination()
+DESTINATIONS["git"] = GitRepoDestination()
 
 __all__ = [
     "ARCHIVE_NAME_RE",
@@ -76,6 +78,7 @@ __all__ = [
     "AzureBlobDestination",
     "FtpDestination",
     "GcsDestination",
+    "GitRepoDestination",
     "HttpsPutDestination",
     "LocalVolumeDestination",
     "NfsDestination",
