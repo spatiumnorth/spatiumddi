@@ -336,6 +336,9 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-node-ip"
 chmod 0755 "$BUILDROOT/etc/NetworkManager/dispatcher.d/50-spatium-k3s-service-route"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
+# #5027 — rescue.service ExecStart (drop-in); the `-` prefix would swallow a 203/EXEC
+# and leave the recovery entry with no shell at all.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-recovery-login"
 # #999 Part C2 — keeps the mirror member's ESP in step with the primary's.
 # Called by spatium-install, spatium-upgrade-slot (apply / set-next-boot /
 # set-default) and spatium-grub-render — i.e. every writer of grub.cfg or

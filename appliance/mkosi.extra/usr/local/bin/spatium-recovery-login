@@ -1,0 +1,199 @@
+#!/bin/bash
+# spatium-recovery-login — the console login behind rescue and emergency mode (#5027).
+#
+# The stock shell of rescue.target and emergency.target is sulogin, which wants
+# root's password; root is locked on a default install (#995 item 12), so it
+# gave no shell (and the installer's SYSTEMD_SULOGIN_FORCE drop-in, a
+# password-free root shell, reached only the slot it was written to). This asks
+# for a username and password on every enabled console instead, and opens
+# that account's shell through login(1) (PAM: password check, sudo works from
+# the shell). Allowed: root and members of the `sudo` group. Whether root can
+# actually log in is PAM's call: a locked root fails the password check.
+#
+# One prompt per console in /proc/consoles (the entry passes console=tty0
+# console=ttyS0, and /dev/console is only the last of them). The first
+# session to end wins: the other prompts are killed and the boot continues
+# to the default target (what systemd-sulogin-shell does after sulogin).
+#
+# Usage: spatium-recovery-login [--emergency]   (only changes the banner)
+#
+# The admin account is in /etc/passwd + /etc/shadow of the /etc OVERLAY
+# (installer: useradd through the overlay, so it lands in the upper layer
+# /var/persist/etc on the /var partition). rescue.target pulls sysinit and
+# local-fs, so etc.mount has run. emergency.target pulls neither: only the
+# root filesystem is mounted, so /etc is the slot's bare baseline, which has
+# no admin account, and /var is not mounted. mount_account_store therefore
+# mounts /var read-only and a read-only overlay of the same two layers on /etc
+# (no upperdir, no workdir: nothing is written), and undoes both before the
+# boot continues, or systemd would find an external /etc mount and keep a
+# read-only /etc for the whole boot. If that fails the prompt is only offered
+# when the bare /etc still has an account that can log in; otherwise the
+# console says why and waits. Every path goes through PAM, none is
+# password-free.
+#
+# Overridable for tests: SPATIUM_RECOVERY_{PROC_CONSOLES,DEV,SUDO_GROUP,DELAY,OUT_SUFFIX,NOLOGIN,ETC,VAR,ETC_LOWER,VAR_LABEL}.
+set -u
+
+MODE=rescue
+[ "${1:-}" = "--emergency" ] && MODE=emergency
+
+PROC_CONSOLES=${SPATIUM_RECOVERY_PROC_CONSOLES:-/proc/consoles}
+DEV=${SPATIUM_RECOVERY_DEV:-/dev}
+GROUP=${SPATIUM_RECOVERY_SUDO_GROUP:-sudo}
+DELAY=${SPATIUM_RECOVERY_DELAY:-2}
+NOLOGIN=${SPATIUM_RECOVERY_NOLOGIN:-/run/nologin}
+OUT_SUFFIX=${SPATIUM_RECOVERY_OUT_SUFFIX:-} # tests: a regular file cannot be read and written as one
+ETC=${SPATIUM_RECOVERY_ETC:-/etc}
+VAR=${SPATIUM_RECOVERY_VAR:-/var}
+ETC_LOWER=${SPATIUM_RECOVERY_ETC_LOWER:-/usr/lib/etc.image} # the slot's baseline, as etc.mount's lowerdir
+VAR_LABEL=${SPATIUM_RECOVERY_VAR_LABEL:-var}
+
+MOUNTED=() # what this script mounted, in order; undone in reverse
+ACCOUNT_STORE_ERROR=""
+
+# mount_account_store — make the admin account visible in $ETC (see the header).
+# Returns 0 when $ETC is the overlay (already, or now), 1 with ACCOUNT_STORE_ERROR
+# set when it cannot be.
+mount_account_store() {
+    local upper="$VAR/persist/etc" err
+    if mountpoint -q "$ETC"; then
+        return 0
+    fi
+    if ! mountpoint -q "$VAR"; then
+        # By label, not through fstab: a broken fstab is a common reason to be here.
+        # noload: a journal that needs replay must not stop a read-only look.
+        if err=$(mount -o ro -L "$VAR_LABEL" "$VAR" 2>&1) ||
+            err=$(mount -o ro,noload -L "$VAR_LABEL" "$VAR" 2>&1); then
+            MOUNTED+=("$VAR")
+        else
+            ACCOUNT_STORE_ERROR="the /var partition (label $VAR_LABEL) did not mount: $err"
+            return 1
+        fi
+    fi
+    if [ ! -d "$upper" ] || [ ! -d "$ETC_LOWER" ]; then
+        ACCOUNT_STORE_ERROR="$upper or $ETC_LOWER is missing, so the /etc overlay cannot be assembled"
+        return 1
+    fi
+    # No upperdir: a read-only overlay; the leftmost lower layer is on top, as
+    # the upper is in etc.mount, and its whiteouts still apply.
+    if err=$(mount -t overlay overlay -o "ro,lowerdir=$upper:$ETC_LOWER" "$ETC" 2>&1); then
+        MOUNTED+=("$ETC")
+        return 0
+    fi
+    ACCOUNT_STORE_ERROR="the read-only /etc overlay did not mount: $err"
+    return 1
+}
+
+# unmount_account_store — release what mount_account_store mounted, last first.
+unmount_account_store() {
+    local i
+    for ((i = ${#MOUNTED[@]} - 1; i >= 0; i--)); do
+        umount -- "${MOUNTED[$i]}" 2>/dev/null || umount -l -- "${MOUNTED[$i]}" 2>/dev/null
+    done
+    MOUNTED=()
+}
+
+# has_login_account — does the /etc in view hold anyone allowed() could accept?
+has_login_account() {
+    local members
+    [ "$(passwd -S root 2>/dev/null | awk '{print $2}')" = P ] && return 0
+    members=$(getent group "$GROUP" | cut -d: -f4)
+    [ -n "$members" ]
+}
+
+# Enabled consoles (flag E), as device names. The virtual console tty0 is
+# "whichever VT is showing"; VT1 is free in rescue.target (no getty there).
+consoles() {
+    local name flags rest out=""
+    if [ -r "$PROC_CONSOLES" ]; then
+        while read -r name flags rest; do
+            case "$flags$rest" in *E*) ;; *) continue ;; esac
+            case "$name" in
+                tty0) name=tty1 ;;
+                *[!A-Za-z0-9]*) continue ;;
+            esac
+            out="$out $name"
+        done <"$PROC_CONSOLES"
+    fi
+    echo "${out:- console}"
+}
+
+# allowed USER: root, or a member of the sudo group.
+allowed() {
+    [ "$1" = root ] && return 0
+    local g
+    for g in $(id -nG -- "$1" 2>/dev/null); do
+        [ "$g" = "$GROUP" ] && return 0
+    done
+    return 1
+}
+
+# prompt_loop DEVICE — runs until a login session on DEVICE has ended.
+prompt_loop() {
+    local dev=$DEV/$1 user
+    exec <"$dev" >>"$dev$OUT_SUFFIX" 2>&1
+    printf '\r\nSpatiumDDI recovery console (%s mode: the appliance services are not running).\r\n' "$MODE"
+    if [ -n "$ACCOUNT_STORE_ERROR" ]; then
+        printf 'The admin account could not be loaded: %s\r\n' "$ACCOUNT_STORE_ERROR"
+        printf 'Only the accounts in this slot'"'"'s own /etc are available.\r\n'
+    fi
+    if [ "$NO_ACCOUNT" = 1 ]; then
+        printf 'No account here can log in, and no shell is offered without a password.\r\n'
+        printf 'Reboot (Ctrl-Alt-Del) and choose the other slot in the boot menu, or repair this\r\n'
+        printf 'disk from the installer ISO. Check: the filesystem labelled "%s", then /etc/fstab.\r\n' "$VAR_LABEL"
+        while :; do sleep 3600; done
+    fi
+    printf 'Log in as the admin account (or root, if it has a password). Leaving the shell continues the boot.\r\n\r\n'
+    while :; do
+        printf 'recovery login: '
+        IFS= read -r user || { sleep 5; continue; }
+        user=${user%$'\r'}
+        [ -n "$user" ] || continue
+        if ! allowed "$user"; then
+            sleep "$DELAY"
+            printf '\r\nLogin incorrect (not root or a member of the %s group)\r\n\r\n' "$GROUP"
+            continue
+        fi
+        # pam_nologin (auth requisite in /etc/pam.d/login) refuses every non-root
+        # login while /run/nologin exists. tmpfiles creates it at boot and only
+        # systemd-user-sessions.service removes it, which rescue.target never
+        # starts. Do what that unit's `start` does: remove /run/nologin, and
+        # nothing else (an operator's /etc/nologin stays and still applies).
+        rm -f -- "$NOLOGIN"
+        # login(1) exits 0 once a session has ended, 1 on a failed login.
+        if setsid -w -c login -- "$user"; then
+            return 0
+        fi
+        sleep "$DELAY"
+    done
+}
+
+NO_ACCOUNT=0
+if ! mount_account_store && ! has_login_account; then
+    NO_ACCOUNT=1
+fi
+trap unmount_account_store EXIT
+
+pids=()
+devs=()
+for c in $(consoles); do
+    # A console without a device node must not end the wait for the others.
+    [ -e "$DEV/$c" ] || continue
+    prompt_loop "$c" &
+    pids+=("$!")
+    devs+=("$c")
+done
+
+# Wait for the first loop to finish with a session, then stop the others.
+wait -n
+for i in "${!pids[@]}"; do
+    pkill -P "${pids[$i]}" 2>/dev/null
+    kill "${pids[$i]}" 2>/dev/null
+    pkill -t "${devs[$i]}" 2>/dev/null
+done
+wait
+
+# Before the boot continues: etc.mount and var.mount must find /etc and /var
+# unmounted, or the rest of the boot runs on a read-only /etc.
+unmount_account_store
+systemctl --no-block default
