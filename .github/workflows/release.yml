@@ -3,7 +3,8 @@ name: Release
 # Publishes a release from a pushed tag. Nothing is tagged in a registry or
 # published on the Releases page until three gates pass (#1226):
 #
-#   1. The tag names a release and sits on main, and CI passed on it
+#   1. The tag names a release and sits on main (a pre-release may sit on a
+#      release/* branch instead), and CI passed on it
 #      (the ``meta`` job). Tags are not covered by any branch ruleset, so
 #      without the ancestry check anyone with write access could release
 #      any commit.
@@ -65,6 +66,7 @@ jobs:
       make_latest: ${{ steps.ver.outputs.make_latest }}
       prev_tag: ${{ steps.ver.outputs.prev_tag }}
       images: ${{ steps.ver.outputs.images }}
+      images_ubi: ${{ steps.ver.outputs.images_ubi }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -81,15 +83,28 @@ jobs:
 
           # Exactly a release tag: CalVer with its -N, or SemVer >= 1.0.0
           # with no build metadata. Prints prerelease=true|false.
-          python3 scripts/release_version.py check "$VERSION" >> "$GITHUB_OUTPUT"
+          CHECK=$(python3 scripts/release_version.py check "$VERSION")
+          echo "$CHECK" >> "$GITHUB_OUTPUT"
 
           # On main, or it is not a release. A tag on a feature branch, an
           # unmerged PR head or a local commit would otherwise publish.
+          #
+          # One exception: a SemVer PRE-release (1.0.1-soak.1) may sit on a
+          # release/* branch, so the QA soak can install what the branch
+          # holds before it is merged into main. A final tag never may.
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          ON_MAIN=true
           if ! git merge-base --is-ancestor "$SHA" origin/main; then
-            echo "::error::${VERSION} points at ${SHA}, which is not on main. Tag a commit on main."
-            exit 1
+            ON_MAIN=false
+            git fetch --no-tags --quiet origin '+refs/heads/release/*:refs/remotes/origin/release/*'
+            BRANCHES=$(git branch -r --contains "$SHA" --list 'origin/release/*')
+            if [ "$CHECK" != "prerelease=true" ] || [ -z "$BRANCHES" ]; then
+              echo "::error::${VERSION} points at ${SHA}, which is not on main. Tag a commit on main (only a pre-release tag may sit on a release/* branch)."
+              exit 1
+            fi
+            echo "::notice::pre-release ${VERSION} is on release branch(es): $(printf '%s' "$BRANCHES" | tr -s ' \n' ' ')"
           fi
+          echo "on_main=${ON_MAIN}" >> "$GITHUB_OUTPUT"
 
           # Ranked only against tags on main that were actually released:
           # see release-tags.sh for why a stray tag must not count.
@@ -105,6 +120,10 @@ jobs:
             # The one list of shipped images, shared with nightly.yml and
             # scripts/lint_image_upgrades.py.
             echo "images=$(jq -c . .github/images.json)"
+            # #3913 — the Red Hat UBI variants of four of them, published as
+            # <image>:<version>-ubi. A list of their own: they are not part of
+            # the appliance and not baked anywhere.
+            echo "images_ubi=$(jq -c . .github/images-ubi.json)"
           } >> "$GITHUB_OUTPUT"
           echo "→ ${VERSION} at ${SHA::7}: previous release ${PREV_TAG:-<none>}, becomes latest: ${MAKE_LATEST}"
 
@@ -113,8 +132,19 @@ jobs:
       # publishes (``make changelog``). A fragment still in the tree means
       # the fold was skipped, so the notes below would silently miss those
       # entries. Refused before an hour of CI waiting and image builds.
+      #
+      # A pre-release on a release/* branch is exempt: the branch is folded
+      # only at real release prep, and the ``release`` job builds that
+      # pre-release's notes from the fragments in its own workspace.
       - name: Require the changelog fragments to be folded
-        run: python3 scripts/changelog_assemble.py --pending
+        env:
+          ON_MAIN: ${{ steps.ver.outputs.on_main }}
+        run: |
+          if [ "$ON_MAIN" != "true" ]; then
+            echo "::notice::release-branch pre-release: changelog fragments are not required to be folded"
+            exit 0
+          fi
+          python3 scripts/changelog_assemble.py --pending
 
       - name: Require CI to have passed on this commit
         env:
@@ -350,6 +380,222 @@ jobs:
             tag "${IMAGE_PREFIX}/${img}:${VERSION}" "${IMAGE_PREFIX}/${img}@${digest}"
           done
 
+  # ── Red Hat UBI 9 variants (#3913) ─────────────────────────────────────────
+  # The api, frontend, BIND9 and Kea images rebuilt on ubi9 for OpenShift's
+  # certified-image profile (``charts/spatiumddi/values-openshift-certified.yaml``),
+  # published to GHCR ONLY as ``<image>:<version>-ubi`` and ``:latest-ubi``.
+  # Same shape as the three gates above, so what is tagged is what was scanned:
+  #
+  #   build-ubi   one leg per (image, architecture), each on a NATIVE runner
+  #               (BIND and Kea compile from source; under QEMU that is hours).
+  #               Pushed by digest only, no tag. The leg then pulls its own
+  #               digest, runs Trivy + trivy-gate.sh on it and, for amd64, Red
+  #               Hat's ``preflight check container`` (check only; the
+  #               submission is the separate submit-ubi-preflight job).
+  #   images-ubi  once EVERY leg of an image passed, joins its two digests into
+  #               one multi-arch ``:<version>-ubi``. Nothing is rebuilt.
+  #   submit-ubi-preflight
+  #               after images-ubi, submits preflight results for the PUBLISHED
+  #               ``:<version>-ubi`` (each arch) to Red Hat's certification
+  #               components when ``PYXIS_API_TOKEN`` is set. Non-gating.
+  #   promote-latest-ubi
+  #               ``:latest-ubi`` moves last, after the GitHub release exists,
+  #               all four or none, like ``:latest``.
+  #
+  # Deliberately NOT a dependency of ``release``: a UBI build or scan that
+  # fails (a Red Hat base-image CVE with no fix yet, say) leaves the four
+  # ``-ubi`` tags untagged for that release and holds nothing else back. The
+  # certified profile then has no images for that version until a rebuild.
+  build-ubi:
+    name: Build and scan ${{ matrix.image_def.image }} (UBI, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: meta
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image_def: ${{ fromJSON(needs.meta.outputs.images_ubi) }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.image_def.image }}
+      IMAGE: ${{ matrix.image_def.image }}
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        name: Build and push by digest
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.image_def.context }}
+          file: ${{ matrix.image_def.file }}
+          target: ${{ matrix.image_def.target }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REF }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            VITE_APP_VERSION=${{ needs.meta.outputs.version }}
+            APP_VERSION=${{ needs.meta.outputs.version }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.meta.outputs.sha_short }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Pull the pushed digest for scanning
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "${REF}@${DIGEST}"
+          docker tag "${REF}@${DIGEST}" "scan-target:${IMAGE}-${ARCH}"
+          mkdir -p digests
+          printf '%s\n' "$DIGEST" > "digests/${IMAGE}-${ARCH}"
+
+      - name: Install Trivy
+        uses: ./.github/actions/install-trivy
+      - name: Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          skip-setup-trivy: true
+          image-ref: scan-target:${{ matrix.image_def.image }}-${{ matrix.arch }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+          format: json
+          output: trivy.json
+      - name: Gate on the scan
+        run: .github/scripts/trivy-gate.sh trivy.json "scan-target:${IMAGE}-${ARCH}"
+
+      - name: Preflight (Red Hat container certification checks, check only)
+        if: matrix.arch == 'amd64'
+        uses: ./.github/actions/preflight-check
+        with:
+          image: scan-target:${{ matrix.image_def.image }}-amd64
+          name: ${{ matrix.image_def.image }}
+          tag: ${{ needs.meta.outputs.version }}-ubi
+
+      # Only a digest that passed its gates reaches the tagging job.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ubidigest-${{ matrix.image_def.image }}-${{ matrix.arch }}
+          path: digests/${{ matrix.image_def.image }}-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  images-ubi:
+    name: Tag UBI images :${{ needs.meta.outputs.version }}-ubi
+    runs-on: ubuntu-latest
+    needs: [meta, build-ubi]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ubidigest-*
+          merge-multiple: true
+          path: digests/
+      - name: Join each image's two digests into one multi-arch tag
+        env:
+          IMAGES_JSON: ${{ needs.meta.outputs.images_ubi }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGES=$(printf '%s' "$IMAGES_JSON" | jq -r '.[].image')
+          # Every leg of every image must have passed before any is tagged.
+          for img in $IMAGES; do
+            for arch in amd64 arm64; do
+              [ -s "digests/${img}-${arch}" ] || { echo "::error::no scanned ${arch} digest for ${img}"; exit 1; }
+            done
+          done
+          tag() {
+            local attempt target=$1; shift
+            for attempt in 1 2 3; do
+              docker buildx imagetools create --tag "$target" "$@" && return 0
+              echo "… ${target}: attempt ${attempt} failed; retrying"
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
+          for img in $IMAGES; do
+            amd64=$(cat "digests/${img}-amd64")
+            arm64=$(cat "digests/${img}-arm64")
+            echo "→ ${img}:${VERSION}-ubi = ${amd64} + ${arm64}"
+            tag "${IMAGE_PREFIX}/${img}:${VERSION}-ubi" \
+              "${IMAGE_PREFIX}/${img}@${amd64}" "${IMAGE_PREFIX}/${img}@${arm64}"
+          done
+
+  # ── Submit preflight results to Red Hat (#3913) ────────────────────────────
+  # After images-ubi has published the multi-arch ``:<version>-ubi``, submit
+  # `preflight check container` results for each image and architecture to its
+  # Partner Connect certification component (``rh_component_id`` in
+  # images-ubi.json). It checks the PUBLISHED ghcr.io reference, never the
+  # localhost registry build-ubi uses: Red Hat records the repository path from
+  # what preflight checks. preflight runs on x86-64 and reaches the arm64 image
+  # with ``--platform arm64``.
+  #
+  # Non-gating by design. Nothing ``needs:`` this job (promote-latest-ubi and
+  # release do not), the submit step is continue-on-error and a failure only
+  # raises a ::warning:: naming the image and architecture: the images are
+  # already published, and a Red Hat API outage must not hold a release back.
+  # With no ``PYXIS_API_TOKEN`` secret it logs a notice and submits nothing.
+  submit-ubi-preflight:
+    name: Submit ${{ matrix.image_def.image }} ${{ matrix.arch }} to Red Hat
+    runs-on: ubuntu-latest
+    needs: [meta, images-ubi]
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image_def: ${{ fromJSON(needs.meta.outputs.images_ubi) }}
+        arch: [amd64, arm64]
+    env:
+      HAVE_TOKEN: ${{ secrets.PYXIS_API_TOKEN != '' }}
+    steps:
+      - name: Skip when no Pyxis token is configured
+        if: env.HAVE_TOKEN != 'true'
+        run: echo "::notice::PYXIS_API_TOKEN is not set; preflight results for ${{ matrix.image_def.image }} ${{ matrix.arch }} are not submitted to Red Hat"
+      - uses: actions/checkout@v7
+        if: env.HAVE_TOKEN == 'true'
+      - id: submit
+        if: env.HAVE_TOKEN == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/preflight-check
+        with:
+          mode: submit
+          registry-ref: ghcr.io/${{ github.repository_owner }}
+          name: ${{ matrix.image_def.image }}
+          tag: ${{ needs.meta.outputs.version }}-ubi
+          platform: ${{ matrix.arch }}
+          component-id: ${{ matrix.image_def.rh_component_id }}
+          pyxis-api-token: ${{ secrets.PYXIS_API_TOKEN }}
+      - name: Warn when the submission failed
+        if: steps.submit.outcome == 'failure'
+        run: echo "::warning::preflight submission to Red Hat failed for ${{ matrix.image_def.image }} ${{ matrix.arch }}; the images are published and the release is unaffected. Re-run this job or submit by hand."
+
   # ── Publish Helm chart (OCI) ───────────────────────────────────────────────
   # Packages `charts/spatiumddi` (umbrella: api + frontend + worker + beat
   # + migrate + Postgres/Redis subcharts + optional DNS/DHCP agents) and
@@ -581,11 +827,26 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           PREV_TAG: ${{ needs.meta.outputs.prev_tag }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
           # The "## <VERSION>" section, matched exactly (#1182): a prefix
           # match took "## 1.0.10" when asked for "## 1.0.1".
           NOTES=$(python3 scripts/release_version.py notes "$VERSION" CHANGELOG.md)
+
+          # A pre-release tagged on a release/* branch still carries its
+          # changelog.d/ fragments (folded only at real release prep). Fold
+          # them in this runner's workspace, never committed, and use the
+          # resulting "## Unreleased" section as the notes. Best effort: a
+          # failed fold falls through to the commit shortlog below.
+          if [ "$PRERELEASE" = "true" ] && [ -z "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ] \
+             && ! python3 scripts/changelog_assemble.py --pending >/dev/null 2>&1; then
+            if python3 scripts/changelog_assemble.py; then
+              NOTES=$(python3 scripts/release_version.py notes Unreleased CHANGELOG.md)
+            else
+              echo "::warning::could not fold the changelog fragments for ${VERSION}"
+            fi
+          fi
 
           # Fall back to a commit shortlog if the CHANGELOG section is empty
           # or missing (e.g. forgot to update it before tagging).
@@ -884,6 +1145,78 @@ jobs:
               if [ -n "${previous[$back]}" ]; then
                 tag "${IMAGE_PREFIX}/${back}:latest" "${IMAGE_PREFIX}/${back}@${previous[$back]}" \
                   || echo "::error::${back}:latest could not be restored to ${previous[$back]}"
+              fi
+            done
+            exit 1
+          done
+
+  # ── :latest-ubi (#3913) ────────────────────────────────────────────────────
+  # After the release exists and only for the newest release, like :latest.
+  # All four or none: a half-moved pair would run, say, this release's api
+  # beside the previous release's Kea.
+  promote-latest-ubi:
+    name: Tag :latest-ubi
+    runs-on: ubuntu-latest
+    needs: [meta, release, images-ubi]
+    if: needs.release.outputs.make_latest == 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Point :latest-ubi at this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGES_JSON: ${{ needs.meta.outputs.images_ubi }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          newest=$(.github/scripts/release-tags.sh | python3 scripts/release_version.py is-newest "$VERSION")
+          if [ "$newest" != "true" ]; then
+            echo "::notice::a newer release was published while ${VERSION} built; :latest-ubi stays where it is"
+            exit 0
+          fi
+
+          IMAGES=$(printf '%s' "$IMAGES_JSON" | jq -r '.[].image')
+          digest_of() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest
+          }
+          tag() {
+            local attempt
+            for attempt in 1 2 3; do
+              docker buildx imagetools create --tag "$1" "$2" && return 0
+              echo "… ${1}: attempt ${attempt} failed; retrying"
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
+
+          declare -A previous
+          for img in $IMAGES; do
+            digest_of "${IMAGE_PREFIX}/${img}:${VERSION}-ubi" >/dev/null
+            previous[$img]=$(digest_of "${IMAGE_PREFIX}/${img}:latest-ubi" 2>/dev/null || true)
+          done
+
+          moved=()
+          for img in $IMAGES; do
+            echo "→ ${img}:latest-ubi = ${img}:${VERSION}-ubi"
+            if tag "${IMAGE_PREFIX}/${img}:latest-ubi" "${IMAGE_PREFIX}/${img}:${VERSION}-ubi"; then
+              moved+=("$img")
+              continue
+            fi
+            echo "::error::could not move ${img}:latest-ubi; restoring the ${#moved[@]} already moved"
+            for back in "${moved[@]}"; do
+              if [ -n "${previous[$back]}" ]; then
+                tag "${IMAGE_PREFIX}/${back}:latest-ubi" "${IMAGE_PREFIX}/${back}@${previous[$back]}" \
+                  || echo "::error::${back}:latest-ubi could not be restored to ${previous[$back]}"
               fi
             done
             exit 1

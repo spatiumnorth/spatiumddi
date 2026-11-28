@@ -46,7 +46,7 @@ _PLACEHOLDER_RNAME_LABEL = "admin"
 _PLACEHOLDER_OUTSIDE = "invalid."
 _PLACEHOLDER_OUTSIDE_RNAME = "invalid."
 
-_ZONEFILE_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f]')
+_ZONEFILE_UNSAFE_RE = re.compile(r'[\s;$()"@\\]|[\x00-\x1f\x7f-\x9f]')
 _HOST_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 

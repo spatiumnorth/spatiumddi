@@ -225,7 +225,7 @@ liveness verify + bounded retry**, **stagger auto-tuning** for large fleets, and
 Lives behind the `tools.wake_scheduler` feature module, which ships
 **disabled** — it ends in magic packets going out on a schedule, so it is
 opted into ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)).
-Enable it under Settings → Features; while it is off the router prefix,
+Enable it under Features & Integrations; while it is off the router prefix,
 sidebar entry, and MCP tools all drop out (non-negotiable #14). REST surface is mounted at `/api/v1/wake-scheduler`
 (the Python package is `wol_schedules`; the wire prefix is `wake-scheduler`,
 the cross-surface contract shared with the frontend and MCP layers). Every
@@ -2074,7 +2074,7 @@ shows every mapping touching the subnet's CIDR.
 **Feature module `ipam.nat` (#2100).** The whole surface (the
 NAT Mappings page, the routes above, the Dashboard card and the
 subnet / IP detail NAT tab, badges and dialog) can be turned off
-under Settings → Features. While it is off the routes answer 404,
+under Features & Integrations. While it is off the routes answer 404,
 but the rows are kept, and the PAN-OS / Fortinet / Meraki mirrors
 keep writing them. The module ships off, but with no operator
 override it resolves **on** whenever `nat_mapping` holds a row
@@ -2085,7 +2085,7 @@ from "on when there is data": on a fresh install a firewall
 mirror's first NAT rule turns the surface on, and deleting the
 last mapping on an install that never set the toggle turns it
 off. The NAT Mappings page then says the feature is off and links
-to Settings → Features. Turning it on there pins it on.
+to Features & Integrations. Turning it on there pins it on.
 
 ### ✅ 15.19 VXLAN ID surface in the UI
 
@@ -2103,7 +2103,9 @@ settings (plus an optional sub-subnet `child_layout`) and stamps
 them onto blocks or subnets at apply time. ``applies_to`` locks
 each template to one of the two carriers so apply-time semantics
 stay unambiguous. ``force=False`` fills only empty/null target
-columns; ``force=True`` overwrites unconditionally and is the path
+columns; ``force=True`` overwrites unconditionally, except that
+tags and custom fields are merged (the template's keys win, keys the
+template does not hold stay, #4420), and is the path
 ``/reapply-all`` uses to refresh drift across every recorded
 instance (cap 200). ``IPBlockCreate.template_id`` /
 ``SubnetCreate.template_id`` add optional pre-fill on the create

@@ -14,7 +14,8 @@ from datetime import datetime
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import String, cast, func, literal, select, union_all
 from sqlalchemy import delete as sa_delete
@@ -31,6 +32,9 @@ from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer
+from app.services.ai.operations import get_operation
+from app.services.ai.operations_risky import PURGE_TRASHED_OPERATIONS, PurgeTrashedArgs
+from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
@@ -39,12 +43,15 @@ from app.services.dhcp.static_ipam import (
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.dns.record_ops import push_records_restore, retract_address_records
 from app.services.dns.view_collisions import RenderGuard, collision_detail
+from app.services.e911.address_bindings import bound_static_mirror_ids
 from app.services.e911.delete_guard import refuse_if_e911_bound
 from app.services.ipam.orphan_aliases import (
     is_withdrawn_alias,
     orphan_record_owners,
     orphan_record_reason,
     refusal_reason,
+    superseded_record_owners,
+    superseded_record_reason,
     withdrawn_alias_owners,
 )
 from app.services.ipam.utilization import recount_subnets_and_blocks
@@ -111,6 +118,10 @@ class RestoreResponse(BaseModel):
     # Trash (#2732): moved into that subnet's batch, one entry per subnet. They
     # come back when the subnet is restored and go if it is purged.
     held_back: list[RestoreConflict] = []
+    # What the restore could not bring back exactly as it was and did not refuse
+    # over (#4754): a reservation whose DNS zone is gone is published in its
+    # subnet's zone instead.
+    warnings: list[str] = []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -661,6 +672,16 @@ async def restore_row(
                 status_code=409,
                 detail=f"Cannot restore {_row_label(target)}: {orphan_record_reason(owner[2])}.",
             )
+        # #4361 — and one whose address was renamed or blanked meanwhile.
+        superseded = (await superseded_record_owners(db, record_ids=[target.id])).get(target.id)
+        if superseded is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot restore {_row_label(target)}: "
+                    f"{superseded_record_reason(superseded[2])}."
+                ),
+            )
 
     batch_id = target.deletion_batch_id
     if batch_id is None:
@@ -728,6 +749,7 @@ async def restore_row(
     # would be N serial bumps and, on an agentless driver, N WinRM round trips
     # inside one request — the cost the bulk-delete route exists to avoid.
     records_by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
+    restore_warnings: list[str] = []
     # #3503: the audit rows are added last, after every serial bump below. Their
     # flush takes the audit-chain lock, and a zone row written after that waits
     # for a record create on the zone that holds the row and waits for the lock.
@@ -740,7 +762,7 @@ async def restore_row(
             # re-asserting status + back-link + DNS. Leases need no restore work:
             # push_scope_restore re-creates the device scope and the next poll
             # re-populates them.
-            await remirror_scope_statics(db, obj)
+            await remirror_scope_statics(db, obj, restore_warnings)
         elif isinstance(obj, DNSRecord) and obj.zone_id not in restored_zone_ids:
             records_by_zone.setdefault(obj.zone_id, []).append(obj)
         audit_rows.append(
@@ -813,8 +835,17 @@ async def restore_row(
     # task: a restore is rare and operator-driven, and the zone must not answer
     # a name IPAM gave up for even a moment (nor for good if the broker is down
     # and the opt-in auto-sync is off). The task is the retry if this fails.
-    if restored_zone_ids:
+    # #4227 — the same for the subnets a restore brought back (a subnet, or a
+    # block / space holding some): the zone restore before it left their
+    # records with the subnet's batch, and they come back as the Trash held
+    # them. One pass over zone + subnets, so the order of the two restores
+    # does not matter.
+    reconcile_subnet_ids = {o.id for o in restored if isinstance(o, Subnet)}
+    if restored_zone_ids or reconcile_subnet_ids:
+        from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
+            reconcile_restored_subnet_records,
+            reconcile_restored_subnet_records_task,
             reconcile_restored_zone_records,
             reconcile_restored_zone_records_task,
         )
@@ -822,22 +853,37 @@ async def restore_row(
         # The restore's UPDATE left the identity map holding the rows as they
         # were read; the planner must read them as they are now.
         db.expunge_all()
-        try:
-            _changed, reconcile_wake = await reconcile_restored_zone_records(
-                db, list(restored_zone_ids)
-            )
-            restore_wake_groups |= set(reconcile_wake)
-        except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
-            await db.rollback()
-            logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
-            from app.core.celery_dispatch import dispatch as _dispatch  # noqa: PLC0415
-
+        if restored_zone_ids:
             try:
-                await _dispatch(
-                    reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                _changed, reconcile_wake = await reconcile_restored_zone_records(
+                    db, list(restored_zone_ids)
                 )
-            except Exception as exc2:  # noqa: BLE001
-                logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
+                restore_wake_groups |= set(reconcile_wake)
+            except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+                await db.rollback()
+                logger.warning("trash.restore_zone_reconcile_failed", error=str(exc))
+                try:
+                    await _dispatch(
+                        reconcile_restored_zone_records_task, [str(i) for i in restored_zone_ids]
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("trash.restore_zone_reconcile_enqueue_failed", error=str(exc2))
+        if reconcile_subnet_ids:
+            try:
+                _changed, reconcile_wake = await reconcile_restored_subnet_records(
+                    db, list(reconcile_subnet_ids)
+                )
+                restore_wake_groups |= set(reconcile_wake)
+            except Exception as exc:  # noqa: BLE001 — the restore is committed and stands
+                await db.rollback()
+                logger.warning("trash.restore_subnet_reconcile_failed", error=str(exc))
+                try:
+                    await _dispatch(
+                        reconcile_restored_subnet_records_task,
+                        [str(i) for i in reconcile_subnet_ids],
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.warning("trash.restore_subnet_reconcile_enqueue_failed", error=str(exc2))
     if republish_subnet_ids:
         from app.core.celery_dispatch import dispatch  # noqa: PLC0415
         from app.tasks.ipam_dns_sync import (  # noqa: PLC0415
@@ -871,6 +917,7 @@ async def restore_row(
         restored=result.total,
         skipped=[RestoreConflict(**c) for c in conflicts],
         held_back=[RestoreConflict(**c) for c in result.held_back],
+        warnings=restore_warnings,
     )
 
 
@@ -915,19 +962,73 @@ async def _tear_down_scope_leases_before_purge(
     )
 
 
+async def _find_trashed(db: Any, type: str, row_id: uuid.UUID) -> Any:
+    """The soft-deleted row of ``type`` / ``row_id``, or a 404."""
+    if type not in SOFT_DELETE_RESOURCE_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown type {type!r}. Valid: {sorted(SOFT_DELETE_RESOURCE_TYPES)}",
+        )
+    model = TYPE_TO_MODEL[type]
+    stmt: Any = (
+        select(model)
+        .where(model.id == row_id, model.deleted_at.is_not(None))
+        .execution_options(include_deleted=True)
+    )
+    target = (await db.execute(stmt)).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(
+            status_code=404, detail="Not in the Trash: the row was restored or already purged"
+        )
+    return target
+
+
 @router.delete("/trash/{type}/{row_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def permanent_delete_from_trash(
     type: str,
     row_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
+    request: Request,
 ) -> Response:
     """Hard-delete a soft-deleted row from the trash.
+
+    A type an approval policy can cover (subnet, block, space, zone, scope) goes
+    through the same gate as the object's own permanent delete: a matching enabled
+    ``delete`` policy queues a change request and this answers 202, and approving
+    it runs :func:`purge_trashed_row`. Otherwise the purge runs inline.
+    """
+    await _find_trashed(db, type, row_id)
+    op_name = PURGE_TRASHED_OPERATIONS.get(type)
+    if op_name is not None:
+        op = get_operation(op_name)
+        assert op is not None  # registered at import
+        args = PurgeTrashedArgs(row_id=row_id)
+        pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
+        if pending is not None:
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content=pending.as_dict())
+    kept_provider_copies = await purge_trashed_row(db, current_user, type, row_id)
+    if kept_provider_copies:
+        # #3812: 204 has no body; say so in a header, as the zone delete does.
+        from app.services.dns.zone_move import provider_copies_kept_header  # noqa: PLC0415
+
+        return Response(
+            status_code=204,
+            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept_provider_copies)},
+        )
+    return Response(status_code=204)
+
+
+async def purge_trashed_row(db: Any, current_user: Any, type: str, row_id: uuid.UUID) -> list[str]:
+    """Hard-delete a soft-deleted row from the trash; the body of the endpoint.
+
+    Also what an approved change request runs for the same purge. Returns the
+    provider copies of a zone that were kept (empty for every other type).
 
     The agentless write-through for a Windows DHCP scope already fired at
     soft-delete time (#616). A DNS zone's did NOT: a zone is the one object
     never torn down at soft-delete (a hosted zone re-created on restore gets a
-    new id + NS set, #632), so this endpoint is its retraction point — it is
+    new id + NS set, #632), so this is its retraction point — it is
     pushed to every agentless server (Windows DNS, cloud, ``technitium_api``)
     BEFORE the row goes, and a failing provider keeps the zone in the trash
     with a 409/502 so it can be retried, never orphaned (#1830). A shared auto
@@ -942,21 +1043,8 @@ async def permanent_delete_from_trash(
     first (spatiumddi#1151).
     """
 
-    if type not in SOFT_DELETE_RESOURCE_TYPES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unknown type {type!r}. Valid: {sorted(SOFT_DELETE_RESOURCE_TYPES)}",
-        )
-
+    target = await _find_trashed(db, type, row_id)
     model = TYPE_TO_MODEL[type]
-    stmt: Any = (
-        select(model)
-        .where(model.id == row_id, model.deleted_at.is_not(None))
-        .execution_options(include_deleted=True)
-    )
-    target = (await db.execute(stmt)).scalar_one_or_none()
-    if target is None:
-        raise HTTPException(status_code=404, detail="Soft-deleted row not found")
 
     if isinstance(target, DNSRecord):
         orphan_address = (await withdrawn_alias_owners(db, [target.id])).get(target.id)
@@ -975,6 +1063,8 @@ async def permanent_delete_from_trash(
     # before the commit (#3354).
     touched_subnets: set[uuid.UUID] = set()
     if isinstance(target, DHCPScope):
+        # #4286: the purge takes the binding on a reservation's address (#3891).
+        await refuse_if_e911_bound(db, label, ip_ids=await bound_static_mirror_ids(db, [target.id]))
         await _tear_down_scope_leases_before_purge(db, target.id, label)
     try:
         if isinstance(target, DHCPScope):
@@ -985,7 +1075,9 @@ async def permanent_delete_from_trash(
             # back into free gaps, and purge any dynamic leases still pointing here —
             # defense-in-depth for pre-fix strays / convergence-race leftovers (the
             # first soft-delete normally already cleaned both up).
-            await remove_ipam_for_scope_statics(db, target.id, touched_subnets=touched_subnets)
+            await remove_ipam_for_scope_statics(
+                db, target.id, touched_subnets=touched_subnets, user=current_user
+            )
             await delete_leases_for_scope(db, target.id, touched_subnets=touched_subnets)
         elif isinstance(target, Customer):
             # network_service.customer_id is RESTRICT, so a customer that still
@@ -1140,12 +1232,4 @@ async def permanent_delete_from_trash(
     # instead of leaving them to the safety tick.
     for gid in dns_wake_group_ids:
         await publish_wake(dns_group_channel(gid))
-    if kept_provider_copies:
-        # #3812: 204 has no body; say so in a header, as the zone delete does.
-        from app.services.dns.zone_move import provider_copies_kept_header  # noqa: PLC0415
-
-        return Response(
-            status_code=204,
-            headers={"X-Provider-Copies-Kept": provider_copies_kept_header(kept_provider_copies)},
-        )
-    return Response(status_code=204)
+    return kept_provider_copies

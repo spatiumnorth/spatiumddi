@@ -14,6 +14,7 @@
  * operator types so they see the rendered hostnames before posting.
  */
 
+import { countNoun, pluralize } from "@/lib/count-noun";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -244,7 +245,7 @@ export function BulkAllocateModal({
   const zoneQueries = useQueries({
     queries: zoneGroupIds.map((gId) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, subnet.id),
       // Re-read on open too: the primary may be a zone created since the
       // cached list was taken (#4028, as #3078).
       staleTime: 0,
@@ -273,9 +274,9 @@ export function BulkAllocateModal({
   const zonesSettled = zoneQueries.every((q) => !q.isLoading && !q.isFetching);
   // Zones still on their way, or the subnet's DNS being re-read over a cached
   // copy: the pick is not final yet, so Preview waits (#3080).
-  const zonesPending =
-    dnsOn &&
-    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
+  // The first read counts too: until it lands there are no zones to pick and
+  // no primary, and "needs a DNS zone" would be a guess (#4860).
+  const zonesPending = dnsOn && (effectiveFetching || !zonesSettled);
   useEffect(() => {
     if (dnsZoneTouched || availableZones.length === 0) return;
     const target =
@@ -461,7 +462,9 @@ export function BulkAllocateModal({
           ) : (
             <CheckCircle2 className="h-4 w-4" />
           )}
-          {previewData ? `Allocate ${previewData.will_create} IPs` : "Allocate"}
+          {previewData
+            ? `Allocate ${countNoun(previewData.will_create, "IP")}`
+            : "Allocate"}
         </button>
       </>
     ) : (
@@ -484,10 +487,14 @@ export function BulkAllocateModal({
         <>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-range-start"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Range start
               </label>
               <input
+                id="bulk-allocate-range-start"
                 className={cn(inputCls, "font-mono")}
                 value={rangeStart}
                 onChange={(e) => setRangeStart(e.target.value)}
@@ -496,10 +503,14 @@ export function BulkAllocateModal({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-range-end"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Range end
               </label>
               <input
+                id="bulk-allocate-range-end"
                 className={cn(inputCls, "font-mono")}
                 value={rangeEnd}
                 onChange={(e) => setRangeEnd(e.target.value)}
@@ -509,10 +520,14 @@ export function BulkAllocateModal({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="bulk-allocate-hostname-template"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Hostname template
             </label>
             <input
+              id="bulk-allocate-hostname-template"
               className={cn(inputCls, "font-mono")}
               value={hostnameTemplate}
               onChange={(e) => setHostnameTemplate(e.target.value)}
@@ -532,10 +547,14 @@ export function BulkAllocateModal({
 
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-iterator-start"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Iterator start
               </label>
               <input
+                id="bulk-allocate-iterator-start"
                 type="number"
                 className={cn(inputCls, "font-mono")}
                 value={templateStart}
@@ -543,10 +562,14 @@ export function BulkAllocateModal({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-status"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Status
               </label>
               <select
+                id="bulk-allocate-status"
                 className={inputCls}
                 value={statusValue}
                 onChange={(e) => setStatusValue(e.target.value)}
@@ -557,10 +580,14 @@ export function BulkAllocateModal({
               </select>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="bulk-allocate-on-collision"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 On collision
               </label>
               <select
+                id="bulk-allocate-on-collision"
                 className={inputCls}
                 value={onCollision}
                 onChange={(e) =>
@@ -574,10 +601,14 @@ export function BulkAllocateModal({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="bulk-allocate-description-optional"
+              className="mb-1 block text-xs font-medium text-muted-foreground"
+            >
               Description (optional)
             </label>
             <input
+              id="bulk-allocate-description-optional"
               className={inputCls}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -597,10 +628,14 @@ export function BulkAllocateModal({
               </label>
               {createDnsRecords && availableZones.length > 0 && (
                 <div className="mt-2">
-                  <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                  <label
+                    htmlFor="bulk-allocate-forward-zone"
+                    className="mb-1 block text-xs font-medium text-muted-foreground"
+                  >
                     Forward zone
                   </label>
                   <select
+                    id="bulk-allocate-forward-zone"
                     className={inputCls}
                     value={dnsZoneId}
                     onChange={(e) => {
@@ -638,7 +673,8 @@ export function BulkAllocateModal({
           {livePreview && (
             <div className="rounded-md border bg-muted/20 p-3">
               <div className="mb-1 text-xs font-medium text-muted-foreground">
-                Preview ({livePreview.total} IPs total)
+                Preview ({livePreview.total}{" "}
+                {pluralize(livePreview.total, "IP")} total)
               </div>
               <table className="w-full text-xs font-mono">
                 <tbody>

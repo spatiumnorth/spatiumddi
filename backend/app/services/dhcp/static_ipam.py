@@ -43,20 +43,24 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.mac import canonicalize_mac
+from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment
-from app.models.ipam import IPAddress, Subnet
+from app.models.dns import DNSRecord, DNSZone
+from app.models.ipam import IPAddress, IpMacHistory, Subnet
 from app.services.dhcp.ipam_mirror import (
     insert_ipam_mirror_row,
     lease_hostname_suppressed_subnets,
 )
 from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 from app.services.dns.record_ops import purge_trashed_address_records
-from app.services.e911.address_bindings import carry_ip_bindings, keep_row_if_bound
+from app.services.e911.address_bindings import bound_ip_ids, carry_ip_bindings, keep_row_if_bound
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.utilization import recount_subnets_and_blocks
 
 logger = structlog.get_logger(__name__)
@@ -93,7 +97,19 @@ _OPERATOR_MIRROR_FIELDS: tuple[str, ...] = (
     "role",
     "reserved_until",
     "decom_date",
+    # The zones the address publishes into (#4754): the restore re-checks them
+    # against the subnet's DNS group before re-applying, see
+    # ``_restore_zone_binding``.
+    "forward_zone_id",
+    "extra_zone_ids",
 )
+
+# Snapshot key holding the address's ``ip_mac_history`` rows (#4913); not an
+# ``ip_address`` column, so ``_restore_operator_fields`` ignores it.
+_MAC_HISTORY_KEY = "mac_history"
+
+# Snapshot keys ``_restore_operator_fields`` leaves to ``_restore_zone_binding``.
+_ZONE_SNAPSHOT_FIELDS: frozenset[str] = frozenset({"forward_zone_id", "extra_zone_ids"})
 
 
 def _snapshot_operator_fields(row: IPAddress) -> dict[str, Any] | None:
@@ -109,6 +125,8 @@ def _snapshot_operator_fields(row: IPAddress) -> dict[str, Any] | None:
             continue
         if isinstance(val, uuid.UUID):
             snap[field] = str(val)
+        elif field == "extra_zone_ids":
+            snap[field] = [str(z) for z in val]
         elif isinstance(val, (datetime, date)):
             snap[field] = val.isoformat()
         else:
@@ -119,7 +137,7 @@ def _snapshot_operator_fields(row: IPAddress) -> dict[str, Any] | None:
 def _restore_operator_fields(row: IPAddress, snapshot: dict[str, Any]) -> None:
     """Re-apply a :func:`_snapshot_operator_fields` dict onto a fresh mirror row."""
     for field, val in snapshot.items():
-        if field not in _OPERATOR_MIRROR_FIELDS:
+        if field not in _OPERATOR_MIRROR_FIELDS or field in _ZONE_SNAPSHOT_FIELDS:
             continue
         try:
             if field in ("owner_user_id", "owner_group_id") and isinstance(val, str):
@@ -135,14 +153,193 @@ def _restore_operator_fields(row: IPAddress, snapshot: dict[str, Any]) -> None:
             continue
 
 
+async def _snapshot_mac_history(db: AsyncSession, row: IPAddress) -> list[dict[str, Any]]:
+    """The address's ``ip_mac_history`` rows as JSON-safe dicts (#4913).
+
+    The table cascades off the address row, and a restore re-creates the row, so
+    without this the history of every MAC the reservation's address was given
+    (its first-seen, last-seen and classification) goes with the Trash round trip.
+    """
+    res = await db.execute(
+        select(IpMacHistory)
+        .where(IpMacHistory.ip_address_id == row.id)
+        .order_by(IpMacHistory.first_seen, IpMacHistory.id)
+    )
+    return [
+        {
+            "mac_address": str(h.mac_address),
+            "first_seen": h.first_seen.isoformat(),
+            "last_seen": h.last_seen.isoformat(),
+            "classification": h.classification,
+            "source": h.source,
+            "is_randomized": h.is_randomized,
+            "acknowledged_at": h.acknowledged_at.isoformat() if h.acknowledged_at else None,
+            "acknowledged_by_user_id": (
+                str(h.acknowledged_by_user_id) if h.acknowledged_by_user_id else None
+            ),
+        }
+        for h in res.scalars().all()
+    ]
+
+
+async def _restore_mac_history(
+    db: AsyncSession, ip_id: uuid.UUID, entries: list[dict[str, Any]]
+) -> None:
+    """Put a :func:`_snapshot_mac_history` list back on the re-created address.
+
+    Upserts, because the restore has just recorded the reservation's current MAC
+    with fresh timestamps: the snapshot's ``first_seen`` / ``last_seen`` win.
+    A malformed entry is skipped; it must never break the restore.
+    """
+    for e in entries:
+        try:
+            params = {
+                "ip_id": str(ip_id),
+                "mac": str(e["mac_address"]),
+                "first_seen": datetime.fromisoformat(e["first_seen"]),
+                "last_seen": datetime.fromisoformat(e["last_seen"]),
+                "classification": e.get("classification") or "new",
+                "source": e.get("source") or "sweep",
+                "is_randomized": bool(e.get("is_randomized")),
+                "ack_at": (
+                    datetime.fromisoformat(e["acknowledged_at"])
+                    if e.get("acknowledged_at")
+                    else None
+                ),
+                "ack_by": e.get("acknowledged_by_user_id"),
+            }
+            async with db.begin_nested():
+                await db.execute(
+                    text("""
+                        INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen,
+                            last_seen, classification, source, is_randomized, acknowledged_at,
+                            acknowledged_by_user_id)
+                        VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), :first_seen,
+                            :last_seen, :classification, :source, :is_randomized, :ack_at,
+                            (SELECT id FROM "user" WHERE id = CAST(:ack_by AS uuid)))
+                        ON CONFLICT (ip_address_id, mac_address) DO UPDATE SET
+                            first_seen = EXCLUDED.first_seen, last_seen = EXCLUDED.last_seen,
+                            classification = EXCLUDED.classification, source = EXCLUDED.source,
+                            is_randomized = EXCLUDED.is_randomized,
+                            acknowledged_at = EXCLUDED.acknowledged_at,
+                            acknowledged_by_user_id = EXCLUDED.acknowledged_by_user_id
+                        """),
+                    params,
+                )
+        except (KeyError, ValueError, TypeError, DBAPIError):
+            continue
+
+
+async def _restore_zone_binding(
+    db: AsyncSession,
+    row: IPAddress,
+    subnet: Subnet | None,
+    snapshot: dict[str, Any],
+    warnings: list[str] | None,
+) -> None:
+    """Put a re-created mirror row back in the zones it was published into (#4754).
+
+    A zone applies only while it still exists (not deleted, not in the Trash)
+    and is in one of the subnet's effective DNS groups, as the zone select
+    offers only those. One that is not is dropped, with a warning: the row then
+    publishes where an address with no zone of its own does, the subnet's zone.
+    """
+    from app.api.v1.ipam.router import _resolve_effective_dns  # noqa: PLC0415
+
+    raw_ids: list[str] = []
+    fwd = snapshot.get("forward_zone_id")
+    if fwd:
+        raw_ids.append(str(fwd))
+    raw_ids.extend(str(z) for z in snapshot.get("extra_zone_ids") or [])
+    if not raw_ids:
+        return
+    group_ids: set[str] = set()
+    if subnet is not None:
+        group_ids = {str(g) for g in (await _resolve_effective_dns(db, subnet))[0]}
+    ok: dict[str, bool] = {}
+    for raw in raw_ids:
+        if raw in ok:
+            continue
+        try:
+            zone = await db.get(DNSZone, uuid.UUID(raw))
+        except (ValueError, TypeError):
+            zone = None
+        ok[raw] = zone is not None and zone.deleted_at is None and str(zone.group_id) in group_ids
+        if not ok[raw] and warnings is not None:
+            warnings.append(
+                f"{row.address}: its DNS zone {raw} is gone or no longer in the subnet's "
+                "DNS group, so the address is published in the subnet's zone instead"
+            )
+    if fwd and ok[str(fwd)]:
+        row.forward_zone_id = uuid.UUID(str(fwd))
+    row.extra_zone_ids = [
+        str(z)
+        for z in snapshot.get("extra_zone_ids") or []
+        if ok.get(str(z)) and str(z) != str(fwd)
+    ]
+
+
+def _mirror_audit_view(row: IPAddress) -> dict[str, Any]:
+    """The columns a reservation's mirror writes, as an audit ``old_value`` /
+    ``new_value`` (``subnet_id`` rides along so a delete row can still be
+    mapped back to its subnet by the compliance evaluator)."""
+    return {
+        "subnet_id": str(row.subnet_id),
+        "address": str(row.address),
+        "hostname": row.hostname or "",
+        "mac_address": str(row.mac_address) if row.mac_address else None,
+        "status": row.status,
+    }
+
+
+def _audit_mirror(
+    user: User | None,
+    action: str,
+    row: IPAddress,
+    *,
+    old: dict[str, Any] | None = None,
+    new: dict[str, Any] | None = None,
+) -> AuditLog:
+    """Build the ``ip_address`` audit row the IPAM REST API writes for the same
+    change (#4240). The mirror used to change IPAM silently, so a compliance
+    rule on a PCI subnet never heard of a reservation's address and no
+    ``ip.*`` event fired for it. Same transaction as the change; ``user`` is
+    the actor (None for a machine sync, audited as ``system``).
+
+    Returned, not added: the caller adds it AFTER every zone lock its DNS work
+    takes, because adding it takes the audit-chain lock and ``lock_order``
+    wants that last."""
+    changed = (
+        sorted(k for k in new if (old or {}).get(k) != new[k]) if old is not None and new else None
+    )
+    return AuditLog(
+        user_id=user.id if user else None,
+        user_display_name=user.display_name if user else "system",
+        auth_source=user.auth_source if user else "system",
+        action=action,
+        resource_type="ip_address",
+        resource_id=str(row.id),
+        resource_display=str(row.address),
+        changed_fields=changed,
+        old_value=old,
+        new_value=new,
+        result="success",
+    )
+
+
 async def upsert_ipam_for_static(
     db: AsyncSession,
     scope: DHCPScope,
     st: DHCPStaticAssignment,
     *,
     action: str = "create",
+    user: User | None = None,
+    warnings: list[str] | None = None,
 ) -> None:
     """Create or update the IPAM row mirroring a static DHCP assignment.
+
+    Audited as ``ip_address`` (create when the address row is new, update when
+    a field changed), attributed to ``user`` (#4240).
 
     The static is the source of truth for hostname/MAC; IPAM reflects it with
     ``status='static_dhcp'`` and a back-link via ``static_assignment_id`` so the
@@ -163,6 +360,7 @@ async def upsert_ipam_for_static(
     # When a live lease still holds the address left behind, the address
     # becomes that lease's row instead of free (#1302, ``_release_moved_row``).
     handovers: list[LeaseHandover] = []
+    audits: list[AuditLog] = []
     # Find or create the IPAM row for this IP within the scope's subnet. First,
     # so a binding on a row left behind can be carried onto it (#3964).
     res = await db.execute(
@@ -177,7 +375,10 @@ async def upsert_ipam_for_static(
         # static is the source of truth) instead of 500-ing on
         # uq_ip_address_subnet_address.
         candidate = IPAddress(subnet_id=scope.subnet_id, address=ip_str, status="static_dhcp")
-        row, _created = await insert_ipam_mirror_row(db, candidate)
+        row, created = await insert_ipam_mirror_row(db, candidate)
+    else:
+        created = False
+    audit_before = None if created else _mirror_audit_view(row)
 
     # Locked: a row released here asks the lease table whether a live lease
     # holds its address, and that answer is only good while the lease ingest
@@ -189,7 +390,7 @@ async def upsert_ipam_for_static(
             # The reservation's E911 location binding moves to its new
             # address (#3964); left on the old row it would be lost with it.
             await carry_ip_bindings(db, old.id, row.id)
-            handover = await _release_moved_row(db, old, st)
+            handover = await _release_moved_row(db, old, st, user=user, audits=audits)
             if handover is not None:
                 handovers.append(handover)
         else:
@@ -206,6 +407,9 @@ async def upsert_ipam_for_static(
     # and the DNS sync below retracts what an earlier name published.
     row.hostname = (st.hostname or "").strip()
     row.mac_address = str(st.mac_address)
+    # The MAC history dialog promises every MAC the address was given, and a
+    # reservation gives one (#4848).
+    await record_mac_history(db, row.id, row.mac_address)
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
     # A row taken over here may be a lease's mirror: the address a client
@@ -220,16 +424,25 @@ async def upsert_ipam_for_static(
     # Restore any operator-authored columns captured when this reservation's
     # mirror was deleted (lossless Trash restore, #630), then clear the
     # snapshot so it can't go stale or re-apply on a later ordinary edit.
+    subnet_row = await db.get(Subnet, scope.subnet_id)
     if st.ipam_metadata_snapshot:
         _restore_operator_fields(row, st.ipam_metadata_snapshot)
+        await _restore_mac_history(
+            db, row.id, st.ipam_metadata_snapshot.get(_MAC_HISTORY_KEY) or []
+        )
+        await _restore_zone_binding(db, row, subnet_row, st.ipam_metadata_snapshot, warnings)
         st.ipam_metadata_snapshot = None
     await db.flush()
     st.ip_address_id = row.id
+    audit_after = _mirror_audit_view(row)
+    if created:
+        audits.append(_audit_mirror(user, "create", row, new=audit_after))
+    elif audit_before != audit_after:
+        audits.append(_audit_mirror(user, "update", row, old=audit_before, new=audit_after))
     # Fire DNS sync so forward/reverse records follow the static.
     from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
     from app.services.dns.sync_check import address_own_forward_zone_id  # noqa: PLC0415
 
-    subnet_row = await db.get(Subnet, scope.subnet_id)
     # Run even when the reservation carries no name: the sync then retracts
     # the A / PTR an earlier name published, rather than leaving them served
     # for a name the row no longer carries.
@@ -249,6 +462,7 @@ async def upsert_ipam_for_static(
     # Last, with the reservation already at its new address: DDNS lets a
     # reservation's hostname win, and none sits at the address handed over.
     await publish_handover_ddns(db, handovers)
+    db.add_all(audits)
 
 
 async def lock_static_rows(db: AsyncSession, st: DHCPStaticAssignment) -> list[IPAddress]:
@@ -286,7 +500,12 @@ async def lock_static_rows(db: AsyncSession, st: DHCPStaticAssignment) -> list[I
 
 
 async def _release_moved_row(
-    db: AsyncSession, row: IPAddress, st: DHCPStaticAssignment
+    db: AsyncSession,
+    row: IPAddress,
+    st: DHCPStaticAssignment,
+    *,
+    user: User | None = None,
+    audits: list[AuditLog],
 ) -> LeaseHandover | None:
     """Release a reservation's row at the address it has just moved away from.
 
@@ -308,7 +527,7 @@ async def _release_moved_row(
     """
     lease = await _live_lease_at(db, row)
     subnet_id, address = row.subnet_id, row.address
-    await _delete_mirror_row(db, row, st)
+    await _delete_mirror_row(db, row, st, user=user, audits=audits)
     if lease is None:
         return None
     # The delete has to reach the database before the insert:
@@ -338,6 +557,8 @@ async def detach_ipam_for_static(
     st: DHCPStaticAssignment,
     *,
     to_status: str = "available",
+    user: User | None = None,
+    audits: list[AuditLog] | None = None,
 ) -> list[LeaseHandover]:
     """Release the IPAM row back to ``available`` when the static is removed.
 
@@ -366,6 +587,10 @@ async def detach_ipam_for_static(
     path that asked for it. A held row stays held whatever holds the address;
     the lease mirror leaves a reserved row alone as well.
 
+    ``audits``, when given, collects the ``ip_address`` audit rows (#4240) for
+    the caller to add after its own DDNS publish: that publish row-locks zones,
+    and ``lock_order`` wants the audit-chain lock taken last.
+
     Returns the rows handed to a live lease. Their DDNS records are the
     caller's to publish with ``publish_handover_ddns``, and only once the
     reservation itself is deleted: DDNS lets a reservation's hostname win, so
@@ -386,6 +611,7 @@ async def detach_ipam_for_static(
                 await _sync_dns_record(db, row, subnet_row, action="delete")
             except Exception:  # noqa: BLE001 — DNS sync is best-effort
                 pass
+        audit_before = _mirror_audit_view(row)
         row.static_assignment_id = None
         if row.status == "static_dhcp":
             lease = await _live_lease_at(db, row) if to_status == "available" else None
@@ -399,6 +625,12 @@ async def detach_ipam_for_static(
                     handovers.append(LeaseHandover(subnet_row, row, lease))
             else:
                 row.status = to_status
+            if audits is not None:
+                audits.append(
+                    _audit_mirror(
+                        user, "update", row, old=audit_before, new=_mirror_audit_view(row)
+                    )
+                )
     return handovers
 
 
@@ -611,6 +843,8 @@ async def remove_ipam_for_static(
     st: DHCPStaticAssignment,
     *,
     touched_subnets: set[uuid.UUID] | None = None,
+    user: User | None = None,
+    keep_bound: bool = False,
 ) -> int:
     """DELETE the IPAM mirror row(s) for a reservation (not just free them).
 
@@ -628,21 +862,60 @@ async def remove_ipam_for_static(
     Does not recount: a caller freeing many mirrors passes ``touched_subnets``,
     collects every removed row's subnet, and recounts them once with
     ``recount_subnets_and_blocks`` (#3354). Returns the number of rows removed.
+
+    ``keep_bound`` leaves a row that something hangs off exactly as it is (see
+    ``_row_kept_through_trash``): an E911 ``ip`` binding (#4286), a DNS alias or an OT
+    descriptor (#4870). A scope going to the Trash is not an end for the address, and
+    the restore finds the row where it was. Without it an E911-bound row is kept as a
+    free address with the binding deactivated (#3964).
     """
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     removed = 0
+    audits: list[AuditLog] = []
     for row in res.scalars().all():
+        if keep_bound and await _row_kept_through_trash(db, row.id):
+            continue
         if touched_subnets is not None:
             touched_subnets.add(row.subnet_id)
-        await _delete_mirror_row(db, row, st)
+        await _delete_mirror_row(db, row, st, user=user, audits=audits)
         removed += 1
+    db.add_all(audits)
     return removed
 
 
+async def _row_kept_through_trash(db: AsyncSession, ip_id: uuid.UUID) -> bool:
+    """Does anything hang off this address that a delete-and-recreate would lose?
+
+    An E911 ``ip`` binding (#4286), a DNS alias (``ip_alias`` records are deleted
+    outright with the row) or an OT descriptor (``ON DELETE CASCADE``) (#4870).
+    """
+    from app.models.ot import OTDevice  # noqa: PLC0415
+
+    if await bound_ip_ids(db, [ip_id]):
+        return True
+    alias = await db.execute(
+        select(DNSRecord.id)
+        .where(DNSRecord.ip_address_id == ip_id, DNSRecord.ip_alias.is_(True))
+        .limit(1)
+    )
+    if alias.first() is not None:
+        return True
+    ot = await db.execute(select(OTDevice.id).where(OTDevice.ip_address_id == ip_id).limit(1))
+    return ot.first() is not None
+
+
 async def _delete_mirror_row(
-    db: AsyncSession, row: IPAddress, st: DHCPStaticAssignment | None
+    db: AsyncSession,
+    row: IPAddress,
+    st: DHCPStaticAssignment | None,
+    *,
+    user: User | None = None,
+    audits: list[AuditLog] | None = None,
 ) -> None:
     """Tear down a mirror row's DNS and delete it.
+
+    The delete's audit row goes onto ``audits`` for the caller to add once its
+    own zone locks are taken (it is added here when none is passed).
 
     ``st`` is the reservation the row mirrors, when we still have it — the
     orphan sweep calls this for rows whose reservation is *gone*, so it passes
@@ -655,6 +928,10 @@ async def _delete_mirror_row(
         # reservation before we hard-delete the mirror, so a Trash restore is
         # lossless (#630). The last mirror row wins — there is realistically one.
         snapshot = _snapshot_operator_fields(row)
+        # ...and the MAC history, which cascades off the row (#4913).
+        history = await _snapshot_mac_history(db, row)
+        if history:
+            snapshot = {**(snapshot or {}), _MAC_HISTORY_KEY: history}
         if snapshot is not None:
             st.ipam_metadata_snapshot = snapshot
         # Clear the forward FK before the delete so the ORM's in-memory ``st``
@@ -673,6 +950,11 @@ async def _delete_mirror_row(
     # reservation's scope or subnet going to the Trash must not take the
     # phone's location with it.
     if not await keep_row_if_bound(db, row):
+        audit = _audit_mirror(user, "delete", row, old=_mirror_audit_view(row))
+        if audits is None:
+            db.add(audit)
+        else:
+            audits.append(audit)
         await db.delete(row)
 
 
@@ -761,12 +1043,24 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
 
     freed = 0
     touched: list[uuid.UUID] = []
+    audits: list[AuditLog] = []
     for row, static_id in parsed:
         if static_id is not None and static_id in live:
             continue
+        # A scope in the Trash keeps its bound reservation's row (#4286); the
+        # reservation is in the Trash, not gone, and its restore re-adopts the row.
+        if (
+            static_id is not None
+            and await _row_kept_through_trash(db, row.id)
+            and await _load_reservation_any(db, row.static_assignment_id) is not None
+        ):
+            continue
         touched.append(row.subnet_id)
-        await _delete_mirror_row(db, row, await _load_reservation_any(db, row.static_assignment_id))
+        await _delete_mirror_row(
+            db, row, await _load_reservation_any(db, row.static_assignment_id), audits=audits
+        )
         freed += 1
+    db.add_all(audits)
     # Freed rows leave the subnet's and its blocks' cached counters stale until
     # the hourly recount; settle them once for the whole run (#3354).
     await recount_subnets_and_blocks(db, touched)
@@ -808,6 +1102,8 @@ async def remove_ipam_for_scope_statics(
     scope_id: uuid.UUID,
     *,
     touched_subnets: set[uuid.UUID] | None = None,
+    keep_bound: bool = False,
+    user: User | None = None,
 ) -> int:
     """DELETE the IPAM mirror of every reservation under ``scope_id``.
 
@@ -821,7 +1117,10 @@ async def remove_ipam_for_scope_statics(
     A caller looping over several scopes passes ``touched_subnets`` and recounts
     once itself with ``recount_subnets_and_blocks``, so the subnets and blocks
     are locked in one id-ordered pass rather than scope by scope; with none,
-    this recounts what it freed before returning.
+    this recounts what it freed before returning. ``keep_bound`` is passed through
+    (see ``remove_ipam_for_static``): the soft delete keeps a bound address row.
+    ``user`` attributes the ``ip_address`` delete audit rows (#4447); ``None`` is
+    ``system``.
     """
     res = await db.execute(
         select(DHCPStaticAssignment)
@@ -831,20 +1130,26 @@ async def remove_ipam_for_scope_statics(
     touched: set[uuid.UUID] = set() if touched_subnets is None else touched_subnets
     removed = 0
     for st in res.scalars().all():
-        removed += await remove_ipam_for_static(db, st, touched_subnets=touched)
+        removed += await remove_ipam_for_static(
+            db, st, touched_subnets=touched, keep_bound=keep_bound, user=user
+        )
     if touched_subnets is None:
         await recount_subnets_and_blocks(db, touched)
     return removed
 
 
-async def remirror_scope_statics(db: AsyncSession, scope: DHCPScope) -> int:
+async def remirror_scope_statics(
+    db: AsyncSession, scope: DHCPScope, warnings: list[str] | None = None
+) -> int:
     """Re-create the IPAM mirror for each of a restored scope's reservations.
 
     Counterpart to ``remove_ipam_for_scope_statics``: soft-deleting a scope now
     deletes its ``static_dhcp`` mirror rows, so a Trash restore has to put them
     back. ``upsert_ipam_for_static`` re-creates the row (status + back-link) and
     re-syncs DNS; its #564 savepoint self-heal reclaims the IP if it was taken
-    during the Trash window (the static is the source of truth). Call AFTER the
+    during the Trash window (the static is the source of truth). A reservation
+    gets back the zones its address was published into; one that no longer
+    applies is reported on ``warnings`` (#4754). Call AFTER the
     batch has been un-stamped so the statics are visible. Returns the count.
     """
     res = await db.execute(
@@ -852,7 +1157,7 @@ async def remirror_scope_statics(db: AsyncSession, scope: DHCPScope) -> int:
     )
     statics = list(res.scalars().all())
     for st in statics:
-        await upsert_ipam_for_static(db, scope, st, action="create")
+        await upsert_ipam_for_static(db, scope, st, action="create", warnings=warnings)
     return len(statics)
 
 

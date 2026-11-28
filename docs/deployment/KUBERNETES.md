@@ -81,10 +81,10 @@ not tested and not supported. Report a problem on a supported version in
 The chart installs on OpenShift under its **default** SecurityContextConstraints:
 the control plane runs under plain `restricted-v2`, with no grant. It is the
 same chart, not a fork. Tested on OpenShift 5.0.0 (Kubernetes 1.36) and
-OpenShift 4.22.14, both on OpenShift Local: every control-plane pod admitted by
-`restricted-v2`, the BIND9 and Kea agents by the chart's own SCCs, DNS and DHCP
-serving, `helm test` passing. On 4.22 `restricted-v3` exists but does not admit
-the chart's pods, so no `hostUsers` setting is needed. OKD is not tested.
+OpenShift 4.22.14 (Kubernetes 1.35), both on OpenShift Local, from the command
+line and through the web console's Helm install: every control-plane pod
+admitted by `restricted-v2`, the BIND9 and Kea agents by the chart's own SCCs,
+DNS and DHCP serving. OKD is not tested.
 
 ```bash
 helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
@@ -150,7 +150,7 @@ The api, worker, beat, frontend, migrate Job, Postgres and Redis should show
   allows `NET_BIND_SERVICE`) can never be the SCC that admits them. Where
   cluster admins manage SCCs, set `openshift.scc.create: false`: the chart
   still creates the ServiceAccounts, and you grant an equivalent SCC to
-  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (`<fullname>` is
+  `<fullname>-dns-agent` / `<fullname>-dhcp-agent` yourself (see **If your cluster admins manage SCCs** below; `<fullname>` is
   `<release>-spatiumddi`, or the release name when it already contains
   `spatiumddi`). `anyuid` is not a substitute: it has no `seccompProfiles`, so it
   rejects every pod that sets `seccompProfile: RuntimeDefault`.
@@ -166,32 +166,155 @@ chown and drop privileges at start). `frontend.tls.enabled` (the appliance's
 `:80` / `:443` nginx) and `frontend.hostNetwork` are refused: let the Route
 terminate TLS. Kea's opt-in
 rogue-DHCP probe and fingerprint sniffer need `NET_RAW` in a process that is not
-Kea, and are unavailable. `restricted-v3` (4.22+) also requires `hostUsers:
+Kea, and are unavailable; so is radvd (`RADVD_MANAGED`), which also needs
+`NET_ADMIN`, in the default and the `-ubi` Kea image alike (the `-ubi` image does
+ship radvd, for platforms where you grant it). `restricted-v3` (4.22+) also requires `hostUsers:
 false`; set the per-workload `hostUsers` values where the chart offers them
 (api, worker, beat, redis).
 
-**Red Hat certification status.** The chart and images are **not** Red Hat
-certified. What ships today is the part that needs no Red Hat account: every
-image carries `name`, `vendor`, `version`, `release`, `summary`, `description`,
-`maintainer` and `url` labels (plus the `org.opencontainers.image.*` set) and the
-project `LICENSE` and `NOTICE` under `/licenses`; the chart has a
-`values.schema.json`, `charts.openshift.io/*` annotations in `Chart.yaml` and a
-`helm test` hook (`helm test <release>` checks the api and the frontend answer).
-Not done, and tracked in
-[#4020](https://github.com/spatiumnorth/spatiumddi/issues/4020) for 1.1.0: UBI-based
-image variants (the images keep their current Alpine / Debian bases) and the
-certification submission itself, which needs a Red Hat Partner Connect
-account. Two image checks are knowingly unmet: the frontend, `dns-bind9` and
-`dhcp-kea` images still start as root and drop privileges themselves (the
-chart already runs them under a random uid on OpenShift), so a `USER` line would
-break Docker Compose, which relies on the start-as-root volume chown.
+**Red Hat certification status.** The chart and images are **not yet** Red Hat
+certified. Partner Connect certification components exist for the four `-ubi`
+images, and when the repository secret `PYXIS_API_TOKEN` is set the release
+submits `preflight` results for each image and architecture against the published
+`ghcr.io/spatiumnorth/<image>:<version>-ubi` (the `submit-ubi-preflight` job; it is
+non-gating and skipped without the secret). Certification stays pending until Red
+Hat reviews and publishes them. What exists is everything short of it. Every image carries `name`,
+`vendor`, `version`, `release`, `summary`, `description`, `maintainer` and `url`
+labels (plus the `org.opencontainers.image.*` set) and the project `LICENSE` and
+`NOTICE` under `/licenses`; the chart has a `values.schema.json`,
+`charts.openshift.io/*` annotations in `Chart.yaml` and a `helm test` hook
+(`helm test <release>` checks the api and the frontend answer); and four of the
+images have Red Hat UBI 9 variants, described next.
+
+**UBI image variants and the certified profile (#3913).** The api, frontend,
+`dns-bind9` and `dhcp-kea` images are also published on `ubi9` as
+`ghcr.io/spatiumnorth/<image>:<version>-ubi` (and `:latest-ubi`), GHCR only. They
+are an addition: the default images, the appliance and the default chart values
+are unchanged, and the nightly does not publish `-ubi` tags (the release does,
+after the same Trivy gate, per architecture on a native runner). They run as a
+numeric non-root `USER` and keep the random-uid behaviour above. BIND 9.20 and
+Kea are built from checksummed source, since Red Hat ships neither at these
+versions (see `docs/THIRD_PARTY.md`). Compared with the default images the UBI
+ones lack `whois` and `traceroute` (the Tools page reports the missing binary),
+the NFS backup destination (`libnfs`), `kea-admin` and the SQL lease backends in
+the Kea image, and the frontend's nginx is Red Hat's 1.26.
+
+`charts/spatiumddi/values-openshift-certified.yaml` selects them:
+
+```bash
+oc create secret docker-registry redhat-registry -n spatiumddi \
+  --docker-server=registry.redhat.io \
+  --docker-username=<registry service account> --docker-password=<token>
+helm install ddi oci://ghcr.io/spatiumnorth/charts/spatiumddi \
+  --version <CHART_VERSION> --namespace spatiumddi --create-namespace \
+  -f values-openshift-certified.yaml
+```
+
+It keeps `openshift.scc.create: true`, so the chart creates the DNS and DHCP
+agents' SecurityContextConstraints exactly as the plain chart does (Red Hat
+confirmed that SCCs in a certified chart are acceptable). The control plane needs
+none and runs under `restricted-v2`; the agents are admitted by the chart's SCCs
+when you enable them. Creating an SCC needs cluster-scoped permissions, so a user
+who is admin of one namespace only cannot install with the agents on: Helm (and
+the web console's Helm install) stops before creating anything, with
+`securitycontextconstraints ... is forbidden ... at the cluster scope`. Where your
+cluster admins manage SCCs, or the installing user is a namespace admin, set
+`openshift.scc.create: false` and follow **If your cluster admins manage SCCs**
+below: a cluster admin applies the SCC files once, and the namespace admin can
+then install.
+
+It also sets `image.tagSuffix: -ubi` (appended to the tag of those four images; the
+agents' BIND9 and Kea included) and runs the bundled PostgreSQL and Redis from
+Red Hat's `registry.redhat.io/rhel9/postgresql-16` and `rhel9/redis-7`
+(`postgresql.image.flavor: rhel`, `redis.image.flavor: rhel`; standalone kind
+only, and the Redis 8-only `aof-load-corrupt-tail-max-size` is not passed to
+Redis 7). Those two need a Red Hat registry pull secret, an account at
+<https://access.redhat.com/terms-based-registry/>; the chart passes
+`image.pullSecrets` to them as to every other pod. The two Red Hat tags are
+immutable `<RHEL minor>-<build>` builds. The `rhel` flavors follow the sclorg
+image contract (`POSTGRESQL_*` variables, `/var/lib/pgsql/data`,
+`/var/lib/redis/data`) and have been rendered and schema-checked, not yet run
+against a `registry.redhat.io` pull. For anything beyond a single pod of each,
+bring your own PostgreSQL and Redis (`externalDatabase`, `externalRedis`).
+
+The release runs Red Hat's `preflight check container` against each `-ubi` image
+(amd64, check only, never submitting); `.github/workflows/build-ubi-images.yml`
+does the same on a PR and weekly.
+
+**If your cluster admins manage SCCs.** Set `openshift.scc.create: false` (with the
+certified profile or without it), for example `--set openshift.scc.create=false`
+after `-f values-openshift-certified.yaml`. The chart still renders the agents' ServiceAccounts (`<fullname>-dns-agent`,
+`<fullname>-dhcp-agent`, where `<fullname>` is `<release>-spatiumddi`, or the
+release name when it already contains `spatiumddi`) but no SCC, so an agent pod is
+admitted under `restricted-v2` and fails to start (`named` and `kea-dhcp4` cannot
+get `NET_BIND_SERVICE` / `NET_RAW`) until a cluster admin has done the following.
+Ready-to-apply manifests ship in the chart under `files/openshift/`; fetch them
+with `helm pull oci://ghcr.io/spatiumnorth/charts/spatiumddi --version <CHART_VERSION> --untar`:
+
+| File | SCC name | Allows | For |
+|---|---|---|---|
+| `dns-agent-scc.yaml` | `spatiumddi-dns-agent` | `NET_BIND_SERVICE` | BIND9 DNS agents |
+| `dhcp-agent-scc.yaml` | `spatiumddi-dhcp-agent` | `NET_BIND_SERVICE`, `NET_RAW` | Kea DHCP agents |
+| `dhcp-agent-hostnetwork-scc.yaml` | `spatiumddi-dhcp-agent-hostnetwork` | the above plus host network / ports | Kea only when a server sets `hostNetwork: true` (use instead of the one above) |
+
+Each is the same SCC the chart renders with `openshift.scc.create: true` (a CI
+check keeps them identical), with a release-independent name: `restricted-v2`
+plus those capabilities and `allowPrivilegeEscalation: true`, not privileged.
+
+1. As a cluster admin, apply the SCC(s) for the agents you will run (cluster-scoped,
+   once per cluster):
+
+   ```bash
+   oc apply -f spatiumddi/files/openshift/dns-agent-scc.yaml
+   oc apply -f spatiumddi/files/openshift/dhcp-agent-scc.yaml   # or dhcp-agent-hostnetwork-scc.yaml
+   ```
+
+2. Grant each SCC to its ServiceAccount (the account does not have to exist yet):
+
+   ```bash
+   oc adm policy add-scc-to-user spatiumddi-dns-agent  -z ddi-spatiumddi-dns-agent  -n spatiumddi
+   oc adm policy add-scc-to-user spatiumddi-dhcp-agent -z ddi-spatiumddi-dhcp-agent -n spatiumddi
+   ```
+
+   (shown for release `ddi` in namespace `spatiumddi`; `-z` takes the
+   ServiceAccount name without the namespace.) Do not grant an SCC to the
+   namespace's `default` account.
+
+3. Enable the agents: `--set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1`
+   and/or `--set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1`
+   on `helm install` / `helm upgrade`. Without a server listed no agent pod is
+   rendered.
+
+4. Verify with the `openshift.io/scc` annotation check above: the DNS agent pods
+   must show `spatiumddi-dns-agent` and the DHCP agent pods `spatiumddi-dhcp-agent`
+   (or `-hostnetwork`). If the agent pods never appear, the grant in step 2 is
+   missing or names the wrong ServiceAccount: the StatefulSet's events show
+   `FailedCreate ... unable to validate against any security context constraint`.
+   Fix the grant and the pods are created without another `helm upgrade`.
+
+To remove the prerequisite after `helm uninstall`, undo the grants and delete the
+SCCs. Deleting an SCC leaves behind the ClusterRole that `add-scc-to-user`
+created, so delete that as well:
+
+```bash
+oc adm policy remove-scc-from-user spatiumddi-dns-agent  -z ddi-spatiumddi-dns-agent  -n spatiumddi
+oc adm policy remove-scc-from-user spatiumddi-dhcp-agent -z ddi-spatiumddi-dhcp-agent -n spatiumddi
+oc delete scc spatiumddi-dns-agent spatiumddi-dhcp-agent
+oc delete clusterrole system:openshift:scc:spatiumddi-dns-agent system:openshift:scc:spatiumddi-dhcp-agent
+```
+
+`openshift.workerNetRaw` is not covered by these files: with `openshift.scc.create: false` it needs an SCC for the worker's ServiceAccount that you write yourself, or leave it off (the default).
+
+With the default `openshift.scc.create: true`, certified profile or not, none of this
+is needed: the chart creates the same SCCs, named
+`<fullname>-<namespace>-dns-agent` / `-dhcp-agent`.
 
 To run Red Hat's checks yourself, install
 [`openshift-preflight`](https://github.com/redhat-openshift-ecosystem/openshift-preflight)
-and run `preflight check container ghcr.io/spatiumnorth/spatiumddi-api:<version>`
+and run `preflight check container ghcr.io/spatiumnorth/spatiumddi-api:<version>-ubi`
 (add `--platform amd64`). Check-only mode needs no account; do not pass
-`--submit`. Expect `RunAsNonRoot` and `BasedOnUbi` failures on the images
-described above. For the chart, `chart-verifier verify` against the packaged
+`--submit`. The default (non-`-ubi`) images fail `RunAsNonRoot` and
+`BasedOnUbi` by design. For the chart, `chart-verifier verify` against the packaged
 `.tgz` runs the offline checks (`helm lint`, schema, annotations).
 
 **Reaching DNS and DHCP from outside the cluster.** The Route is for the UI
@@ -199,6 +322,105 @@ only: a Route carries HTTP and TLS, not DNS on 53 or DHCP on 67. Both need a
 `LoadBalancer` Service (MetalLB on bare metal), and DHCP also needs a relay or
 `hostNetwork`. See [Exposing DNS to clients](#exposing-dns-to-clients) and
 [Exposing DHCP to clients](#exposing-dhcp-to-clients).
+
+### Join an appliance agent node to a Helm or OpenShift control plane
+
+An OS appliance installed in the **agent role** (the installer's *Additional
+node*) can serve DNS and DHCP for a control plane that runs from this chart,
+on plain Kubernetes or on OpenShift. This was tested on OpenShift 4.22 with a
+1.0.0 chart and a 1.0.0 appliance: the appliance registered, took the
+`dns-bind9` and `dhcp` roles, answered a zone made on the control plane and
+handed out a relayed DHCP lease. Two steps below (2 and 3) are off by default
+on a Helm install, and skipping either leaves the appliance idle with no error
+in the UI, so do them in this order.
+
+1. **Make the API reachable from the appliance.** Expose the frontend with
+   the chart's Ingress (see [Exposing the UI](#exposing-the-ui)) or, on
+   OpenShift, the Route (`openshift.route.host`). The hostname must resolve
+   **from the appliance**: the installer's answer file has no hosts-entry
+   option, so use a real DNS name. For a lab, a nip.io-style name works with
+   no DNS server (`ddi.192.0.2.51.nip.io` resolves to `192.0.2.51`). The
+   default `*.apps-crc.testing` style names of OpenShift Local do not resolve
+   from another machine. The appliance needs outbound access to the host on
+   443, and the DNS and DHCP agents it runs reach the API through the same URL.
+
+2. **Turn on supervisor registration.** `supervisor_registration_enabled` is
+   **off** on a Helm control plane. While it is off the supervisor logs
+   `supervisor_registration_enabled=false` and idles, and nothing appears in
+   Fleet. Turn it on under **Appliance → Fleet → Pairing codes → Enable registration**, or:
+
+   ```bash
+   curl -sk -X PUT https://<host>/api/v1/settings \
+     -H "Authorization: Bearer <superadmin token>" \
+     -H "Content-Type: application/json" \
+     -d '{"supervisor_registration_enabled": true}'
+   ```
+
+3. **Make the DNS and DHCP agent keys reach the api and worker.** The chart
+   sets `DNS_AGENT_KEY` and `DHCP_AGENT_KEY` on the api and worker only while
+   `dnsAgents.enabled` / `dhcpAgents.enabled` is true. With them off, the
+   roles you assign later stay at `roles_awaiting_key` in the supervisor's
+   log and no role pod starts. Until [#4648](https://github.com/spatiumnorth/spatiumddi/issues/4648)
+   makes the keys an independent value, set both with an empty server list,
+   which injects the keys and starts **no** in-cluster agent pods:
+
+   ```yaml
+   # values.yaml
+   dnsAgents:
+     enabled: true
+     servers: []            # no in-cluster DNS agents
+     agentKey:
+       existingSecret: ddi-dns-agent-key   # or value: <random string>
+   dhcpAgents:
+     enabled: true
+     servers: []            # no in-cluster DHCP agents
+     agentKey:
+       existingSecret: ddi-dhcp-agent-key  # or value: <random string>
+   ```
+
+   Apply it with `helm upgrade`. The api and worker roll, and the supervisor
+   picks the keys up on its next heartbeat. This section will change when
+   #4648 lands.
+
+4. **Mint a pairing code.** In **Appliance → Fleet → Pairing codes** create a
+   code. Codes expire within 60 minutes at most, so mint it just before the
+   install.
+
+5. **Install the appliance in the agent role.** In the installer pick
+   *Additional node* and enter the control-plane URL (`https://<host>`, the
+   hostname from step 1) and the 8-digit code; see
+   [APPLIANCE_INSTALL.md](APPLIANCE_INSTALL.md#5-add-dns--dhcp-nodes). For an
+   unattended install, set `role: appliance`, `control_plane_url` and
+   `pairing_code` in the answer file
+   (`appliance/cloud-init/spatium-preseed-appliance.yaml.example`). The
+   supervisor is running about six minutes after boot.
+
+6. **Approve it and assign roles.** The node shows as *pending* in
+   **Appliance → Fleet**. Approve it, then assign `dns-bind9` and / or `dhcp`
+   with their server groups. Role pods start on the appliance within about a
+   minute, and each registers in its group.
+
+7. **Verify.**
+   - The Fleet row is approved and heartbeats about every 30 seconds.
+   - On the appliance, the role pods are running (`sudo k3s kubectl get pods -A`).
+   - Create a test zone with an A record in the DNS group and query the
+     appliance's own IP: `dig @<appliance-ip> www.test.example A`.
+   - Create a subnet, scope and pool in the DHCP group, send a relayed
+     request to the appliance (relay `giaddr` in that subnet) and check that
+     the lease appears in the control plane's lease list.
+
+**TLS.** The supervisor pins the certificate the control plane serves on first
+contact (`supervisor.tls.pinned_on_first_contact` in its log), and it does not
+match the hostname against it, so the router's default certificate works and
+no insecure flag is needed. Known caveat, tracked in
+[#4647](https://github.com/spatiumnorth/spatiumddi/issues/4647): the pin is
+not one the control plane's appliance CA vouches for, so the supervisor logs
+`supervisor.tls.pin_not_vouched` once after approval and everything still
+works, but Fleet cannot show that certificate's fingerprint for an
+out-of-band comparison, and after the router's certificate is replaced the
+supervisor may not re-pin on its own (re-pair the appliance if it loses
+contact).
+
 
 ---
 
@@ -316,6 +538,25 @@ externalRedis:
 
 ---
 
+### Joining appliance agent nodes (#4659)
+
+Appliance registration (`supervisor_registration_enabled`) is **off** on a
+Helm install, on OpenShift too. An appliance that joins with a pairing code
+while it is off cannot register and idles, with nothing in Fleet. Turn it on
+before the first pairing, either from the UI (**Appliance → Fleet → Pairing →
+Enable registration**) or at install time:
+
+```yaml
+supervisorRegistration:
+  initiallyEnabled: true
+```
+
+The value is read only when the settings row is first created, so it sets a
+fresh install's starting state and never overrides a later choice. Minting a
+pairing code while registration is off shows a warning in the UI and returns
+`warning` in the API response. Docker Compose has the same switch as
+`INITIAL_SUPERVISOR_REGISTRATION=true` in `.env`.
+
 ## 3. Managed DNS / DHCP agents
 
 The chart can optionally stand up one StatefulSet (+ Service) per managed DNS
@@ -367,8 +608,19 @@ Getting client traffic to them is different for the two services, and each
 has its own section below: [Exposing DNS to clients](#exposing-dns-to-clients)
 and [Exposing DHCP to clients](#exposing-dhcp-to-clients).
 
-Pre-create the bootstrap PSK Secrets (or use `agentKey.value` inline for lab
-use only):
+The agent keys do not depend on `dnsAgents.enabled` / `dhcpAgents.enabled`
+(#4648): the api and worker always carry `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`, so
+an appliance node can join a Helm control plane as a DNS or DHCP worker with no
+in-cluster agents. When you set neither `existingSecret` nor `value`, the chart
+generates a `<release>-agent-keys` Secret on first install, keeps it across
+upgrades and uninstalls (`helm.sh/resource-policy: keep`), and the in-cluster
+agents read the same Secret. Read the key to give an appliance with
+`kubectl get secret <release>-agent-keys -o jsonpath='{.data.DNS_AGENT_KEY}' | base64 -d`.
+A render with no cluster access (`helm template`, Argo CD / Flux) generates
+nothing, so pin the keys there with the settings below.
+
+To pin the keys, pre-create the bootstrap PSK Secrets (or use `agentKey.value`
+inline for lab use only):
 
 ```bash
 kubectl -n spatiumddi create secret generic spatium-dns-agent-key \
@@ -408,8 +660,8 @@ use the cluster's default StorageClass. Set it before the first install: claim
 templates are immutable, so Kubernetes refuses the change on a live
 StatefulSet, and a PVC that already exists keeps the class it was created with.
 On an existing install, `kubectl delete sts <name> -n <ns> --cascade=orphan`
-(pod and PVCs survive) and then upgrade or sync again; `helm upgrade` stops
-with that command when it detects the change. See the chart README,
+for each agent StatefulSet (pod and PVCs survive) and then upgrade or sync again; `helm upgrade` stops
+with one such command per StatefulSet when it detects the change. See the chart README,
 [Adopting `storageClass` on an existing install](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#adopting-storageclass-on-an-existing-install).
 
 Per-server entry fields (`name`, `role`, `group`, `storage.*`, `storageClass`,

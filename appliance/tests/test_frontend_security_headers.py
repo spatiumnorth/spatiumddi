@@ -113,7 +113,13 @@ def _https_server(path: Path) -> str:
 
 
 def _policy(path: Path, var: str = "spatium_csp") -> str:
-    match = re.search(rf'set \${var} "([^"]+)";', _text(path))
+    text = _text(path)
+    if var == "spatium_csp":
+        # A map, not a ``set`` (#4839): read before the rewrite phase too.
+        assert not re.search(rf"set \${var}\s", text), f"{path.name}: ${var} is a set"
+        _, entries = _map(text, var)
+        return entries["default"]
+    match = re.search(rf'set \${var} "([^"]+)";', text)
     assert match, f"{path.name}: no `set ${var}` policy"
     return match.group(1)
 

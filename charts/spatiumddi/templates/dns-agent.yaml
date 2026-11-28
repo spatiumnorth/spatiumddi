@@ -1,22 +1,11 @@
+{{- /* #4682 — one refusal for every agent StatefulSet whose claim class would change. */ -}}
+{{- include "spatiumddi.checkAgentClaimClasses" . -}}
 {{- if .Values.dnsAgents.enabled }}
 {{- $root := . -}}
 {{- /* #3209 — fail on two servers rendering one object name. */ -}}
 {{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dnsAgents.image.tag | default .Chart.AppVersion -}}
-{{- $secretName := .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) -}}
-{{- if and (not .Values.dnsAgents.agentKey.existingSecret) .Values.dnsAgents.agentKey.value }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $secretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") .) | nindent 4 }}
-type: Opaque
-stringData:
-  DNS_AGENT_KEY: {{ .Values.dnsAgents.agentKey.value | quote }}
----
-{{- end }}
+{{- $secretName := include "spatiumddi.dnsAgentKeySecret" . -}}
 {{- range $server := .Values.dnsAgents.servers }}
 {{- $flavor := $server.flavor | default "bind9" -}}
 {{- /* #1553 — refuse encrypted-transport ports the flavor cannot serve,
@@ -42,7 +31,6 @@ stringData:
 {{- end }}
 {{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dns-%s-%s" $flavor $server.name) "prefix" $root.Values.dnsAgents.prefixWithFullname) -}}
 {{- $storageClass := $server.storageClass | default $root.Values.dnsAgents.storageClass -}}
-{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 {{- /* Per-flavor image lookup (issue #127). dnsAgents.flavors.<flavor>
        optionally overrides repository + tag; missing keys (or the default
        bind9 case) fall back to the top-level dnsAgents.image. Same
@@ -53,6 +41,11 @@ stringData:
 {{- end -}}
 {{- $repo := $flavorImg.repository | default $root.Values.dnsAgents.image.repository -}}
 {{- $imgTag := $flavorImg.tag | default $tag -}}
+{{- /* #3913 — image.tagSuffix ("-ubi") picks the UBI build, which exists for
+       the BIND9 image only. */ -}}
+{{- if eq $flavor "bind9" -}}
+  {{- $imgTag = printf "%s%s" $imgTag ($root.Values.image.tagSuffix | default "") -}}
+{{- end -}}
 {{- /* Volume mount path for the driver's zone-state volume. BIND9 caches
        zone files under /var/cache/bind; PowerDNS LMDB lives at
        /var/lib/powerdns; Technitium's own config + zone store lives at
@@ -247,7 +240,7 @@ spec:
         resources:
           requests:
             storage: {{ (get ($server.storage | default dict) "dnsState") | default "2Gi" }}
----
+{{- "\n---\n" }}
 {{- $svc := $server.service | default dict -}}
 {{- /* #3229 — ClusterIP by default. A LoadBalancer default turns into a
        hostPort-53 svclb pod on every node under k3s's bundled servicelb,
@@ -313,7 +306,7 @@ spec:
     {{- with $server.doqPort }}
     - { name: dns-doq, port: {{ . }}, targetPort: {{ . }}, protocol: UDP }
     {{- end }}
----
+{{- "\n---\n" }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -339,6 +332,6 @@ spec:
     {{- with $server.doqPort }}
     - { name: dns-doq, port: {{ . }}, protocol: UDP }
     {{- end }}
----
+{{- "\n---\n" }}
 {{- end }}
 {{- end }}

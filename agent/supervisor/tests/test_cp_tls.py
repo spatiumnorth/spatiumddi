@@ -86,16 +86,20 @@ class CA:
     key: rsa.RSAPrivateKey
     pem: str
 
-    def sign_list(self, fingerprints: list[str], issued_at: datetime | None = None) -> dict[str, str]:
-        payload = json.dumps(
-            {
-                "version": 1,
-                "certs_sha256": fingerprints,
-                "issued_at": (issued_at or datetime.now(UTC)).isoformat(),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
+    def sign_list(
+        self,
+        fingerprints: list[str],
+        issued_at: datetime | None = None,
+        pems: list[str] | None = None,
+    ) -> dict[str, str]:
+        doc: dict[str, Any] = {
+            "version": 1,
+            "certs_sha256": fingerprints,
+            "issued_at": (issued_at or datetime.now(UTC)).isoformat(),
+        }
+        if pems is not None:
+            doc["certs_pem"] = pems
+        payload = json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
         sig = self.key.sign(
             payload,
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32),
@@ -381,6 +385,20 @@ def test_a_certificate_the_ca_does_not_vouch_for_is_refused(server, tmp_path: Pa
     assert cp_tls.load_pins(state) == before
 
 
+def test_a_refused_router_rotation_says_how_to_repin(server, tmp_path: Path) -> None:
+    """#4647: behind a router the CA never vouches for the new certificate;
+    the refusal must tell the operator the manual re-pin, not just stop."""
+    state = _pinned(server, tmp_path)
+    ca = _ca()
+    _approve(state, ca)
+    server.use(_leaf("router.example"))
+    server.pin_set = ca.sign_list([_leaf("control-plane.example").sha256])
+    with _capture() as logs:
+        assert cp_tls.try_repin(state, server.url) is False
+    assert [e["event"] for e in logs] == ["supervisor.tls.certificate_not_vouched"]
+    assert "control-plane.pem" in logs[0]["detail"]
+
+
 def test_a_list_signed_by_another_ca_is_refused(server, tmp_path: Path) -> None:
     """An interceptor can sign a list naming its own certificate; it cannot
     sign one with the appliance CA's key."""
@@ -447,7 +465,9 @@ def test_an_intercepted_first_contact_is_reported(server, tmp_path: Path) -> Non
     with _capture() as logs:
         cp_tls.check_pin_vouched_once(state, server.url)
     assert [e["event"] for e in logs] == ["supervisor.tls.pin_not_vouched"]
-    assert logs[0]["log_level"] == "error"
+    assert logs[0]["log_level"] == "warning"
+    # #4647: the line must name the router topology AND the interception case.
+    assert "Route" in logs[0]["detail"] and "intercepted" in logs[0]["detail"]
 
 
 # ── the signed list, on its own ──────────────────────────────────────────────
@@ -489,3 +509,213 @@ def _capture():  # type: ignore[no-untyped-def]
 
     return capture_logs()
 
+
+
+# ── keeping the pin current on the node-local http path (#4223) ──────────────
+
+
+class PlainControlPlane:
+    """An http control plane (the in-cluster api) serving a signed list."""
+
+    def __init__(self) -> None:
+        self.pin_set: dict[str, Any] | None = None
+        self.hits = 0
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == cp_tls.PIN_SET_PATH:
+                    outer.hits += 1
+                body = json.dumps(outer.pin_set or {}).encode()
+                self.send_response(200 if outer.pin_set is not None else 404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+
+@pytest.fixture
+def plain() -> Iterator[PlainControlPlane]:
+    srv = PlainControlPlane()
+    yield srv
+    srv.httpd.shutdown()
+    srv.httpd.server_close()
+
+
+def _stale_member(tmp_path: Path) -> tuple[Path, CA, Cert, Cert]:
+    state = _state(tmp_path)
+    ca = _ca()
+    _approve(state, ca)
+    stale, current = _leaf("first.example"), _leaf("formed.example")
+    cp_tls._save_pins(state, stale.pem)
+    return state, ca, stale, current
+
+
+def test_a_stale_pin_is_refreshed_without_any_https_failure(plain, tmp_path: Path) -> None:
+    state, ca, _stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    with _capture() as logs:
+        assert cp_tls.refresh_pin(state, plain.url) is True
+    assert cp_tls.cert_sha256(cp_tls.load_pins(state)) == current.sha256
+    assert [e["event"] for e in logs] == ["supervisor.tls.pin_refreshed"]
+
+
+def test_a_current_pin_is_not_rewritten(plain, tmp_path: Path) -> None:
+    state, ca, _stale, current = _stale_member(tmp_path)
+    cp_tls._save_pins(state, current.pem)
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    mtime = (state / "tls" / "control-plane.pem").stat().st_mtime_ns
+    with _capture() as logs:
+        assert cp_tls.refresh_pin(state, plain.url) is False
+    assert logs == []
+    assert (state / "tls" / "control-plane.pem").stat().st_mtime_ns == mtime
+
+
+@pytest.mark.parametrize("flaw", ["forged", "expired", "tampered"])
+def test_an_untrustworthy_list_changes_nothing(plain, tmp_path: Path, flaw: str) -> None:
+    state, ca, stale, current = _stale_member(tmp_path)
+    if flaw == "forged":
+        signed = _ca("Attacker CA").sign_list([current.sha256], pems=[current.pem])
+    elif flaw == "expired":
+        signed = ca.sign_list(
+            [current.sha256],
+            issued_at=datetime.now(UTC) - timedelta(days=3),
+            pems=[current.pem],
+        )
+    else:
+        signed = ca.sign_list([stale.sha256], pems=[stale.pem])
+        evil = json.loads(base64.b64decode(signed["payload"]))
+        evil["certs_sha256"], evil["certs_pem"] = [current.sha256], [current.pem]
+        signed["payload"] = base64.b64encode(json.dumps(evil).encode()).decode()
+    plain.pin_set = signed
+    with pytest.raises(cp_tls.PinSetError):
+        cp_tls.refresh_pin(state, plain.url)
+    assert cp_tls.load_pins(state) == stale.pem
+
+
+def test_an_old_format_list_changes_nothing(plain, tmp_path: Path) -> None:
+    state, ca, stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list([current.sha256])  # no certs_pem
+    assert cp_tls.refresh_pin(state, plain.url) is False
+    assert cp_tls.load_pins(state) == stale.pem
+
+
+def test_a_pem_that_is_not_the_listed_fingerprint_is_not_pinned(plain, tmp_path: Path) -> None:
+    state, ca, stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list(["aa" * 32], pems=[current.pem])
+    assert cp_tls.refresh_pin(state, plain.url) is False
+    assert cp_tls.load_pins(state) == stale.pem
+
+
+def test_refresh_is_throttled_and_never_raises(plain, tmp_path: Path) -> None:
+    state, ca, stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list([current.sha256], issued_at=datetime(2000, 1, 1, tzinfo=UTC))
+    cp_tls.refresh_pin_if_due(state, plain.url, now=1000.0)  # bad list: logged, not raised
+    assert plain.hits == 1
+    cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0)  # inside the retry window
+    assert plain.hits == 1
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    cp_tls.refresh_pin_if_due(state, plain.url, now=1000.0 + cp_tls.PIN_REFRESH_RETRY_S + 1)
+    assert cp_tls.cert_sha256(cp_tls.load_pins(state)) == current.sha256
+
+
+def test_an_https_control_plane_is_left_to_the_failure_path(server, tmp_path: Path) -> None:
+    state, ca, _stale, current = _stale_member(tmp_path)
+    server.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    assert cp_tls.refresh_pin(state, server.url) is False
+
+
+# ── a refresh that fails while the control plane is down is still owed (#4223) ──
+
+_DEAD_URL = "http://127.0.0.1:1"  # nothing listens: a connection-level failure
+
+
+def _events(logs) -> list[str]:
+    return [e["event"] for e in logs]
+
+
+def test_a_failed_refresh_is_retried_when_node_local_is_restored(plain, tmp_path: Path) -> None:
+    from spatium_supervisor import heartbeat
+
+    state, ca, _stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    with _capture() as logs:
+        cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)  # timed out / refused
+        assert cp_tls._state["pin_refresh_pending"] is not None
+        # Still inside the backoff: no attempt, even though the api is now up.
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0)
+        assert plain.hits == 0
+        # The node-local path coming back makes it due at once.
+        heartbeat._local_api["failures"] = 1
+        try:
+            heartbeat.note_local_api_result(heartbeat._IN_CLUSTER_NODE_LOCAL_URL, True)
+        finally:
+            heartbeat._local_api["failures"] = 0
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1002.0)
+    assert cp_tls.cert_sha256(cp_tls.load_pins(state)) == current.sha256
+    assert _events(logs) == [
+        "supervisor.tls.pin_refresh_failed",
+        "supervisor.control_plane.node_local_restored",
+        "supervisor.tls.pin_refreshed",
+    ]
+    assert cp_tls._state["pin_refresh_pending"] is None
+
+
+def test_a_repin_that_already_matches_satisfies_the_pending_refresh(plain, tmp_path: Path) -> None:
+    state, ca, _stale, current = _stale_member(tmp_path)
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    with _capture() as logs:
+        cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)
+        cp_tls._save_pins(state, current.pem)  # the reactive repin got there first
+        cp_tls.request_pin_refresh()
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0)
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0 + cp_tls.PIN_REFRESH_INTERVAL_S + 1)
+    assert _events(logs) == [
+        "supervisor.tls.pin_refresh_failed",
+        "supervisor.tls.pin_refresh_satisfied_by_repin",
+    ]
+    assert cp_tls._state["pin_refresh_pending"] is None
+
+
+def test_a_pending_refresh_still_replaces_a_pin_a_repin_left_older(plain, tmp_path: Path) -> None:
+    state, ca, _stale, current = _stale_member(tmp_path)
+    middle = _leaf("middle.example")
+    plain.pin_set = ca.sign_list([current.sha256], pems=[current.pem])
+    cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)
+    cp_tls._save_pins(state, middle.pem)  # a repin to a certificate since replaced again
+    cp_tls.request_pin_refresh()
+    with _capture() as logs:
+        cp_tls.refresh_pin_if_due(state, plain.url, now=1001.0)
+    assert cp_tls.cert_sha256(cp_tls.load_pins(state)) == current.sha256
+    assert _events(logs) == ["supervisor.tls.pin_refreshed"]
+
+
+def test_the_refresh_backoff_is_bounded_and_does_not_spin(tmp_path: Path) -> None:
+    state, _ca, _stale, _current = _stale_member(tmp_path)
+    t, attempts = 1000.0, []
+    for _ in range(600):  # ten minutes of one-second ticks against a dead api
+        before = cp_tls._state.get("pin_refresh_failures", 0)
+        cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=t)
+        if cp_tls._state.get("pin_refresh_failures", 0) != before:
+            attempts.append(t)
+        t += 1.0
+    gaps = [b - a for a, b in zip(attempts, attempts[1:], strict=False)]
+    assert gaps == sorted(gaps)  # backs off, never speeds up
+    assert max(gaps) <= cp_tls.PIN_REFRESH_RETRY_MAX_S
+    assert len(attempts) <= 12  # not one per tick
+
+
+def test_off_the_node_local_path_a_pending_refresh_stays_owed(tmp_path: Path) -> None:
+    state, _ca, _stale, _current = _stale_member(tmp_path)
+    cp_tls.refresh_pin_if_due(state, _DEAD_URL, now=1000.0)
+    cp_tls.refresh_pin_if_due(state, "https://127.0.0.1:1", now=1000.0 + 200)  # fallback path
+    assert cp_tls._state["pin_refresh_pending"] is not None

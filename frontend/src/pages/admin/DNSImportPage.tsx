@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useMutation, useQuery } from "@tanstack/react-query";
@@ -536,7 +537,10 @@ function WindowsDNSPullForm({
       </div>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div>
-          <label className="block text-sm font-medium">
+          <label
+            htmlFor="dnsimport-windows-dns-server"
+            className="block text-sm font-medium"
+          >
             Windows DNS server
           </label>
           <p className="mb-2 text-[11px] text-muted-foreground">
@@ -546,6 +550,7 @@ function WindowsDNSPullForm({
             out — open the DNS server modal to add them.
           </p>
           <select
+            id="dnsimport-windows-dns-server"
             value={state.serverId}
             onChange={(e) =>
               setState((s) => ({
@@ -595,7 +600,10 @@ function WindowsDNSPullForm({
         </div>
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">
+            <label
+              htmlFor="dnsimport-target-server-group"
+              className="block text-sm font-medium"
+            >
               Target server group
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
@@ -604,6 +612,7 @@ function WindowsDNSPullForm({
               different group (e.g., a staging group) for review.
             </p>
             <select
+              id="dnsimport-target-server-group"
               value={state.groupId}
               onChange={(e) =>
                 setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
@@ -620,10 +629,14 @@ function WindowsDNSPullForm({
           </div>
           {views.length > 0 && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="dnsimport-target-view-optional"
+                className="block text-sm font-medium"
+              >
                 Target view (optional)
               </label>
               <select
+                id="dnsimport-target-view-optional"
                 value={state.viewId}
                 onChange={(e) =>
                   setState((s) => ({ ...s, viewId: e.target.value }))
@@ -882,7 +895,12 @@ function CloudDNSPullForm({
       </div>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div>
-          <label className="block text-sm font-medium">Cloud DNS server</label>
+          <label
+            htmlFor="dnsimport-cloud-dns-server"
+            className="block text-sm font-medium"
+          >
+            Cloud DNS server
+          </label>
           <p className="mb-2 text-[11px] text-muted-foreground">
             Pick a registered cloud-driver DNS server (Cloudflare / Route 53 /
             Azure DNS / Google Cloud DNS) with provider credentials configured.
@@ -891,6 +909,7 @@ function CloudDNSPullForm({
             add them.
           </p>
           <select
+            id="dnsimport-cloud-dns-server"
             value={state.serverId}
             onChange={(e) =>
               setState((s) => ({
@@ -948,7 +967,10 @@ function CloudDNSPullForm({
         </div>
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">
+            <label
+              htmlFor="dnsimport-target-server-group-2"
+              className="block text-sm font-medium"
+            >
               Target server group
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
@@ -957,6 +979,7 @@ function CloudDNSPullForm({
               different group (e.g., a staging group) for review.
             </p>
             <select
+              id="dnsimport-target-server-group-2"
               value={state.groupId}
               onChange={(e) =>
                 setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
@@ -973,10 +996,14 @@ function CloudDNSPullForm({
           </div>
           {views.length > 0 && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="dnsimport-target-view-optional-2"
+                className="block text-sm font-medium"
+              >
                 Target view (optional)
               </label>
               <select
+                id="dnsimport-target-view-optional-2"
                 value={state.viewId}
                 onChange={(e) =>
                   setState((s) => ({ ...s, viewId: e.target.value }))
@@ -1222,13 +1249,19 @@ function PowerDNSPullForm({
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">API URL</label>
+            <label
+              htmlFor="dnsimport-api-url"
+              className="block text-sm font-medium"
+            >
+              API URL
+            </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
               Base URL of the PowerDNS Authoritative API. Example:{" "}
               <code>http://pdns.internal:8081</code>. Don't include the{" "}
               <code>/api/v1</code> suffix — we append it.
             </p>
             <input
+              id="dnsimport-api-url"
               value={state.apiUrl}
               onChange={(e) =>
                 setState((s) => ({
@@ -1242,13 +1275,19 @@ function PowerDNSPullForm({
             />
           </div>
           <div>
-            <label className="block text-sm font-medium">API key</label>
+            <label
+              htmlFor="dnsimport-api-key"
+              className="block text-sm font-medium"
+            >
+              API key
+            </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
               The PowerDNS <code className="text-[10px]">api-key</code> setting
               from <code>pdns.conf</code>. Read once and never persisted — if
               you re-import you'll re-paste.
             </p>
             <input
+              id="dnsimport-api-key"
               type="password"
               value={state.apiKey}
               onChange={(e) =>
@@ -1263,7 +1302,10 @@ function PowerDNSPullForm({
             />
           </div>
           <div>
-            <label className="block text-sm font-medium">
+            <label
+              htmlFor="dnsimport-server-name-optional"
+              className="block text-sm font-medium"
+            >
               Server name (optional)
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
@@ -1272,6 +1314,7 @@ function PowerDNSPullForm({
               your upstream is fronted by a multi-server API.
             </p>
             <input
+              id="dnsimport-server-name-optional"
               value={state.serverName}
               onChange={(e) =>
                 setState((s) => ({ ...s, serverName: e.target.value }))
@@ -1301,7 +1344,10 @@ function PowerDNSPullForm({
         </div>
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">
+            <label
+              htmlFor="dnsimport-target-server-group-3"
+              className="block text-sm font-medium"
+            >
               Target server group
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
@@ -1309,6 +1355,7 @@ function PowerDNSPullForm({
               registered server so the agent picks them up on its next sync.
             </p>
             <select
+              id="dnsimport-target-server-group-3"
               value={state.groupId}
               onChange={(e) =>
                 setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
@@ -1325,10 +1372,14 @@ function PowerDNSPullForm({
           </div>
           {views.length > 0 && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="dnsimport-target-view-optional-3"
+                className="block text-sm font-medium"
+              >
                 Target view (optional)
               </label>
               <select
+                id="dnsimport-target-view-optional-3"
                 value={state.viewId}
                 onChange={(e) =>
                   setState((s) => ({ ...s, viewId: e.target.value }))
@@ -1570,13 +1621,19 @@ function TechnitiumPullForm({
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">API URL</label>
+            <label
+              htmlFor="dnsimport-api-url-2"
+              className="block text-sm font-medium"
+            >
+              API URL
+            </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
               Base URL of the Technitium Authoritative API. Example:{" "}
               <code>http://pdns.internal:8081</code>. Don't include the{" "}
               <code>/api/v1</code> suffix — we append it.
             </p>
             <input
+              id="dnsimport-api-url-2"
               value={state.apiUrl}
               onChange={(e) =>
                 setState((s) => ({
@@ -1590,13 +1647,19 @@ function TechnitiumPullForm({
             />
           </div>
           <div>
-            <label className="block text-sm font-medium">API key</label>
+            <label
+              htmlFor="dnsimport-api-key-2"
+              className="block text-sm font-medium"
+            >
+              API key
+            </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
               The Technitium <code className="text-[10px]">api-key</code>{" "}
               setting from <code>pdns.conf</code>. Read once and never persisted
               — if you re-import you'll re-paste.
             </p>
             <input
+              id="dnsimport-api-key-2"
               type="password"
               value={state.apiToken}
               onChange={(e) =>
@@ -1633,7 +1696,10 @@ function TechnitiumPullForm({
         </div>
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">
+            <label
+              htmlFor="dnsimport-target-server-group-4"
+              className="block text-sm font-medium"
+            >
               Target server group
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
@@ -1641,6 +1707,7 @@ function TechnitiumPullForm({
               registered server so the agent picks them up on its next sync.
             </p>
             <select
+              id="dnsimport-target-server-group-4"
               value={state.groupId}
               onChange={(e) =>
                 setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
@@ -1657,10 +1724,14 @@ function TechnitiumPullForm({
           </div>
           {views.length > 0 && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="dnsimport-target-view-optional-4"
+                className="block text-sm font-medium"
+              >
                 Target view (optional)
               </label>
               <select
+                id="dnsimport-target-view-optional-4"
                 value={state.viewId}
                 onChange={(e) =>
                   setState((s) => ({ ...s, viewId: e.target.value }))
@@ -1720,7 +1791,12 @@ function UploadForm({
       </div>
       <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
         <div>
-          <label className="block text-sm font-medium">Archive</label>
+          <label
+            htmlFor="dnsimport-archive-file"
+            className="block text-sm font-medium"
+          >
+            Archive
+          </label>
           <p className="mb-2 text-[11px] text-muted-foreground">
             ZIP, .tar.gz, .tar.bz2, or .tar.xz. Max 50 MB. Must contain a
             named.conf plus all referenced zone files.
@@ -1738,6 +1814,7 @@ function UploadForm({
                 : "Choose archive…"}
             </span>
             <input
+              id="dnsimport-archive-file"
               type="file"
               accept=".zip,.tar,.tar.gz,.tgz,.tar.bz2,.tbz2,.tar.xz,.txz,application/zip,application/x-tar,application/gzip"
               className="sr-only"
@@ -1747,7 +1824,10 @@ function UploadForm({
         </div>
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">
+            <label
+              htmlFor="dnsimport-target-server-group-5"
+              className="block text-sm font-medium"
+            >
               Target server group
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
@@ -1755,6 +1835,7 @@ function UploadForm({
               registered server so the agent picks them up on its next sync.
             </p>
             <select
+              id="dnsimport-target-server-group-5"
               value={state.groupId}
               onChange={(e) =>
                 setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
@@ -1771,10 +1852,14 @@ function UploadForm({
           </div>
           {views.length > 0 && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="dnsimport-target-view-optional-5"
+                className="block text-sm font-medium"
+              >
                 Target view (optional)
               </label>
               <select
+                id="dnsimport-target-view-optional-5"
                 value={state.viewId}
                 onChange={(e) =>
                   setState((s) => ({ ...s, viewId: e.target.value }))
@@ -2007,7 +2092,8 @@ export function PreviewPanel({
                       {conflict ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
                           <AlertTriangle className="h-3 w-3" />
-                          conflicts ({conflict.existing_record_count} records)
+                          conflicts (
+                          {countNoun(conflict.existing_record_count, "record")})
                         </span>
                       ) : z.parse_warnings.length > 0 ? (
                         <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">

@@ -17,7 +17,8 @@ k8s/
 One StatefulSet per DHCP server row, matching the DNS-agent topology.
 
 ```bash
-# Create the agent PSK secret (must match DHCP_AGENT_KEY on the control plane)
+# Create the agent PSK secret (must match DHCP_AGENT_KEY on the control plane,
+# i.e. the `dhcp-agent-key` key of spatiumddi-secrets read by base/api.yaml + worker.yaml, #4648)
 kubectl create secret generic spatium-dhcp-agent-key \
   --from-literal=SPATIUM_AGENT_KEY=$(openssl rand -hex 32) \
   -n spatiumddi
@@ -480,6 +481,15 @@ scaling to zero and back, and restoring the previous replica count needs
 somewhere durable to remember it. See
 [`k8s/service-control/README.md`](service-control/README.md) for the
 scoping rationale.
+
+## Appliance registration (#4659)
+
+Appliance registration is off on a fresh install, so an appliance paired with a
+pairing code idles. To start a fresh install with it on, add
+`INITIAL_SUPERVISOR_REGISTRATION: "true"` to the `env` of the api and worker
+(the Helm chart sets it from `supervisorRegistration.initiallyEnabled`). It is
+read only when the settings row is first created; it never overrides a later
+choice in the UI.
 
 ## Image Tags
 

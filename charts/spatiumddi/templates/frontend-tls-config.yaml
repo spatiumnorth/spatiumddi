@@ -92,6 +92,14 @@ data:
         https "max-age=31536000";
     }
 
+    # The console policy is a map, not a ``set``: a ``set`` runs in the rewrite
+    # phase, so nginx's own 400 for a request whose headers it cannot parse
+    # (before that phase) went out with an empty policy and logged an
+    # uninitialized-variable warning (#4839). A map evaluates when read.
+    map "" $spatium_csp {
+        default "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
+    }
+
     # One server for both ports (was two, a :80 redirect-only block and
     # this one): the :80 listener has to serve the whole application for a
     # proxy that terminates TLS and talks http, and two copies of every
@@ -132,7 +140,6 @@ data:
         # them. nginx ``add_header`` does NOT inherit into a location that
         # declares its own, so every location below with an add_header
         # re-emits the set. Must not diverge from frontend/default.conf.template.
-        set $spatium_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
         # /api/redoc's policy (#1157): see ``location = /api/redoc``.
         set $spatium_redoc_csp "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.redoc.ly; font-src 'self'; connect-src 'self'; worker-src blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'";
         add_header Content-Security-Policy $spatium_csp always;

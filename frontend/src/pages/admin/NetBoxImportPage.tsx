@@ -299,7 +299,10 @@ export function NetBoxImportPage() {
 
         <div className="space-y-4">
           {state.error && (
-            <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive"
+            >
               <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
               <div className="break-all">{state.error}</div>
             </div>
@@ -434,12 +437,18 @@ function ConnectForm({
         {/* ── Connection ── */}
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">Base URL</label>
+            <label
+              htmlFor="net-box-import-base-url"
+              className="block text-sm font-medium"
+            >
+              Base URL
+            </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
               NetBox base URL — no <code>/api</code> suffix. Example:{" "}
               <code>https://netbox.internal:8080</code>.
             </p>
             <input
+              id="net-box-import-base-url"
               value={state.baseUrl}
               onChange={(e) =>
                 setState((s) => ({
@@ -453,13 +462,19 @@ function ConnectForm({
             />
           </div>
           <div>
-            <label className="block text-sm font-medium">API token</label>
+            <label
+              htmlFor="net-box-import-api-token"
+              className="block text-sm font-medium"
+            >
+              API token
+            </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
               NetBox API token (read-once; never persisted). Accepts the v1{" "}
               <code className="text-[10px]">Token</code> or v2{" "}
               <code className="text-[10px]">nbt_…</code> scheme.
             </p>
             <input
+              id="net-box-import-api-token"
               type="password"
               value={state.token}
               onChange={(e) =>
@@ -513,11 +528,20 @@ function ConnectForm({
         {/* ── Target + strategy ── */}
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">Space strategy</label>
+            <span
+              id="netbox-import-space-strategy"
+              className="block text-sm font-medium"
+            >
+              Space strategy
+            </span>
             <p className="mb-2 text-[11px] text-muted-foreground">
               How NetBox prefixes map onto SpatiumDDI IP spaces.
             </p>
-            <div className="space-y-2">
+            <div
+              role="radiogroup"
+              aria-labelledby="netbox-import-space-strategy"
+              className="space-y-2"
+            >
               <label className="flex items-start gap-2 text-xs">
                 <input
                   type="radio"
@@ -570,10 +594,14 @@ function ConnectForm({
 
           {state.spaceStrategy === "single" && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="net-box-import-target-ip-space"
+                className="block text-sm font-medium"
+              >
                 Target IP space
               </label>
               <select
+                id="net-box-import-target-ip-space"
                 value={state.targetSpaceId}
                 onChange={(e) =>
                   setState((s) => ({
@@ -605,8 +633,14 @@ function ConnectForm({
             </summary>
             <div className="mt-3 grid grid-cols-2 gap-2">
               <div>
-                <label className="block text-[11px] font-medium">VRF id</label>
+                <label
+                  htmlFor="net-box-import-vrf-id"
+                  className="block text-[11px] font-medium"
+                >
+                  VRF id
+                </label>
                 <input
+                  id="net-box-import-vrf-id"
                   type="number"
                   value={state.filters.vrf_id ?? ""}
                   onChange={(e) =>
@@ -619,10 +653,14 @@ function ConnectForm({
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium">
+                <label
+                  htmlFor="net-box-import-tenant-id"
+                  className="block text-[11px] font-medium"
+                >
                   Tenant id
                 </label>
                 <input
+                  id="net-box-import-tenant-id"
                   type="number"
                   value={state.filters.tenant_id ?? ""}
                   onChange={(e) =>
@@ -635,8 +673,14 @@ function ConnectForm({
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium">Status</label>
+                <label
+                  htmlFor="net-box-import-status"
+                  className="block text-[11px] font-medium"
+                >
+                  Status
+                </label>
                 <input
+                  id="net-box-import-status"
                   value={state.filters.status ?? ""}
                   onChange={(e) =>
                     setFilter({ status: e.target.value || null })
@@ -646,8 +690,14 @@ function ConnectForm({
                 />
               </div>
               <div>
-                <label className="block text-[11px] font-medium">Family</label>
+                <label
+                  htmlFor="net-box-import-family"
+                  className="block text-[11px] font-medium"
+                >
+                  Family
+                </label>
                 <select
+                  id="net-box-import-family"
                   value={state.filters.family ?? ""}
                   onChange={(e) =>
                     setFilter({
@@ -665,10 +715,14 @@ function ConnectForm({
                 </select>
               </div>
               <div className="col-span-2">
-                <label className="block text-[11px] font-medium">
+                <label
+                  htmlFor="net-box-import-within-cidr"
+                  className="block text-[11px] font-medium"
+                >
                   Within (CIDR)
                 </label>
                 <input
+                  id="net-box-import-within-cidr"
                   value={state.filters.within_include ?? ""}
                   onChange={(e) =>
                     setFilter({ within_include: e.target.value || null })

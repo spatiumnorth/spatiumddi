@@ -26,6 +26,7 @@ from app.core.permissions import require_permission
 from app.services.api_token_scopes import token_outbound
 from app.services.appliance.releases import (
     get_installed_version,
+    last_fetch_failure,
 )
 from app.services.appliance.releases import (
     list_releases as svc_list_releases,
@@ -49,6 +50,10 @@ class ReleaseInfo(BaseModel):
 class ReleasesResponse(BaseModel):
     installed_version: str
     releases: list[ReleaseInfo]
+    # Why the list is empty when the fetch failed: "unreachable" (no route
+    # to GitHub), "rate_limited" (a real 403 / 429) or "error". Null when
+    # the fetch worked. #4799
+    fetch_error: str | None = None
 
 
 @router.get(
@@ -62,6 +67,7 @@ async def list_releases() -> ReleasesResponse:
     rels = await svc_list_releases()
     return ReleasesResponse(
         installed_version=get_installed_version(),
+        fetch_error=last_fetch_failure(),
         releases=[
             ReleaseInfo(
                 tag=r.tag,

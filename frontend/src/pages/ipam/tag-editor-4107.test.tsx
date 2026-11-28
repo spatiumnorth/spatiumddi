@@ -141,7 +141,11 @@ describe("IPAM dialogs carry a tag editor (#4107)", () => {
       const createAddress = vi.fn((..._a: unknown[]) =>
         Promise.resolve({ id: "x", address: "10.0.0.9" }),
       );
-      answers.ipamApi = { createAddress };
+      answers.ipamApi = {
+        createAddress,
+        getEffectiveSubnetDns: () =>
+          Promise.resolve({ dns_group_ids: [], dns_zone_id: null }),
+      };
       open(
         <AddAddressModal
           subnetId="sn-1"
@@ -156,6 +160,16 @@ describe("IPAM dialogs carry a tag editor (#4107)", () => {
       fireEvent.change(screen.getByPlaceholderText("Required"), {
         target: { value: "h1" },
       });
+      // Allocate waits for the subnet's DNS to load (#4860).
+      await waitFor(() =>
+        expect(
+          (
+            screen.getByRole("button", {
+              name: /^Allocate/,
+            }) as HTMLButtonElement
+          ).disabled,
+        ).toBe(false),
+      );
       save(/^Allocate/);
       await waitFor(() => expect(createAddress).toHaveBeenCalled());
       expect(

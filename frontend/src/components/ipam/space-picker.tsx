@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatApiError, ipamApi, type IPSpace } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
+import { useFieldControl } from "@/components/ui/field";
 import { FormError } from "@/components/ui/form-error";
 
 // Dropdown + "+ New" shortcut used inside the integration-endpoint modals
@@ -26,22 +27,28 @@ export function IPSpacePicker({
   onChange: (id: string) => void;
   required?: boolean;
 }) {
-  const { data: spaces = [] } = useQuery<IPSpace[]>({
+  const { data: spaces = [], isPending } = useQuery<IPSpace[]>({
     queryKey: ["spaces"],
     queryFn: () => ipamApi.listSpaces(),
   });
   const [showCreate, setShowCreate] = useState(false);
+  const fieldControl = useFieldControl();
 
   return (
     <>
       <div className="flex items-center gap-1">
         <select
+          {...fieldControl}
           className={selectCls}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           required={required}
         >
           <option value="">— select —</option>
+          {/* A stored value stays selected until the list arrives. Without
+              this option the select reads "" and a required form refuses to
+              submit (#4419). */}
+          {isPending && value && <option value={value}>Loading…</option>}
           {spaces.map((s) => (
             <option key={s.id} value={s.id}>
               {s.name}
@@ -118,10 +125,14 @@ function QuickCreateSpaceModal({
     <Modal title="New IP Space" onClose={onClose}>
       <form onSubmit={submit} className="space-y-3">
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="space-picker-name"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="space-picker-name"
             className={selectCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -131,10 +142,14 @@ function QuickCreateSpaceModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="space-picker-description"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <input
+            id="space-picker-description"
             className={selectCls}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -142,9 +157,9 @@ function QuickCreateSpaceModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <span className="block text-xs font-medium text-muted-foreground">
             Color
-          </label>
+          </span>
           <SwatchPicker value={color} onChange={setColor} />
         </div>
         <p className="text-[11px] text-muted-foreground/70">

@@ -228,6 +228,11 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=False, server_default="false"
     )
 
+    # #4185 — BIND ``max-cache-size`` for each recursive view's cache (``64m``,
+    # ``512m``, ``1g``). NULL = the agent's own default. Validated by the
+    # server-group API; ``unlimited`` / ``0`` are never stored (#3565).
+    max_cache_size: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )
@@ -291,6 +296,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     # status: active | unreachable | syncing | error | disabled
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
+    # #4173 — set when the operator asked for the server to be deleted; the
+    # heavy cascade runs in a worker task (``dns_server_removal``). While set the
+    # row shows as "Removing…" and its agent is refused. Not ``status``: the
+    # heartbeat and health sweep rewrite that every cycle.
+    removing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -388,6 +398,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # a container with no limit at all. Only overwritten when a heartbeat
     # carries the field. Read by ``services/dns/memory_estimate``.
     memory_limit_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # #4193 — the agent's actual memory use as last reported on the heartbeat
+    # (``services/agents/memory_status``): container used / peak / limit and the
+    # daemon's and the agent's own RSS, plus ``reported_at``. NULL = never
+    # reported (an older agent, an agentless driver): UNKNOWN, never 0.
+    memory_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # ── #1067 daemon state ──
     #
@@ -1300,6 +1315,13 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     agentless_create_due_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # #1771 — ids (as strings) of the agentless servers where SpatiumDDI itself
+    # created this auto-generated zone (the provider create reported a change).
+    # Retiring the zone sends ``delete`` only to those: a same-named zone the
+    # operator already had on a server is not ours to delete. NULL (every zone
+    # that pre-dates the column) means none.
+    agentless_created_server_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     # Zone-level ACL overrides (inherit from server options if null)
     allow_query: Mapped[list | None] = mapped_column(JSONB, nullable=True)

@@ -34,7 +34,7 @@ def _superadmin_gate(user: User) -> dict[str, Any] | None:
         return {
             "error": (
                 "Redis diagnostics are restricted to superadmin users. "
-                "Ask your platform admin, or open Platform Insights → Redis."
+                "Ask your platform admin, or open Administration → Platform Insights → Redis."
             )
         }
     return None

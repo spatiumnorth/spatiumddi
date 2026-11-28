@@ -156,7 +156,10 @@ export function UnifiControllerDetailPage() {
                 : "never"}
             </p>
             {c.last_sync_error && (
-              <div className="mt-2 flex items-start gap-1 rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-xs text-destructive">
+              <div
+                role="alert"
+                className="mt-2 flex items-start gap-1 rounded border border-destructive/30 bg-destructive/5 px-2 py-1 text-xs text-destructive"
+              >
                 <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
                 <span className="break-all">{c.last_sync_error}</span>
               </div>
@@ -190,13 +193,16 @@ export function UnifiControllerDetailPage() {
             >
               Sync Now
             </HeaderButton>
-            <Link
-              to="/unifi"
-              className="inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs hover:bg-accent"
-              title="Edit on the UniFi list page"
-            >
-              <Pencil className="h-3 w-3" /> Edit
-            </Link>
+            {/* The list page's Edit takes a superadmin (#4588). */}
+            {!superadminGate.disabled && (
+              <Link
+                to="/unifi"
+                className="inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs hover:bg-accent"
+                title="Edit on the UniFi list page"
+              >
+                <Pencil className="h-3 w-3" /> Edit
+              </Link>
+            )}
           </div>
         </div>
         {testResult && (

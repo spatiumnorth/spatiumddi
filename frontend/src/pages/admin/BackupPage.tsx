@@ -18,6 +18,11 @@ import {
   type BackupManifestPreviewResponse,
   type BackupRestoreResponse,
 } from "@/lib/api";
+import {
+  markRestoreInFlight,
+  clearRestoreInFlight,
+} from "@/lib/restoreInFlight";
+import { FormError } from "@/components/ui/form-error";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { BackupTargetsSection } from "./BackupTargetsSection";
 import { FactoryResetSection } from "./FactoryResetSection";
@@ -300,9 +305,19 @@ function RestoreBackupCard() {
     },
   });
 
+  // A restore revokes every session (the restored auth tables replace the
+  // live ones), so this response may never arrive: the next call 401s and
+  // the page jumps to sign-in. The flag tells the sign-in page why, and the
+  // outcome is read back from the audit row after signing in (#4676).
+  const lastRestore = useQuery({
+    queryKey: ["backup", "last-restore"],
+    queryFn: () => backupApi.lastRestore(),
+    retry: false,
+  });
   const restoreMut = useMutation({
     mutationFn: () => {
       if (!file) throw new Error("no archive selected");
+      markRestoreInFlight();
       return backupApi.restore(
         file,
         passphrase,
@@ -310,7 +325,18 @@ function RestoreBackupCard() {
         mode === "selective" ? sections : undefined,
       );
     },
-    onSuccess: setOutcome,
+    onSuccess: (data) => {
+      clearRestoreInFlight();
+      setOutcome(data);
+    },
+    onError: (err: unknown) => {
+      // No response at all is the connection the restore itself cut, so the
+      // note stays. Any answer, a 401 included, means the restore did not run:
+      // a 401 on the POST is a session that ended BEFORE Apply.
+      const status = (err as { response?: { status?: number } })?.response
+        ?.status;
+      if (status) clearRestoreInFlight();
+    },
   });
 
   function onPickFile(f: File | null) {
@@ -364,7 +390,9 @@ function RestoreBackupCard() {
             {mode === "selective" ? (
               <>
                 Only the sections you tick below are replaced with what&rsquo;s
-                in the archive; the rest of the install is left as it is.
+                in the archive, along with every table in other sections that
+                references them (listed under the section picker); everything
+                else is left as it is.
               </>
             ) : (
               <>
@@ -403,9 +431,9 @@ function RestoreBackupCard() {
           </div>
         )}
         {previewError && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {previewError}
-          </div>
+          </FormError>
         )}
         {preview && <ManifestPreview preview={preview} />}
 
@@ -418,10 +446,10 @@ function RestoreBackupCard() {
           />
         )}
         {restoreRefused && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          <FormError className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             This archive cannot be restored:{" "}
             {preview?.restore_refusal ?? "the restore refuses it"}
-          </div>
+          </FormError>
         )}
         {selectiveBlockedByPlainFormat && (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
@@ -497,6 +525,16 @@ function RestoreBackupCard() {
         </div>
 
         {outcome && <RestoreResultCard outcome={outcome} />}
+        {!outcome && lastRestore.data && (
+          <RestoreResultCard
+            outcome={lastRestore.data}
+            heading={`Last restore, ${new Date(lastRestore.data.performed_at).toLocaleString()}${
+              lastRestore.data.performed_by
+                ? ` by ${lastRestore.data.performed_by}`
+                : ""
+            }`}
+          />
+        )}
       </form>
     </section>
   );
@@ -560,12 +598,18 @@ function Row({
   );
 }
 
-function RestoreResultCard({ outcome }: { outcome: BackupRestoreResponse }) {
+function RestoreResultCard({
+  outcome,
+  heading = "Restore complete",
+}: {
+  outcome: BackupRestoreResponse;
+  heading?: string;
+}) {
   const warnings = outcome.warnings ?? [];
   return (
     <div className="space-y-2">
       <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
-        <div className="mb-1 font-medium">Restore complete</div>
+        <div className="mb-1 font-medium">{heading}</div>
         <div className="space-y-0.5">
           <div>Duration: {outcome.duration_ms} ms</div>
           {outcome.pre_restore_safety_path && (

@@ -1,3 +1,5 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
+import { FreshEdit } from "@/components/FreshEdit";
 import { cloneElement, isValidElement, useId, useState } from "react";
 import {
   useInfiniteQuery,
@@ -17,6 +19,7 @@ import {
 } from "lucide-react";
 import {
   alertsApi,
+  formatApiError,
   type AlertParamSpec,
   type AlertRule,
   type AlertRuleTypeSpec,
@@ -356,8 +359,9 @@ export function RuleEditorModal({
           </p>
           <p className="text-[11px] text-muted-foreground/80">
             Fans out to every enabled target of the matching kind in Settings →
-            Audit Event Forwarding (webhook covers Slack / Teams / Discord chat
-            flavors automatically).
+            Audit Event Forwarding whose own minimum severity and resource type
+            filters accept the alert (webhook covers Slack / Teams / Discord
+            chat flavors automatically).
           </p>
           <label className="flex items-center gap-2 text-sm">
             <input
@@ -686,7 +690,10 @@ export function AlertsPage() {
                         />
                         {!ev.resolved_at && (
                           <button
-                            onClick={() => resolve.mutate(ev.id)}
+                            onClick={() => {
+                              armRemovalFocus();
+                              resolve.mutate(ev.id);
+                            }}
                             className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                             {...superadminGate}
                           >
@@ -725,6 +732,9 @@ export function AlertsPage() {
               {rulesError ? "not loaded" : `${rules.length} total`}
             </span>
           </div>
+          <FormError className="px-4 py-2 text-sm">
+            {del.error ? formatApiError(del.error, "Delete failed") : null}
+          </FormError>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-xs uppercase tracking-wider text-muted-foreground">
@@ -844,6 +854,7 @@ export function AlertsPage() {
                         </button>
                         <button
                           onClick={() => {
+                            del.reset();
                             if (confirm(`Delete rule "${r.name}"?`)) {
                               del.mutate(r.id);
                             }
@@ -871,10 +882,19 @@ export function AlertsPage() {
           />
         )}
         {editing && (
-          <RuleEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            queryKeys={[["alert-rules"]]}
+            title="Edit alert rule"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <RuleEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
       </div>
     </div>
