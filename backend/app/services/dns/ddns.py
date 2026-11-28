@@ -396,12 +396,12 @@ async def _ddns_records_current(
         cands = await load_reverse_candidates(db, subnet, group_ids)
         if cache is not None:
             cache.reverse[subnet.id] = cands
-    rev_zone = pick_reverse_zone(subnet, ip_obj, cands)
-    if rev_zone is None:
-        return True
     fwd_zone = await db.get(DNSZone, published.zone_id)
     if fwd_zone is None:
         return False
+    rev_zone = pick_reverse_zone(subnet, ip_obj, cands, fwd_zone.view_id)
+    if rev_zone is None:
+        return True
     rev_pointer_full = ip_obj.reverse_pointer + "."
     rev_zone_name = rev_zone.name.rstrip(".") + "."
     if rev_pointer_full == rev_zone_name:

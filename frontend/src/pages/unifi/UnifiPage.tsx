@@ -1,4 +1,7 @@
 import { useCredentialReask } from "@/hooks/useCredentialReask";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useModuleOn } from "@/hooks/useModuleOn";
 import { useState } from "react";
 import { Link } from "react-router-dom";
@@ -347,7 +350,16 @@ export function UnifiPage() {
 
       {showCreate && <ControllerModal onClose={() => setShowCreate(false)} />}
       {edit && (
-        <ControllerModal controller={edit} onClose={() => setEdit(null)} />
+        <FreshEdit
+          row={edit}
+          queryKeys={[["unifi-controllers"]]}
+          title="Edit UniFi Controller"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <ControllerModal controller={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
       )}
       {del && (
         <DeleteControllerModal
@@ -533,7 +545,12 @@ export function ControllerModal({
         if (apiKey) update.api_key = apiKey;
         if (username) update.username = username;
         if (password) update.password = password;
-        return unifiApi.updateController(controller!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(controller!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(controller!);
+        return unifiApi.updateController(controller!.id, body);
       }
       const create: UnifiControllerCreate = {
         name,
@@ -1043,28 +1060,6 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  className,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className={`space-y-1 ${className ?? ""}`}>
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function Toggle({
   label,

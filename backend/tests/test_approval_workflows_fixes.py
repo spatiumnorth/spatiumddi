@@ -197,6 +197,7 @@ async def test_delete_zone_apply_requires_superadmin_only_when_permanent(
     random id instead."""
     from fastapi import HTTPException
 
+    from app.services.ai.operations import OperationPermissionError
     from app.services.ai.operations_risky import DeleteZoneArgs, _apply_delete_zone
 
     nonadmin, _ = await _user(
@@ -205,9 +206,13 @@ async def test_delete_zone_apply_requires_superadmin_only_when_permanent(
         permissions=[{"action": "delete", "resource_type": "dns_zone"}],
     )
     args = DeleteZoneArgs(group_id=uuid.uuid4(), zone_id=uuid.uuid4(), permanent=permanent)
-    with pytest.raises(HTTPException) as ei:
+    # The permanent refusal is an OperationPermissionError (#4790): it leaves
+    # the request pending for a superadmin instead of ending it failed.
+    expected = OperationPermissionError if permanent else HTTPException
+    with pytest.raises(expected) as ei:
         await _apply_delete_zone(db_session, nonadmin, args)
-    assert ei.value.status_code == status
+    if not permanent:
+        assert ei.value.status_code == status
 
 
 @pytest.mark.asyncio
@@ -218,6 +223,7 @@ async def test_delete_scope_apply_requires_superadmin_only_when_permanent(
     """delete_scope.apply(): superadmin on the permanent branch only (#8, #1861)."""
     from fastapi import HTTPException
 
+    from app.services.ai.operations import OperationPermissionError
     from app.services.ai.operations_risky import DeleteScopeArgs, _apply_delete_scope
 
     nonadmin, _ = await _user(
@@ -226,16 +232,19 @@ async def test_delete_scope_apply_requires_superadmin_only_when_permanent(
         permissions=[{"action": "delete", "resource_type": "dhcp_scope"}],
     )
     args = DeleteScopeArgs(scope_id=uuid.uuid4(), permanent=permanent)
-    with pytest.raises(HTTPException) as ei:
+    # The permanent refusal is an OperationPermissionError (#4790): it leaves
+    # the request pending for a superadmin instead of ending it failed.
+    expected = OperationPermissionError if permanent else HTTPException
+    with pytest.raises(expected) as ei:
         await _apply_delete_scope(db_session, nonadmin, args)
-    assert ei.value.status_code == status
+    if not permanent:
+        assert ei.value.status_code == status
 
 
 @pytest.mark.asyncio
 async def test_delete_group_apply_requires_superadmin(db_session: AsyncSession) -> None:
     """delete_group.apply() requires superadmin always (#8)."""
-    from fastapi import HTTPException
-
+    from app.services.ai.operations import OperationPermissionError
     from app.services.ai.operations_risky import DeleteGroupArgs, _apply_delete_group
 
     nonadmin, _ = await _user(
@@ -244,9 +253,8 @@ async def test_delete_group_apply_requires_superadmin(db_session: AsyncSession) 
         permissions=[{"action": "delete", "resource_type": "dhcp_server_group"}],
     )
     args = DeleteGroupArgs(group_id=uuid.uuid4())
-    with pytest.raises(HTTPException) as ei:
+    with pytest.raises(OperationPermissionError):
         await _apply_delete_group(db_session, nonadmin, args)
-    assert ei.value.status_code == 403
 
 
 # ── #5: approval refused when the requester was deleted (requested_by NULL) ────

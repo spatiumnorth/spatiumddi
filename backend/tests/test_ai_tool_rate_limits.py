@@ -373,6 +373,7 @@ _SENDS_TRAFFIC_WITHOUT_A_BUDGET: dict[str, str] = {
     "find_services": "local Docker socket / Kubernetes API, superadmin",
     "find_upgrade_preflight": "in-cluster slot-image mirror, superadmin",
     "find_cluster_metrics": "in-cluster CoreDNS probe, superadmin",
+    "get_support_bundle_preview": "self-test asks the host's own resolvers (#4799), superadmin",
     "find_available_upgrade_images": "fixed release feed, superadmin",
     # A one-shot migration read of a source server the superadmin names;
     # its REST twin (/dns/import) carries no network-tool budget either.

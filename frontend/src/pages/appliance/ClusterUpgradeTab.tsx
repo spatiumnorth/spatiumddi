@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -196,15 +197,12 @@ function LeasePill({ lease }: { lease: UpgradeLeaseState | undefined }) {
   const qc = useQueryClient();
   const { isSuperadmin } = usePermissions();
   const [confirming, setConfirming] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const releaseMut = useMutation({
     mutationFn: clusterUpgradesApi.forceReleaseLease,
     onSuccess: () => {
-      setError(null);
+      setConfirming(false);
       qc.invalidateQueries({ queryKey: ["upgrades"] });
     },
-    onError: (err) => setError(formatApiError(err)),
-    onSettled: () => setConfirming(false),
   });
   if (!lease)
     return (
@@ -255,16 +253,17 @@ function LeasePill({ lease }: { lease: UpgradeLeaseState | undefined }) {
           Force release
         </button>
       ) : null}
-      {error ? (
-        <span className="text-xs text-red-700 dark:text-red-300">{error}</span>
-      ) : null}
       <ConfirmModal
         open={confirming}
         title="Force-release the upgrade Lease?"
         message="Only for a drive that died: its Lease would otherwise lapse on its own within 10 minutes. The server refuses while the holder still renews it. Releasing a live drive's Lease lets a second run drive the cluster beside it. Audited."
         confirmLabel="Force release"
         tone="destructive"
-        onClose={() => setConfirming(false)}
+        error={releaseMut.error ? formatApiError(releaseMut.error) : null}
+        onClose={() => {
+          setConfirming(false);
+          releaseMut.reset();
+        }}
         onConfirm={() => releaseMut.mutate()}
       />
     </span>
@@ -568,7 +567,10 @@ function PlanFormPanel() {
       </div>
 
       {planError ? (
-        <div className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+        <div
+          role="alert"
+          className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+        >
           {planError}
         </div>
       ) : null}
@@ -671,27 +673,24 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["upgrades"] });
       setActionError(null);
+      setHalting(false);
     },
-    onError: (err) => setActionError(`Halt failed: ${formatApiError(err)}`),
-    onSettled: () => setHalting(false),
   });
   const resumeMut = useMutation({
     mutationFn: () => clusterUpgradesApi.resume(run.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["upgrades"] });
       setActionError(null);
+      setResuming(false);
     },
-    onError: (err) => setActionError(`Resume failed: ${formatApiError(err)}`),
-    onSettled: () => setResuming(false),
   });
   const abortMut = useMutation({
     mutationFn: () => clusterUpgradesApi.abort(run.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["upgrades"] });
       setActionError(null);
+      setAborting(false);
     },
-    onError: (err) => setActionError(`Abort failed: ${formatApiError(err)}`),
-    onSettled: () => setAborting(false),
   });
   // #296 review fix — a ``planned`` run that the operator landed on
   // after refresh (the original PlanFormPanel start button is gone
@@ -783,7 +782,10 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
       </header>
 
       {actionError ? (
-        <div className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+        <div
+          role="alert"
+          className="mt-3 rounded-md border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+        >
           {actionError}
         </div>
       ) : null}
@@ -792,7 +794,7 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
         <div className="rounded-md border px-2 py-1.5">
           <div className="text-muted-foreground">Progress</div>
           <div className="font-mono">
-            {completedCount} / {planOrder.length} nodes
+            {completedCount} / {countNoun(planOrder.length, "node")}
           </div>
         </div>
         <div className="rounded-md border px-2 py-1.5">
@@ -826,7 +828,13 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
         title="Halt upgrade?"
         message="Halt pauses the current run between nodes. The currently-driving node finishes its step before pausing. Use Resume to continue."
         confirmLabel="Halt"
-        onClose={() => setHalting(false)}
+        error={
+          haltMut.error ? `Halt failed: ${formatApiError(haltMut.error)}` : null
+        }
+        onClose={() => {
+          setHalting(false);
+          haltMut.reset();
+        }}
         onConfirm={() => haltMut.mutate()}
       />
       <ConfirmModal
@@ -834,7 +842,15 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
         title="Resume upgrade?"
         message="Re-enqueues the orchestrator to pick up where it halted. Already-completed nodes are skipped."
         confirmLabel="Resume"
-        onClose={() => setResuming(false)}
+        error={
+          resumeMut.error
+            ? `Resume failed: ${formatApiError(resumeMut.error)}`
+            : null
+        }
+        onClose={() => {
+          setResuming(false);
+          resumeMut.reset();
+        }}
         onConfirm={() => resumeMut.mutate()}
       />
       <ConfirmModal
@@ -843,7 +859,15 @@ function ActiveRunPanel({ run }: { run: SystemUpgradeRun }) {
         message="Abort is terminal — no resume. The node in flight is not cut short: the drive finishes it, then stops, and holds the upgrade Lease until then, so a new run cannot start beside it. Leaves the cluster in whatever partial state the in-flight nodes ended in. Operator owns cleanup."
         confirmLabel="Abort"
         tone="destructive"
-        onClose={() => setAborting(false)}
+        error={
+          abortMut.error
+            ? `Abort failed: ${formatApiError(abortMut.error)}`
+            : null
+        }
+        onClose={() => {
+          setAborting(false);
+          abortMut.reset();
+        }}
         onConfirm={() => abortMut.mutate()}
       />
     </section>

@@ -10,6 +10,7 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 
+import { FreshEdit } from "@/components/FreshEdit";
 import { PeerFormModal, SessionsTab } from "./SessionsTab";
 import { RoutesTab } from "./RoutesTab";
 import { QueryTab } from "./QueryTab";
@@ -222,16 +223,39 @@ export function LookingGlassPage() {
         )}
       </div>
 
-      {showPeerModal && (
-        <PeerFormModal
-          existing={editingPeer}
-          collectors={collectors}
-          onClose={() => {
+      {showPeerModal &&
+        (() => {
+          const close = () => {
             setShowPeerModal(false);
             setEditingPeer(null);
-          }}
-        />
-      )}
+          };
+          return editingPeer ? (
+            <FreshEdit
+              row={editingPeer}
+              load={async () =>
+                (await lookingGlassApi.listPeers()).find(
+                  (p) => p.id === editingPeer.id,
+                )
+              }
+              title="Edit BGP peer"
+              onClose={close}
+            >
+              {(fresh) => (
+                <PeerFormModal
+                  existing={fresh}
+                  collectors={collectors}
+                  onClose={close}
+                />
+              )}
+            </FreshEdit>
+          ) : (
+            <PeerFormModal
+              existing={null}
+              collectors={collectors}
+              onClose={close}
+            />
+          );
+        })()}
     </div>
   );
 }

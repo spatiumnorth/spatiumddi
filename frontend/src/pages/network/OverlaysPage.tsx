@@ -1,3 +1,5 @@
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
@@ -173,7 +175,12 @@ export function OverlayEditorModal({
         status,
         notes,
       };
-      if (existing) return overlaysApi.update(existing.id, body);
+      if (existing) {
+        // Only what changed against the row read when the dialog opened (#4379).
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return overlaysApi.update(existing.id, changed);
+      }
       return overlaysApi.create(body as OverlayCreate);
     },
     onSuccess: () => {
@@ -193,10 +200,14 @@ export function OverlayEditorModal({
     >
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div className="sm:col-span-2">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlays-name"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="overlays-name"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -205,10 +216,14 @@ export function OverlayEditorModal({
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlays-kind"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Kind
           </label>
           <select
+            id="overlays-kind"
             className={inputCls}
             value={kind}
             onChange={(e) => setKind(e.target.value as OverlayKind)}
@@ -222,10 +237,14 @@ export function OverlayEditorModal({
         </div>
         {own.customer && (
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="overlays-customer-optional"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Customer (optional)
             </label>
             <select
+              id="overlays-customer-optional"
               className={inputCls}
               value={customerId ?? ""}
               onChange={(e) => setCustomerId(e.target.value || null)}
@@ -244,10 +263,14 @@ export function OverlayEditorModal({
           </div>
         )}
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlays-vendor"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Vendor
           </label>
           <input
+            id="overlays-vendor"
             className={inputCls}
             value={vendor}
             onChange={(e) => setVendor(e.target.value)}
@@ -265,10 +288,14 @@ export function OverlayEditorModal({
           </p>
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlays-default-path-strategy"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Default path strategy
           </label>
           <select
+            id="overlays-default-path-strategy"
             className={inputCls}
             value={strategy}
             onChange={(e) => setStrategy(e.target.value as OverlayPathStrategy)}
@@ -284,10 +311,14 @@ export function OverlayEditorModal({
           </p>
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlays-status"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Status
           </label>
           <select
+            id="overlays-status"
             className={inputCls}
             value={status}
             onChange={(e) => setStatus(e.target.value as OverlayStatus)}
@@ -300,10 +331,14 @@ export function OverlayEditorModal({
           </select>
         </div>
         <div className="sm:col-span-2">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlays-encryption-profile"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Encryption profile
           </label>
           <input
+            id="overlays-encryption-profile"
             className={inputCls}
             value={encryptionProfile}
             onChange={(e) => setEncryptionProfile(e.target.value)}
@@ -314,10 +349,14 @@ export function OverlayEditorModal({
           </p>
         </div>
         <div className="sm:col-span-2">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="overlays-notes"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Notes
           </label>
           <textarea
+            id="overlays-notes"
             className={cn(inputCls, "min-h-[80px]")}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
@@ -712,10 +751,19 @@ export function OverlaysPage() {
           />
         )}
         {editing && (
-          <OverlayEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            load={() => overlaysApi.get(editing.id)}
+            title="Edit overlay"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <OverlayEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

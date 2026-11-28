@@ -1,4 +1,6 @@
 import { ListEmpty } from "@/components/ui/list-read-error";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
@@ -75,7 +77,7 @@ function ProviderEditorModal({
     mutationFn: async () => {
       if (!name.trim()) throw new Error("Name is required");
       if (existing) {
-        const body: ProviderUpdate = {
+        const full: ProviderUpdate = {
           name,
           kind,
           account_number: accountNumber || null,
@@ -84,6 +86,10 @@ function ProviderEditorModal({
           default_asn_id: defaultAsnId || null,
           notes,
         };
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const body = changedFields(existing, full);
+        if (Object.keys(body).length === 0) return Promise.resolve(existing);
         return providersApi.update(existing.id, body);
       }
       const body: ProviderCreate = {
@@ -115,10 +121,14 @@ function ProviderEditorModal({
       <div className="space-y-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div className="space-y-1 sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="providers-name"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Name
             </label>
             <input
+              id="providers-name"
               className={inputCls}
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -127,10 +137,14 @@ function ProviderEditorModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="providers-kind"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Kind
             </label>
             <select
+              id="providers-kind"
               className={inputCls}
               value={kind}
               onChange={(e) => setKind(e.target.value as ProviderKind)}
@@ -143,10 +157,14 @@ function ProviderEditorModal({
             </select>
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="providers-account-number"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Account number
             </label>
             <input
+              id="providers-account-number"
               className={inputCls}
               value={accountNumber}
               onChange={(e) => setAccountNumber(e.target.value)}
@@ -154,20 +172,28 @@ function ProviderEditorModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="providers-contact-email"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Contact email
             </label>
             <input
+              id="providers-contact-email"
               className={inputCls}
               value={email}
               onChange={(e) => setEmail(e.target.value)}
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="providers-contact-phone"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Contact phone
             </label>
             <input
+              id="providers-contact-phone"
               className={inputCls}
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
@@ -213,10 +239,14 @@ function ProviderEditorModal({
             </p>
           </div>
           <div className="space-y-1 sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="providers-notes"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Notes
             </label>
             <textarea
+              id="providers-notes"
               className={cn(inputCls, "min-h-[80px]")}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
@@ -573,10 +603,19 @@ export function ProvidersPage() {
           />
         )}
         {editing && (
-          <ProviderEditorModal
-            existing={editing}
+          <FreshEdit
+            row={editing}
+            queryKeys={[["providers", search, kindFilter]]}
+            title="Edit Provider"
             onClose={() => setEditing(null)}
-          />
+          >
+            {(fresh) => (
+              <ProviderEditorModal
+                existing={fresh}
+                onClose={() => setEditing(null)}
+              />
+            )}
+          </FreshEdit>
         )}
         <ConfirmModal
           open={confirm !== null}

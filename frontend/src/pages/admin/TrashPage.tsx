@@ -18,6 +18,11 @@ import { Modal } from "@/components/ui/modal";
 import { cascadeList } from "@/lib/delete-cascade";
 import { invalidateAfterTrashChange } from "@/lib/trash-invalidate";
 import { ListReadError } from "@/components/ui/list-read-error";
+import {
+  APPROVAL_QUEUED_MESSAGE,
+  CHANGE_REQUEST_QUERY_KEY,
+  handleApprovalQueued,
+} from "@/lib/approvalQueue";
 
 const TYPE_LABELS: Record<TrashEntryType, string> = {
   ip_space: "IP Space",
@@ -311,9 +316,17 @@ function ConfirmPermanentDeleteModal({
 }) {
   const qc = useQueryClient();
   const [error, setError] = useState<string | null>(null);
+  const [queued, setQueued] = useState(false);
   const mut = useMutation({
     mutationFn: () => trashApi.permanentDelete(entry.type, entry.id),
-    onSuccess: () => {
+    onSuccess: (resp) => {
+      // A matching delete approval policy queues the purge (202): say so and
+      // keep the dialog open, or the press looks as if it did nothing.
+      if (handleApprovalQueued(resp)) {
+        setQueued(true);
+        qc.invalidateQueries({ queryKey: CHANGE_REQUEST_QUERY_KEY });
+        return;
+      }
       invalidateAfterTrashChange(qc);
       onClose();
     },
@@ -346,23 +359,34 @@ function ConfirmPermanentDeleteModal({
             {error}
           </p>
         )}
+        {queued && (
+          <p
+            role="status"
+            className="rounded bg-amber-500/15 p-2 text-xs text-amber-800 dark:text-amber-200"
+          >
+            {APPROVAL_QUEUED_MESSAGE} It stays in the Trash until the request is
+            approved in Administration, Change Requests.
+          </p>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
             className="rounded-md border px-3 py-1.5 text-sm"
           >
-            Cancel
+            {queued ? "Close" : "Cancel"}
           </button>
-          <button
-            onClick={() => {
-              setError(null);
-              mut.mutate();
-            }}
-            disabled={mut.isPending}
-            className="rounded-md bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700 disabled:opacity-50"
-          >
-            {mut.isPending ? "Deleting…" : "Delete permanently"}
-          </button>
+          {!queued && (
+            <button
+              onClick={() => {
+                setError(null);
+                mut.mutate();
+              }}
+              disabled={mut.isPending}
+              className="rounded-md bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              {mut.isPending ? "Deleting…" : "Delete permanently"}
+            </button>
+          )}
         </div>
       </div>
     </Modal>
@@ -401,6 +425,9 @@ export function TrashPage() {
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["trash", params],
     queryFn: () => trashApi.list(params),
+    // A delete on any other page adds a row here without touching this cache
+    // (#4872): read every time the page opens, not only once 30 s have passed.
+    refetchOnMount: "always",
   });
 
   const items = data?.items ?? [];
@@ -432,8 +459,14 @@ export function TrashPage() {
 
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2">
-            <label className="text-xs text-muted-foreground">Type</label>
+            <label
+              htmlFor="trash-type"
+              className="text-xs text-muted-foreground"
+            >
+              Type
+            </label>
             <select
+              id="trash-type"
               className="rounded-md border bg-background px-2 py-1 text-sm"
               value={filterType}
               onChange={(e) => {
@@ -450,8 +483,14 @@ export function TrashPage() {
             </select>
           </div>
           <div className="flex items-center gap-2">
-            <label className="text-xs text-muted-foreground">Since</label>
+            <label
+              htmlFor="trash-since"
+              className="text-xs text-muted-foreground"
+            >
+              Since
+            </label>
             <input
+              id="trash-since"
               type="datetime-local"
               value={filterSince}
               onChange={(e) => {

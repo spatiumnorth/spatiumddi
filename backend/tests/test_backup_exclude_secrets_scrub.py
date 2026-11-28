@@ -66,6 +66,7 @@ _NOT_SECRETS: dict[tuple[str, str], str] = {
     ("acme_http_challenge", "key_authorization"): "HTTP-01 response, served publicly",
     ("appliance", "public_key_der"): "public key",
     ("appliance", "public_key_fingerprint"): "digest of a public key",
+    ("appliance", "roles_awaiting_key"): "role names held back for a missing agent key",
     ("audit_chain_checkpoint", "verified_hash"): "audit chain digest at the checkpoint",
     ("audit_log", "row_hash"): "audit chain digest",
     ("audit_log", "prev_hash"): "audit chain digest",

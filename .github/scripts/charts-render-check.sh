@@ -182,6 +182,8 @@ render() { # name chart [helm --set args...]
         -cache "$KUBECONFORM_CACHE" \
         "$file" || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
+    # #4648 — a repeated env name renders fine and is refused at apply time.
+    python3 "$ROOT/.github/scripts/chart-env-unique.py" "$file" || failures=$((failures + 1))
     # #1042 — a generated credential Secret must carry resource-policy: keep,
     # checked on the RENDER so a value typo or a false condition cannot hide it.
     python3 "$ROOT/.github/scripts/chart-credential-secrets-kept.py" "$file" \
@@ -305,6 +307,25 @@ lint "$UMBRELLA"
 lint "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA_AUTH[@]}"
+# #4278 — ``helm lint`` parses each template's raw output as ONE YAML stream,
+# which ``helm template`` / ``helm install`` do not: a ``---`` glued to the next
+# object's ``apiVersion`` by ``{{-`` trimming installs fine and fails lint. It
+# only shows with a server listed (a loop body) and a generated agent-key Secret
+# (the first ``---``), which none of the lints above set, and Red Hat's
+# chart-verifier lints with whatever values it is given. So lint with DNS +
+# DHCP servers and both keys, plainly and with the OpenShift set.
+UMBRELLA_LINT_SERVERS=(
+    --set dnsAgents.enabled=true
+    --set dnsAgents.agentKey.value=lint-key
+    --set dnsAgents.servers[0].name=ns1
+    --set dnsAgents.servers[1].name=ns2
+    --set dhcpAgents.enabled=true
+    --set dhcpAgents.agentKey.value=lint-key
+    --set dhcpAgents.servers[0].name=dhcp1
+    --set dhcpAgents.servers[1].name=dhcp2
+)
+lint "$UMBRELLA" "${UMBRELLA_LINT_SERVERS[@]}"
+lint "$UMBRELLA" "${UMBRELLA_LINT_SERVERS[@]}" --set global.platform=openshift
 render umbrella-defaults "$UMBRELLA"
 render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
@@ -354,11 +375,87 @@ render umbrella-openshift-no-scc "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
     --set openshift.scc.create=false \
     --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
     --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
+# #3913 — a render with DHCP off hostNetwork, to compare the shipped static SCC
+# manifests (the option for clusters whose admins manage SCCs) with.
+render umbrella-openshift-scc-plain "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1
 # #3907 — the pre-upgrade hook Job is only rendered with --is-upgrade; check it
 # here too (no pinned uid, its ServiceAccount exists).
 render umbrella-openshift-upgrade "$UMBRELLA" --is-upgrade "${UMBRELLA_OPENSHIFT[@]}"
+# #3913 — the certified profile: the -ubi image variants and Red Hat's own
+# PostgreSQL / Redis from registry.redhat.io. Rendered with the agents on (they
+# carry the other two -ubi tags) and Redis auth on (the rhel flavor passes the
+# password through REDIS_PASSWORD, not a command line).
+render umbrella-openshift-certified "$UMBRELLA" "${UMBRELLA_OPENSHIFT_API[@]}" \
+    --set dnsAgents.enabled=true --set dnsAgents.servers[0].name=ns1 \
+    --set dhcpAgents.enabled=true --set dhcpAgents.servers[0].name=dhcp1 \
+    --set dhcpAgents.servers[0].hostNetwork=true \
+    --set ingress.enabled=true \
+    -f "$UMBRELLA/values-openshift-certified.yaml" \
+    --set redis.auth.enabled=true
+echo "── OpenShift: static SCC manifests equal the chart's rendered SCCs (#3913)"
+python3 "$ROOT/.github/scripts/chart-openshift-scc-files.py" \
+    "$ROOT/charts/spatiumddi/files/openshift" \
+    "$OUT/umbrella-openshift-scc-plain.yaml" "$OUT/umbrella-openshift.yaml" \
+    || failures=$((failures + 1))
+# The certified profile lets the chart create the agents' SCCs (Red Hat accepts
+# SCCs in a certified chart): both agent kinds' SCCs must be in its render.
+for kind in dns-agent dhcp-agent; do
+    if ! grep -qE "^  name: [a-z0-9-]+-$kind$" "$OUT/umbrella-openshift-certified.yaml" \
+            || ! grep -qE '^kind: SecurityContextConstraints$' "$OUT/umbrella-openshift-certified.yaml"; then
+        echo "   FAIL #3913: the certified profile renders no $kind SCC" >&2
+        failures=$((failures + 1))
+    fi
+done
+echo "── OpenShift certified profile: -ubi tags, Red Hat PostgreSQL / Redis (#3913)"
+CERT="$OUT/umbrella-openshift-certified.yaml"
+for img in spatiumddi-api spatiumddi-frontend dns-bind9 dhcp-kea; do
+    if ! grep -qE "image: \"?ghcr\.io/[a-z]+/$img:[^\" ]+-ubi\"?$" "$CERT"; then
+        echo "   FAIL #3913: the certified profile renders no $img:<version>-ubi image" >&2
+        failures=$((failures + 1))
+    fi
+done
+if grep -E "image: \"?ghcr\.io/[a-z]+/(spatiumddi-api|spatiumddi-frontend|dns-bind9|dhcp-kea):" "$CERT" \
+        | grep -qv -- '-ubi'; then
+    echo "   FAIL #3913: the certified profile renders a non-UBI image of the four" >&2
+    failures=$((failures + 1))
+fi
+for ref in registry.redhat.io/rhel9/postgresql-16 registry.redhat.io/rhel9/redis-7; do
+    if ! grep -q "image: \"$ref:" "$CERT"; then
+        echo "   FAIL #3913: the certified profile does not run $ref" >&2
+        failures=$((failures + 1))
+    fi
+done
+if ! grep -q 'name: POSTGRESQL_PASSWORD' "$CERT" || grep -q 'name: PGDATA$' "$CERT"; then
+    echo "   FAIL #3913: the rhel PostgreSQL flavor must set POSTGRESQL_* and not the official image's PGDATA" >&2
+    failures=$((failures + 1))
+fi
+if grep -Eq '^ +- .*aof-load-corrupt-tail-max-size' "$CERT"; then
+    echo "   FAIL #3913: Redis 7 (rhel flavor) does not know aof-load-corrupt-tail-max-size" >&2
+    failures=$((failures + 1))
+fi
+# The rhel images start through their own command (run-postgresql / run-redis);
+# args replace it, so it must come first or the entrypoint execs the first
+# argument and the pod crash-loops (found on OpenShift Local, 15 Nov 2026).
+for cmd in run-postgresql run-redis; do
+    if ! grep -Eq "^ +- $cmd\$" "$CERT"; then
+        echo "   FAIL #3913: the rhel flavor's args do not start with $cmd" >&2
+        failures=$((failures + 1))
+    fi
+done
 echo "── OpenShift: no pinned uid / fsGroup, Route + SCCs present (#3852)"
 python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc "$OUT/umbrella-openshift.yaml" \
+    || failures=$((failures + 1))
+# The certified render creates the agents' SCCs through the chart.
+python3 "$ROOT/.github/scripts/chart-openshift.py" --require-scc \
+    "$OUT/umbrella-openshift-certified.yaml" \
+    || failures=$((failures + 1))
+# scc.create=false (admin-managed SCCs): no SCC in the render, the shipped static
+# ones stand in for them.
+python3 "$ROOT/.github/scripts/chart-openshift.py" \
+    --external-sccs "$ROOT/charts/spatiumddi/files/openshift" \
+    "$OUT/umbrella-openshift-no-scc.yaml" \
     || failures=$((failures + 1))
 python3 "$ROOT/.github/scripts/chart-openshift.py" \
     "$OUT/umbrella-openshift-ha.yaml" "$OUT/umbrella-openshift-defaults.yaml" \
@@ -912,7 +1009,9 @@ render umbrella-shared-env "$UMBRELLA" \
     --set sharedEnv[1].name=APPLIANCE_HOSTNAME --set sharedEnv[1].value=node1 \
     --set sharedEnv[2].name=APPLIANCE_HOST_IPS --set sharedEnv[2].value=10.0.0.1 \
     --set sharedEnv[3].name=INITIAL_NTP_SERVERS --set sharedEnv[3].value=ntp.example \
-    --set-string applianceVersion=0.0.0-nightly-20261019+abcdef1
+    --set-string applianceVersion=0.0.0-nightly-20261019+abcdef1 \
+    --set-string dnsAgents.agentKey.value=appliance-dns-key \
+    --set-string dhcpAgents.agentKey.value=appliance-dhcp-key
 echo "── shared env (umbrella, #1826, #2176)"
 python3 "$ROOT/.github/scripts/chart-shared-env.py" \
     --expect VERSION --expect SECRET_KEY --expect DATABASE_URL --expect REDIS_URL \
@@ -922,9 +1021,50 @@ python3 "$ROOT/.github/scripts/chart-shared-env.py" \
     --expect-on api:SLOT_IMAGE_MIRROR_URL --expect-on api:SLOT_IMAGE_MIRROR_SECRET \
     --expect-on worker:SLOT_IMAGE_MIRROR_URL --expect-on worker:SLOT_IMAGE_MIRROR_SECRET \
     --absent beat:SLOT_IMAGE_MIRROR_SECRET \
+    --expect-on api:DNS_AGENT_KEY --expect-on api:DHCP_AGENT_KEY \
+    --expect-on worker:DNS_AGENT_KEY --expect-on worker:DHCP_AGENT_KEY \
     --absent slot-image-mirror:APPLIANCE_MODE \
     --absent slot-image-mirror:SLOT_IMAGE_MIRROR_URL \
     "$OUT/umbrella-shared-env.yaml" || failures=$((failures + 1))
+# #4648 — that render has dnsAgents / dhcpAgents off, yet the api and worker
+# carry both agent keys (an appliance agent node joins with them).
+# The appliance hands the chart its own keys as agentKey.value (#4648): api
+# and worker read them from the one Secret the value renders, not from an
+# inline api.env copy, and no container lists a name twice.
+echo "── appliance agent keys: one source (#4648)"
+python3 - "$OUT/umbrella-shared-env.yaml" <<'PYEOF' || failures=$((failures + 1))
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+secrets = {d["metadata"]["name"]: d.get("stringData", {}) for d in docs if d["kind"] == "Secret"}
+bad = 0
+for comp in ("api", "worker"):
+    for d in docs:
+        if d["kind"] != "Deployment" or d["metadata"]["labels"].get("app.kubernetes.io/component") != comp:
+            continue
+        c = next(c for c in d["spec"]["template"]["spec"]["containers"] if c["name"] == comp)
+        for name, key, want in (("DNS_AGENT_KEY", "DNS_AGENT_KEY", "appliance-dns-key"),
+                                ("DHCP_AGENT_KEY", "SPATIUM_AGENT_KEY", "appliance-dhcp-key")):
+            ref = [e["valueFrom"]["secretKeyRef"] for e in c["env"] if e["name"] == name]
+            if len(ref) != 1 or secrets.get(ref[0]["name"], {}).get(key) != want:
+                print(f"FAIL: {comp} {name} does not read the appliance's value: {ref}", file=sys.stderr)
+                bad = 1
+sys.exit(bad)
+PYEOF
+python3 "$ROOT/.github/scripts/chart-env-unique.py" "$OUT/umbrella-shared-env.yaml" \
+    || failures=$((failures + 1))
+# Negative control: the appliance's old inline api.env copy must be refused.
+echo "── negative control: a repeated env name must fail"
+# (helm directly, not render(): render() would count the refusal as a failure.)
+helm template dup-env "$UMBRELLA" --kube-version "$K8S_VERSION" \
+    --set api.env[0].name=DNS_AGENT_KEY --set-string api.env[0].value=x \
+    > "$OUT/umbrella-dup-env.yaml"
+dup_out=$(python3 "$ROOT/.github/scripts/chart-env-unique.py" "$OUT/umbrella-dup-env.yaml" 2>&1 || true)
+if ! grep -q "env DNS_AGENT_KEY listed 2 times" <<<"$dup_out"; then
+    echo "   FAIL: chart-env-unique.py did not refuse a duplicated DNS_AGENT_KEY" >&2
+    failures=$((failures + 1))
+else
+    echo "   ok: duplicated env name refused"
+fi
 # Negative control: a worker without the variable must be refused, or the
 # guard above could be passing on a render it cannot read.
 echo "── negative control: a worker missing a shared variable must fail"
@@ -991,6 +1131,13 @@ render umbrella-posture-ha "$UMBRELLA" "${UMBRELLA_POSTURE[@]}" "${UMBRELLA_HA[@
 echo "── CNPG WAL budget (umbrella, #2317)"
 python3 "$ROOT/.github/scripts/chart-cnpg-recovery.py" --require-cluster \
     "$OUT/umbrella-ha.yaml" "$OUT/umbrella-posture-ha.yaml" || failures=$((failures + 1))
+# #4610: the app role is in pg_monitor by default, so the rolling-upgrade
+# preflight can read each standby's streaming state and lag.
+echo "── CNPG app role is granted pg_monitor by default (#4610)"
+if ! grep -A3 'inRoles:' "$OUT/umbrella-ha.yaml" | grep -q -- '- pg_monitor'; then
+    echo "   FAIL: the default HA render's CNPG managed role carries no pg_monitor" >&2
+    failures=$((failures + 1))
+fi
 # #3932: a session whose client has gone must not outlive it, or its open
 # transaction holds a migration's ALTER for hours. Both Postgres shapes carry
 # the idle-in-transaction timeout and the TCP keepalives, and a CNPG change of
@@ -1748,6 +1895,27 @@ elif sc_out="$(sc_notes --set dnsAgents.enabled=true --set dnsAgents.agentKey.va
     echo "   FAIL: #3206 NOTES shows the storageClass pointer with none set" >&2; failures=$((failures + 1))
 else
     echo "   ok: #3206 storageClass renders offline; NOTES pointer only when set"
+fi
+
+# #4663 — NOTES.txt described Bitnami-managed Postgres on every release. It
+# must name the Postgres the release uses, and the Secret holding its password.
+echo "── NOTES names the configured Postgres kind (#4663)"
+pn_ok=1
+pn_out="$(sc_notes --set postgresql.kind=cnpg)"
+printf '%s' "$pn_out" | grep -q "CloudNativePG" || pn_ok=0
+printf '%s' "$pn_out" | grep -qi "bitnami" && pn_ok=0
+pn_out="$(sc_notes)"
+printf '%s' "$pn_out" | grep -q "in-chart StatefulSet" || pn_ok=0
+printf '%s' "$pn_out" | grep -qi "bitnami" && pn_ok=0
+pn_out="$(sc_notes --set postgresql.enabled=false --set externalDatabase.host=db.example \
+    --set externalDatabase.existingSecret=extdb)"
+printf '%s' "$pn_out" | grep -q "external database db.example" || pn_ok=0
+printf '%s' "$pn_out" | grep -q "secret extdb " || pn_ok=0
+if [ "$pn_ok" = 1 ]; then
+    echo "   ok: #4663 NOTES matches cnpg / standalone / external"
+else
+    echo "   FAIL: #4663 NOTES does not describe the configured Postgres kind" >&2
+    failures=$((failures + 1))
 fi
 
 # #1550 — no render above sets frontend.controlPlaneVIP, so the

@@ -35,14 +35,33 @@ from app.config import settings
 from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
+from app.models.settings import PlatformSettings
 from app.services.agents.daemon_state import forget_stale_ok
 from app.services.feature_modules import is_module_enabled
+from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
 AGENT_STALE_AFTER = timedelta(seconds=120)
 
 logger = structlog.get_logger(__name__)
+
+
+async def _probe_agentless(server: DHCPServer) -> tuple[bool, str | None]:
+    """The driver round trip for an agentless server, with no session open.
+
+    Any exception from get_driver / health_check is surfaced as unreachable.
+    Returns ``(ok, error)``. A driver that reports a failure as ``(False,
+    message)`` instead of raising (the Windows driver does) has its message
+    returned as the error, so the worker log says why the server is
+    unreachable.
+    """
+    try:
+        driver = get_driver(server.driver)
+        ok, msg = await driver.health_check(server)
+        return ok, None if ok else (msg or "health check failed")
+    except Exception as exc:  # noqa: BLE001 — surface any driver error
+        return False, str(exc)
 
 
 async def _check_health(server_id: uuid.UUID) -> None:
@@ -76,24 +95,16 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 )
                 return
 
-            if is_agentless(server.driver):
-                # Agentless: ask the driver to round-trip against the server.
-                # Any exception from get_driver / health_check is caught and
-                # surfaced as status="unreachable" — we still stamp the check
-                # timestamp so the dashboard reflects that we did try.
-                try:
-                    driver = get_driver(server.driver)
-                    ok, _msg = await driver.health_check(server)
-                    server.status = "active" if ok else "unreachable"
-                except Exception as exc:  # noqa: BLE001 — surface any driver error
-                    server.status = "unreachable"
-                    logger.warning(
-                        "dhcp_health_driver_probe_failed",
-                        server_id=str(server_id),
-                        driver=server.driver,
-                        host=server.host,
-                        error=str(exc),
-                    )
+            agentless = is_agentless(server.driver)
+            if agentless:
+                # #4775 — end the read transaction before the network call.
+                # A WinRM host that answers nothing holds it open for the whole
+                # timeout, and an ``idle in transaction`` session keeps
+                # AccessShareLock on dhcp_server, which a migration's ALTER
+                # TABLE waits behind. ``expire_on_commit=False`` leaves the row
+                # readable for the driver; the result is written by a fresh
+                # session below.
+                await db.commit()
             else:
                 # Agent-based: trust the heartbeat.
                 last_seen = server.agent_last_seen
@@ -104,17 +115,47 @@ async def _check_health(server_id: uuid.UUID) -> None:
                     # #2961 — no heartbeat, so no current daemon state: the
                     # last ``ok`` is not evidence of anything any more.
                     forget_stale_ok(server)
+                server.last_health_check_at = now
+                await db.commit()
+                logger.info(
+                    "dhcp_health_checked",
+                    server_id=str(server_id),
+                    driver=server.driver,
+                    agentless=False,
+                    status=server.status,
+                    host=server.host,
+                )
+                return
 
-            server.last_health_check_at = now
+        # Agentless: ask the driver to round-trip against the server, with no
+        # session open. We still stamp the check timestamp on failure so the
+        # dashboard reflects that we did try.
+        ok, error = await _probe_agentless(server)
+        if error is not None:
+            logger.warning(
+                "dhcp_health_driver_probe_failed",
+                server_id=str(server_id),
+                driver=server.driver,
+                host=server.host,
+                error=error,
+            )
+
+        async with session_factory() as db:
+            # The server may have been deleted (or the subsystem switched
+            # off) while the probe ran.
+            fresh = await db.get(DHCPServer, server_id)
+            if fresh is None or fresh.maintenance_mode:
+                return
+            fresh.status = "active" if ok else "unreachable"
+            fresh.last_health_check_at = datetime.now(UTC)
             await db.commit()
-
             logger.info(
                 "dhcp_health_checked",
                 server_id=str(server_id),
-                driver=server.driver,
-                agentless=is_agentless(server.driver),
-                status=server.status,
-                host=server.host,
+                driver=fresh.driver,
+                agentless=True,
+                status=fresh.status,
+                host=fresh.host,
             )
     finally:
         await engine.dispose()
@@ -135,6 +176,31 @@ def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ign
         raise self.retry(exc=exc, countdown=30) from exc  # type: ignore[attr-defined]
 
 
+async def _check_many(server_ids: list[uuid.UUID]) -> None:
+    """Check agentless servers concurrently inside one worker process (#4829).
+
+    Each probe spends its connect bound (10 s) on a host that answers nothing,
+    so N dead servers as N queued tasks hold a worker process for N x 10 s and
+    the event outbox and sweeps behind them wait. Gathered, the batch costs
+    one bound. One probe failing never stops the others.
+    """
+    results = await asyncio.gather(
+        *(_check_health(sid) for sid in server_ids), return_exceptions=True
+    )
+    for sid, res in zip(server_ids, results, strict=True):
+        if isinstance(res, BaseException):
+            logger.warning("dhcp_health_check_error", server_id=str(sid), error=str(res))
+
+
+@celery_app.task(
+    name="app.tasks.dhcp_health.check_agentless_dhcp_servers_health",
+    acks_late=True,
+)
+def check_agentless_dhcp_servers_health(server_ids: list[str]) -> None:
+    """Idempotent batch health check for agentless servers (#4829)."""
+    asyncio.run(_check_many([uuid.UUID(s) for s in server_ids]))
+
+
 async def _enqueue_all() -> None:
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
@@ -146,12 +212,31 @@ async def _enqueue_all() -> None:
             # do no work (and open no driver connections) when it is.
             if not await is_module_enabled(db, "core.dhcp"):
                 return
-            result = await db.execute(select(DHCPServer.id))
-            ids = [str(row[0]) for row in result.all()]
+            result = await db.execute(select(DHCPServer.id, DHCPServer.driver))
+            rows = [(str(row[0]), row[1]) for row in result.all()]
+            # #4759 — agent-based servers are judged from the heartbeat they
+            # already sent (no round trip), so they are evaluated on every
+            # tick. Agentless ones cost a WinRM / REST session each and are
+            # gated on the operator's interval.
+            ids = [sid for sid, drv in rows if not is_agentless(drv)]
+            agentless = [sid for sid, drv in rows if is_agentless(drv)]
+            due_agentless: list[str] = []
+            if agentless:
+                ps = await db.get(PlatformSettings, 1)
+                now = datetime.now(UTC)
+                interval = timedelta(seconds=max(60, ps.dhcp_health_interval_seconds if ps else 60))
+                if ps is None or interval_skip(now, ps.dhcp_health_last_run_at, interval) is None:
+                    due_agentless = agentless
+                    if ps is not None:
+                        ps.dhcp_health_last_run_at = now
+                        await db.commit()
     finally:
         await engine.dispose()
     for sid in ids:
         check_dhcp_server_health.delay(sid)
+    # #4829 — one task for every due agentless server, probed concurrently.
+    if due_agentless:
+        check_agentless_dhcp_servers_health.delay(due_agentless)
 
 
 @celery_app.task(name="app.tasks.dhcp_health.check_all_dhcp_servers_health", bind=True)
@@ -159,6 +244,8 @@ async def _enqueue_all() -> None:
 def check_all_dhcp_servers_health(self: object) -> None:  # type: ignore[type-arg]
     """Fan-out task — enqueues one health check per registered DHCP server.
 
-    Scheduled every 60s by Celery beat (see app.celery_app).
+    Scheduled every 60s by Celery beat (see app.celery_app). Agent-based
+    servers are enqueued on every tick; agentless servers only once
+    ``PlatformSettings.dhcp_health_interval_seconds`` has elapsed (#4759).
     """
     asyncio.run(_enqueue_all())

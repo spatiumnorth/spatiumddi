@@ -21,6 +21,11 @@ image:
   repository: spatiumnorth       # images are ghcr.io/spatiumnorth/<name>
   # Image tag applied to every control-plane workload. Empty → use Chart.appVersion.
   tag: ""
+  # #3913 — appended to the resolved tag of the images that have a Red Hat UBI
+  # build (spatiumddi-api, spatiumddi-frontend, dns-bind9, dhcp-kea): ``-ubi``
+  # turns ``2026.11.1`` into ``2026.11.1-ubi``. Empty (the default) keeps the
+  # Alpine / Debian images. ``values-openshift-certified.yaml`` sets it.
+  tagSuffix: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -147,6 +152,15 @@ sharedEnv: []
 # until every node runs the target: a HelmChartConfig pins a scalar, but
 # replaces a list whole. Empty (the default, and every install that is not an
 # appliance) renders no APPLIANCE_VERSION, which the api reads as unknown.
+# #4659 — Appliance registration (``supervisor_registration_enabled``). Off by
+# default (#1356, #2798): an appliance joining with a pairing code cannot
+# register and idles. Set ``initiallyEnabled: true`` on an install meant to
+# take appliance agent nodes. Applied only when the settings row is first
+# created (a fresh install); it never overrides a later choice in
+# Appliance > Pairing or Settings.
+supervisorRegistration:
+  initiallyEnabled: false
+
 applianceVersion: ""
 
 api:
@@ -668,6 +682,11 @@ worker:
   # here to replace the default entirely.
   topologySpreadConstraints: []
   concurrency: 4
+  # #4306 — recycle a prefork child after this many tasks, or once its RSS
+  # passes this many KiB (409600 = 400 MiB; keep it well under the memory
+  # limit below, which has to hold ``concurrency`` children). 0 disables.
+  maxTasksPerChild: 1000
+  maxMemoryPerChildKiB: 409600
   # #1111 — ``bundles`` carries the DNS agent bundle renders; give it its
   # own worker (concurrency 1, its own memory cap) on large-record estates.
   queues: "ipam,dns,dhcp,default,bundles"
@@ -844,6 +863,11 @@ postgresql:
   image:
     repository: postgres
     tag: "16-alpine"
+    # #3913 — ``docker`` (the official postgres image) or ``rhel`` (Red Hat's
+    # rhel9/postgresql-16: POSTGRESQL_* env, data in /var/lib/pgsql/data, uid
+    # 26). Set it with ``repository`` / ``tag`` for the certified profile. Only
+    # the standalone kind reads it; CloudNativePG picks its own image.
+    flavor: docker
     pullPolicy: IfNotPresent
   auth:
     username: spatiumddi
@@ -909,6 +933,14 @@ postgresql:
     # reaches clusters created before #702. Set false to withhold the
     # privilege — drills then report a clear "role lacks CREATEDB" error.
     appRoleCreateDb: true
+    # Make the application role a member of ``pg_monitor`` (#4610), the
+    # read-only monitoring role. Without it Postgres hides every standby's
+    # state and LSNs from the app's role, so the rolling-upgrade preflight's
+    # replication_lag check and the Cluster screen's streaming check can see
+    # replicas but not verify them. Applied via ``managed.roles`` so it also
+    # reaches existing clusters. Set false to withhold it; both then report
+    # "not verified" instead of a measured result.
+    appRoleMonitor: true
     # Replica count. 3 is the smallest etcd-quorum-friendly default
     # (primary + sync replica + async replica). 5 / 7 for larger
     # clusters. CNPG enforces odd counts implicitly via its leader-
@@ -1172,6 +1204,10 @@ redis:
   image:
     repository: redis
     tag: "8.10.2-alpine"
+    # #3913 — ``docker`` (the official redis image) or ``rhel`` (Red Hat's
+    # rhel9/redis-7: its own entrypoint, data in /var/lib/redis/data, Redis 7).
+    # Standalone kind only.
+    flavor: docker
     pullPolicy: IfNotPresent
   # Cap and eviction policy match docker-compose.yml's redis-server
   # CLI flags. Bump if your install needs a larger cache.
@@ -1299,7 +1335,9 @@ dnsAgents:
       repository: ghcr.io/spatiumnorth/dns-technitium
       tag: ""                    # empty → use Chart.appVersion
   # PSK carrying DNS_AGENT_KEY. Prefer `existingSecret`; `value` lives here
-  # only to make lab walk-throughs runnable in one command.
+  # only to make lab walk-throughs runnable in one command. The api + worker
+  # get the key even with `enabled: false` (#4648, appliance agent nodes);
+  # with neither set the chart generates <fullname>-agent-keys and keeps it.
   agentKey:
     existingSecret: ""           # external secret with key DNS_AGENT_KEY
     value: ""
@@ -1406,6 +1444,8 @@ dhcpAgents:
   # Per server: ``servers[].storageClass``. On an existing install see README
   # "Adopting storageClass on an existing install" (orphan-delete the sts first).
   storageClass: ""
+  # Same contract as dnsAgents.agentKey (#4648): injected into the api +
+  # worker as DHCP_AGENT_KEY whether or not `enabled`; unset = generated.
   agentKey:
     existingSecret: ""           # external secret with key SPATIUM_AGENT_KEY
     value: ""

@@ -278,6 +278,12 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_health_check_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # #4759 — a MAC deny list has been pushed to this agentless server and
+    # not yet cleared. Lets the periodic sync skip the WinRM round trip when
+    # no block applies and nothing is left to remove.
+    mac_blocks_pushed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
     # Agent bookkeeping (mirrors DNSServer — see docs/deployment/DNS_AGENT.md)
     agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
@@ -347,6 +353,10 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # carries the field. Read by the server-list chip and the
     # ``agent_spool_trimmed`` alert.
     spool_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # #4193 — the agent's actual memory use as last reported on the heartbeat
+    # (container used / peak / limit, Kea's and the agent's RSS, reported_at).
+    # NULL = never reported: UNKNOWN, never 0.
+    memory_status: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # #1067 — the agent's own word about the Kea daemon, reported on every
     # heartbeat (``daemon: {status, reason}``; sync.py sets ``degraded`` when a
     # control socket is unreachable or a config was rejected, ``ok`` after a

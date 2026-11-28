@@ -487,7 +487,8 @@ class LeaseWatcher:
         name. The open descriptor keeps the old file readable after the
         rename or delete: the rows Kea appended between our last read and the
         rotation are read from it to the end before the new file is opened
-        at offset 0. Rotation is told by inode, so a new file that has
+        at offset 0 (drained a second time once the rotation is seen, since
+        a row can land between the first drain and the rename). Rotation is told by inode, so a new file that has
         already outgrown the old offset is not read from the middle; an
         in-place truncation (same inode, shorter file) still restarts at 0.
         """
@@ -507,6 +508,10 @@ class LeaseWatcher:
             except OSError:
                 return data
             if rotated:
+                # Kea may have appended after the drain above and before the
+                # rename: the old file is reachable only through this handle,
+                # so read it to the end once more before letting it go.
+                data += self._drain_handle(path, fh)
                 fh.close()
                 del self._handles[path]
                 self._offsets[path] = 0

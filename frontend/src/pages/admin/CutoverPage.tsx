@@ -222,7 +222,10 @@ function Chip({
 
 function ErrorBanner({ message }: { message: string }) {
   return (
-    <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+    <div
+      role="alert"
+      className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive"
+    >
       <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
       <div className="min-w-0 break-all">{message}</div>
     </div>
@@ -625,8 +628,12 @@ function PlanListView({
         }
         confirmLabel="Delete plan"
         loading={deleteMut.isPending}
+        error={deleteMut.error ? extractError(deleteMut.error) : null}
         onConfirm={() => deleting && deleteMut.mutate(deleting.id)}
-        onClose={() => setDeleting(null)}
+        onClose={() => {
+          setDeleting(null);
+          deleteMut.reset();
+        }}
       />
     </div>
   );
@@ -714,8 +721,11 @@ function NewPlanModal({
         {error && <ErrorBanner message={error} />}
 
         <div>
-          <label className="block text-sm font-medium">Name</label>
+          <label htmlFor="cutover-name" className="block text-sm font-medium">
+            Name
+          </label>
           <input
+            id="cutover-name"
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="Retire DC01 — corp.example + 10.0.20.0/24"
@@ -724,8 +734,14 @@ function NewPlanModal({
         </div>
 
         <div>
-          <label className="block text-sm font-medium">Description</label>
+          <label
+            htmlFor="cutover-description"
+            className="block text-sm font-medium"
+          >
+            Description
+          </label>
           <textarea
+            id="cutover-description"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             rows={2}
@@ -737,7 +753,10 @@ function NewPlanModal({
           {dnsOn && (
             <>
               <div>
-                <label className="block text-sm font-medium">
+                <label
+                  htmlFor="cutover-source-windows-dns-server"
+                  className="block text-sm font-medium"
+                >
                   Source Windows DNS server
                 </label>
                 <p className="mb-1 text-[11px] text-muted-foreground">
@@ -745,6 +764,7 @@ function NewPlanModal({
                   driver.
                 </p>
                 <select
+                  id="cutover-source-windows-dns-server"
                   value={dnsSource}
                   onChange={(e) => setDnsSource(e.target.value)}
                   className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -764,13 +784,17 @@ function NewPlanModal({
               </div>
 
               <div>
-                <label className="block text-sm font-medium">
+                <label
+                  htmlFor="cutover-target-dns-server-group"
+                  className="block text-sm font-medium"
+                >
                   Target DNS server group
                 </label>
                 <p className="mb-1 text-[11px] text-muted-foreground">
                   The SpatiumDDI group taking the zones over.
                 </p>
                 <select
+                  id="cutover-target-dns-server-group"
                   value={dnsTarget}
                   onChange={(e) => setDnsTarget(e.target.value)}
                   className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -788,7 +812,10 @@ function NewPlanModal({
 
           {dhcpOn && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="cutover-source-windows-dhcp-server"
+                className="block text-sm font-medium"
+              >
                 Source Windows DHCP server
               </label>
               <p className="mb-1 text-[11px] text-muted-foreground">
@@ -796,6 +823,7 @@ function NewPlanModal({
                 <code>windows_dhcp</code> driver.
               </p>
               <select
+                id="cutover-source-windows-dhcp-server"
                 value={dhcpSource}
                 onChange={(e) => setDhcpSource(e.target.value)}
                 className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -817,13 +845,17 @@ function NewPlanModal({
 
           {dhcpOn && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="cutover-target-dhcp-server-group"
+                className="block text-sm font-medium"
+              >
                 Target DHCP server group
               </label>
               <p className="mb-1 text-[11px] text-muted-foreground">
                 The SpatiumDDI group taking the scopes over.
               </p>
               <select
+                id="cutover-target-dhcp-server-group"
                 value={dhcpTarget}
                 onChange={(e) => setDhcpTarget(e.target.value)}
                 className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -1262,8 +1294,12 @@ function ItemsTab({
         }
         confirmLabel="Remove item"
         loading={removeMut.isPending}
+        error={removeMut.error ? extractError(removeMut.error) : null}
         onConfirm={() => removing && removeMut.mutate(removing.id)}
-        onClose={() => setRemoving(null)}
+        onClose={() => {
+          setRemoving(null);
+          removeMut.reset();
+        }}
       />
     </div>
   );

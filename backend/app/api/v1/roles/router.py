@@ -243,10 +243,14 @@ def _audit(
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
-@router.get("", response_model=list[RoleResponse])
+@router.get(
+    "",
+    response_model=list[RoleResponse],
+    dependencies=[Depends(require_permission("read", "role"))],
+)
 async def list_roles(db: DB, _: CurrentUser) -> list[RoleResponse]:
-    """Any authenticated user may list roles (the Groups admin page needs
-    this to populate the role picker). Mutations require admin on `role`."""
+    """List roles; needs `read` on `role` (the Groups admin page uses this
+    to populate the role picker). Mutations require admin on `role`."""
     res = await db.execute(select(Role).order_by(Role.is_builtin.desc(), Role.name))
     return [_to_response(r) for r in res.scalars().all()]
 
@@ -287,7 +291,11 @@ async def create_role(
     return _to_response(r)
 
 
-@router.get("/{role_id}", response_model=RoleResponse)
+@router.get(
+    "/{role_id}",
+    response_model=RoleResponse,
+    dependencies=[Depends(require_permission("read", "role"))],
+)
 async def get_role(role_id: uuid.UUID, db: DB, _: CurrentUser) -> RoleResponse:
     r = await db.get(Role, role_id)
     if r is None:
@@ -359,13 +367,21 @@ async def update_role(
             resource_id=str(r.id),
             resource_display=f"update role {r.name}",
         )
+    unchanged = (
+        (body.name is None or body.name == r.name)
+        and (body.description is None or body.description == r.description)
+        and (new_permissions is None or new_permissions == r.permissions)
+    )
     if body.name is not None:
         r.name = body.name
     if body.description is not None:
         r.description = body.description
     if new_permissions is not None:
         r.permissions = new_permissions
-    db.add(_audit(current_user, "update", r, f"Updated role {r.name}", method, granted))
+    # An edit that changes nothing writes no audit row (#4452); a step-up
+    # that was verified is still recorded.
+    if not unchanged or method is not None:
+        db.add(_audit(current_user, "update", r, f"Updated role {r.name}", method, granted))
     await db.commit()
     await db.refresh(r)
     return _to_response(r)

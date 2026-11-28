@@ -17,6 +17,7 @@ prefix.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -45,7 +46,7 @@ from app.services.backup import (
     build_backup_archive,
 )
 from app.services.backup.crypto import HINT_REVEALS_PASSPHRASE, hint_reveals_passphrase
-from app.services.backup.sections import SECTIONS
+from app.services.backup.sections import SECTIONS, SECTIONS_BY_KEY, also_restored_by_section
 
 # nginx admits up to 2 GiB on /api/v1/backup/ with request buffering off,
 # so every body here is authorised from its headers before it is read
@@ -62,6 +63,14 @@ _MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 # ── /backup/create-and-download ──────────────────────────────────────
 
 
+class BackupSectionReach(BaseModel):
+    """Tables of one other section that a selective restore also replaces."""
+
+    key: str  #: owning section's key; "" for tables no section claims
+    label: str
+    tables: list[str]
+
+
 class BackupSection(BaseModel):
     """One selectable slice of the backup, as offered to the operator."""
 
@@ -75,6 +84,9 @@ class BackupSection(BaseModel):
     #: False for sections that must always be included; the UI renders those
     #: as fixed rather than as an unticked checkbox.
     selectable: bool
+    #: What a selective restore of this section also replaces from the
+    #: archive, because those tables hold a foreign key into it (#4333).
+    also_restores: list[BackupSectionReach]
 
 
 class BackupSectionCatalog(BaseModel):
@@ -96,6 +108,14 @@ async def list_backup_sections(current_user: SuperAdmin) -> BackupSectionCatalog
                 table_count=len(s.tables),
                 volatile=s.volatile,
                 selectable=s.selectable,
+                also_restores=[
+                    BackupSectionReach(
+                        key=k,
+                        label=SECTIONS_BY_KEY[k].label if k else "Other tables",
+                        tables=tables,
+                    )
+                    for k, tables in also_restored_by_section(s.key).items()
+                ],
             )
             for s in SECTIONS
         ]
@@ -255,177 +275,15 @@ class RestoreOutcomeResponse(BaseModel):
     # caveat — the destination agent regenerates LMDB keys on
     # first sync and produces new DS records.
     warnings: list[str] = []
+    # Sessions that were live when the restore ended them; None when the
+    # restore did not touch the session table, -1 when ending them failed.
+    sessions_ended: int | None = None
 
 
-@router.post("/restore", response_model=RestoreOutcomeResponse)
-async def restore_backup(
-    db: DB,
-    current_user: SuperAdmin,
-    archive: UploadFile = File(...),
-    passphrase: str = Form(..., min_length=8, max_length=512),
-    confirmation_phrase: str = Form(...),
-    sections: str = Form(default=""),
-    allow_newer_schema: bool = Form(default=False),
-) -> RestoreOutcomeResponse:
-    """Apply a backup archive — hard overwrite OR selective per
-    sections. The operator must type the literal phrase
-    ``RESTORE-FROM-BACKUP`` so accidental drag-and-drops don't
-    nuke the install. A pre-restore safety dump is taken before
-    any destructive change so botched restores have a recovery
-    path on the local filesystem.
-
-    When ``sections`` is empty (Phase 1 default) the call is a
-    full restore. Pass a comma-separated list of section keys
-    (from ``GET /backup/sections``) for a selective restore;
-    those sections' tables are TRUNCATEd CASCADE and re-loaded
-    from the archive.
-
-    A selective restore necessarily reaches past the sections you
-    pick: ``TRUNCATE … CASCADE`` empties every table holding a foreign
-    key into a selected one, so those are restored from the archive
-    too rather than left empty (#781). ``cascade_widened_tables`` on
-    the response lists exactly which, and a warning repeats it.
-
-    ``allow_newer_schema`` overrides the refusal to restore an archive
-    whose schema head this build does not know. It exists for the
-    A/B-rollback case — an operator who rolled back *because* the new
-    build broke would otherwise be told to upgrade into it. The
-    override is audited, and the response warns that the api's
-    schema-head readiness gate may now fail.
-    """
-    # #296 Phase H — restoring a backup mid-upgrade would rip the
-    # schema + data state out from under the orchestrator. Refuse.
-    from app.services.upgrades.safety import (  # noqa: PLC0415
-        assert_no_upgrade_in_flight,
-    )
-
-    await assert_no_upgrade_in_flight(db, operation_hint="backup restore")
-
-    archive_bytes = await archive.read()
-    if not archive_bytes:
-        raise HTTPException(status_code=422, detail="archive is empty")
-    if len(archive_bytes) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"archive exceeds {_MAX_UPLOAD_BYTES} bytes",
-        )
-
-    sections_list = [s.strip() for s in sections.split(",") if s.strip()] or None
-    try:
-        outcome = await apply_backup_restore(
-            db,
-            archive_bytes=archive_bytes,
-            passphrase=passphrase,
-            confirmation_phrase=confirmation_phrase,
-            db_url=str(settings.database_url),
-            sections=sections_list,
-            allow_newer_schema=allow_newer_schema,
-        )
-    except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
-        # Same shape for archive / crypto / restore errors — the
-        # message is enough for the operator to know whether to
-        # re-export, retype the passphrase, or upgrade the
-        # destination install. Surfacing class names would just
-        # confuse non-engineers without adding info.
-        logger.warning(
-            "backup_restore_failed",
-            error=str(exc),
-            error_class=type(exc).__name__,
-            archive_bytes=len(archive_bytes),
-        )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # The restore replayed the archive's SQL, which means the
-    # ``audit_log`` table is now whatever was in the archive — our
-    # own commit below survives because it's a NEW row inserted
-    # post-replay. We deliberately log the restore *after* the
-    # destructive step so the trail of evidence sits in the freshly
-    # restored database, not in the wiped one.
-    #
-    # Re-open the session via a fresh insertion. The current ``db``
-    # session was closed inside ``apply_backup_restore``; reach for
-    # AsyncSessionLocal here instead.
-    from app.db import AsyncSessionLocal  # noqa: PLC0415
-
-    async with AsyncSessionLocal() as fresh:
-        fresh.add(
-            AuditLog(
-                action="backup_restored",
-                resource_type="platform",
-                resource_id="backup",
-                resource_display=str(outcome.manifest.get("hostname", "unknown-source")),
-                user_id=current_user.id,
-                user_display_name=current_user.username,
-                result="success",
-                new_value={
-                    "manifest": outcome.manifest,
-                    "pre_restore_safety_path": outcome.pre_restore_path,
-                    "duration_ms": outcome.duration_ms,
-                    "migration": (
-                        {
-                            "state": outcome.migration.state,
-                            "source_head": outcome.migration.source_head,
-                            "local_head": outcome.migration.local_head,
-                            "migrations_applied": outcome.migration.migrations_applied,
-                            "error": outcome.migration.error,
-                        }
-                        if outcome.migration is not None
-                        else None
-                    ),
-                    "rewrap": (
-                        {
-                            "same_install": outcome.rewrap.same_install,
-                            "rewrapped_rows": outcome.rewrap.rewrapped_rows,
-                            "rewrapped_jsonb_fields": (outcome.rewrap.rewrapped_jsonb_fields),
-                            "skipped_idempotent_rows": (outcome.rewrap.skipped_idempotent_rows),
-                            "failed_rows": outcome.rewrap.failed_rows,
-                            "columns_visited": outcome.rewrap.columns_visited,
-                            "aborted": outcome.rewrap.aborted,
-                            "failures": outcome.rewrap.failures,
-                        }
-                        if outcome.rewrap is not None
-                        else None
-                    ),
-                    "selective": outcome.selective,
-                    "restored_sections": outcome.restored_sections,
-                    "cascade_widened_tables": outcome.cascade_widened_tables,
-                    # Both of these change what the operator got versus
-                    # what they asked for, so the trail has to carry them
-                    # (#781): the override bypassed a safety refusal, and
-                    # the widening restored tables outside the selection.
-                    "allow_newer_schema": allow_newer_schema,
-                    "warnings": outcome.warnings,
-                    "reconciled_backup_targets": outcome.reconciled_backup_targets,
-                },
-            )
-        )
-        await fresh.commit()
-
+def _restore_note(outcome: Any) -> str:
+    """The operator-facing summary line(s) of a restore outcome."""
     migration = outcome.migration
-    migration_resp: MigrationOutcomeResponse | None = None
-    if migration is not None:
-        migration_resp = MigrationOutcomeResponse(
-            state=migration.state,
-            source_head=migration.source_head,
-            local_head=migration.local_head,
-            migrations_applied=migration.migrations_applied,
-            error=migration.error,
-        )
-
     rewrap = outcome.rewrap
-    rewrap_resp: RewrapOutcomeResponse | None = None
-    if rewrap is not None:
-        rewrap_resp = RewrapOutcomeResponse(
-            same_install=rewrap.same_install,
-            rewrapped_rows=rewrap.rewrapped_rows,
-            rewrapped_jsonb_fields=rewrap.rewrapped_jsonb_fields,
-            skipped_idempotent_rows=rewrap.skipped_idempotent_rows,
-            failed_rows=rewrap.failed_rows,
-            columns_visited=rewrap.columns_visited,
-            aborted=rewrap.aborted,
-            failures=rewrap.failures,
-        )
-
     if rewrap is None or rewrap.same_install:
         note = (
             "Restore complete. Source archive came from this install — " "no key rewrap was needed."
@@ -489,12 +347,198 @@ async def restore_backup(
     elif migration is not None and migration.state == "unknown":
         note += f" Schema-version skew check skipped: {migration.error or 'unknown reason'}."
 
+    if outcome.sessions_ended is not None and outcome.sessions_ended >= 0:
+        note += " Every session was ended; sign in again."
+
     if outcome.pre_restore_path is None:
         note += (
             " WARNING: pre-restore safety dump was NOT written "
             "(no writable /var/lib/spatiumddi/backups path). If you "
             "need to roll back, the only path is restoring from a "
             "prior backup."
+        )
+    return note
+
+
+@router.post("/restore", response_model=RestoreOutcomeResponse)
+async def restore_backup(
+    db: DB,
+    current_user: SuperAdmin,
+    archive: UploadFile = File(...),
+    passphrase: str = Form(..., min_length=8, max_length=512),
+    confirmation_phrase: str = Form(...),
+    sections: str = Form(default=""),
+    allow_newer_schema: bool = Form(default=False),
+) -> RestoreOutcomeResponse:
+    """Apply a backup archive — hard overwrite OR selective per
+    sections. The operator must type the literal phrase
+    ``RESTORE-FROM-BACKUP`` so accidental drag-and-drops don't
+    nuke the install. A pre-restore safety dump is taken before
+    any destructive change so botched restores have a recovery
+    path on the local filesystem.
+
+    When ``sections`` is empty (Phase 1 default) the call is a
+    full restore. Pass a comma-separated list of section keys
+    (from ``GET /backup/sections``) for a selective restore;
+    those sections' tables are TRUNCATEd CASCADE and re-loaded
+    from the archive.
+
+    A selective restore necessarily reaches past the sections you
+    pick: ``TRUNCATE … CASCADE`` empties every table holding a foreign
+    key into a selected one, so those are restored from the archive
+    too rather than left empty (#781). ``cascade_widened_tables`` on
+    the response lists exactly which, and a warning repeats it.
+
+    ``allow_newer_schema`` overrides the refusal to restore an archive
+    whose schema head this build does not know. It exists for the
+    A/B-rollback case — an operator who rolled back *because* the new
+    build broke would otherwise be told to upgrade into it. The
+    override is audited, and the response warns that the api's
+    schema-head readiness gate may now fail.
+    """
+    # #296 Phase H — restoring a backup mid-upgrade would rip the
+    # schema + data state out from under the orchestrator. Refuse.
+    from app.services.upgrades.safety import (  # noqa: PLC0415
+        assert_no_upgrade_in_flight,
+    )
+
+    await assert_no_upgrade_in_flight(db, operation_hint="backup restore")
+
+    # #4678 — not while the booted slot and the serving api are different releases.
+    from app.services.upgrades.schema_rollback import (  # noqa: PLC0415
+        assert_restore_allowed_for_release,
+    )
+
+    assert_restore_allowed_for_release()
+
+    archive_bytes = await archive.read()
+    if not archive_bytes:
+        raise HTTPException(status_code=422, detail="archive is empty")
+    if len(archive_bytes) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"archive exceeds {_MAX_UPLOAD_BYTES} bytes",
+        )
+
+    sections_list = [s.strip() for s in sections.split(",") if s.strip()] or None
+    try:
+        outcome = await apply_backup_restore(
+            db,
+            archive_bytes=archive_bytes,
+            passphrase=passphrase,
+            confirmation_phrase=confirmation_phrase,
+            db_url=str(settings.database_url),
+            sections=sections_list,
+            allow_newer_schema=allow_newer_schema,
+        )
+    except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
+        # Same shape for archive / crypto / restore errors — the
+        # message is enough for the operator to know whether to
+        # re-export, retype the passphrase, or upgrade the
+        # destination install. Surfacing class names would just
+        # confuse non-engineers without adding info.
+        logger.warning(
+            "backup_restore_failed",
+            error=str(exc),
+            error_class=type(exc).__name__,
+            archive_bytes=len(archive_bytes),
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # The restore replayed the archive's SQL, which means the
+    # ``audit_log`` table is now whatever was in the archive — our
+    # own commit below survives because it's a NEW row inserted
+    # post-replay. We deliberately log the restore *after* the
+    # destructive step so the trail of evidence sits in the freshly
+    # restored database, not in the wiped one.
+    #
+    # Re-open the session via a fresh insertion. The current ``db``
+    # session was closed inside ``apply_backup_restore``; reach for
+    # AsyncSessionLocal here instead.
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+    note = _restore_note(outcome)
+    async with AsyncSessionLocal() as fresh:
+        fresh.add(
+            AuditLog(
+                action="backup_restored",
+                resource_type="platform",
+                resource_id="backup",
+                resource_display=str(outcome.manifest.get("hostname", "unknown-source")),
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                new_value={
+                    "manifest": outcome.manifest,
+                    "pre_restore_safety_path": outcome.pre_restore_path,
+                    "duration_ms": outcome.duration_ms,
+                    "note": note,
+                    "secrets_payload_keys": outcome.secrets_payload_keys,
+                    "migration": (
+                        {
+                            "state": outcome.migration.state,
+                            "source_head": outcome.migration.source_head,
+                            "local_head": outcome.migration.local_head,
+                            "migrations_applied": outcome.migration.migrations_applied,
+                            "error": outcome.migration.error,
+                        }
+                        if outcome.migration is not None
+                        else None
+                    ),
+                    "rewrap": (
+                        {
+                            "same_install": outcome.rewrap.same_install,
+                            "rewrapped_rows": outcome.rewrap.rewrapped_rows,
+                            "rewrapped_jsonb_fields": (outcome.rewrap.rewrapped_jsonb_fields),
+                            "skipped_idempotent_rows": (outcome.rewrap.skipped_idempotent_rows),
+                            "failed_rows": outcome.rewrap.failed_rows,
+                            "columns_visited": outcome.rewrap.columns_visited,
+                            "aborted": outcome.rewrap.aborted,
+                            "failures": outcome.rewrap.failures,
+                        }
+                        if outcome.rewrap is not None
+                        else None
+                    ),
+                    "selective": outcome.selective,
+                    "restored_sections": outcome.restored_sections,
+                    "cascade_widened_tables": outcome.cascade_widened_tables,
+                    # Both of these change what the operator got versus
+                    # what they asked for, so the trail has to carry them
+                    # (#781): the override bypassed a safety refusal, and
+                    # the widening restored tables outside the selection.
+                    "allow_newer_schema": allow_newer_schema,
+                    "warnings": outcome.warnings,
+                    "reconciled_backup_targets": outcome.reconciled_backup_targets,
+                    "sessions_ended": outcome.sessions_ended,
+                    "adopted_appliances": outcome.adopted_appliances,
+                },
+            )
+        )
+        await fresh.commit()
+
+    migration = outcome.migration
+    migration_resp: MigrationOutcomeResponse | None = None
+    if migration is not None:
+        migration_resp = MigrationOutcomeResponse(
+            state=migration.state,
+            source_head=migration.source_head,
+            local_head=migration.local_head,
+            migrations_applied=migration.migrations_applied,
+            error=migration.error,
+        )
+
+    rewrap = outcome.rewrap
+    rewrap_resp: RewrapOutcomeResponse | None = None
+    if rewrap is not None:
+        rewrap_resp = RewrapOutcomeResponse(
+            same_install=rewrap.same_install,
+            rewrapped_rows=rewrap.rewrapped_rows,
+            rewrapped_jsonb_fields=rewrap.rewrapped_jsonb_fields,
+            skipped_idempotent_rows=rewrap.skipped_idempotent_rows,
+            failed_rows=rewrap.failed_rows,
+            columns_visited=rewrap.columns_visited,
+            aborted=rewrap.aborted,
+            failures=rewrap.failures,
         )
 
     return RestoreOutcomeResponse(
@@ -510,6 +554,56 @@ async def restore_backup(
         migration=migration_resp,
         rewrap=rewrap_resp,
         warnings=outcome.warnings,
+        sessions_ended=outcome.sessions_ended,
+    )
+
+
+class LastRestoreResponse(RestoreOutcomeResponse):
+    performed_at: datetime
+    performed_by: str | None = None
+
+
+@router.get("/restore/last", response_model=LastRestoreResponse)
+async def last_restore_outcome(db: DB, current_user: SuperAdmin) -> LastRestoreResponse:
+    """The outcome of the most recent restore, read from its audit row.
+
+    A restore replaces the auth tables, which revokes every session,
+    so the browser that applied it is signed out before the
+    ``POST /backup/restore`` response (duration, warnings, the
+    pre-restore safety dump path) can be shown (#4676). The audit row is
+    written after the replay and survives it, so the same outcome is
+    fetchable here after signing in again. 404 when no restore has been
+    recorded.
+    """
+    from sqlalchemy import select  # noqa: PLC0415
+
+    row = (
+        await db.execute(
+            select(AuditLog)
+            .where(AuditLog.action == "backup_restored", AuditLog.result == "success")
+            .order_by(AuditLog.timestamp.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no restore has been recorded")
+    v: dict[str, Any] = row.new_value or {}
+    return LastRestoreResponse(
+        success=True,
+        pre_restore_safety_path=v.get("pre_restore_safety_path"),
+        duration_ms=v.get("duration_ms") or 0,
+        manifest=v.get("manifest") or {},
+        secrets_payload_keys=v.get("secrets_payload_keys") or [],
+        note=v.get("note") or "Restore complete.",
+        selective=bool(v.get("selective")),
+        restored_sections=v.get("restored_sections"),
+        cascade_widened_tables=v.get("cascade_widened_tables") or [],
+        migration=v.get("migration"),
+        rewrap=v.get("rewrap"),
+        warnings=v.get("warnings") or [],
+        sessions_ended=v.get("sessions_ended"),
+        performed_at=row.timestamp,
+        performed_by=row.user_display_name,
     )
 
 

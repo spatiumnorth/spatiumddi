@@ -16,6 +16,8 @@ name: spatiumddi-agent-dns-powerdns
 # Quickstart:
 #
 #   export CONTROL_PLANE_URL=https://spatium.example.com
+#   # Use the frontend URL (e.g. http://host:8077) or your reverse proxy,
+#   # never :8000: the Compose API listens on 127.0.0.1 only.
 #   export DNS_AGENT_KEY=$(openssl rand -hex 32)
 #   # Register the key on the control plane first (Settings → Agent
 #   # Keys) so the agent can bootstrap. Create the matching
@@ -56,6 +58,12 @@ services:
       AGENT_GROUP: ${DNS_AGENT_GROUP:-default}
       AGENT_ROLES: ${DNS_AGENT_ROLES:-authoritative}
       # AGENT_DRIVER is baked into the image (powerdns); no override.
+
+      # ── Zone removal (#4564) ──────────────────────────────────────
+      # The agent deletes zones the bundle drops, but holds back a delete
+      # that would remove EVERY managed zone. Uncomment (and add to .env
+      # as PDNS_ALLOW_EMPTY_RETIRE=1) to allow an empty server.
+      # PDNS_ALLOW_EMPTY_RETIRE: "${PDNS_ALLOW_EMPTY_RETIRE:-0}"
 
       # ── TLS ───────────────────────────────────────────────────────
       # The control plane's certificate is verified (#1220). A cert from a

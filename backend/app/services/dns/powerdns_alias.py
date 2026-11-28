@@ -19,7 +19,11 @@ queried in plaintext against the operator's stated choice.
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from collections.abc import Iterable
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def alias_resolver(forwarders: Iterable[str] | None, forward_transport: str | None) -> str:
@@ -55,3 +59,56 @@ def alias_resolver(forwarders: Iterable[str] | None, forward_transport: str | No
             continue
         out.append(f"[{addr}]:{number}" if addr.version == 6 else f"{addr}:{number}")
     return ",".join(out)
+
+
+async def group_can_resolve_alias(db: AsyncSession, group_id: uuid.UUID) -> bool:
+    """Whether ``group_id`` has Do53 forwarders to expand an ALIAS through.
+
+    The one check behind the record API's 422 and the importer's drop (#4604),
+    so the two cannot disagree about which groups can serve an ALIAS.
+    """
+    from app.models.dns import DNSServerOptions  # models import drivers: keep it lazy
+
+    opts = (
+        await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
+    ).scalar_one_or_none()
+    return bool(
+        alias_resolver(getattr(opts, "forwarders", None), getattr(opts, "forward_transport", None))
+    )
+
+
+ALIAS_NO_FORWARDER_MESSAGE = (
+    "ALIAS records are resolved through the group's forwarders, and this "
+    "group has none over plain DNS (Do53). Set forwarders under the "
+    "group's server options first; SpatiumDDI no longer falls back to "
+    "public resolvers."
+)
+
+
+async def groups_without_alias_resolver(
+    db: AsyncSession, group_ids: Iterable[uuid.UUID]
+) -> set[uuid.UUID]:
+    """The groups among ``group_ids`` that run PowerDNS alone and have no Do53 forwarder.
+
+    The record API's ALIAS guard applies to exactly these (a group with no
+    server yet, or a mixed one, is refused or deferred elsewhere), so a Trash
+    restore asks the same question (#4756).
+    """
+    from app.models.dns import DNSServer  # models import drivers: keep it lazy
+
+    ids = set(group_ids)
+    if not ids:
+        return set()
+    drivers: dict[uuid.UUID, set[str]] = {}
+    for gid, driver in (
+        await db.execute(
+            select(DNSServer.group_id, DNSServer.driver).where(DNSServer.group_id.in_(ids))
+        )
+    ).tuples():
+        if driver:
+            drivers.setdefault(gid, set()).add(driver)
+    out: set[uuid.UUID] = set()
+    for group_id, found in drivers.items():
+        if found == {"powerdns"} and not await group_can_resolve_alias(db, group_id):
+            out.add(group_id)
+    return out

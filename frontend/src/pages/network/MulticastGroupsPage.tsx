@@ -1,3 +1,6 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { useEffect, useMemo, useState } from "react";
 import { MissingCustomerOption } from "@/components/ownership/pickers";
@@ -7,7 +10,7 @@ import {
 } from "@/components/ownership/missingCustomer";
 import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ListEmpty } from "@/components/ui/list-read-error";
+import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
 import { MulticastDomainsTab } from "./MulticastDomainsPage";
@@ -77,10 +80,13 @@ type EditorTab = "general" | "ports" | "memberships";
 export function MulticastGroupModal({
   existing,
   spaces,
+  spacesError,
   onClose,
 }: {
   existing: MulticastGroupRead | null;
   spaces: IPSpace[];
+  /** The spaces read's error: a refused list is not an empty one (#4635). */
+  spacesError?: unknown;
   onClose: () => void;
 }) {
   const own = useOwnershipModules();
@@ -145,7 +151,11 @@ export function MulticastGroupModal({
         // wave; that's a Wave 3 / Phase 2 conversation).
         const upd: MulticastGroupUpdate = { ...body };
         delete (upd as { space_id?: string }).space_id;
-        return multicastApi.update(existing.id, upd);
+        // Only what changed against the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const changed = changedFields(existing, upd);
+        if (Object.keys(changed).length === 0) return existing;
+        return multicastApi.update(existing.id, changed);
       }
       return multicastApi.create(body as MulticastGroupCreate);
     },
@@ -167,10 +177,14 @@ export function MulticastGroupModal({
       <div className="space-y-3 pb-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-name"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Name
             </label>
             <input
+              id="multicast-groups-name"
               className={inputCls}
               value={name}
               onChange={(e) => setName(e.target.value)}
@@ -179,10 +193,14 @@ export function MulticastGroupModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-address"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Address
             </label>
             <input
+              id="multicast-groups-address"
               className={cn(inputCls, "font-mono")}
               value={address}
               onChange={(e) => setAddress(e.target.value)}
@@ -209,10 +227,14 @@ export function MulticastGroupModal({
       {tab === "general" && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-ip-space"
+              className="text-xs font-medium text-muted-foreground"
+            >
               IP space
             </label>
             <select
+              id="multicast-groups-ip-space"
               className={inputCls}
               value={spaceId}
               onChange={(e) => setSpaceId(e.target.value)}
@@ -225,6 +247,11 @@ export function MulticastGroupModal({
                 </option>
               ))}
             </select>
+            {!existing && spacesError != null && (
+              <p className="mt-1 text-[11px]">
+                <ListReadError error={spacesError} what="IP spaces" />
+              </p>
+            )}
             {existing && (
               <p className="mt-1 text-[10px] text-muted-foreground">
                 Space is fixed after creation.
@@ -233,10 +260,14 @@ export function MulticastGroupModal({
           </div>
           {own.customer && (
             <div>
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="multicast-groups-customer-optional"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Customer (optional)
               </label>
               <select
+                id="multicast-groups-customer-optional"
                 className={inputCls}
                 value={customerId ?? ""}
                 onChange={(e) => setCustomerId(e.target.value || null)}
@@ -255,10 +286,14 @@ export function MulticastGroupModal({
             </div>
           )}
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-pim-domain-optional"
+              className="text-xs font-medium text-muted-foreground"
+            >
               PIM domain (optional)
             </label>
             <select
+              id="multicast-groups-pim-domain-optional"
               className={inputCls}
               value={domainId ?? ""}
               onChange={(e) => setDomainId(e.target.value || null)}
@@ -276,10 +311,14 @@ export function MulticastGroupModal({
             </p>
           </div>
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-application"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Application
             </label>
             <input
+              id="multicast-groups-application"
               className={inputCls}
               value={application}
               onChange={(e) => setApplication(e.target.value)}
@@ -287,10 +326,14 @@ export function MulticastGroupModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-rtp-payload-type-0-127"
+              className="text-xs font-medium text-muted-foreground"
+            >
               RTP payload type (0-127)
             </label>
             <input
+              id="multicast-groups-rtp-payload-type-0-127"
               className={inputCls}
               value={rtpPayloadType}
               onChange={(e) => setRtpPayloadType(e.target.value)}
@@ -299,10 +342,14 @@ export function MulticastGroupModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-estimated-bandwidth-mbps"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Estimated bandwidth (Mbps)
             </label>
             <input
+              id="multicast-groups-estimated-bandwidth-mbps"
               className={inputCls}
               value={bandwidth}
               onChange={(e) => setBandwidth(e.target.value)}
@@ -310,10 +357,14 @@ export function MulticastGroupModal({
             />
           </div>
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-description"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Description
             </label>
             <textarea
+              id="multicast-groups-description"
               className={cn(inputCls, "min-h-[80px]")}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -481,7 +532,10 @@ export function PortsTab({ groupId }: { groupId: string }) {
               <PortRow
                 key={p.id}
                 row={p}
-                onDelete={() => remove.mutate(p.id)}
+                onDelete={() => {
+                  armRemovalFocus();
+                  remove.mutate(p.id);
+                }}
               />
             ))}
           </tbody>
@@ -586,6 +640,7 @@ function MembershipsTab({ groupId }: { groupId: string }) {
             }}
           />
           <select
+            aria-label="Role"
             className={inputCls}
             value={role}
             onChange={(e) => setRole(e.target.value as MulticastMembershipRole)}
@@ -645,7 +700,10 @@ function MembershipsTab({ groupId }: { groupId: string }) {
               <MembershipRow
                 key={m.id}
                 row={m}
-                onDelete={() => remove.mutate(m.id)}
+                onDelete={() => {
+                  armRemovalFocus();
+                  remove.mutate(m.id);
+                }}
               />
             ))}
           </tbody>
@@ -692,9 +750,11 @@ function MembershipRow({
 
 function BulkAllocateModal({
   spaces,
+  spacesError,
   onClose,
 }: {
   spaces: IPSpace[];
+  spacesError?: unknown;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -773,10 +833,14 @@ function BulkAllocateModal({
       <div className="space-y-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-ip-space-2"
+              className="text-xs font-medium text-muted-foreground"
+            >
               IP space
             </label>
             <select
+              id="multicast-groups-ip-space-2"
               className={inputCls}
               value={spaceId}
               onChange={(e) => {
@@ -791,12 +855,21 @@ function BulkAllocateModal({
                 </option>
               ))}
             </select>
+            {spacesError != null && (
+              <p className="mt-1 text-[11px]">
+                <ListReadError error={spacesError} what="IP spaces" />
+              </p>
+            )}
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-customer-optional-2"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Customer (optional)
             </label>
             <select
+              id="multicast-groups-customer-optional-2"
               className={inputCls}
               value={customerId ?? ""}
               onChange={(e) => setCustomerId(e.target.value || null)}
@@ -810,10 +883,14 @@ function BulkAllocateModal({
             </select>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-start-address"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Start address
             </label>
             <input
+              id="multicast-groups-start-address"
               className={cn(inputCls, "font-mono")}
               value={startAddress}
               onChange={(e) => {
@@ -824,10 +901,14 @@ function BulkAllocateModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-count-max-256"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Count (max 256)
             </label>
             <input
+              id="multicast-groups-count-max-256"
               className={inputCls}
               value={count}
               onChange={(e) => {
@@ -838,10 +919,14 @@ function BulkAllocateModal({
             />
           </div>
           <div className="sm:col-span-2">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-name-template"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Name template
             </label>
             <input
+              id="multicast-groups-name-template"
               className={cn(inputCls, "font-mono")}
               value={nameTemplate}
               onChange={(e) => {
@@ -857,10 +942,14 @@ function BulkAllocateModal({
             </p>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-template-start-n-initial-value"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Template start (n initial value)
             </label>
             <input
+              id="multicast-groups-template-start-n-initial-value"
               className={inputCls}
               value={templateStart}
               onChange={(e) => {
@@ -871,10 +960,14 @@ function BulkAllocateModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="multicast-groups-application-2"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Application
             </label>
             <input
+              id="multicast-groups-application-2"
               className={inputCls}
               value={application}
               onChange={(e) => setApplication(e.target.value)}
@@ -1205,19 +1298,35 @@ export function MulticastGroupsPage() {
         )}
       </div>
 
-      {(showNew || editing) && (
+      {showNew && (
         <MulticastGroupModal
-          existing={editing}
+          existing={null}
           spaces={spacesQ.data ?? []}
-          onClose={() => {
-            setShowNew(false);
-            setEditing(null);
-          }}
+          spacesError={spacesQ.error}
+          onClose={() => setShowNew(false)}
         />
+      )}
+      {editing && (
+        <FreshEdit
+          row={editing}
+          load={() => multicastApi.get(editing.id)}
+          title="Edit multicast group"
+          onClose={() => setEditing(null)}
+        >
+          {(fresh) => (
+            <MulticastGroupModal
+              existing={fresh}
+              spaces={spacesQ.data ?? []}
+              spacesError={spacesQ.error}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
       {showBulk && (
         <BulkAllocateModal
           spaces={spacesQ.data ?? []}
+          spacesError={spacesQ.error}
           onClose={() => setShowBulk(false)}
         />
       )}

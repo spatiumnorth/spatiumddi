@@ -1,4 +1,5 @@
 import { poolDeleteSummary } from "@/lib/pool-delete-copy";
+import { Field } from "@/components/ui/field";
 import { useState } from "react";
 import { humanTime } from "../network/_shared";
 import { memberCheckCell } from "@/lib/pool-health";
@@ -195,8 +196,12 @@ export function PoolsView({
           pool={confirmDelete}
           zone={zone}
           onConfirm={() => del.mutate(confirmDelete.id)}
-          onClose={() => setConfirmDelete(null)}
+          onClose={() => {
+            setConfirmDelete(null);
+            del.reset();
+          }}
           pending={del.isPending}
+          error={del.error ? formatApiError(del.error, "Delete failed") : null}
         />
       )}
     </div>
@@ -254,7 +259,7 @@ function PoolCard({
           <p className="mt-0.5 text-xs text-muted-foreground">
             {pool.hc_type === "none"
               ? "No health check — all enabled members rendered"
-              : `${pool.hc_type.toUpperCase()} check${pool.hc_target_port ? ` :${pool.hc_target_port}` : ""}${pool.hc_path && pool.hc_type !== "tcp" ? ` ${pool.hc_path}` : ""} · every ${pool.hc_interval_seconds}s`}
+              : `${pool.hc_type.toUpperCase()} check${pool.hc_target_port ? ` :${pool.hc_target_port}` : pool.hc_type === "https" ? " :443 (default)" : pool.hc_type === "http" ? " :80 (default)" : ""}${pool.hc_path && pool.hc_type !== "tcp" ? ` ${pool.hc_path}` : ""} · every ${pool.hc_interval_seconds}s`}
             {" · "}
             ttl {pool.ttl}s
           </p>
@@ -483,7 +488,12 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
   const [hcType, setHcType] = useState<DNSPoolWrite["hc_type"]>(
     pool?.hc_type ?? "tcp",
   );
-  const [hcPort, setHcPort] = useState(pool?.hc_target_port ?? 80);
+  // #4307 — empty means "the check type's default port" (what the API stores
+  // as null), so it is never shown as, or saved as, a number the operator did
+  // not type. TCP has no default: it needs a port.
+  const [hcPort, setHcPort] = useState<number | null>(
+    pool?.hc_target_port ?? null,
+  );
   const [hcPath, setHcPath] = useState(pool?.hc_path ?? "/");
   const [hcMethod, setHcMethod] = useState(pool?.hc_method ?? "GET");
   const [hcVerifyTls, setHcVerifyTls] = useState(pool?.hc_verify_tls ?? false);
@@ -688,6 +698,9 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
             return;
           }
           const hcError =
+            (hcType === "tcp" && !hcPort
+              ? "A TCP health check needs a target port."
+              : null) ??
             secondsFieldError(
               "Health-check interval",
               hcInterval,
@@ -795,8 +808,17 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
                   type="number"
                   min={1}
                   max={65535}
-                  value={hcPort}
-                  onChange={(e) => setHcPort(parseInt(e.target.value, 10) || 0)}
+                  value={hcPort ?? ""}
+                  placeholder={
+                    hcType === "https"
+                      ? "443 (HTTPS default)"
+                      : hcType === "http"
+                        ? "80 (HTTP default)"
+                        : "required"
+                  }
+                  onChange={(e) =>
+                    setHcPort(parseInt(e.target.value, 10) || null)
+                  }
                   className={inputCls}
                 />
               </Field>
@@ -974,10 +996,14 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div className="space-y-1">
-                    <label className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                    <label
+                      htmlFor={`pool-member-cidrs-${idx}`}
+                      className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
+                    >
                       Serving scope — client CIDRs
                     </label>
                     <input
+                      id={`pool-member-cidrs-${idx}`}
                       value={m.servingCidrs}
                       onChange={(e) =>
                         updateMember(idx, { servingCidrs: e.target.value })
@@ -987,10 +1013,14 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
                     />
                   </div>
                   <div className="space-y-1">
-                    <label className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                    <label
+                      htmlFor={`pool-member-site-${idx}`}
+                      className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
+                    >
                       Serving scope — Site
                     </label>
                     <select
+                      id={`pool-member-site-${idx}`}
                       value={m.siteId ?? ""}
                       onChange={(e) =>
                         updateMember(idx, {
@@ -1053,12 +1083,14 @@ export function ConfirmDelete({
   onConfirm,
   onClose,
   pending,
+  error,
 }: {
   pool: DNSPool;
   zone: DNSZone;
   onConfirm: () => void;
   onClose: () => void;
   pending: boolean;
+  error?: string | null;
 }) {
   const fqdn =
     pool.record_name === "@"
@@ -1080,6 +1112,7 @@ export function ConfirmDelete({
             : 0,
         })}
       </p>
+      <FormError className="mt-2 text-sm">{error}</FormError>
       <div className="mt-4 flex justify-end gap-2">
         <button
           type="button"
@@ -1105,23 +1138,3 @@ export function ConfirmDelete({
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}

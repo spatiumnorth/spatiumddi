@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -1130,7 +1131,7 @@ export function WorkloadHealth({
                             ? "not ready"
                             : "not replicating"
                         }`
-                      : `${w.findings!.length} instances unhealthy`}
+                      : `${countNoun(w.findings!.length, "instance")} unhealthy`}
                   </span>
                 )}
                 {w.jobs_running > 0 && (
@@ -1508,7 +1509,7 @@ export function ClusterOverview({
             color={s.nodes_ready === s.nodes_total ? EMERALD : ROSE}
             title="Nodes ready / total"
           >
-            {s.nodes_ready}/{s.nodes_total} nodes
+            {s.nodes_ready}/{countNoun(s.nodes_total, "node")}
             {s.is_ha && <span className="opacity-70">· HA</span>}
           </Chip>
           {s.kubelet_version && (
@@ -1713,11 +1714,9 @@ export function ClusterOverview({
             The host will power-cycle in ~10 seconds. Existing DHCP leases keep
             their state (DB-backed); DNS zones reload from the served config;
             the web UI will be unreachable for ~1 minute.
-            {rebootError && (
-              <span className="mt-2 block text-destructive">{rebootError}</span>
-            )}
           </span>
         }
+        error={rebootError}
         confirmLabel="Reboot now"
         tone="destructive"
         requireCheckboxLabel="I understand the appliance will go offline for ~1 minute."

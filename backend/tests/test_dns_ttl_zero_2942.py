@@ -87,13 +87,16 @@ def test_powerdns_rrset_ttl(ttl: int | None, expected: int) -> None:
 
 
 async def _rfc2136(monkeypatch: pytest.MonkeyPatch, change: RecordChange) -> Any:
+    import dns.message
     import dns.query
 
     from app.drivers.dns import windows
 
     sent: list[Any] = []
     monkeypatch.setattr(windows, "resolve_server_address", lambda *a, **k: ["192.0.2.53"])
-    monkeypatch.setattr(dns.query, "tcp", lambda msg, *a, **k: sent.append(msg))
+    monkeypatch.setattr(
+        dns.query, "tcp", lambda msg, *a, **k: (sent.append(msg), dns.message.make_response(msg))[1]
+    )
     server = SimpleNamespace(id="s1", host="dc1.example.com", api_port=53)
     await windows.WindowsDNSDriver().apply_record_change(server, change)
     (msg,) = sent
