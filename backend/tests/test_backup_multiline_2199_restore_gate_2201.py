@@ -100,6 +100,8 @@ def test_every_field_whose_value_is_lines_is_multiline() -> None:
         ("scp", "known_hosts"),
         ("https_put", "extra_headers"),
         ("gcs", "service_account_json"),
+        ("git", "ssh_private_key"),
+        ("git", "known_hosts"),
     }
 
 
