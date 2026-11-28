@@ -56,6 +56,7 @@ from app.services.integration_ownership import (
     refuse_sync_into_trashed_space,
     retire_vanished_subnet,
 )
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.utilization import counts_toward_utilization
 from app.services.proxmox.client import (
     ProxmoxClient,
@@ -828,6 +829,7 @@ async def _apply_addresses(
                     changed = True
                 if d.mac and (row.mac_address or "") != d.mac.lower():
                     row.mac_address = d.mac.lower()
+                    await record_mac_history(db, row.id, row.mac_address)
                     changed = True
             if changed:
                 dirty_subnets.add(subnet.id)
@@ -839,17 +841,19 @@ async def _apply_addresses(
             # would hit ``uq_ip_address_subnet_address``.
             if await address_taken(db, subnet.id, d.address):
                 continue
-            db.add(
-                IPAddress(
-                    subnet_id=subnet.id,
-                    address=d.address,
-                    status=d.status,
-                    hostname=d.hostname,
-                    description=d.description,
-                    mac_address=d.mac.lower() if d.mac else None,
-                    proxmox_node_id=node.id,
-                )
+            new_row = IPAddress(
+                subnet_id=subnet.id,
+                address=d.address,
+                status=d.status,
+                hostname=d.hostname,
+                description=d.description,
+                mac_address=d.mac.lower() if d.mac else None,
+                proxmox_node_id=node.id,
             )
+            db.add(new_row)
+            if new_row.mac_address:
+                await db.flush()
+                await record_mac_history(db, new_row.id, new_row.mac_address)
             dirty_subnets.add(subnet.id)
             summary.addresses_created += 1
 
