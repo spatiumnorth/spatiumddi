@@ -97,6 +97,7 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && apk add --no-cache \
       'kea>=3.0.3-r0' kea-dhcp4 kea-dhcp6 kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
+      kea-hook-subnet-cmds kea-hook-host-cmds \
       tini su-exec setpriv \
       python3 py3-pip libpcap \
       libcap \

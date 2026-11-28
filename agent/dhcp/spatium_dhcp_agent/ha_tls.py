@@ -23,6 +23,18 @@ CAPABILITY = "ha_peer_tls"
 # Everything this agent advertises on register + heartbeat.
 AGENT_CAPABILITIES: tuple[str, ...] = (CAPABILITY,)
 
+
+def current_capabilities() -> list[str]:
+    """What this agent advertises right now: the static set plus
+    ``kea-incremental-subnets`` when the image carries the subnet_cmds and
+    host_cmds hooks (#3790), so an older image keeps reloading."""
+    from .incremental import CAPABILITY as INCREMENTAL, hooks_installed
+
+    caps = list(AGENT_CAPABILITIES)
+    if hooks_installed():
+        caps.append(INCREMENTAL)
+    return caps
+
 CA_FILE = "ca.pem"
 CERT_FILE = "cert.pem"
 KEY_FILE = "key.pem"

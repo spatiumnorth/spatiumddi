@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -502,9 +502,57 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         kea_packet_logging=kea_packet_logging,
         ra_configs=tuple(ra_configs),
         radvd_conf=radvd_conf,
+        incremental=_incremental_block(server, group, failover),
     )
     bundle.etag = bundle.compute_etag()
     return bundle
+
+
+# #3790 — capability a Kea agent advertises when its image carries the
+# subnet_cmds + host_cmds hooks.
+INCREMENTAL_CAPABILITY = "kea-incremental-subnets"
+# A partner that has not heartbeated this recently is treated as unreachable:
+# with no partner there is nothing to protect, and waiting on a set that can
+# never change would hold a subnet change back forever.
+PARTNER_REPORT_MAX_AGE = timedelta(minutes=2)
+
+
+def _incremental_block(
+    server: DHCPServer, group: DHCPServerGroup | None, failover: FailoverConfig | None
+) -> dict | None:
+    """Whether this member may apply subnet-only changes in memory (#3790).
+
+    ``None`` keeps today's behaviour (full ``config-reload`` on every change).
+
+    * Standalone (no HA hook for this member): allowed once the agent advertises
+      the capability.
+    * ``hot-standby`` pair: allowed when both members advertise it and the
+      partner has reported its applied subnet ids recently. The ids ride in the
+      bundle so the agent applies the ordering rule: a member only carries
+      subnets its partner also has, or the partner rejects its lease updates
+      and both go to TERMINATED.
+    * Load-balancing, or an HA group of more than two: full reload.
+    """
+    if INCREMENTAL_CAPABILITY not in (server.agent_capabilities or []):
+        return None
+    if failover is None:
+        return {"ok": True, "role": "standalone", "partner_applied_subnet_ids": None}
+    if group is None or failover.mode != "hot-standby" or len(failover.peers) != 2:
+        return None
+    partner_name = next((p["name"] for p in failover.peers if p["name"] != server.name), None)
+    partner = next((s for s in group.servers if s.name == partner_name), None)
+    if partner is None or INCREMENTAL_CAPABILITY not in (partner.agent_capabilities or []):
+        return None
+    reported = partner.applied_subnet_ids
+    seen = partner.last_health_check_at
+    if reported is None or seen is None or datetime.now(UTC) - seen > PARTNER_REPORT_MAX_AGE:
+        return None
+    role = next(p["role"] for p in failover.peers if p["name"] == server.name)
+    return {
+        "ok": True,
+        "role": "primary" if role == "primary" else "standby",
+        "partner_applied_subnet_ids": sorted(reported),
+    }
 
 
 def _build_pxe_match_expression(
