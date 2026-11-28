@@ -1304,12 +1304,21 @@ def _sync_task_files() -> list[Path]:
     ]
 
 
+# Reconcilers that write no IPAM rows (a store of their own only).
+_NON_IPAM_RECONCILERS = {"ddi_mirror"}
+
+
 def test_every_reconciler_reports_its_release_on_audit_log_and_result() -> None:
     """Each reconciler's sync audit row and log line, and each sync task's
     result, carry ``summary.released`` — a release is never left out of the
     counts the operator reads."""
+    # ddi_mirror (#4729) writes only to its own ddi_mirror_object store and
+    # never touches IPAM rows, so there is nothing to release and no IP space
+    # to check: it is not one of the IPAM-mirror reconcilers this guards.
     files = [
-        p for p in sorted(_APP.glob("services/*/reconcile.py")) if '.reconcile",' in p.read_text()
+        p
+        for p in sorted(_APP.glob("services/*/reconcile.py"))
+        if '.reconcile",' in p.read_text() and p.parent.name not in _NON_IPAM_RECONCILERS
     ]
     assert len(files) == 11, [p.parent.name for p in files]
     missing = []
