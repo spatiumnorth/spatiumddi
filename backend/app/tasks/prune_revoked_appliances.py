@@ -24,6 +24,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.appliance import APPLIANCE_STATE_REVOKED, Appliance
 from app.models.settings import PlatformSettings
+from app.tasks._system_audit import add_system_audit
 
 logger = structlog.get_logger(__name__)
 
@@ -48,8 +49,20 @@ async def _sweep() -> dict[str, int]:
                 Appliance.revoked_at < cutoff,
             )
         )
+        removed = result.rowcount or 0
+        if removed:
+            # Hard-deleting Fleet rows is a mutation (non-negotiable #4, #1257):
+            # one summary row per run.
+            add_system_audit(
+                db,
+                action="appliance-prune-revoked",
+                resource_type="appliance",
+                resource_id="prune-revoked-appliances",
+                resource_display="revoked appliances past retention",
+                new_value={"removed": removed, "retention_days": retention_days},
+            )
         await db.commit()
-        return {"removed": result.rowcount or 0, "disabled": False}
+        return {"removed": removed, "disabled": False}
 
 
 @celery_app.task(name="app.tasks.prune_revoked_appliances.prune_revoked_appliances")
