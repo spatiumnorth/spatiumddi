@@ -32,6 +32,7 @@ EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
         "/api/v1/dhcp/import/isc/preview",
         "/api/v1/dhcp/import/kea/preview",
         "/api/v1/dicom/aes/import/preview",
+        "/api/v1/dns/groups/{group_id}/zones/{zone_id}/apply-template/preview",
         "/api/v1/dns/groups/{group_id}/zones/{zone_id}/import/preview",
         "/api/v1/dns/groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview",
         "/api/v1/dns/groups/{group_id}/zones/{zone_id}/move/preview",

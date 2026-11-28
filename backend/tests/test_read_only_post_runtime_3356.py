@@ -445,6 +445,10 @@ CASES: dict[str, Callable[[Seed], Req]] = {
             "column_map": {"ae_title": "AE Title", "address": "IP", "port": "Port"},
         },
     ),
+    "/api/v1/dns/groups/{group_id}/zones/{zone_id}/apply-template/preview": lambda s: _json(
+        f"/api/v1/dns/groups/{s.dns_group_id}/zones/{s.zone_id}/apply-template/preview",
+        {"template_id": "mail-basic", "params": {"mx_host": "mx.example.com."}},
+    ),
     "/api/v1/dns/groups/{group_id}/zones/{zone_id}/import/preview": lambda s: _json(
         f"/api/v1/dns/groups/{s.dns_group_id}/zones/{s.zone_id}/import/preview",
         {"zone_file": _ZONE_TEXT, "zone_name": "example.com."},
