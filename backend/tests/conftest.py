@@ -182,9 +182,11 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     from app.services import feature_modules
     from app.services.appliance import cluster_health
     from app.services.dns import tld_registry
+    from app.services.web_exposure import store as web_exposure_store
 
     maintenance_mode.invalidate_cache()
     feature_modules.invalidate_cache()
+    web_exposure_store.reset_buffer()
     # #986 — the effective TLD registry is cached the same way, so a test
     # that stores a snapshot would keep classifying later tests' zones
     # against it after the per-test TRUNCATE removed the row.

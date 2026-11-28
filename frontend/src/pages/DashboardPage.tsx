@@ -133,6 +133,7 @@ import {
 } from "@/lib/configApply";
 import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
 import { CredentialChip } from "@/components/CredentialChip";
+import { WebExposureCard } from "@/components/WebExposureCard";
 import { cardTargets } from "@/lib/credential-chip";
 
 /**
@@ -5928,6 +5929,7 @@ function SecurityPanel() {
   return (
     <div className="space-y-5">
       <DNSThreatCard />
+      <WebExposureCard />
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <Link
           to="/admin/users"

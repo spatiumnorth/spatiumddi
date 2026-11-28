@@ -99,6 +99,7 @@ from app.api.v1.users.router import router as users_router
 from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
 from app.api.v1.vrfs import router as vrfs_router
+from app.api.v1.web_exposure.router import router as web_exposure_router
 from app.api.v1.webhooks import router as webhooks_router
 from app.api.v1.wol_schedules import router as wake_scheduler_router
 from app.core.agent_wake import wake_publishing
@@ -340,6 +341,12 @@ api_v1_router.include_router(
     prefix="/dns-threat",
     tags=["dns-threat"],
     dependencies=[Depends(require_module("security.dns_threat"))],
+)
+api_v1_router.include_router(
+    web_exposure_router,
+    prefix="/web-exposure",
+    tags=["web-exposure"],
+    dependencies=[Depends(require_module("security.web_exposure"))],
 )
 api_v1_router.include_router(
     dnsbl_router,

@@ -118,6 +118,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     "security.block_sync": False,
     "security.firewall_feeds": False,
     "security.dnsbl": False,
+    "security.web_exposure": False,
 }
 
 
