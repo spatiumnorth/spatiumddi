@@ -674,6 +674,7 @@ def _additive_import(
             port=rec.port,
             auto_generated=False,
             ip_address_id=None,
+            dynamic=rec.dynamic,
         )
         if apply:
             db.add(row)

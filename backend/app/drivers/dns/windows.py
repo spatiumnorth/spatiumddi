@@ -799,6 +799,7 @@ foreach ($r in $records) {{
         HostName = $r.HostName
         Type     = "$t"
         TTL      = $ttl
+        Dynamic  = [bool]($null -ne $r.Timestamp)
     }}
     switch ("$t") {{
         'A'     {{ $o.Value = $data.IPv4Address.IPAddressToString }}
@@ -871,6 +872,7 @@ def _parse_records(raw: str) -> list[RecordData]:
         priority = item.get("Priority")
         weight = item.get("Weight")
         port = item.get("Port")
+        dyn = item.get("Dynamic")
         out.append(
             RecordData(
                 name=name,
@@ -880,6 +882,7 @@ def _parse_records(raw: str) -> list[RecordData]:
                 priority=int(priority) if priority is not None else None,
                 weight=int(weight) if weight is not None else None,
                 port=int(port) if port is not None else None,
+                dynamic=dyn if isinstance(dyn, bool) else None,
             )
         )
     return out

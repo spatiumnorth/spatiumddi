@@ -60,6 +60,8 @@ AUDITED_TOKEN_BINDING_TOOLS = frozenset(
         "find_by_tag",
         # Shared search engine, which narrows results to the bound instances.
         "global_search",
+        # Filters its subnets and zones to the token's grants (#2251).
+        "preview_populate_ipam_from_dns",
         # No resource data.
         "ask_yes_no",
         "help_write_permission",

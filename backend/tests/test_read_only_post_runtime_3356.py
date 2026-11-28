@@ -463,6 +463,9 @@ CASES: dict[str, Callable[[Seed], Req]] = {
         "files": {"file": ("bind.tar.gz", _bind_archive(), "application/gzip")},
         "data": {"target_group_id": str(s.dns_group_id)},
     },
+    "/api/v1/ipam/import/dns/preview": lambda s: _json(
+        "/api/v1/ipam/import/dns/preview", {"space_id": str(s.space_id)}
+    ),
     "/api/v1/ipam/blocks/{block_id}/move/preview": lambda s: _json(
         f"/api/v1/ipam/blocks/{s.resize_block_id}/move/preview",
         {"target_space_id": str(s.other_space_id)},

@@ -47,6 +47,9 @@ class RecordData:
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
+    # #2251 — registered dynamically (Windows aging timestamp present).
+    # None = the source cannot say (AXFR).
+    dynamic: bool | None = None
 
 
 @dataclass(frozen=True)
