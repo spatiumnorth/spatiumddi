@@ -401,8 +401,27 @@ def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("ascii")).hexdigest()
 
 
+_LOOPBACK_PEERS = frozenset({"127.0.0.1", "::1"})
+
+
 def _client_ip(request: Request) -> str | None:
-    return request.client.host if request.client else None
+    """The supervisor's address.
+
+    The api pod's TLS sidecar (#4430, ``api.tlsListener``) reaches the app over
+    the pod's loopback, so the TCP peer is 127.0.0.1 for a supervisor that came
+    in over TLS. Only a process in the pod's own network namespace can be that
+    peer, and the sidecar OVERWRITES ``X-Forwarded-For`` with the address it
+    accepted the connection from, so that header is believed from a loopback
+    peer and from nobody else (uvicorn runs with ``--no-proxy-headers``).
+    """
+    if request.client is None:
+        return None
+    host = request.client.host
+    if host in _LOOPBACK_PEERS:
+        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded
+    return host
 
 
 # #272 Phase 1 — self-bootstrap path for the control-plane appliance.
