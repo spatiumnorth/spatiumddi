@@ -182,6 +182,7 @@ _UNCLASSIFIED_BASELINE: frozenset[str] = frozenset(
         "network_block_push",
         "opnsense_router",
         "packet_capture",
+        "pairing_attempt",
         "pairing_claim",
         "pairing_code",
         "panos_firewall",

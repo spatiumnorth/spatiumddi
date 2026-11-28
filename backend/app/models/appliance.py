@@ -298,6 +298,45 @@ class PairingClaim(Base):
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
+class PairingAttempt(Base):
+    """A refused ``supervisor/register`` attempt, kept so Fleet can show it (#2225).
+
+    The wire answer to a refusal is one generic 403 (anything more would be
+    a guessing oracle for 8-digit codes), so the reason lives here, where
+    only a superadmin reads it. Rows are grouped: repeats of the same
+    (code, hostname, reason) bump ``attempts`` and ``last_attempted_at``
+    instead of adding a row, because an appliance retries on a timer.
+
+    Never stores the submitted code or the key material: ``pairing_code_id``
+    is set only when the code matched a real row (and so only names a code
+    the operator already owns), and ``hostname`` is the joiner's own
+    caller-supplied string, length-capped. Bounded on insert by
+    ``record_pairing_attempt`` (row caps + age), since the endpoint is
+    unauthenticated.
+    """
+
+    __tablename__ = "pairing_attempt"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pairing_code_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pairing_code.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # unknown_code / revoked / expired / already_used / disabled / exhausted
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    first_attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
 # Supervisor lifecycle states (#170 Wave A2). State machine:
 #
 #   pending_approval ──(admin Approve in B1)──▶ approved
