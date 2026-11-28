@@ -28,7 +28,7 @@ and group ids are distinct UUIDs, so the two readings never collide.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -223,7 +223,7 @@ def _server_scope(column: Any, server_ids: Sequence[uuid.UUID], include_orphans:
 
 
 def log_row_server_name(
-    row_server_id: uuid.UUID | None, stored_name: str | None, names: dict[uuid.UUID, str]
+    row_server_id: uuid.UUID | None, stored_name: str | None, names: Mapping[uuid.UUID, str]
 ) -> str:
     """The server name a merged log read shows for one row.
 
