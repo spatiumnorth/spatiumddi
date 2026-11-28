@@ -87,6 +87,10 @@ class ZoneData:
     # primary / forward zones. Defaulted empty so existing constructors keep
     # working.
     masters: tuple[str, ...] = ()
+    # Per-primary ``(master, tsig_key, tls_hostname)`` (#3568), one triple per
+    # ``masters`` entry that carries either. Rendered as ``primaries { ip
+    # [port n] [key k] [tls t]; }`` by the BIND9 driver.
+    master_options: tuple[tuple[str, str | None, str | None], ...] = ()
     # DNSSEC inline-signing (issue #49). When ``dnssec_enabled`` the BIND9
     # driver renders ``dnssec-policy "<dnssec_policy_name>"; inline-signing
     # yes;`` into the zone stanza and BIND auto-signs. ``dnssec_policy_name``
@@ -215,6 +219,8 @@ class ServerOptions:
     allow_query: tuple[str, ...] = ("any",)
     allow_query_cache: tuple[str, ...] = ("localhost", "localnets")
     allow_transfer: tuple[str, ...] = ("none",)
+    # ``allow-transfer transport tls`` (XFR-over-TLS, #3568); needs ``dot_enabled``.
+    allow_transfer_tls_only: bool = False
     blackhole: tuple[str, ...] = ()
     trust_anchors: tuple[TrustAnchorData, ...] = ()
     query_log_enabled: bool = False

@@ -1448,6 +1448,15 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
             # as ``masters { <ip> [port <n>]; … };`` for slave/stub zones;
             # ignored for primary / forward.
             "masters": list(getattr(z, "masters", []) or []),
+            # #3568 — per-primary TSIG key / TLS hostname, keyed by a
+            # ``masters`` entry. Present only when set, so a zone without
+            # any keeps its bundle (and ETag) byte for byte, and an agent
+            # that predates the field renders the plain list it always did.
+            **(
+                {"master_options": dict(z.master_options)}
+                if getattr(z, "master_options", None)
+                else {}
+            ),
             # DNSSEC inline-signing (issue #49). policy_name None ⇒ BIND
             # built-in "default".
             "dnssec_enabled": bool(getattr(z, "dnssec_enabled", False)),
@@ -1647,6 +1656,13 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         ),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
         "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
+        # #3568 — present only when on, so every other group's bundle is
+        # unchanged and an older agent simply ignores it.
+        **(
+            {"allow_transfer_tls_only": True}
+            if opts and getattr(opts, "allow_transfer_tls_only", False)
+            else {}
+        ),
         # NOTIFY behaviour (#1523). Settable in the UI / API, validated
         # (#1316) and persisted, but never shipped, so `notify no` (a
         # stealth primary) still sent NOTIFY from BIND9 (whose default is

@@ -46,8 +46,11 @@ except ImportError:  # pragma: no cover - runtime-optional
 from ..blocklist_entries import entry_count, iter_entries
 from ..ingest import read_seen_keys as _read_seen_keys
 from ..oom_watch import cgroup_memory_limit_bytes as _cgroup_memory_limit_bytes
+from ._forwarders import bind_zone_forwarder as _bind_zone_forwarder
 from ._forwarders import bind_zone_forwarders as _bind_zone_forwarders
 from ._forwarders import bind_zone_tls_statement as _bind_zone_tls_statement
+from ._forwarders import safe_tls_hostname as _safe_tls_hostname
+from ._forwarders import zone_tls_statement_name as _zone_tls_statement_name
 from ._process import (
     find_running_daemon,
     is_zombie,
@@ -505,6 +508,7 @@ def _zone_notify_clauses(zone: dict[str, Any]) -> str:
 def _render_allow_transfer(
     acl: list[Any] | None,
     key_grants: list[str],
+    tls_only: bool = False,
 ) -> str:
     """Build an ``allow-transfer { ... };`` clause (issue #734).
 
@@ -532,14 +536,20 @@ def _render_allow_transfer(
 
     Entries that could break out of the statement (``;``, braces, newlines)
     are dropped, as for the other address-match lists.
+
+    ``tls_only`` (#3568, XFR-over-TLS) renders ``allow-transfer transport tls
+    { … };``: BIND then applies the list to transfers over TLS, served by the
+    DoT listener, and no longer to the plain TCP ones. The caller passes it
+    only while that listener is rendered.
     """
+    transport = "transport tls " if tls_only else ""
     items = list(key_grants)
     tokens = _safe_conf_entries(acl)
     if any(t.lower() != "none" for t in tokens):
         items += [f"{t};" for t in tokens]
     if not items:
-        return "allow-transfer { none; }; "
-    return f'allow-transfer {{ {" ".join(items)} }}; '
+        return f"allow-transfer {transport}{{ none; }}; "
+    return f'allow-transfer {transport}{{ {" ".join(items)} }}; '
 
 
 _UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
@@ -939,7 +949,8 @@ def _render_tls_statements(
 
 def _render_zone_tls_statements(zones: list[dict[str, Any]] | None) -> str:
     """One ``tls`` statement per distinct upstream hostname that a TLS forward
-    zone forwards to (#2121), sorted so the file is stable.
+    zone forwards to (#2121) or a secondary zone transfers from over TLS
+    (#3568), sorted so the file is stable.
 
     Rendered with the other top-level tls statements, above ``options`` and
     so above every zone that names one: BIND resolves a tls name where it is
@@ -948,6 +959,14 @@ def _render_zone_tls_statements(zones: list[dict[str, Any]] | None) -> str:
     """
     hostnames: set[str] = set()
     for zone in zones or []:
+        if zone.get("type") in {"secondary", "slave", "stub"}:
+            # Transfer-over-TLS primaries (#3568) name the same kind of
+            # statement; one per hostname whichever zone asks for it.
+            for opts in (zone.get("master_options") or {}).values():
+                host = _safe_tls_hostname((opts or {}).get("tls_hostname"))
+                if host:
+                    hostnames.add(host)
+            continue
         if zone.get("type") != "forward":
             continue
         _tokens, hostname, _refusal = _bind_zone_forwarders(zone)
@@ -1037,23 +1056,51 @@ def _lifetime(days: int, *, key: str, policy: str | None = None) -> str:
     return "unlimited" if not held else f"{held}d"
 
 
-def _format_master(entry: str) -> str:
-    """Render one secondary/stub master entry as a BIND9 ``masters`` token.
+def _format_master(
+    entry: str,
+    options: dict[str, Any] | None = None,
+    key_names: dict[str, str] | None = None,
+) -> str:
+    """Render one secondary/stub master entry as a BIND9 ``primaries`` token.
 
     Accepts ``ip`` or ``ip@port`` (the control-plane wire shape, matching
     the forwarders convention) and emits ``<ip>`` or ``<ip> port <n>``.
     A non-numeric / malformed port suffix is dropped — better to AXFR
     from the default port 53 than to render an un-loadable stanza.
+
+    ``options`` is the master's ``master_options`` entry (#3568): a
+    ``tsig_key`` adds ``key "<name>"`` and a ``tls_hostname`` adds
+    ``tls <statement>`` (port 853 unless the entry pins one; an explicit
+    ``@53`` stays plain DNS). ``key_names`` maps a normalised key name to
+    the name the bundle's key file defines: a key it does not hold is left
+    off, because ``key`` naming an undefined key makes named refuse the
+    whole file.
     """
     entry = entry.strip()
-    if "@" in entry:
-        ip, _, port = entry.partition("@")
-        ip = ip.strip()
-        port = port.strip()
-        if port.isdigit():
-            return f"{ip} port {port}"
-        return ip
-    return entry
+    ip, _, port = entry.partition("@")
+    ip = ip.strip()
+    port = port.strip()
+    options = options or {}
+    host = _safe_tls_hostname(options.get("tls_hostname"))
+    if not host and not options.get("tsig_key"):
+        return f"{ip} port {port}" if port.isdigit() else ip
+    out = _bind_zone_forwarder(
+        f"{ip}@{port}" if port.isdigit() else ip,
+        _zone_tls_statement_name(host) if host else None,
+    )
+    # BIND's order is ``ip [port n] [key k] [tls t]``.
+    out, _sep, tls_part = out.partition(" tls ")
+    wanted = str(options.get("tsig_key") or "").strip()
+    if wanted:
+        name = (key_names or {}).get(wanted.rstrip(".").lower())
+        if name and _KEY_NAME_SAFE.match(name):
+            out += f' key "{name}"'
+        else:
+            log.warning("bind9_master_tsig_key_unknown_skipped", master=ip, key=wanted)
+    return f"{out} tls {tls_part}" if tls_part else out
+
+
+_KEY_NAME_SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _parses_as_rdata(rtype: str, wire: str, origin: str | None = None) -> bool:
@@ -3510,6 +3557,11 @@ class Bind9Driver(DriverBase):
 
         tsig_keys = _dedupe_key_names(_renderable_tsig_keys(bundle.get("tsig_keys") or []))
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
+        # #3568 — a secondary's ``primaries`` entry may sign with any key of
+        # the bundle; look it up the way BIND compares names.
+        tsig_key_names = {
+            str(k["name"]).rstrip(".").lower(): str(k["name"]) for k in tsig_keys
+        }
         # #2835 — the control plane marks its own group key; only that one
         # may write the SOA under ``update-policy``.
         loopback_owned = bool(tsig_keys and tsig_keys[0].get("loopback"))
@@ -3560,8 +3612,14 @@ class Bind9Driver(DriverBase):
         # BIND lets shadow this one entirely. The view keys are granted with
         # the rest: selecting a view is only half a transfer.
         key_grants = _transfer_key_grants([*tsig_keys, *view_keys.values()])
+        # #3568 — XFR-over-TLS only while the DoT listener it rides on is
+        # rendered; without a certificate the group falls back to plain
+        # transfers rather than to none.
+        xfer_tls_only = bool(opts.get("allow_transfer_tls_only")) and _dot_listener_active(
+            opts, has_cert
+        )
         allow_transfer_opt = _render_allow_transfer(
-            opts.get("allow_transfer"), key_grants
+            opts.get("allow_transfer"), key_grants, xfer_tls_only
         )
 
         def _rpz_key(view: str | None) -> dict[str, Any] | None:
@@ -3709,7 +3767,7 @@ class Bind9Driver(DriverBase):
             # Secondary / stub zones (issue #336): the daemon AXFRs the zone
             # from the configured masters, so we emit no zone file (BIND
             # writes it on first transfer) and a ``masters { <ip> [port
-            # <n>]; … };`` clause. Without masters, ``named-checkconf``
+            # <n>] [key <k>] [tls <t>]; … };`` clause. Without masters, ``named-checkconf``
             # rejects the stanza, so a misconfigured zone (no masters) is
             # simply skipped rather than poisoning the whole config.
             if zone_type in {"secondary", "slave", "stub"}:
@@ -3720,7 +3778,10 @@ class Bind9Driver(DriverBase):
                 rel_zfile = f"zones/{file_prefix}{_zone_fname(zname.rstrip('.'))}.db"
                 abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
                 bind_type = "stub" if zone_type == "stub" else "slave"
-                masters_clause = "; ".join(_format_master(m) for m in masters)
+                master_opts = zone.get("master_options") or {}
+                masters_clause = "; ".join(
+                    _format_master(m, master_opts.get(m), tsig_key_names) for m in masters
+                )
                 return (
                     f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
                     f"masters {{ {masters_clause}; }}; "
@@ -3754,7 +3815,7 @@ class Bind9Driver(DriverBase):
             # the bug this replaced.
             zone_xfer_acl = zone.get("allow_transfer")
             allow_transfer = (
-                _render_allow_transfer(zone_xfer_acl, key_grants)
+                _render_allow_transfer(zone_xfer_acl, key_grants, xfer_tls_only)
                 if zone_xfer_acl is not None
                 else ""
             )

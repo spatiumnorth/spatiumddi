@@ -122,6 +122,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             allow_query=tuple(opts_row.allow_query or ("any",)),
             allow_query_cache=tuple(opts_row.allow_query_cache or ("localhost", "localnets")),
             allow_transfer=tuple(opts_row.allow_transfer or ("none",)),
+            allow_transfer_tls_only=bool(opts_row.allow_transfer_tls_only),
             blackhole=tuple(opts_row.blackhole or ()),
             query_log_enabled=opts_row.query_log_enabled,
             response_log_enabled=opts_row.response_log_enabled,
@@ -301,6 +302,10 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             forward_transport=z.forward_transport or "do53",
             forward_tls_hostname=z.forward_tls_hostname,
             masters=tuple(z.masters or ()),
+            master_options=tuple(
+                (m, o.get("tsig_key"), o.get("tls_hostname"))
+                for m, o in (z.master_options or {}).items()
+            ),
             dnssec_enabled=bool(z.dnssec_enabled),
             dnssec_policy_name=_zone_policy_name(z),
             dynamic_update_enabled=bool(z.dynamic_update_enabled),
