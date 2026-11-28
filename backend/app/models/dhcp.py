@@ -1598,6 +1598,43 @@ class RAObservedRouter(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class DHCPDiscoverRate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """The latest DISCOVER-rate reading for one MAC or one relay on a server (#4737).
+
+    The DHCP agent's opt-in DISCOVER watch counts DISCOVERs per client MAC and
+    per relay (``giaddr``) in a fixed window and ships only the sources above a
+    floor. One row per ``(server, kind, subject)`` holds the most recent
+    window; the ``dhcp_discover_flood`` alert reads rows whose window ended
+    recently. ``kind`` is ``mac`` (``subject`` is the client MAC) or ``relay``
+    (``subject`` is the relay address, ``distinct_macs`` is how many different
+    client MACs it forwarded in the window).
+
+    A reading is the present, not history, so a row is replaced by the next
+    window and pruned when it is a day old.
+    """
+
+    __tablename__ = "dhcp_discover_rate"
+    __table_args__ = (
+        UniqueConstraint("server_id", "kind", "subject", name="uq_dhcp_discover_rate_subject"),
+        Index("ix_dhcp_discover_rate_window_end", "window_end"),
+    )
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    subject: Mapped[str] = mapped_column(String(64), nullable=False)
+    # The relay the DISCOVERs arrived through (NULL = broadcast on the
+    # server's own segment). For a ``relay`` row this equals ``subject``.
+    giaddr: Mapped[str | None] = mapped_column(INET, nullable=True)
+    discovers: Mapped[int] = mapped_column(Integer, nullable=False)
+    distinct_macs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    window_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class RARouterAllowlist(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """An operator-approved IPv6 RA source router (issue #524).
 

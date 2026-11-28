@@ -229,6 +229,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "dhcp_server_group",
             "dhcp_log_entry",
             "dhcp_metric_sample",
+            "dhcp_discover_rate",
             "dhcp_config_op",
             "dhcp_fingerprint",
         ),

@@ -696,7 +696,7 @@ before (and every in-memory buffer was lost on an agent restart besides).
 | | |
 |---|---|
 | Location | `<state dir>/spool/<stream>/` — `/var/lib/spatium-dns-agent/spool/` by default. One file per batch, written tmp + fsync + rename, so a crash leaves a batch whole or absent. Survives agent restarts. |
-| Streams | DNS: `query_log`, `metrics`. (DHCP: `dhcp_log`, `lease_events`, `metrics`, `mac_sightings`, `fingerprints`, `ra_observations` — see [`DHCP.md`](../features/DHCP.md).) |
+| Streams | DNS: `query_log`, `metrics`. (DHCP: `dhcp_log`, `lease_events`, `metrics`, `mac_sightings`, `fingerprints`, `ra_observations`, `discover_rates` — see [`DHCP.md`](../features/DHCP.md).) |
 | `AGENT_SPOOL_ENABLED` | Default `true`. `false` restores the pre-#1077 drop behaviour — kept for the negative control in tests, not as a tuning knob. |
 | `AGENT_SPOOL_MAX_BYTES` | Default `268435456` (256 MiB), shared across the agent's streams by fixed weights. At the cap the **oldest** batches are trimmed and counted. Keep it well under the agent state volume (the Helm chart's `storage.agentState` defaults to 1 Gi, and PowerDNS also keeps `pdns.log` in that directory). |
 | `AGENT_SPOOL_LOG_MAX_AGE_HOURS` | Default `24`, matching the control plane's query-log retention. Log batches spooled longer ago than this are dropped at drain time (counted as *expired*) rather than shipped into a table the nightly prune would empty. Metrics are not age-limited. |
