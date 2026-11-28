@@ -130,6 +130,27 @@ def test_exceptions_render_as_passthru(tmp_path: Path) -> None:
     ]
 
 
+def test_a_subdomain_exception_carves_out_of_a_wildcard_parent(tmp_path: Path) -> None:
+    """#4250: allowing ``a.example.test`` while ``example.test`` is blocked
+    with its subdomains. The exception owners (``a.`` and ``*.a.``) are more
+    specific than the parent's ``*.`` wildcard, and BIND's RPZ takes the most
+    specific owner within a zone, so only that name and what is under it is
+    let through. The parent's own lines must stay, or the rest of it would
+    stop being blocked."""
+    lines = _render(
+        tmp_path,
+        [{"domain": "example.test", "action": "block", "block_mode": "nxdomain",
+          "is_wildcard": True}],
+        ["a.example.test"],
+    )
+    assert lines == [
+        "example.test CNAME .",
+        "*.example.test CNAME .",
+        "a.example.test CNAME rpz-passthru.",
+        "*.a.example.test CNAME rpz-passthru.",
+    ]
+
+
 def test_an_excepted_entry_is_not_also_emitted_as_a_block(tmp_path: Path) -> None:
     """Un-blocking a domain a feed lists is what exceptions are FOR.
 
