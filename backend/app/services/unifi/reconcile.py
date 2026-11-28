@@ -60,6 +60,7 @@ from app.services.integration_ownership import (
     subnet_for_address,
     unowned_subnets_at,
 )
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.subnet_placeholders import sync_mirror_gateway_row
 from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.router_naming import pick_unique_router_name
@@ -910,6 +911,7 @@ async def _apply_addresses(
                     changed = True
                 if d.mac and (row.mac_address or "") != d.mac.lower():
                     row.mac_address = d.mac.lower()
+                    await record_mac_history(db, row.id, row.mac_address)
                     changed = True
             if changed:
                 dirty_subnets.add(subnet.id)
@@ -931,17 +933,19 @@ async def _apply_addresses(
             ).scalar_one_or_none()
             if occupied is not None:
                 continue
-            db.add(
-                IPAddress(
-                    subnet_id=subnet.id,
-                    address=d.address,
-                    status=d.status,
-                    hostname=d.hostname,
-                    description=d.description,
-                    mac_address=d.mac.lower() if d.mac else None,
-                    unifi_controller_id=controller.id,
-                )
+            new_row = IPAddress(
+                subnet_id=subnet.id,
+                address=d.address,
+                status=d.status,
+                hostname=d.hostname,
+                description=d.description,
+                mac_address=d.mac.lower() if d.mac else None,
+                unifi_controller_id=controller.id,
             )
+            db.add(new_row)
+            if new_row.mac_address:
+                await db.flush()
+                await record_mac_history(db, new_row.id, new_row.mac_address)
             dirty_subnets.add(subnet.id)
             summary.addresses_created += 1
 

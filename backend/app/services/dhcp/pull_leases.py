@@ -98,11 +98,13 @@ from app.services.dhcp.windows_failover import (
     record_failover_observation,
     record_scope_observation,
 )
+from app.services.ipam.mac_history import record_mac_history
 from app.services.ipam.utilization import recount_subnets_and_blocks
 from app.services.lock_order import lock_lease_rows, lock_mirror_rows, lock_zones_for_addresses
 
 
-def _refresh_lease_owned_row(
+async def _refresh_lease_owned_row(
+    db: AsyncSession,
     row: IPAddress,
     lease: dict[str, Any],
     mac: str,
@@ -114,8 +116,14 @@ def _refresh_lease_owned_row(
 
     ``write_hostname=False`` (scope not set to ``on_lease``, #2269) leaves the
     row's hostname alone.
+
+    A changed MAC is written to ``ip_mac_history`` like a direct edit's (#5007);
+    an unchanged one is not, so a steady-state sweep adds no row.
     """
+    mac_changed = (row.mac_address or "").lower() != str(mac or "").lower()
     row.mac_address = mac
+    if mac_changed:
+        await record_mac_history(db, row.id, mac)
     if write_hostname and lease.get("hostname"):
         row.hostname = lease.get("hostname")
     row.last_seen_at = now
@@ -749,13 +757,14 @@ async def _pull_leases_core(
                 # it below.
                 ipam_row, created = await insert_ipam_mirror_row(db, candidate)
                 if created:
+                    await record_mac_history(db, ipam_row.id, mac)
                     result.ipam_created += 1
                     touched_subnets.add(containing.id)
                 elif ipam_row.auto_from_lease:
                     # Lost the race to a lease-owned row — refresh it
                     # like the elif path below.
-                    _refresh_lease_owned_row(
-                        ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
+                    await _refresh_lease_owned_row(
+                        db, ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
                     )
                     result.ipam_refreshed += 1
                 else:
@@ -768,8 +777,8 @@ async def _pull_leases_core(
             # Only refresh rows we own. Manually-allocated rows are left
             # alone — the lease + IPAM coexist.
             if apply:
-                _refresh_lease_owned_row(
-                    ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
+                await _refresh_lease_owned_row(
+                    db, ipam_row, lease, mac, now, write_hostname=not hostname_suppressed
                 )
             result.ipam_refreshed += 1
         else:
