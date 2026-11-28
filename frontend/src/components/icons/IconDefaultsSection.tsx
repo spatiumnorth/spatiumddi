@@ -27,15 +27,9 @@ const KINDS: { kind: IconDefaultKind; title: string; hint: string }[] = [
     title: "IP role",
     hint: "The role set on an IP address, when no device class matches.",
   },
-  {
-    kind: "network_device_type",
-    title: "Network device type",
-    hint: "The type of a discovered network device.",
-  },
 ];
 
-/** Settings -> Icons (#5022): the mapping from a device class, IP role or
- *  network device type to the icon a row shows when it has none of its own.
+/** Settings -> Icons (#5022): the mapping from a device class or IP role to the icon a row shows when it has none of its own.
  *  The shipped mapping lives in the server; a row here exists only where an
  *  operator changed or added one, and Reset returns to the shipped icon. */
 export function IconDefaultsSection() {

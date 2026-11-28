@@ -671,7 +671,7 @@ async def test_defaults_routes_permissions_and_audit(
     r = await client.get("/api/v1/icons/defaults", headers=reader)
     assert r.status_code == 200, r.text
     items = r.json()["items"]
-    assert {i["kind"] for i in items} == {"device_class", "ip_role", "network_device_type"}
+    assert {i["kind"] for i in items} == {"device_class", "ip_role"}
     assert not any(i["overridden"] for i in items)
     printer = next(i for i in items if i["match_value"] == "printer")
     assert printer == {
@@ -917,3 +917,164 @@ async def test_propose_set_icon_stages_then_apply_matches_the_rest_edit(
     assert [i["effective_icon"] for i in shown if i["id"] == rid] == ["mdi:web"]
     with pytest.raises(ValidationError):
         rop.args_model(record_id=rid, icon="mdi:zz")
+
+
+# ── Trash: an icon is never set on, or read through, a trashed row ───────
+
+
+async def test_icon_writes_on_trashed_rows_are_refused(
+    client: AsyncClient, db_session: AsyncSession, world: dict[str, Any]
+) -> None:
+    h, sid = world["h"], world["sid"]
+    user = await _plain_user(db_session)
+    tool = _tool("propose_set_icon")
+
+    # a soft-deleted DNS record
+    r = await client.post(
+        _rec_url(world), headers=h, json={"name": "tr2", "record_type": "A", "value": "10.150.9.51"}
+    )
+    rid = r.json()["id"]
+    assert (await client.delete(_rec_url(world, rid), headers=h)).status_code == 204
+    put = await client.put(_rec_url(world, rid), headers=h, json={"icon": "mdi:cctv"})
+    assert put.status_code == 404, put.text
+    rop = get_operation("set_dns_record_icon")
+    assert rop is not None
+    with pytest.raises(ValueError, match="not found"):
+        await rop.apply(db_session, user, rop.args_model(record_id=rid, icon="mdi:cctv"))
+    staged = await tool.executor(
+        db_session, user, ProposeSetIconArgs(target="dns_record", id=rid, icon="mdi:cctv")
+    )
+    assert staged["kind"] == "proposal_rejected"
+
+    # an address whose subnet is in the Trash
+    ip_id = await _address(client, h, sid, "10.150.1.140", "trashed1")
+    assert (await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=h)).status_code == 204
+    put = await client.put(f"/api/v1/ipam/addresses/{ip_id}", headers=h, json={"icon": "mdi:lock"})
+    assert put.status_code == 404, put.text
+    iop = get_operation("set_ip_address_icon")
+    assert iop is not None
+    with pytest.raises(ValueError, match="not found"):
+        await iop.apply(db_session, user, iop.args_model(address_id=ip_id, icon="mdi:lock"))
+    staged = await tool.executor(
+        db_session, user, ProposeSetIconArgs(target="ip_address", id=ip_id, icon="mdi:lock")
+    )
+    assert staged["kind"] == "proposal_rejected"
+    assert (await _row(db_session, ip_id)).icon is None
+
+
+async def test_trashed_rows_are_hidden_from_icon_reads(
+    client: AsyncClient, db_session: AsyncSession, world: dict[str, Any]
+) -> None:
+    h, sid = world["h"], world["sid"]
+    user = await _plain_user(db_session)
+    ip_id = await _address(client, h, sid, "10.150.1.141", "hidden1", icon="mdi:printer")
+    r = await client.post(
+        _rec_url(world),
+        headers=h,
+        json={"name": "hid", "record_type": "A", "value": "10.150.9.52", "icon": "mdi:web"},
+    )
+    rid = r.json()["id"]
+    assert (await client.delete(_rec_url(world, rid), headers=h)).status_code == 204
+    assert (await client.delete(f"/api/v1/ipam/subnets/{sid}", headers=h)).status_code == 204
+
+    assert (await client.get(f"/api/v1/ipam/addresses/{ip_id}", headers=h)).status_code == 404
+    listed = (await client.get(_rec_url(world), headers=h)).json()["items"]
+    assert rid not in [i["id"] for i in listed]
+    found = await _tool("find_ip_addresses").executor(
+        db_session, user, _tool("find_ip_addresses").args_model(q="hidden1")
+    )
+    assert found["matches"] == []
+    recs = await _tool("query_dns_records").executor(
+        db_session, user, _tool("query_dns_records").args_model(name="hid")
+    )
+    assert rid not in [x["id"] for x in recs]
+
+
+async def test_trashed_linked_address_never_feeds_a_live_record(
+    client: AsyncClient, db_session: AsyncSession, world: dict[str, Any]
+) -> None:
+    h, sid = world["h"], world["sid"]
+    ip_id = await _address(client, h, sid, "10.150.1.142", "feeder", icon="mdi:printer")
+    rec = (
+        await db_session.execute(
+            select(DNSRecord).where(
+                DNSRecord.ip_address_id == uuid.UUID(ip_id), DNSRecord.record_type == "A"
+            )
+        )
+    ).scalar_one()
+    live = {i["id"]: i for i in (await client.get(_rec_url(world), headers=h)).json()["items"]}
+    assert live[str(rec.id)]["icon_source"] == "linked_ip"  # precondition: it does feed
+
+    from datetime import UTC, datetime
+
+    from app.models.ipam import Subnet
+
+    subnet = (
+        await db_session.execute(select(Subnet).where(Subnet.id == uuid.UUID(sid)))
+    ).scalar_one()
+    subnet.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+    # Read the live record through the attach helper, not the list route (which
+    # may hide the record with its subnet): the address must not feed it.
+    rec.effective_icon = rec.icon_source = None  # type: ignore[attr-defined]
+    await icon_svc.attach_record_icons(db_session, [rec])
+    assert (rec.effective_icon, rec.icon_source) == (None, "none")  # type: ignore[attr-defined]
+
+
+# ── The "Automatic (currently: ...)" value survives an explicit icon ──────
+
+
+async def test_automatic_icon_is_reported_while_an_explicit_one_is_set(
+    client: AsyncClient, db_session: AsyncSession, world: dict[str, Any]
+) -> None:
+    h, sid = world["h"], world["sid"]
+    ip_id = await _address(client, h, sid, "10.150.1.150", "auto1", role="gateway", icon="mdi:lock")
+    got = (await client.get(f"/api/v1/ipam/addresses/{ip_id}", headers=h)).json()
+    assert (got["effective_icon"], got["icon_source"]) == ("mdi:lock", "explicit")
+    # what clearing it would give, so the edit form can say so without a guess
+    assert (got["automatic_icon"], got["automatic_icon_source"]) == (
+        "mdi:router-network",
+        "ip_role",
+    )
+    cleared = await client.put(f"/api/v1/ipam/addresses/{ip_id}", headers=h, json={"icon": None})
+    assert cleared.json()["effective_icon"] == cleared.json()["automatic_icon"]
+
+    # a record with its own icon still reports the linked address's icon
+    rec = (
+        await db_session.execute(
+            select(DNSRecord).where(
+                DNSRecord.ip_address_id == uuid.UUID(ip_id), DNSRecord.record_type == "A"
+            )
+        )
+    ).scalar_one()
+    put = await client.put(_rec_url(world, str(rec.id)), headers=h, json={"icon": "mdi:web"})
+    assert put.status_code == 200, put.text
+    body = put.json()
+    assert (body["effective_icon"], body["icon_source"]) == ("mdi:web", "explicit")
+    assert (body["automatic_icon"], body["automatic_icon_source"]) == (
+        "mdi:router-network",
+        "linked_ip",
+    )
+
+
+async def test_overrides_changed_by_another_worker_arrive_within_the_ttl(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another api worker changes the table; this process picks it up when its
+    cached copy ages out (the same bound feature modules use), and a forced
+    read (the Settings page) sees it at once."""
+    clock = [1000.0]
+    monkeypatch.setattr(icon_svc.time, "monotonic", lambda: clock[0])
+    icon_svc.reset_overrides()
+    await icon_svc.refresh_overrides(db_session)
+    assert icon_svc.default_icon_for("device_class", "printer") == "mdi:printer"
+
+    db_session.add(IconDefault(kind="device_class", match_value="printer", icon="mdi:fax"))
+    await db_session.commit()  # "the other worker"
+    clock[0] += 1.0
+    await icon_svc.refresh_overrides(db_session)
+    assert icon_svc.default_icon_for("device_class", "printer") == "mdi:printer"  # still cached
+    clock[0] += icon_svc._OVERRIDES_TTL
+    await icon_svc.refresh_overrides(db_session)
+    assert icon_svc.default_icon_for("device_class", "printer") == "mdi:fax"
+    icon_svc.reset_overrides()

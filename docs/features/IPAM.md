@@ -193,11 +193,12 @@ bmc, lb, ...). An ordinary host with an unknown class gets no icon rather than a
 
 * Set it in the address create / edit forms, or for many rows in bulk edit (**Automatic** clears
   it). Through the API, send `icon` on create, `PUT /ipam/addresses/{id}`, the next-IP allocator
-  or `POST /ipam/addresses/bulk-edit` (`""` or null clears). Setting one needs the write
+  or `POST /ipam/addresses/bulk-edit` (`""` or null clears on create and update; bulk edit
+  clears on `""` only, as for `role`, because null there means "leave this field alone"). Setting one needs the write
   permission the row already takes.
 * `GET /api/v1/icons/catalog?q=&page=&page_size=` lists the names the API accepts (about 7,000
   from the Material Design Icons community set, brand logos excluded); an unknown name is a 422.
-* The shipped device-class, IP-role and network-device-type defaults are editable in
+* The shipped device-class and IP-role defaults are editable in
   **Settings -> Icons** (`GET|PUT|DELETE /api/v1/icons/defaults`). A row is stored only for an
   entry you changed, so a later change to a shipped mapping still reaches entries you never
   touched. Changing a mapping needs the `icon` permission (superadmin by default).

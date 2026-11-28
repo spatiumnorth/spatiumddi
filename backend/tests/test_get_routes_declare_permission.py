@@ -109,6 +109,8 @@ NO_PERMISSION_DEPENDENCY: dict[str, str] = {
     "/api/v1/bgp/asn/{asn}/overview": "public RIPEstat / PeeringDB data, no install data",
     "/api/v1/bgp/prefix/origin": "public RIPEstat / PeeringDB data, no install data",
     "/api/v1/bgp/prefix/routing-history": "public RIPEstat / PeeringDB data, no install data",
+    "/api/v1/icons/catalog": "built-in icon names; every signed-in screen draws icons (#5022)",
+    "/api/v1/icons/defaults": "default-icon mapping; every signed-in screen draws icons (#5022)",
     # ── checked in the handler ──────────────────────────────────────────
     "/api/v1/settings/resolver": "needs read (or write) on settings, checked in the handler",
     "/api/v1/settings": (

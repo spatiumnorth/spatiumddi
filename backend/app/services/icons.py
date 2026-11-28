@@ -7,9 +7,8 @@ Three things live here:
   ``frontend/scripts/gen-mdi-icons.mjs``; a test fails when it lags the
   package-lock pin). A stored icon is ``mdi:<name>``; the namespace leaves room
   for other sets without a migration. A typo is a 422, never a blank cell.
-* the **shipped default mapping** (device class, IP role, network device type
-  -> icon), in code. An ``icon_default`` row exists only when an operator
-  changed an entry, so a fresh install has none and a change to the shipped
+* the **shipped default mapping** (device class, IP role -> icon), in code. An
+  ``icon_default`` row exists only when an operator changed an entry, so a fresh install has none and a change to the shipped
   mapping reaches every install that never touched the entry.
 * the **resolution**: explicit -> device-class default -> IP-role default for
   an address; explicit -> the linked address's effective icon for a DNS record.
@@ -32,7 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 ICON_NAMESPACE = "mdi:"
-DEFAULT_KINDS: tuple[str, ...] = ("device_class", "ip_role", "network_device_type")
+DEFAULT_KINDS: tuple[str, ...] = ("device_class", "ip_role")
 IconSource = Literal["explicit", "device_class", "ip_role", "linked_ip", "none"]
 
 _CATALOG_FILE = Path(__file__).resolve().parent.parent / "data" / "mdi_icons.json"
@@ -205,19 +204,9 @@ _IP_ROLE_DEFAULTS: dict[str, str] = {
     "lb": "mdi:scale-balance",
 }
 
-_NETWORK_DEVICE_TYPE_DEFAULTS: dict[str, str] = {
-    "router": "mdi:router-network",
-    "switch": "mdi:switch",
-    "l3_switch": "mdi:switch",
-    "ap": "mdi:access-point",
-    "firewall": "mdi:wall-fire",
-    "other": "mdi:server-network",
-}
-
 SHIPPED_DEFAULTS: dict[str, dict[str, str]] = {
     "device_class": _DEVICE_CLASS_DEFAULTS,
     "ip_role": _IP_ROLE_DEFAULTS,
-    "network_device_type": _NETWORK_DEVICE_TYPE_DEFAULTS,
 }
 
 
@@ -231,8 +220,10 @@ def normalise_match(value: str | None) -> str:
 # ``(kind, match_value) -> icon`` for the rows operators changed. Read by the
 # response validators, which are synchronous, so it is held in memory and
 # refreshed by :func:`refresh_overrides` (one small query at most once per
-# ``_OVERRIDES_TTL`` per process, and straight away after a local change).
-_OVERRIDES_TTL = 10.0
+# ``_OVERRIDES_TTL`` per process, and straight away after a local change). A
+# change made on another api worker arrives within the TTL, the bound feature
+# modules use; the Settings list reads the table directly.
+_OVERRIDES_TTL = 5.0
 _overrides: dict[tuple[str, str], str] = {}
 _overrides_loaded_at: float = float("-inf")
 
@@ -341,13 +332,13 @@ def resolve_record_icon(*, icon: str | None, linked: ResolvedIcon | None) -> Res
 async def attach_record_icons(db: AsyncSession, records: Iterable[Any]) -> None:
     """Set ``effective_icon`` / ``icon_source`` on DNS record rows, for the
     response schema to read. One query for every linked address on the page
-    (none when no row needs one); an address whose subnet is in the Trash does
+    (none when no row is linked); an address whose subnet is in the Trash does
     not feed a live record."""
     from app.models.ipam import IPAddress
     from app.services.ipam.live_address import live_subnet_clause
 
     rows = list(records)
-    link_ids = {r.ip_address_id for r in rows if not r.icon and r.ip_address_id is not None}
+    link_ids = {r.ip_address_id for r in rows if r.ip_address_id is not None}
     linked: dict[uuid.UUID, ResolvedIcon] = {}
     if link_ids:
         found = await db.execute(
@@ -364,8 +355,10 @@ async def attach_record_icons(db: AsyncSession, records: Iterable[Any]) -> None:
                 icon=icon, device_class=device_class, device_type=device_type, role=role
             )
     for r in rows:
-        resolved = resolve_record_icon(
-            icon=r.icon, linked=linked.get(r.ip_address_id) if r.ip_address_id else None
-        )
+        link = linked.get(r.ip_address_id) if r.ip_address_id else None
+        resolved = resolve_record_icon(icon=r.icon, linked=link)
         r.effective_icon = resolved.icon
         r.icon_source = resolved.source
+        auto = resolve_record_icon(icon=None, linked=link)
+        r.automatic_icon = auto.icon
+        r.automatic_icon_source = auto.source

@@ -2164,6 +2164,10 @@ class RecordResponse(BaseModel):
     icon: str | None = None
     effective_icon: str | None = None
     icon_source: str = "none"
+    # What the record would draw with no explicit icon (the linked address's
+    # effective icon), for the edit form's "Automatic (currently: ...)".
+    automatic_icon: str | None = None
+    automatic_icon_source: str = "none"
     created_at: datetime
     modified_at: datetime
     # #1538 — set when the record's agentless provider op did not land on

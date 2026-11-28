@@ -1072,7 +1072,7 @@ const SECTIONS: SectionDef[] = [
     title: "Icons",
     group: "IPAM",
     description:
-      "Which built-in icon an IP address or DNS record shows when it has none of its own, by device class, IP role and network device type.",
+      "Which built-in icon an IP address or DNS record shows when it has none of its own, by device class and IP role.",
     keywords: [
       "icon",
       "icons",

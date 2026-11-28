@@ -4169,14 +4169,10 @@ function RecordModalForm({
           <IconField
             value={icon}
             onChange={setIcon}
-            auto={
-              record?.icon
-                ? undefined
-                : {
-                    icon: record?.effective_icon ?? null,
-                    source: record?.icon_source ?? "none",
-                  }
-            }
+            auto={{
+              icon: record?.automatic_icon ?? null,
+              source: record?.automatic_icon_source ?? "none",
+            }}
           />
         </Field>
         {error && <FormError className="text-sm">{error}</FormError>}

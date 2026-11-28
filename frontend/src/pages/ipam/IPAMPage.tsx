@@ -10610,14 +10610,10 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
             <IconField
               value={icon}
               onChange={setIcon}
-              auto={
-                address.icon
-                  ? undefined
-                  : {
-                      icon: address.effective_icon ?? null,
-                      source: address.icon_source ?? "none",
-                    }
-              }
+              auto={{
+                icon: address.automatic_icon ?? null,
+                source: address.automatic_icon_source ?? "none",
+              }}
             />
           </Field>
           {status === "reserved" ? (

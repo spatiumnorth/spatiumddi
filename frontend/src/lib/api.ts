@@ -997,6 +997,14 @@ export interface IPAddress {
   icon?: string | null;
   effective_icon?: string | null;
   icon_source?: "explicit" | "device_class" | "ip_role" | "linked_ip" | "none";
+  // What the row would draw with no explicit icon (for the edit form).
+  automatic_icon?: string | null;
+  automatic_icon_source?:
+    | "explicit"
+    | "device_class"
+    | "ip_role"
+    | "linked_ip"
+    | "none";
   created_at?: string;
   modified_at?: string;
 }
@@ -6525,6 +6533,14 @@ export interface DNSRecord {
   icon?: string | null;
   effective_icon?: string | null;
   icon_source?: "explicit" | "device_class" | "ip_role" | "linked_ip" | "none";
+  // What the row would draw with no explicit icon (for the edit form).
+  automatic_icon?: string | null;
+  automatic_icon_source?:
+    | "explicit"
+    | "device_class"
+    | "ip_role"
+    | "linked_ip"
+    | "none";
   created_at: string;
   modified_at: string;
 }
@@ -22353,10 +22369,7 @@ export const otApi = {
 
 // ── Built-in icons (#5022) ────────────────────────────────────────────────
 
-export type IconDefaultKind =
-  | "device_class"
-  | "ip_role"
-  | "network_device_type";
+export type IconDefaultKind = "device_class" | "ip_role";
 
 export interface IconCatalogItem {
   /** ``mdi:<name>`` */

@@ -5297,6 +5297,10 @@ class IPAddressResponse(BaseModel):
     icon: str | None = None
     effective_icon: str | None = None
     icon_source: str = "none"
+    # What the row would draw with no explicit icon, so an edit form can say
+    # "Automatic (currently: ...)" while an explicit icon is set or being cleared.
+    automatic_icon: str | None = None
+    automatic_icon_source: str = "none"
     created_at: datetime
     modified_at: datetime
 
@@ -5304,6 +5308,13 @@ class IPAddressResponse(BaseModel):
 
     @model_validator(mode="after")
     def _resolve_icon(self) -> "IPAddressResponse":
+        auto = resolve_ip_icon(
+            icon=None,
+            device_class=self.device_class,
+            device_type=self.device_type,
+            role=self.role,
+        )
+        self.automatic_icon, self.automatic_icon_source = auto.icon, auto.source
         resolved = resolve_ip_icon(
             icon=self.icon,
             device_class=self.device_class,

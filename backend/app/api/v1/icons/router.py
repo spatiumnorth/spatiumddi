@@ -28,7 +28,7 @@ from app.services import icons as icon_svc
 
 router = APIRouter()
 
-IconKind = Literal["device_class", "ip_role", "network_device_type"]
+IconKind = Literal["device_class", "ip_role"]
 
 
 class IconCatalogItem(BaseModel):
