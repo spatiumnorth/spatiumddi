@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Boxes,
   Container as ContainerIcon,
+  Database,
   DatabaseBackup,
   Gauge,
 } from "lucide-react";
@@ -12,6 +13,7 @@ import { ListEmpty } from "@/components/ui/list-read-error";
 import { useSessionState } from "@/lib/useSessionState";
 import { ClusterOverview } from "./ClusterOverview";
 import { ContainersTab } from "./ContainersTab";
+import { DatabaseReplicationCard } from "./DatabaseReplicationCard";
 import { EtcdSnapshotsCard } from "./EtcdSnapshotsCard";
 
 /**
@@ -36,7 +38,7 @@ import { EtcdSnapshotsCard } from "./EtcdSnapshotsCard";
  * Pods needs the in-cluster kubeapi and etcd snapshots need the embedded
  * etcd seed — neither exists on a docker / k8s control plane.
  */
-type ClusterSection = "overview" | "pods" | "etcd";
+type ClusterSection = "overview" | "pods" | "etcd" | "database";
 
 const SECTIONS: {
   key: ClusterSection;
@@ -55,6 +57,12 @@ const SECTIONS: {
     label: "Pods",
     icon: ContainerIcon,
     hint: "Running workloads",
+  },
+  {
+    key: "database",
+    label: "Database",
+    icon: Database,
+    hint: "Replication durability",
   },
   {
     key: "etcd",
@@ -136,6 +144,10 @@ export function ClusterTab({
           <ClusterOverview onViewPods={() => setSection("pods")} />
         ) : section === "pods" ? (
           <ContainersTab />
+        ) : section === "database" ? (
+          <div className="mx-auto max-w-3xl">
+            <DatabaseReplicationCard />
+          </div>
         ) : etcdAvailable ? (
           <div className="mx-auto max-w-4xl">
             <EtcdSnapshotsCard />

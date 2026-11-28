@@ -144,6 +144,35 @@ spec:
       {{- $_ := set $params "max_connections" (include "spatiumddi.postgresMaxConnections" . | trim) }}
       {{- end }}
       {{- toYaml $params | nindent 6 }}
+    {{- $sync := .Values.postgresql.cnpg.synchronous | default dict }}
+    {{- if $sync.enabled }}
+    {{- /* #1261: opt-in synchronous replication. ``number`` standbys must
+           confirm each commit, so it has to leave at least the primary out
+           of the count: number >= instances can never be satisfied and
+           would block every write under ``required``. */}}
+    {{- if lt (int .Values.postgresql.cnpg.instances) 2 }}
+    {{- fail "postgresql.cnpg.synchronous.enabled needs postgresql.cnpg.instances >= 2: a single instance has no replica to confirm a commit" }}
+    {{- end }}
+    {{- $num := int ($sync.number | default 1) }}
+    {{- if or (lt $num 1) (ge $num (int .Values.postgresql.cnpg.instances)) }}
+    {{- fail (printf "postgresql.cnpg.synchronous.number must be between 1 and instances-1 (%d), got %d" (sub (int .Values.postgresql.cnpg.instances) 1 | int) $num) }}
+    {{- end }}
+    {{- $method := $sync.method | default "any" }}
+    {{- if not (has $method (list "any" "first")) }}
+    {{- fail (printf "postgresql.cnpg.synchronous.method must be any or first, got %q" $method) }}
+    {{- end }}
+    {{- $dur := $sync.dataDurability | default "required" }}
+    {{- if not (has $dur (list "required" "preferred")) }}
+    {{- fail (printf "postgresql.cnpg.synchronous.dataDurability must be required or preferred, got %q" $dur) }}
+    {{- end }}
+    # #1261 — synchronous replication (CNPG spec.postgresql.synchronous,
+    # operator 1.25+). ``required`` blocks writes when too few sync replicas
+    # are available; ``preferred`` drops to async instead.
+    synchronous:
+      method: {{ $method }}
+      number: {{ $num }}
+      dataDurability: {{ $dur }}
+    {{- end }}
 
   bootstrap:
     initdb:

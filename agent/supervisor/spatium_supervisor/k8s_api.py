@@ -2776,6 +2776,58 @@ def dns_sizing_memory_mib(timeout: float = 5.0) -> tuple[int | None, str | None]
 _CONTROL_FAILURE_POLICY = "retry"
 
 
+def postgres_synchronous_values(cfg: Any, instances: int) -> dict[str, Any]:
+    """PURE (#1261): the chart's ``postgresql.cnpg.synchronous`` block for the
+    operator's setting ``cfg`` (the heartbeat's ``desired_postgres_synchronous``,
+    ``{enabled, method, number, data_durability}``) on a cluster of
+    ``instances``. Anything not a dict, or with ``enabled`` false, renders the
+    chart's own defaults (asynchronous), so a control plane that never sets it
+    changes nothing.
+
+    The chart refuses to render ``number >= instances`` or a single instance,
+    and the instance count moves with the control-plane size (a demote, a
+    dead-node replace). A failed render here would roll the release back, so the
+    saved setting is CLAMPED to the live count instead: ``number`` is held to
+    ``instances - 1``, and below two instances the block renders off. It
+    returns to the saved value by itself when the cluster grows back."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    method = cfg.get("method") if cfg.get("method") in ("any", "first") else "any"
+    durability = (
+        cfg.get("data_durability")
+        if cfg.get("data_durability") in ("required", "preferred")
+        else "required"
+    )
+    try:
+        number = max(1, int(cfg.get("number") or 1))
+    except (TypeError, ValueError):
+        number = 1
+    enabled = bool(cfg.get("enabled")) and instances >= 2
+    if enabled:
+        number = min(number, instances - 1)
+    return {
+        "enabled": enabled,
+        "method": method,
+        "number": number,
+        "dataDurability": durability,
+    }
+
+
+def _synchronous_override(cfg: Any, instances: int, current_doc: dict) -> dict[str, Any]:
+    """The ``cnpg.synchronous`` key for the owned overrides (#1261). Off is
+    rendered as ``{"enabled": False}`` only to switch off a block this
+    supervisor wrote earlier; otherwise it is left out, so an install that
+    never opted in keeps the exact values firstboot rendered (#1005)."""
+    vals = postgres_synchronous_values(cfg, instances)
+    if vals["enabled"]:
+        return {"synchronous": vals}
+    was_on = bool(
+        (((current_doc.get("postgresql") or {}).get("cnpg") or {}).get("synchronous") or {}).get(
+            "enabled"
+        )
+    )
+    return {"synchronous": {"enabled": False}} if was_on else {}
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
@@ -2784,6 +2836,7 @@ def apply_control_plane_overrides(
     mem_total_mib: int | None = None,
     cpu_count: int | None = None,
     cnpg_instances: int | None = None,
+    postgres_synchronous: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None]:
     """Durably set the spatium-control overrides: api / frontend / worker
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
@@ -2818,6 +2871,11 @@ def apply_control_plane_overrides(
     re-applies the Cluster on every upgrade and may not force the field the
     supervisor's patch wrote, so rendering ``cp_size`` there failed the
     upgrade, and the helm-controller's recovery uninstalled the release.
+
+    #1261 — ``postgres_synchronous`` (the operator's opt-in, see
+    ``postgres_synchronous_values``) renders ``postgresql.cnpg.synchronous``,
+    clamped to the CNPG instance count; ``None`` (an older control plane that
+    does not send it) renders the chart defaults, i.e. asynchronous.
 
     #285 Phase 6 — ``web_ui_allowed_cidrs`` (empty = open) also lands on the
     frontend as ``loadBalancerSourceRanges``, so the MetalLB VIP path is
@@ -2898,6 +2956,11 @@ def apply_control_plane_overrides(
                         "instances": cnpg_instances if cnpg_instances else cp_size,
                         "nodeLocalApiServer": {"enabled": True},
                     }
+                    | _synchronous_override(
+                        postgres_synchronous,
+                        cnpg_instances if cnpg_instances else cp_size,
+                        current_doc,
+                    )
                 },
                 sized.get("postgresql", {}),
             ),
