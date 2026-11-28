@@ -19,7 +19,7 @@ record the ops created answers.
 It needs to bind port 53 (run it as root in a container)::
 
     docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \\
-      'pip -q install -e . && python bench/bench_ops_drain.py --records 200000 \\
+      'pip -q install -e . && python tests/bench_ops_drain.py --records 200000 \\
        --zones 2000 --ops 20000'
 
 Run it from a checkout of the code under test: the same script runs on the
