@@ -1044,6 +1044,7 @@ const SERVER_STATUS_PILL_CLS: Record<string, string> = {
   active: "bg-emerald-500/15 text-emerald-600",
   unreachable: "bg-red-500/15 text-red-600",
   syncing: "bg-blue-500/15 text-blue-600",
+  pending: "bg-amber-500/15 text-amber-600",
   error: "bg-red-500/15 text-red-600",
   disabled: "bg-muted text-muted-foreground",
 };
@@ -1052,6 +1053,7 @@ const SERVER_STATUS_DOT_CLS: Record<string, string> = {
   active: "bg-emerald-500",
   unreachable: "bg-red-500",
   syncing: "bg-blue-500",
+  pending: "bg-amber-500",
   error: "bg-red-500",
   disabled: "bg-muted-foreground/40",
 };
@@ -1114,16 +1116,17 @@ function GroupServersList({
             <span className="font-medium text-muted-foreground uppercase tracking-wider">
               Health
             </span>
-            {(["active", "unreachable", "syncing", "error"] as const).map(
-              (s) =>
-                healthCounts[s] ? (
-                  <span key={s} className="flex items-center gap-1.5">
-                    <span
-                      className={`inline-block h-2 w-2 rounded-full ${SERVER_STATUS_DOT_CLS[s]}`}
-                    />
-                    {healthCounts[s]} {s}
-                  </span>
-                ) : null,
+            {(
+              ["active", "pending", "unreachable", "syncing", "error"] as const
+            ).map((s) =>
+              healthCounts[s] ? (
+                <span key={s} className="flex items-center gap-1.5">
+                  <span
+                    className={`inline-block h-2 w-2 rounded-full ${SERVER_STATUS_DOT_CLS[s]}`}
+                  />
+                  {healthCounts[s]} {s}
+                </span>
+              ) : null,
             )}
           </div>
         </div>

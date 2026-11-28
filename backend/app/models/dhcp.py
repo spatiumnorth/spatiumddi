@@ -264,7 +264,8 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
-    # status: active | unreachable | syncing | error | pending
+    # status: active | unreachable | syncing | error | pending. An agentless
+    # server is created ``pending`` until its first health check (#5010).
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # #2306 — why the most recent scheduled lease pull failed (agentless

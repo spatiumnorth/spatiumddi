@@ -668,6 +668,10 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
     # dance entirely so the UI doesn't show a bogus "Approve" button.
     if is_agentless(body.driver):
         s.agent_approved = True
+        # #5010 — nothing has probed this server yet; "active" (the column
+        # default) would claim a health nobody checked. The first health
+        # check, queued below, sets active or unreachable.
+        s.status = "pending"
     db.add(s)
     await db.flush()
 
@@ -692,7 +696,21 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
         collect_wake(dhcp_group_channel(s.server_group_id))
     await db.commit()
     await db.refresh(s)
+    if s.status == "pending":
+        _queue_first_health_check(s.id)
     return ServerResponse.from_model(s)
+
+
+def _queue_first_health_check(server_id: uuid.UUID) -> None:
+    """Probe a just-created agentless server now (#5010) rather than at the
+    next sweep. Fire-and-forget: a broker outage must not fail the create —
+    the periodic sweep picks the server up."""
+    from app.tasks.dhcp_health import check_dhcp_server_health  # noqa: PLC0415
+
+    try:
+        check_dhcp_server_health.delay(str(server_id))
+    except Exception:  # noqa: BLE001
+        logger.warning("dhcp_first_health_check_not_queued", server_id=str(server_id))
 
 
 @router.get("/{server_id}", response_model=ServerResponse)
