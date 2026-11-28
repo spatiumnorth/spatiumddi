@@ -20,6 +20,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
+import { countNoun } from "@/lib/count-noun";
 
 type Tab = "profiles" | "feeds" | "templates";
 
@@ -312,7 +313,7 @@ function ProfileRow({
             <ShieldCheck className="h-3.5 w-3.5 text-primary" />
             {profile.name}
             <span className="rounded bg-muted px-1 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-              {total} lists
+              {countNoun(total, "list")}
             </span>
           </div>
           <p className="mt-0.5 text-xs text-muted-foreground">

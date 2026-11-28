@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the chrony sync-state sidecar (issue #4825)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4825
+After=etc.mount local-fs.target chrony.service
+ConditionKernelCommandLine=!boot=live
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-chrony-reload --status-only
+# Driven by spatiumddi-chrony-status.timer — no [Install].

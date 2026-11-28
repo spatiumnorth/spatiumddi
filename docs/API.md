@@ -526,7 +526,7 @@ changed it. A module ships **enabled** only if it is core IPAM / DNS /
 DHCP workflow, a zero-footprint UI convenience, or a hand-invoked
 read-only diagnostic; everything else ships **disabled**
 ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)). 16 of
-57 are on out of the box. Settings → Features lists every module with
+57 are on out of the box. Features & Integrations lists every module with
 its description either way, so a disabled one is still discoverable.
 Examples of gated prefixes (from `router.py`):
 

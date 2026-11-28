@@ -243,19 +243,22 @@ async def check_replication_lag(*, threshold_bytes: int = 16 * 1024) -> Prefligh
         )
     # #1445 — ``pg_stat_replication`` shows a replica's ``state`` and LSNs
     # only to a superuser or a member of ``pg_monitor``; to anyone else the
-    # row is there but those columns are NULL. The app's role is neither on
-    # the appliance (CNPG manages it and reverts a manual GRANT), so every
-    # replica read as "not streaming" and the preflight refused to start a
-    # healthy cluster's upgrade. A NULL state is unverified, not broken.
+    # row is there but those columns are NULL. A NULL state is unverified,
+    # not broken, so it is a warn rather than a refusal. The appliance chart
+    # grants the app role pg_monitor through CNPG ``managed.roles`` (#4610);
+    # this branch is what a cluster where that grant is absent, or has not
+    # reconciled yet, reports.
     unverified = [r for r in replicas if r["state"] is None]
     if len(unverified) == len(replicas):
         return PreflightResult(
             name="replication_lag",
             level="warn",
             message=(
-                f"{len(replicas)} replica(s) connected; their streaming state "
-                "is not visible to the app's database role (needs pg_monitor), "
-                "so it was not verified"
+                f"could not verify replication: {len(replicas)} replica(s) "
+                "connected, but the app's database role lacks pg_monitor so "
+                "their streaming state and lag are hidden (not measured). "
+                "Grant it (appliance / Helm: postgresql.cnpg.appRoleMonitor="
+                "true; otherwise GRANT pg_monitor TO <app role>) and re-run"
             ),
             detail={"replicas": replicas, "unverified": True},
         )

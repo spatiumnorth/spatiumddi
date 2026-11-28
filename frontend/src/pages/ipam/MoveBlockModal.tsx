@@ -265,7 +265,10 @@ export function MoveBlockModal({
                 </ul>
               )}
               {hasBlockers && (
-                <div className="space-y-1 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-2">
+                <div
+                  role="alert"
+                  className="space-y-1 rounded-md border border-destructive/40 bg-destructive/5 px-2 py-2"
+                >
                   <p className="font-semibold text-destructive">
                     Move refused — {preview.integration_blockers.length}{" "}
                     descendant

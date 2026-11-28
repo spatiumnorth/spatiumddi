@@ -37,6 +37,7 @@ from app.core.permissions import (
     require_permission,
     user_has_permission,
 )
+from app.core.responses import PemResponse
 from app.models.appliance import (
     CERT_SOURCE_CSR,
     CERT_SOURCE_UPLOADED,
@@ -199,6 +200,55 @@ async def get_certificate(cert_id: uuid.UUID, db: DB) -> CertificateDetail:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "certificate not found")
     summary = _to_summary(row)
     return CertificateDetail(**summary.model_dump(), cert_pem=row.cert_pem)
+
+
+def _pem_download(row: ApplianceCertificate) -> PemResponse:
+    """The certificate as a ``.pem`` attachment: public half only, never the key."""
+    if row.cert_pem is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "certificate is not signed yet")
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in row.name) or "certificate"
+    return PemResponse(
+        content=row.cert_pem,
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": f'attachment; filename="{safe}.pem"'},
+    )
+
+
+@router.get(
+    "/active/pem",
+    response_class=PemResponse,
+    dependencies=[Depends(require_certificate_store("read"))],
+    summary="Download the active Web UI certificate (PEM, public cert only)",
+)
+async def download_active_certificate(db: DB) -> PemResponse:
+    """The certificate a standalone DNS / DHCP agent should trust (#4660):
+    save it, then mount it as ``TLS_CA_PATH`` (the control plane must be
+    reached by a name or address in its SANs) or ``TLS_PINNED_CERTS_PATH``."""
+    row = (
+        (
+            await db.execute(
+                select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no active certificate")
+    return _pem_download(row)
+
+
+@router.get(
+    "/{cert_id:uuid}/pem",
+    response_class=PemResponse,
+    dependencies=[Depends(require_certificate_store("read"))],
+    summary="Download one certificate (PEM, public cert only)",
+)
+async def download_certificate(cert_id: uuid.UUID, db: DB) -> PemResponse:
+    row = await db.get(ApplianceCertificate, cert_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "certificate not found")
+    return _pem_download(row)
 
 
 @router.post(

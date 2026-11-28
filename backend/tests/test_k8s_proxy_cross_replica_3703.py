@@ -73,13 +73,35 @@ async def test_abandoned_request_is_not_handed_out_and_late_reply_is_stale() -> 
     assert await k8s_proxy.pop_request(aid, timeout=1.2) is None
 
 
-async def test_queue_is_bounded() -> None:
+async def test_queue_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     aid = uuid.uuid4()
+    total = k8s_proxy.MAX_QUEUED_PER_APPLIANCE + 5
+    # Count finished enqueues rather than sleeping a fixed time: on a slow runner
+    # a push that lands after the drain starts trims one more out and back in,
+    # and the drain reads MAX + 1 (seen in the 1.0.2 merge queue, 21 Nov).
+    enqueued = 0
+    real_logger = k8s_proxy.logger
+
+    class _CountingLogger:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_logger, name)
+
+        def info(self, event: str, *args: Any, **kwargs: Any) -> Any:
+            nonlocal enqueued
+            if event == "appliance.k8s_proxy.enqueued":
+                enqueued += 1
+            return real_logger.info(event, *args, **kwargs)
+
+    monkeypatch.setattr(k8s_proxy, "logger", _CountingLogger())
     tasks = [
-        asyncio.create_task(k8s_proxy.k8s_call(aid, "GET", f"/p/{i}", timeout=2.0))
-        for i in range(k8s_proxy.MAX_QUEUED_PER_APPLIANCE + 5)
+        asyncio.create_task(k8s_proxy.k8s_call(aid, "GET", f"/p/{i}", timeout=5.0))
+        for i in range(total)
     ]
-    await asyncio.sleep(0.5)
+    for _ in range(200):
+        if enqueued >= total:
+            break
+        await asyncio.sleep(0.025)
+    assert enqueued == total
     got = 0
     while await k8s_proxy.pop_request(aid, timeout=0.3) is not None:
         got += 1

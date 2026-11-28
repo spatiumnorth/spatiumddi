@@ -53,6 +53,7 @@ from app.services.ai.operations import (
     register,
 )
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
+from app.services.dns import dnssec_policy_support
 
 # Re-declared here (tiny) rather than imported from the routers, so this
 # module doesn't drag the whole router import graph in at load time.
@@ -1048,6 +1049,12 @@ async def _preview_sign_zone_dnssec(
     pol = ""
     if args.policy_id is not None:
         pol = f" with policy {args.policy_id}"
+        # #4623 — the same refusal the REST sign endpoint makes.
+        msg = await dnssec_policy_support.set_policy_refusal(
+            db, args.group_id, zone, args.policy_id
+        )
+        if msg:
+            return PreviewResult(ok=False, detail=msg)
     return PreviewResult(
         ok=True,
         detail="ready",
@@ -1063,12 +1070,17 @@ async def _apply_sign_zone_dnssec(
     from app.services.dns.record_ops import enqueue_dnssec_op  # noqa: PLC0415
 
     zone = await _dnssec_lookup(db, user, args.group_id, args.zone_id, "dnssec_sign")
-    zone.dnssec_enabled = True
     if args.policy_id is not None:
         pol = await db.get(DNSSECPolicy, args.policy_id)
         if pol is None:
             raise ValueError("DNSSEC policy not found")
+        msg = await dnssec_policy_support.set_policy_refusal(
+            db, args.group_id, zone, args.policy_id
+        )
+        if msg:
+            raise ValueError(msg)
         zone.dnssec_policy_id = args.policy_id
+    zone.dnssec_enabled = True
     await enqueue_dnssec_op(db, zone, "dnssec_sign")
     write_audit(
         db,

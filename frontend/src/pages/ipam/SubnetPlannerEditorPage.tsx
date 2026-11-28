@@ -292,7 +292,10 @@ export function SubnetPlannerEditorPage() {
           <ApplyErrorBanner error={reopenMut.error as unknown} />
         )}
         {conflicts.length > 0 && (
-          <div className="mt-3 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/5 px-3 py-2">
+          <div
+            role="alert"
+            className="mt-3 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/5 px-3 py-2"
+          >
             <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-destructive" />
             <div className="text-xs">
               <div className="font-medium text-destructive">
@@ -822,7 +825,7 @@ export function PropertiesPanel({
 
 // ── Apply error banner ──────────────────────────────────────────────────
 
-function ApplyErrorBanner({ error }: { error: unknown }) {
+export function ApplyErrorBanner({ error }: { error: unknown }) {
   const detail = (error as { response?: { data?: { detail?: unknown } } })
     ?.response?.data?.detail;
   let conflicts: PlanValidationConflict[] = [];
@@ -841,7 +844,10 @@ function ApplyErrorBanner({ error }: { error: unknown }) {
     if (Array.isArray(d.survivors)) survivors = d.survivors;
   }
   return (
-    <div className="mt-3 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/5 px-3 py-2">
+    <div
+      role="alert"
+      className="mt-3 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/5 px-3 py-2"
+    >
       <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-destructive" />
       <div className="text-xs">
         <div className="font-medium text-destructive">{message}</div>

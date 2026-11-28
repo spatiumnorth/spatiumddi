@@ -179,10 +179,14 @@ export function ZoneSpreadsheetImportModal({
           manages are never changed.
         </p>
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="zone-spreadsheet-import-file"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             File
           </label>
           <input
+            id="zone-spreadsheet-import-file"
             type="file"
             accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             onChange={(e) => {
@@ -194,10 +198,14 @@ export function ZoneSpreadsheetImportModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="zone-spreadsheet-import-mode"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Mode
           </label>
           <select
+            id="zone-spreadsheet-import-mode"
             className={inputCls}
             value={mode}
             onChange={(e) => {

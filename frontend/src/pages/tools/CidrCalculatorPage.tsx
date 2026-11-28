@@ -265,10 +265,14 @@ export function CidrCalculatorPage() {
       <div className="flex-1 overflow-auto p-6">
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           <div className="rounded-lg border bg-card p-4">
-            <label className="mb-2 block text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="cidr-calculator-cidr-or-address"
+              className="mb-2 block text-xs font-medium text-muted-foreground"
+            >
               CIDR or address
             </label>
             <input
+              id="cidr-calculator-cidr-or-address"
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}

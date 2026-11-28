@@ -37,7 +37,7 @@ browser ──https──> your proxy ──http──> SpatiumDDI frontend (ngi
 
 | Setting | Value | Why |
 |---|---|---|
-| **Settings > General > External URL** | the public URL, `https://ddi.example.com` | **Mandatory for OIDC and SAML** (callback / ACS URLs are built from it), recommended always. Empty means the URL is rebuilt from each request; the api logs `sso_external_url_not_set` when it falls back |
+| **Settings → Application → Branding & URL → External URL** | the public URL, `https://ddi.example.com` | **Mandatory for OIDC and SAML** (callback / ACS URLs are built from it), recommended always. Empty means the URL is rebuilt from each request; the api logs `sso_external_url_not_set` when it falls back |
 | `FRONTEND_TRUSTED_PROXY_CIDRS` (Helm: `frontend.trustedProxyCidrs`) | the proxy's address, and nothing else | Lets the real client IP and scheme through, so the login throttle, audit log, `last_login_ip`, the Web UI allow-list and ACME source checks see the user, not the proxy, and the api sees `https` |
 | `TRUSTED_HOSTS` | leave **unset**, or list the exact `Host` the proxy forwards | A proxy that rewrites `Host` to its upstream name gets `400` on every call; the api logs `trusted_hosts_refused_host` |
 
@@ -303,7 +303,7 @@ ingress:
 |---|---|---|
 | Redirect loop (`ERR_TOO_MANY_REDIRECTS`) | Helm `frontend.tls.enabled=true` behind a TLS-terminating proxy that talks http to port 80, with no trusted proxy | Set `frontend.trustedProxyCidrs` to the proxy and send `X-Forwarded-Proto: https`, or set `frontend.tls.enabled=false` |
 | `400 Invalid host header` on every call | `TRUSTED_HOSTS` is set and the proxy forwards a different `Host` (nginx `proxy_pass` without `proxy_set_header Host`) | Preserve `Host`, or add the name the proxy sends to `TRUSTED_HOSTS`, or unset it. The api log names the refused host |
-| SSO `redirect_uri mismatch`; SAML `Destination` error or `saml_requires_https` | External URL is empty, so the callback is built as `http://` from the request | Set **Settings > General > External URL** to the public `https://` URL |
+| SSO `redirect_uri mismatch`; SAML `Destination` error or `saml_requires_https` | External URL is empty, so the callback is built as `http://` from the request | Set **Settings → Application → Branding & URL → External URL** to the public `https://` URL |
 | Signed out on every reload | The refresh cookie is `Secure` but the browser is on an `http://` page, or the proxy is not sending `X-Forwarded-Proto: https` from a trusted address | Serve the public side over https; check `FRONTEND_TRUSTED_PROXY_CIDRS` covers the proxy |
 | `429 Too many login attempts` for everyone | Every user arrives from one address: the proxy is not in `FRONTEND_TRUSTED_PROXY_CIDRS`, or (if you narrowed it) the api's `TRUSTED_PROXY_CIDRS` no longer covers the frontend | Set `FRONTEND_TRUSTED_PROXY_CIDRS` to the address the proxy connects from; check Audit Log source IPs show real clients |
 | `429` from `/health/ready`, `/health/live`, `/health/startup` or `/metrics` | The frontend allows each client 5 requests a second there, with a burst of 20 (#2944); `/health/platform` is not limited. Behind a proxy that is not in `FRONTEND_TRUSTED_PROXY_CIDRS`, every client shares the proxy's one allowance | Set `FRONTEND_TRUSTED_PROXY_CIDRS`; point a fast monitor at the api directly rather than through the frontend |

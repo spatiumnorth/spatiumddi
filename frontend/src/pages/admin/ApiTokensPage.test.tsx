@@ -22,6 +22,7 @@ const list = vi.fn();
 const update = vi.fn();
 const create = vi.fn();
 const myPermissions = vi.fn();
+const listSubnets = vi.fn();
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -29,6 +30,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     ...actual,
     apiTokensApi: { ...actual.apiTokensApi, list, update, create },
     authApi: { ...actual.authApi, myPermissions },
+    ipamApi: { ...actual.ipamApi, listSubnets },
   };
 });
 
@@ -286,5 +288,106 @@ describe("Delete API Token refusal (#3822)", () => {
       ),
     );
     await waitFor(() => expect(list.mock.calls.length).toBeGreaterThan(calls));
+  });
+});
+
+describe("New token resource binding access (#4846)", () => {
+  it("starts at read and disables access the user does not hold", async () => {
+    myPermissions.mockResolvedValue({
+      is_superadmin: false,
+      grants: [{ action: "read", resource_type: "subnet", resource_id: null }],
+    });
+    list.mockResolvedValue([]);
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    fireEvent.click(await screen.findByText("New Token"));
+    fireEvent.change(screen.getByDisplayValue("No resource binding"), {
+      target: { value: "subnet" },
+    });
+    const sel = screen.getByLabelText("Binding access") as HTMLSelectElement;
+    expect(sel.value).toBe("read");
+    const opt = (v: string) =>
+      (Array.from(sel.options).find((o) => o.value === v) as HTMLOptionElement)
+        .disabled;
+    expect(opt("read")).toBe(false);
+    expect(opt("write")).toBe(true);
+    expect(opt("admin")).toBe(true);
+  });
+});
+
+describe("New token with a binding type and no resource (#4857)", () => {
+  it("holds Create, and Enter does not submit, until a resource is picked or the binding is none", async () => {
+    myPermissions.mockResolvedValue({
+      is_superadmin: false,
+      grants: [{ action: "read", resource_type: "subnet", resource_id: null }],
+    });
+    list.mockResolvedValue([]);
+    create.mockClear();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    fireEvent.click(await screen.findByText("New Token"));
+    fireEvent.change(screen.getByPlaceholderText(/ansible-automation/), {
+      target: { value: "one-subnet" },
+    });
+    const pw = screen.getByLabelText(/Password/);
+    fireEvent.change(pw, { target: { value: "pw" } });
+    const createBtn = screen.getByRole("button", {
+      name: "Create",
+    }) as HTMLButtonElement;
+    expect(createBtn.disabled).toBe(false);
+    fireEvent.change(screen.getByDisplayValue("No resource binding"), {
+      target: { value: "subnet" },
+    });
+    expect(createBtn.disabled).toBe(true);
+    fireEvent.submit(pw.closest("form") as HTMLFormElement);
+    await act(async () => {});
+    expect(create).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByDisplayValue("Subnet"), {
+      target: { value: "none" },
+    });
+    expect(createBtn.disabled).toBe(false);
+  });
+});
+
+describe("New token binding picker whose list was refused (#4858)", () => {
+  it("says the list could not be read, and why Create is held", async () => {
+    myPermissions.mockResolvedValue({ is_superadmin: false, grants: [] });
+    list.mockResolvedValue([]);
+    listSubnets.mockRejectedValue({
+      response: { status: 403, data: { detail: "Forbidden" } },
+    });
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ApiTokensPage />
+      </QueryClientProvider>,
+    );
+    await act(async () => {});
+    fireEvent.click(await screen.findByText("New Token"));
+    fireEvent.change(screen.getByDisplayValue("No resource binding"), {
+      target: { value: "subnet" },
+    });
+    await screen.findByText("You don't have permission to see subnets.");
+    const createBtn = screen.getByRole("button", {
+      name: "Create",
+    }) as HTMLButtonElement;
+    expect(createBtn.disabled).toBe(true);
+    expect(createBtn.title).toMatch(/Pick the resource to bind/);
   });
 });

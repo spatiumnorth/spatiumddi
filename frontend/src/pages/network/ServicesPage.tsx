@@ -1,4 +1,5 @@
 import { ListEmpty } from "@/components/ui/list-read-error";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { FreshEdit } from "@/components/FreshEdit";
 import { changedFields } from "@/hooks/useFreshRow";
 import { useMemo, useState } from "react";
@@ -895,10 +896,14 @@ export function ServiceEditorModal({
     >
       <div className="space-y-3 pb-4">
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="services-name"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name
           </label>
           <input
+            id="services-name"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -917,10 +922,14 @@ export function ServiceEditorModal({
       {tab === "general" && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-kind"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Kind
             </label>
             <select
+              id="services-kind"
               className={inputCls}
               value={kind}
               onChange={(e) => setKind(e.target.value as ServiceKind)}
@@ -937,10 +946,14 @@ export function ServiceEditorModal({
             </p>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-customer"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Customer
             </label>
             <select
+              id="services-customer"
               className={inputCls}
               value={customerId}
               onChange={(e) => setCustomerId(e.target.value)}
@@ -958,10 +971,14 @@ export function ServiceEditorModal({
             </select>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-status"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Status
             </label>
             <select
+              id="services-status"
               className={inputCls}
               value={status}
               onChange={(e) => setStatus(e.target.value as ServiceStatus)}
@@ -974,10 +991,14 @@ export function ServiceEditorModal({
             </select>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-sla-tier-optional"
+              className="text-xs font-medium text-muted-foreground"
+            >
               SLA tier (optional)
             </label>
             <input
+              id="services-sla-tier-optional"
               className={inputCls}
               value={slaTier}
               onChange={(e) => setSlaTier(e.target.value)}
@@ -1003,10 +1024,14 @@ export function ServiceEditorModal({
       {tab === "term" && (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-term-start"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Term start
             </label>
             <input
+              id="services-term-start"
               type="date"
               className={inputCls}
               value={termStart}
@@ -1014,10 +1039,14 @@ export function ServiceEditorModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-term-end"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Term end
             </label>
             <input
+              id="services-term-end"
               type="date"
               className={inputCls}
               value={termEnd}
@@ -1028,10 +1057,14 @@ export function ServiceEditorModal({
             </p>
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-monthly-cost"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Monthly cost
             </label>
             <input
+              id="services-monthly-cost"
               type="text"
               inputMode="decimal"
               className={inputCls}
@@ -1041,10 +1074,14 @@ export function ServiceEditorModal({
             />
           </div>
           <div>
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="services-currency"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Currency
             </label>
             <input
+              id="services-currency"
               className={cn(inputCls, "uppercase")}
               maxLength={3}
               value={currency}
@@ -1061,10 +1098,14 @@ export function ServiceEditorModal({
 
       {tab === "notes" && (
         <div>
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="services-notes"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Notes
           </label>
           <textarea
+            id="services-notes"
             className={cn(inputCls, "min-h-[160px]")}
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
@@ -1316,7 +1357,10 @@ export function ServicesPage() {
             </span>
             <button
               type="button"
-              onClick={() => setSearchParams({})}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSearchParams({});
+              }}
               className="inline-flex shrink-0 items-center gap-1 rounded border px-2 py-1 hover:bg-muted"
             >
               <X className="h-3.5 w-3.5" /> Clear filter

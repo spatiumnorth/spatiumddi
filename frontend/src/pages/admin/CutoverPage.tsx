@@ -721,8 +721,11 @@ function NewPlanModal({
         {error && <ErrorBanner message={error} />}
 
         <div>
-          <label className="block text-sm font-medium">Name</label>
+          <label htmlFor="cutover-name" className="block text-sm font-medium">
+            Name
+          </label>
           <input
+            id="cutover-name"
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="Retire DC01 — corp.example + 10.0.20.0/24"
@@ -731,8 +734,14 @@ function NewPlanModal({
         </div>
 
         <div>
-          <label className="block text-sm font-medium">Description</label>
+          <label
+            htmlFor="cutover-description"
+            className="block text-sm font-medium"
+          >
+            Description
+          </label>
           <textarea
+            id="cutover-description"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             rows={2}
@@ -744,7 +753,10 @@ function NewPlanModal({
           {dnsOn && (
             <>
               <div>
-                <label className="block text-sm font-medium">
+                <label
+                  htmlFor="cutover-source-windows-dns-server"
+                  className="block text-sm font-medium"
+                >
                   Source Windows DNS server
                 </label>
                 <p className="mb-1 text-[11px] text-muted-foreground">
@@ -752,6 +764,7 @@ function NewPlanModal({
                   driver.
                 </p>
                 <select
+                  id="cutover-source-windows-dns-server"
                   value={dnsSource}
                   onChange={(e) => setDnsSource(e.target.value)}
                   className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -771,13 +784,17 @@ function NewPlanModal({
               </div>
 
               <div>
-                <label className="block text-sm font-medium">
+                <label
+                  htmlFor="cutover-target-dns-server-group"
+                  className="block text-sm font-medium"
+                >
                   Target DNS server group
                 </label>
                 <p className="mb-1 text-[11px] text-muted-foreground">
                   The SpatiumDDI group taking the zones over.
                 </p>
                 <select
+                  id="cutover-target-dns-server-group"
                   value={dnsTarget}
                   onChange={(e) => setDnsTarget(e.target.value)}
                   className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -795,7 +812,10 @@ function NewPlanModal({
 
           {dhcpOn && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="cutover-source-windows-dhcp-server"
+                className="block text-sm font-medium"
+              >
                 Source Windows DHCP server
               </label>
               <p className="mb-1 text-[11px] text-muted-foreground">
@@ -803,6 +823,7 @@ function NewPlanModal({
                 <code>windows_dhcp</code> driver.
               </p>
               <select
+                id="cutover-source-windows-dhcp-server"
                 value={dhcpSource}
                 onChange={(e) => setDhcpSource(e.target.value)}
                 className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -824,13 +845,17 @@ function NewPlanModal({
 
           {dhcpOn && (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="cutover-target-dhcp-server-group"
+                className="block text-sm font-medium"
+              >
                 Target DHCP server group
               </label>
               <p className="mb-1 text-[11px] text-muted-foreground">
                 The SpatiumDDI group taking the scopes over.
               </p>
               <select
+                id="cutover-target-dhcp-server-group"
                 value={dhcpTarget}
                 onChange={(e) => setDhcpTarget(e.target.value)}
                 className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"

@@ -87,13 +87,23 @@ class ValidationResult:
 MAX_PASSWORD_BYTES = 72
 
 
+def history_error(count: int) -> str:
+    """The refusal for a reused password; singular when the history holds one (#4688)."""
+    if count == 1:
+        return "Password matches your last password; choose a new one."
+    return f"Password matches one of the last {count} passwords; choose a new one."
+
+
 def validate(password: str, policy: PasswordPolicy) -> ValidationResult:
     """Run every enabled rule. Returns one error per failed rule so the
     UI can render all violations at once instead of the operator
     bouncing through them serially."""
     errors: list[str] = []
     if len(password) < policy.min_length:
-        errors.append(f"Password must be at least {policy.min_length} characters")
+        errors.append(
+            f"Password must be at least {policy.min_length} "
+            f"character{'' if policy.min_length == 1 else 's'}"
+        )
     # bcrypt hashes at most 72 BYTES and raises above it, so an unbounded
     # password reaches the hasher and 500s on the set path. Bytes, not
     # characters: a 40-character password of 2-byte characters is over the
