@@ -177,6 +177,33 @@ def _parse_pdns_ts(
         return None
 
 
+_PDNS_RR_RE: Final = re.compile(r"^(?P<n>\d{1,5}) RR\(s\)$")
+
+
+def _answer_source(tail: str) -> str | None:
+    """What the line's trailing verdict says about where the answer came from (#4251).
+
+    ``tail`` is everything after the quoted ``qname|qtype`` — e.g.
+    ``, do = 0, bufsize = 4096: packetcache HIT``. Only two verdicts
+    are claimed:
+
+    * ``packetcache HIT`` -> ``cache``: pdns says so itself.
+    * ``N RR(s)`` with N >= 1 -> ``authoritative``: the Authoritative
+      daemon built a non-empty answer from its own backend. ``0 RR(s)``
+      is NXDOMAIN / NODATA / REFUSED and says nothing about which, so it
+      stays ``None`` rather than being called authoritative.
+
+    Anything else, including a missing verdict, is ``None`` (unknown).
+    """
+    verdict = tail.rsplit(":", 1)[-1].strip()
+    if verdict == "packetcache HIT":
+        return "cache"
+    m = _PDNS_RR_RE.match(verdict)
+    if m and int(m.group("n")) >= 1:
+        return "authoritative"
+    return None
+
+
 def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> ParsedQueryLine | None:
     """Parse one PowerDNS query log line into the shared
     :class:`ParsedQueryLine` shape.
@@ -269,6 +296,8 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
     if qname and qname.rstrip(".").lower() in _CHAOS_PROBE_QNAMES:
         return None
 
+    answer_source = _answer_source(body[m_b.end() :])
+
     return ParsedQueryLine(
         ts=ts,
         client_ip=client_ip,
@@ -282,6 +311,7 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
         flags=None,
         view=None,
         raw=line,
+        answer_source=answer_source,
     )
 
 

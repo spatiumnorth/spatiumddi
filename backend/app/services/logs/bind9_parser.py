@@ -120,6 +120,13 @@ _MONTH_MAP: Final[dict[str, int]] = {
 }
 
 
+#: Closed set stored in ``dns_query_log_entry.answer_source`` (#4251).
+#: ``forwarded`` / ``recursion`` carry the upstream in ``answer_upstream``
+#: when the reporting flavor names it. NULL (never a member) means the
+#: server did not say; there is deliberately no "unknown" value.
+ANSWER_SOURCES: Final = ("authoritative", "cache", "forwarded", "recursion")
+
+
 @dataclass(frozen=True)
 class ParsedQueryLine:
     ts: datetime
@@ -131,6 +138,12 @@ class ParsedQueryLine:
     flags: str | None
     view: str | None
     raw: str
+    # How the server says it produced the answer (#4251) — one of
+    # :data:`ANSWER_SOURCES`, or ``None`` when the daemon's log does not
+    # say. BIND's ``queries`` / ``responses`` categories never do, so the
+    # BIND9 parser always leaves these ``None`` rather than guessing.
+    answer_source: str | None = None
+    answer_upstream: str | None = None
 
 
 def _parse_bind_ts(value: str) -> datetime | None:

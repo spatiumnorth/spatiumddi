@@ -242,6 +242,13 @@ def _rcode_clause(rcode: str) -> Any:
     return DNSQueryLogEntry.rcode == wanted
 
 
+def _answer_source_clause(answer_source: str) -> Any:
+    wanted = answer_source.strip().lower()
+    if wanted == "unknown":
+        return DNSQueryLogEntry.answer_source.is_(None)
+    return DNSQueryLogEntry.answer_source == wanted
+
+
 async def search_dns_queries(
     db: AsyncSession,
     server_ids: Sequence[uuid.UUID],
@@ -254,6 +261,7 @@ async def search_dns_queries(
     client_ip: str | None = None,
     view: str | None = None,
     rcode: str | None = None,
+    answer_source: str | None = None,
     limit: int = 200,
     include_orphans: bool = False,
 ) -> list[DNSQueryLogEntry]:
@@ -282,6 +290,8 @@ async def search_dns_queries(
         stmt = stmt.where(DNSQueryLogEntry.view == view)
     if rcode:
         stmt = stmt.where(_rcode_clause(rcode))
+    if answer_source:
+        stmt = stmt.where(_answer_source_clause(answer_source))
     if qname_contains:
         stmt = stmt.where(
             DNSQueryLogEntry.qname.ilike(like_pattern(qname_contains.strip()), escape="\\")
