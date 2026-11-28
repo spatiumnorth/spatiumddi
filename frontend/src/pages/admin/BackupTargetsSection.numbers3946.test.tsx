@@ -249,4 +249,16 @@ describe("backup destination Edit saves only what changed (#4236)", () => {
     await waitFor(() => expect(container.querySelector("form")).toBeNull());
     expect(update).not.toHaveBeenCalled();
   });
+
+  it("sends the encryption setting when it is changed (#1362)", async () => {
+    const { container } = await openEdit();
+    fireEvent.click(
+      container.querySelector(
+        'input[type="checkbox"][class*="encrypt"], fieldset input[type="checkbox"]',
+      )!,
+    );
+    fireEvent.submit(container.querySelector("form")!);
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update.mock.calls[0][1]).toEqual({ encrypt_archive: true });
+  });
 });

@@ -186,6 +186,9 @@ async def list_backup_targets(
             # target with no retention, unable to say why its recovery
             # readiness is UNVERIFIED.
             "write_only": t.write_only,
+            # #1362 — whether the database dump is encrypted at rest, not
+            # only secrets.enc. Never the passphrase itself.
+            "encrypt_archive": t.encrypt_archive,
         }
         for t in rows
     ]

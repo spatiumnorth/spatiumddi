@@ -714,6 +714,7 @@ async def run_backup_for_target(
             passphrase_hint=target.passphrase_hint or None,
             run_target_id=str(target.id),
             run_claimed_at=started,
+            encrypt_archive=target.encrypt_archive,
         )
         await driver.write(config=plain_config, filename=filename, archive_bytes=archive_bytes)
         # The archive is already on the destination here, so a retention
