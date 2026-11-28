@@ -11,7 +11,8 @@ Two surfaces:
   platform-level allowlist with an explicit list, or send ``null``
   to revert to per-tool registry defaults. Per-provider
   ``AIProvider.enabled_tools`` narrows further; both layers
-  compose. A list naming a tool the catalog cannot keep (an unknown
+  compose. ``changes`` ({name: bool}) merges per-tool switches into the
+  stored list instead (#4885). A list naming a tool the catalog cannot keep (an unknown
   name, or a tool that writes) is refused with a 422 that names it,
   and nothing is saved (#3415).
 """
@@ -62,6 +63,13 @@ class ToolCatalogUpdate(BaseModel):
     list to disable every tool, or an explicit name list."""
 
     enabled: list[str] | None = None
+    # Per-tool switches ({name: on}) merged into the STORED list, so a
+    # client changes only the tools it names. ``enabled`` replaces the
+    # whole set from whatever the caller last read, which puts back any
+    # change another client stored since, and drops the tools of a module
+    # that is off (the read leaves them out of ``enabled``) (#4885).
+    # Mutually exclusive with ``enabled``.
+    changes: dict[str, bool] | None = None
 
 
 @router.get("/tools", response_model=ToolCatalogResponse)
@@ -135,7 +143,23 @@ async def update_tool_catalog(
         list(settings_row.ai_tools_enabled) if settings_row.ai_tools_enabled is not None else None
     )
     before = effective_tool_names(platform_enabled=before_override, provider_enabled=None)
-    if body.enabled is None:
+    if body.changes is not None:
+        if body.enabled is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Send either enabled or changes, not both.",
+            )
+        refusal = _refusal([n for n, on in body.changes.items() if on])
+        if refusal is not None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=refusal)
+        # Start from the stored platform layer (no module filter), so a
+        # module-off tool keeps its stored state and a write another client
+        # stored since the page read is not undone.
+        merged = set(before)
+        for name, on in body.changes.items():
+            (merged.add if on else merged.discard)(name)
+        settings_row.ai_tools_enabled = sorted(merged)
+    elif body.enabled is None:
         settings_row.ai_tools_enabled = None
     else:
         # A name the save cannot keep is refused, never dropped in silence

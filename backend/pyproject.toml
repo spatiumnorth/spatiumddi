@@ -10,7 +10,7 @@ name = "spatiumddi"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.162.6",
+    "fastapi>=0.165.0",
     "uvicorn[standard]>=0.32.0",
     # Below 2.1 until #1187: 2.1.0's new type annotations fail mypy in 23
     # files (#1186). The test suite itself passes on 2.1.
@@ -52,8 +52,8 @@ dependencies = [
     "requests-credssp>=2.0.0",
     "pysnmp~=7.1",
     "pyotp>=2.9.0",
-    "openai>=3.50.0",
-    "anthropic>=2.8.0",
+    "openai>=3.58.0",
+    "anthropic>=2.13.0",
     "reportlab>=4.2.0",
     "croniter>=3.0.0",
     # Scheduled Wake-on-LAN calendar gate (issue #586 Phase 2). ``icalendar``
@@ -69,7 +69,7 @@ dependencies = [
     # form. Already present transitively (httpx / requests); pinned direct
     # because app.core.dns_names imports it.
     "idna>=3.20",
-    "boto3>=1.44.2",
+    "boto3>=1.44.10",
     "paramiko>=3.4.0",
     "azure-storage-blob>=12.20.0",
     "smbprotocol>=1.13.0",
@@ -86,7 +86,7 @@ dependencies = [
     "azure-mgmt-resource>=23.0.0",
     "google-cloud-compute>=1.58.0",
     "google-cloud-dns>=0.35.0",
-    "google-auth>=2.62.2",
+    "google-auth>=2.63.1",
     # docker SDK — only used on the SpatiumDDI OS appliance to send
     # SIGHUP to the frontend container when a new TLS cert is
     # activated (Phase 4b.2, issue #134). The cert deployer is gated
@@ -108,7 +108,7 @@ dev = [
     "pytest-xdist>=3.6.0",
     "pytest-split>=0.9.0",
     "httpx>=0.28.0",
-    "ruff>=0.17.5",
+    "ruff>=0.17.6",
     "black>=24.10.0",
     "mypy>=1.13.0",
     "types-croniter>=3.0.0",

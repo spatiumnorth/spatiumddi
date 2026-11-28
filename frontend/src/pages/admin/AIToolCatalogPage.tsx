@@ -60,8 +60,8 @@ const CATALOG_QUERY_KEY = ["ai-tool-catalog-admin"];
  * `PUT /ai/tools/catalog` immediately so the change takes effect on
  * the next chat turn without operator effort.
  *
- * Per-tool toggling computes the new explicit list from current
- * `enabled` flags ± the toggled tool, then PUTs that list. This
+ * Per-tool toggling sends only the switched tools (`changes`), which
+ * the server merges into the stored list. This
  * implicitly converts a NULL platform override into an explicit one
  * — operators can revert via the "Reset to defaults" button which
  * sends NULL back. Optimistic update prevents the toggle from
@@ -78,27 +78,28 @@ export function AIToolCatalogPage() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: (enabledNames: string[] | null) =>
-      aiToolCatalogApi.update(enabledNames),
-    onMutate: async (enabledNames) => {
+    mutationFn: (v: { reset: true } | { changes: Record<string, boolean> }) =>
+      "reset" in v
+        ? aiToolCatalogApi.update(null)
+        : aiToolCatalogApi.change(v.changes),
+    onMutate: async (v) => {
       // Cancel any in-flight refetch so it doesn't clobber the
       // optimistic state, then patch the cache so the row toggles
       // visually before the server round-trip lands.
       await qc.cancelQueries({ queryKey: CATALOG_QUERY_KEY });
       const prev = qc.getQueryData<AIToolCatalog>(CATALOG_QUERY_KEY);
       if (prev) {
-        const explicit = enabledNames !== null;
-        const enabledSet = explicit
-          ? new Set(enabledNames)
-          : // Null means "revert to registry defaults" — recompute
-            // each row's `enabled` from `default_enabled`.
-            null;
         qc.setQueryData<AIToolCatalog>(CATALOG_QUERY_KEY, {
           ...prev,
-          platform_override: enabledNames,
+          // A reset reverts to registry defaults; a switch leaves the
+          // override for the server's merge (the refetch settles it).
+          platform_override: "reset" in v ? null : prev.platform_override,
           tools: prev.tools.map((t) => ({
             ...t,
-            enabled: enabledSet ? enabledSet.has(t.name) : t.default_enabled,
+            enabled:
+              "reset" in v
+                ? t.default_enabled
+                : (v.changes[t.name] ?? t.enabled),
           })),
         });
       }
@@ -122,15 +123,13 @@ export function AIToolCatalogPage() {
     names: string[];
   } | null>(null);
 
-  function currentEnabledNames(): string[] {
-    return (data?.tools ?? []).filter((t) => t.enabled).map((t) => t.name);
-  }
-
+  // Send only the tools this click switches; the server merges them into
+  // the stored list, so another client's change is not put back (#4885).
   function commitToggle(toAdd: string[], toRemove: string[]) {
-    const current = new Set(currentEnabledNames());
-    for (const n of toAdd) current.add(n);
-    for (const n of toRemove) current.delete(n);
-    updateMutation.mutate([...current].sort());
+    const changes: Record<string, boolean> = {};
+    for (const n of toAdd) changes[n] = true;
+    for (const n of toRemove) changes[n] = false;
+    updateMutation.mutate({ changes });
   }
 
   function toggleOne(t: AIToolCatalogEntry, next: boolean) {
@@ -236,7 +235,7 @@ export function AIToolCatalogPage() {
         </button>
         <button
           type="button"
-          onClick={() => updateMutation.mutate(null)}
+          onClick={() => updateMutation.mutate({ reset: true })}
           disabled={updateMutation.isPending || usingDefaults}
           className={headerCls}
           title="Discard the explicit list and use each tool's registry default."

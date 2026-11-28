@@ -398,3 +398,21 @@ async def test_facets_need_read_audit_log_4482(
     await db_session.flush()
     h = {"Authorization": f"Bearer {create_access_token(str(u.id))}"}
     assert (await client.get("/api/v1/audit/facets", headers=h)).status_code == 403
+
+
+def test_secret_changes_name_list_is_shown_but_real_secrets_stay_redacted() -> None:
+    """#4904: ``secret_changes`` lists field names, so it is not redacted."""
+    from app.services.audit_redact import REDACTED, redact_audit_value
+
+    out = redact_audit_value(
+        {
+            "secret_changes": ["password_set", "token_cleared"],
+            "password": "hunter2-real",
+            "api_secret": "s3cr3t-value",
+        }
+    )
+    assert out["secret_changes"] == ["password_set", "token_cleared"]
+    assert out["password"] == REDACTED
+    assert out["api_secret"] == REDACTED
+    # A non-list value under that key is still treated as a secret.
+    assert redact_audit_value({"secret_changes": "hunter2"})["secret_changes"] == REDACTED

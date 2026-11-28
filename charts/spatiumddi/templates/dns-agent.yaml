@@ -1,22 +1,11 @@
+{{- /* #4682 — one refusal for every agent StatefulSet whose claim class would change. */ -}}
+{{- include "spatiumddi.checkAgentClaimClasses" . -}}
 {{- if .Values.dnsAgents.enabled }}
 {{- $root := . -}}
 {{- /* #3209 — fail on two servers rendering one object name. */ -}}
 {{- include "spatiumddi.agentNamesUnique" . -}}
 {{- $tag := .Values.dnsAgents.image.tag | default .Chart.AppVersion -}}
-{{- $secretName := .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) -}}
-{{- if and (not .Values.dnsAgents.agentKey.existingSecret) .Values.dnsAgents.agentKey.value }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ $secretName }}
-  namespace: {{ .Release.Namespace }}
-  labels:
-    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") .) | nindent 4 }}
-type: Opaque
-stringData:
-  DNS_AGENT_KEY: {{ .Values.dnsAgents.agentKey.value | quote }}
-{{- "\n---\n" }}
-{{- end }}
+{{- $secretName := include "spatiumddi.dnsAgentKeySecret" . -}}
 {{- range $server := .Values.dnsAgents.servers }}
 {{- $flavor := $server.flavor | default "bind9" -}}
 {{- /* #1553 — refuse encrypted-transport ports the flavor cannot serve,
@@ -42,7 +31,6 @@ stringData:
 {{- end }}
 {{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dns-%s-%s" $flavor $server.name) "prefix" $root.Values.dnsAgents.prefixWithFullname) -}}
 {{- $storageClass := $server.storageClass | default $root.Values.dnsAgents.storageClass -}}
-{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $storageClass) -}}
 {{- /* Per-flavor image lookup (issue #127). dnsAgents.flavors.<flavor>
        optionally overrides repository + tag; missing keys (or the default
        bind9 case) fall back to the top-level dnsAgents.image. Same

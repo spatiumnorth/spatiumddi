@@ -244,3 +244,58 @@ async def test_dhcp_pool_update_null_clears_class_restriction(
 
     r = await client.put(f"/api/v1/dhcp/pools/{pool.id}", json={"name": None}, headers=headers)
     assert r.status_code == 422, r.text
+
+
+# ── #4557: a cleared MX / SRV priority is not silently dropped ──────────
+
+
+@pytest.mark.asyncio
+async def test_record_update_null_priority_mx_resets_srv_refuses(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    grp = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(grp)
+    await db_session.flush()
+    zone = DNSZone(
+        group_id=grp.id,
+        name="zone.example.com.",
+        zone_type="primary",
+        kind="forward",
+        primary_ns="ns1.example.com.",
+        admin_email="admin.example.com.",
+    )
+    db_session.add(zone)
+    await db_session.commit()
+    base = f"/api/v1/dns/groups/{grp.id}/zones/{zone.id}/records"
+
+    mx = await client.post(
+        base,
+        headers=headers,
+        json={"name": "mx", "record_type": "MX", "value": "mail.example.com.", "priority": 20},
+    )
+    assert mx.status_code in (200, 201), mx.text
+    r = await client.put(f"{base}/{mx.json()['id']}", json={"priority": None}, headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["priority"] == 10
+    got = await client.get(base, headers=headers)
+    stored = [x for x in got.json()["items"] if x["id"] == mx.json()["id"]]
+    assert stored[0]["priority"] == 10
+
+    srv = await client.post(
+        base,
+        headers=headers,
+        json={
+            "name": "_sip._tcp",
+            "record_type": "SRV",
+            "value": "sip.example.com.",
+            "priority": 5,
+            "weight": 5,
+            "port": 5060,
+        },
+    )
+    assert srv.status_code in (200, 201), srv.text
+    for field in ("priority", "weight", "port"):
+        r = await client.put(f"{base}/{srv.json()['id']}", json={field: None}, headers=headers)
+        assert r.status_code == 422, (field, r.text)
+        assert field in r.text

@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DEFAULT_ALLOW_RECURSION, DNSServer, DNSServerGroup, DNSServerOptions
+from app.services.dns import option_support
 from app.services.dns.agent_config import render_bundle_body
 
 
@@ -54,6 +55,12 @@ async def test_group_not_recursive_still_folds_into_recursion_enabled(
 
 @pytest.mark.asyncio
 async def test_powerdns_does_not_gain_the_key(db_session: AsyncSession) -> None:
+    # Not an oversight: PowerDNS authoritative does not recurse, and the
+    # per-driver table records that decision (#4562), so the API refuses the
+    # value this row holds rather than shipping a key nothing reads.
+    assert option_support.support("powerdns", "allow_recursion").state == (
+        option_support.NOT_APPLIED
+    )
     server = await _server(db_session, "powerdns", allow_recursion=["10.0.0.0/8"])
     body = (await render_bundle_body(db_session, server)).body
     assert "allow_recursion" not in body["options"]

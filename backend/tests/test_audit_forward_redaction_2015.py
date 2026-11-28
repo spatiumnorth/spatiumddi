@@ -203,6 +203,7 @@ async def test_every_target_kind_forwards_redacted(kind: str) -> None:
 
 _SINKS = {
     "_send_syslog",
+    "_send_syslog_batch",
     "_send_webhook",
     "_send_smtp",
     "render_for_target",
@@ -233,7 +234,16 @@ def test_transports_are_reached_only_through_the_redacting_chokepoint() -> None:
         for func in ast.walk(tree):
             if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
                 continue
-            allowed = rel == "app/services/audit_forward.py" and func.name == "_deliver_to_target"
+            # ``_deliver_to_target`` is the chokepoint for audit rows, alerts and
+            # digests; the others carry DNS / DHCP log-stream events (#4545),
+            # whose free text is redacted in ``render_log_stream_lines``, and
+            # ``_send_syslog`` is the one-message wrapper over the batch sender.
+            allowed = rel == "app/services/audit_forward.py" and func.name in {
+                "_deliver_to_target",
+                "render_log_stream_lines",
+                "_deliver_log_stream_batch",
+                "_send_syslog",
+            }
             for node in ast.walk(func):
                 if isinstance(node, ast.Call) and _called_name(node) in _SINKS and not allowed:
                     offenders.append(f"{rel}:{node.lineno} {func.name} -> {_called_name(node)}")

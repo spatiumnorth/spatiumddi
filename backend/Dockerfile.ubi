@@ -74,6 +74,11 @@ WORKDIR /app
 # nightly/weekly rebuild, like APT_SNAPSHOT in the Debian image.
 ARG RPM_SNAPSHOT=dev
 ARG PGDG_KEY_DIGEST=a70c9527426017d00fa4e6f9d2941d515357a27a7be82e155248ece53bbe5453
+# #4638: PGDG signs its aarch64 packages with a SEPARATE key (fingerprint B031 F89F
+# C983 E982 6290 6B6E 177B 343B B973 8825), published as ...-AARCH64-RHEL; the x86_64
+# key above fails ``rpm --checksig`` on them ("NOKEY"). Both keys are pinned and
+# imported, so each architecture's packages verify against the key that signs them.
+ARG PGDG_AARCH64_KEY_DIGEST=cc506fa92aa97e8e58f88551a2ec99a61d9d603f7f2c1ae0c06191f58c29979f
 # #4340: PGDG's rhel-9 metadata lists only a 16.16 client built for RHEL 9.9, which
 # was never uploaded (404 on both architectures), so a repo install fails and no
 # repo pin can reach the 9.8 build that does exist. Fetch the RHEL 9.8 build of the
@@ -95,6 +100,9 @@ RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
     && curl -fsSL -o /tmp/pgdg.key https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-RHEL \
     && echo "${PGDG_KEY_DIGEST}  /tmp/pgdg.key" | sha256sum -c - \
     && rpm --import /tmp/pgdg.key && rm -f /tmp/pgdg.key \
+    && curl -fsSL -o /tmp/pgdg-aarch64.key https://download.postgresql.org/pub/repos/yum/keys/PGDG-RPM-GPG-KEY-AARCH64-RHEL \
+    && echo "${PGDG_AARCH64_KEY_DIGEST}  /tmp/pgdg-aarch64.key" | sha256sum -c - \
+    && rpm --import /tmp/pgdg-aarch64.key && rm -f /tmp/pgdg-aarch64.key \
     && arch="$(uname -m)" \
     && case "${arch}" in \
          x86_64) PGDG_PG_BUILD="${PGDG_PG_BUILD_X86_64}" ;; \
