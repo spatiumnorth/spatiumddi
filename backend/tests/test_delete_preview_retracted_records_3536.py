@@ -156,6 +156,11 @@ async def _tree(db: AsyncSession) -> dict[str, Any]:
     dhcp_group = DHCPServerGroup(name=f"rr3536-{uuid.uuid4().hex[:6]}")
     db.add_all([s1, s3, group, dhcp_group])
     await db.flush()
+    # s3 holds PTRs in the zone, so it is bound to the zone's group: only a
+    # survivor the group serves keeps a deleted subnet's reverse zone.
+    s3.dns_inherit_settings = False
+    s3.dns_group_ids = [str(group.id)]
+    await db.flush()
     zones = {"forward": _zone(group, FORWARD), "reverse": _zone(group, REVERSE, linked=s1)}
     scope = DHCPScope(group_id=dhcp_group.id, subnet_id=s1.id, name="s1-scope")
     server = DHCPServer(name=f"kea-{uuid.uuid4().hex[:6]}", host="10.0.0.1", driver="kea")

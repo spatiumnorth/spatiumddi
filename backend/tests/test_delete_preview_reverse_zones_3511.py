@@ -100,6 +100,9 @@ async def _tree(db: AsyncSession) -> dict[str, Any]:
     group = DNSServerGroup(name=f"rz3511-{uuid.uuid4().hex[:6]}")
     db.add(group)
     await db.flush()
+    # s3 is bound to the zones' group: only a survivor the group serves keeps one.
+    s3.dns_inherit_settings = False
+    s3.dns_group_ids = [str(group.id)]
     z1 = _reverse_zone(group, "1.35.10.in-addr.arpa.", s1)
     z2 = _reverse_zone(group, "2.35.10.in-addr.arpa.", s2)
     db.add_all([z1, z2])

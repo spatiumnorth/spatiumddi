@@ -144,6 +144,36 @@ async def _effective_dns(db: AsyncSession, subnet: Subnet) -> tuple[list[str], u
     return ([], None)
 
 
+async def bound_dns_groups(
+    db: AsyncSession, subnet: Subnet
+) -> tuple[set[uuid.UUID], DNSZone | None]:
+    """The DNS groups ``subnet`` is bound to, and its effective forward zone.
+
+    "Bound to" is every group subnet create can put the subnet's own reverse
+    zone in (``reverse_zone.ensure_reverse_zones_for_subnet`` resolves it from
+    the same fields): the effective groups, the group of the effective forward
+    zone, and the subnet's OWN stored ``dns_group_ids`` and ``dns_zone_id``.
+    The stored ones matter for a subnet created with a ``dns_group_id`` that
+    still inherits: its effective DNS is empty, yet create made its reverse
+    zone in that group (#5004 walk). The PTR pick and the reverse-zone hand-off
+    both read this, so the two rules cannot drift apart.
+    """
+    group_ids, forward_zone_id = await _effective_dns(db, subnet)
+    groups = set(stored_uuid_list(group_ids))
+    groups.update(stored_uuid_list(getattr(subnet, "dns_group_ids", None) or []))
+    forward_zone = await db.get(DNSZone, forward_zone_id) if forward_zone_id else None
+    if forward_zone is not None:
+        groups.add(forward_zone.group_id)
+    stored_zone_id = stored_zone_uuid(getattr(subnet, "dns_zone_id", None))
+    if stored_zone_id is not None and stored_zone_id != forward_zone_id:
+        stored_group = (
+            await db.execute(select(DNSZone.group_id).where(DNSZone.id == stored_zone_id))
+        ).scalar_one_or_none()
+        if stored_group is not None:
+            groups.add(stored_group)
+    return groups, forward_zone
+
+
 async def _effective_forward_zone_id(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
     """Return the effective forward DNS zone UUID for a subnet, whatever the
     zone's type: it names the subnet's hosts. IPAM writes their A/AAAA records
@@ -375,17 +405,25 @@ async def load_reverse_candidates(
     db: AsyncSession, subnet: Subnet, group_ids: Sequence[object]
 ) -> list[ReverseCandidate]:
     """Every zone that could own a reverse name of ``subnet``'s addresses:
-    the zones linked to the subnet, plus the reverse-owner zones of its
-    effective DNS group(s). Load once per subnet and :func:`pick_reverse_zone`
+    the zones linked to the subnet that sit in its effective DNS group(s),
+    plus the reverse-owner zones of those groups. Load once per subnet and :func:`pick_reverse_zone`
     per address (spatiumddi#1840: a subnet wider than a /24 can span more than
     one zone, so the zone is a property of the ADDRESS, not of the subnet)."""
     out: dict[uuid.UUID, ReverseCandidate] = {}
+    # A zone linked to the subnet counts only while it sits in a group the
+    # subnet is bound to (see bound_dns_groups): a zone left linked to the
+    # subnet in a group it is not bound to takes no PTR.
+    own_groups, _ = await bound_dns_groups(db, subnet)
+    own_groups.update(stored_uuid_list(group_ids))
     linked = (
         await db.execute(
-            select(DNSZone).where(
+            select(DNSZone)
+            .where(
                 DNSZone.linked_subnet_id == subnet.id,
                 DNSZone.kind == "reverse",
+                DNSZone.group_id.in_(own_groups),
             )
+            .order_by(DNSZone.name, DNSZone.id)
         )
     ).scalars()
     for z in linked:

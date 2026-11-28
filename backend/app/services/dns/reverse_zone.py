@@ -29,6 +29,7 @@ from app.models.ipam import IPAddress, Subnet
 from app.services.dns.new_object_defaults import default_zone_ttl
 from app.services.dns.sync_check import (  # noqa: F401 — cidrs_overlap, reverse_zone_network re-exported
     _effective_dns,
+    bound_dns_groups,
     cidrs_overlap,
     ipam_authors_zone,
     reverse_zone_network,
@@ -507,7 +508,9 @@ async def surviving_sharer(
 ) -> uuid.UUID | None:
     """The id of another live subnet whose addresses fall inside the network
     ``zone`` covers — a /25 beside the one being deleted in an aggregated /24
-    zone — or ``None``. Such a zone must outlive the subnet: it is re-linked
+    zone and that the zone can be handed to (:func:`_would_resolve_to_zone`:
+    same DNS group and view, never an overlapping subnet of another IP space)
+    — or ``None``. Such a zone must outlive the subnet: it is re-linked
     to the survivor (the same-space one first) instead of retired, the way
     :func:`ensure_reverse_zone_for_subnet` already re-links a dangling zone
     to the next subnet that needs it.
@@ -517,13 +520,13 @@ async def surviving_sharer(
     covered = reverse_zone_network(zone.name)
     if covered is None:
         return None
-    row = (
+    rows = (
         await db.execute(
             text(
                 "SELECT id FROM subnet WHERE id != CAST(:sid AS uuid) "
                 "AND id != ALL(CAST(:excl AS uuid[])) "
                 "AND deleted_at IS NULL AND network <<= CAST(:covered AS cidr) "
-                "ORDER BY (space_id = CAST(:space AS uuid)) DESC, network LIMIT 1"
+                "ORDER BY (space_id = CAST(:space AS uuid)) DESC, network, id"
             ),
             {
                 "sid": str(subnet.id),
@@ -532,8 +535,38 @@ async def surviving_sharer(
                 "excl": [str(i) for i in exclude_ids],
             },
         )
-    ).first()
-    return row[0] if row else None
+    ).all()
+    for (cand_id,) in rows:
+        cand = await db.get(Subnet, cand_id)
+        if cand is not None and await _would_resolve_to_zone(db, cand, zone, subnet):
+            return cand.id
+    return None
+
+
+async def _would_resolve_to_zone(
+    db: AsyncSession, cand: Subnet, zone: DNSZone, going: Subnet
+) -> bool:
+    """True when ``cand`` is a subnet that ``zone`` can be handed to: one the
+    zone belongs to by the rules that place a subnet's PTRs. Its effective DNS
+    must be bound to the zone's group (``bound_dns_groups``: its effective
+    groups and forward zone, or its own stored groups and zone), a
+    view-pinned zone must match the view of its forward zone, and a subnet of
+    another IP space whose network overlaps the one going away is never an heir
+    (#844): the same reverse names there belong to another space's DNS."""
+    if cand.space_id != going.space_id and cidrs_overlap(cand.network, going.network):
+        return False
+    allowed, forward_zone = await bound_dns_groups(db, cand)
+    if zone.group_id not in allowed:
+        return False
+    if (
+        zone.view_id is not None
+        and forward_zone is not None
+        and forward_zone.group_id == zone.group_id
+        and forward_zone.view_id is not None
+        and forward_zone.view_id != zone.view_id
+    ):
+        return False
+    return True
 
 
 async def _retirement_plan(
@@ -577,8 +610,9 @@ async def retire_auto_reverse_zones(
 
     For every zone linked to the subnet and marked ``is_auto_generated``:
 
-    * a zone another live subnet still lives in is re-linked to that
-      survivor and stays (``reverse_zone_relinked``);
+    * a zone another live subnet still lives in, one the zone's DNS group and
+      view serve (:func:`surviving_sharer`), is re-linked to that survivor and
+      stays (``reverse_zone_relinked``);
     * otherwise it is retired — with ``batch`` (the soft path) it is appended
       to the subnet's own deletion batch with its records, so the trash shows
       one deletion and a restore brings subnet and zone back together; without
