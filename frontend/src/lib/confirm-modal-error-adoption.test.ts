@@ -23,6 +23,10 @@ const ALLOWED: Record<string, { count: number; why: string }> = {
     count: 1,
     why: "no mutation: Close without copying only closes the local dialog",
   },
+  "pages/dhcp/CreateClientClassModal.tsx": {
+    count: 1,
+    why: "no mutation: switching match type only changes the local form; the save's refusal is the form's FormError",
+  },
   "components/SSHSection.tsx": {
     count: 2,
     why: "closes at the press; a refused re-save is the form's role=alert 'Failed to save' line",
