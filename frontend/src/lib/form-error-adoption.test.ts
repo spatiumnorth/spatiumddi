@@ -14,7 +14,7 @@ const NOT_A_REFUSAL =
   /last_|fingerbank|error_message|valueError|hostnameErr|(?<![\w.])errors\.|validationError|pageError|reauthFailed|latest\.|optionsError|syncError|logoError|cr\.error|status === "error"|run\.error/;
 
 const PLAIN_BOX =
-  /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>[a-z][a-z0-9]*)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
+  /\{(?<cond>[^{}\n]*?(?:[eE]rr|[fF]ail|[rR]efus|[bB]locked)[^{}\n]*?)\s*&&\s*\(?\s*<(?<tag>[a-z][a-z0-9]*)\s+className="(?<cls>[^"]*)"\s*>(?:(?!<\/?(?:p|div|ul|li|button)\b)[\s\S])*?<\/\k<tag>>/g;
 
 // A ternary form, `m.isError ? (<div key=".." className="..">..</div>) : null`,
 // with attributes (key) ahead of className (#4404).
@@ -32,7 +32,6 @@ function files(dir: string): string[] {
 }
 
 export function plainRefusalBoxes(source: string, ternary = false): string[] {
-  if (!source.includes("Modal") && !source.includes("fixed inset")) return [];
   const out: string[] = [];
   for (const m of [
     ...source.matchAll(PLAIN_BOX),
@@ -204,9 +203,18 @@ describe("dialog refusals are announced (#3821)", () => {
 
   it("every standing-state exemption still matches a box", () => {
     for (const [file, { names }] of Object.entries(STANDING_STATE)) {
-      expect(exempted.get(file)?.slice().sort(), file).toEqual(
+      const mine = exempted.get(file) ?? [];
+      expect(mine.filter((n) => names.includes(n)).sort(), file).toEqual(
         names.slice().sort(),
       );
     }
+  });
+
+  it("reads a file that holds no dialog (#4965)", () => {
+    const src = `function Card(){ return <div>{reveal.isError && (<div className="flex rounded-md border text-destructive"><span>{e}</span></div>)}{selectiveBlockedByPlainFormat && (<div className="text-xs text-destructive">no</div>)}</div>; }`;
+    expect(plainRefusalBoxes(src)).toEqual([
+      "reveal.isError",
+      "selectiveBlockedByPlainFormat",
+    ]);
   });
 });

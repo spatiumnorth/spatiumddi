@@ -141,7 +141,11 @@ export function ChangePasswordPage() {
               <p className="text-sm text-destructive">Passwords do not match</p>
             )}
           </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
           {policyErrors.length > 0 && (
             <ul className="list-disc space-y-1 pl-5 text-sm text-destructive">
               {policyErrors.map((e) => (

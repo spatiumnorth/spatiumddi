@@ -301,7 +301,7 @@ export function NTPSection({
               : "Save NTP settings"}
         </button>
         {saveErr && (
-          <span className="text-xs text-destructive">
+          <span role="alert" className="text-xs text-destructive">
             Failed to save: {saveErr}
           </span>
         )}

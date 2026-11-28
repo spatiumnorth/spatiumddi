@@ -116,3 +116,16 @@ describe("TimezoneSection (#4416)", () => {
     });
   });
 });
+
+describe("a refused save is announced (#4970)", () => {
+  it("draws the refusal in a role=alert region", async () => {
+    update.mockRejectedValueOnce(new Error("nope"));
+    mount();
+    fireEvent.change(screen.getByPlaceholderText("UTC"), {
+      target: { value: "Europe/Paris" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+    const alert = await screen.findByRole("alert", {}, { timeout: 10000 });
+    expect(alert.textContent).toBe("err");
+  });
+});

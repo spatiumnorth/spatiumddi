@@ -126,7 +126,7 @@ function ReportCard({
           </p>
         )}
         {!withheld && !isLoading && isError && (
-          <p className="p-4 text-center text-sm text-destructive">
+          <p role="alert" className="p-4 text-center text-sm text-destructive">
             Failed to load this report.
           </p>
         )}

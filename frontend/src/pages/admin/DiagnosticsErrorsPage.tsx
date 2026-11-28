@@ -233,7 +233,7 @@ export function DiagnosticsErrorsPage() {
               Loading…
             </div>
           ) : listQ.isError ? (
-            <div className="p-6 text-sm text-destructive">
+            <div role="alert" className="p-6 text-sm text-destructive">
               Failed to load errors.
               {(listQ.error as Error)?.message
                 ? ` ${formatApiError(listQ.error)}`
@@ -469,7 +469,9 @@ function ErrorDetailRow({ id }: { id: string }) {
         {detailQ.isLoading ? (
           <Loader2 className="h-4 w-4 animate-spin" />
         ) : detailQ.isError ? (
-          <div className="text-xs text-destructive">Failed to load detail.</div>
+          <div role="alert" className="text-xs text-destructive">
+            Failed to load detail.
+          </div>
         ) : detailQ.data ? (
           <ErrorDetailContent detail={detailQ.data} />
         ) : null}

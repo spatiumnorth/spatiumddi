@@ -741,7 +741,11 @@ export function AptSection({
             <Check className="h-3.5 w-3.5" /> Saved
           </span>
         )}
-        {saveErr && <span className="text-xs text-destructive">{saveErr}</span>}
+        {saveErr && (
+          <span role="alert" className="text-xs text-destructive">
+            {saveErr}
+          </span>
+        )}
       </div>
     </div>
   );

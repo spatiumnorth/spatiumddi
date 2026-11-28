@@ -339,7 +339,7 @@ export function DriftView({
           Pulling the live zone from every server in the group…
         </p>
       ) : error ? (
-        <p className="text-sm text-destructive">
+        <p role="alert" className="text-sm text-destructive">
           Could not build the drift report:{" "}
           {error instanceof Error ? error.message : String(error)}
         </p>
@@ -381,7 +381,10 @@ export function DriftView({
               </span>
             )}
             {failed.length > 0 && (
-              <span className="inline-flex items-center gap-1.5 rounded bg-rose-500/15 px-2 py-1 font-medium text-rose-600 dark:text-rose-400">
+              <span
+                role="alert"
+                className="inline-flex items-center gap-1.5 rounded bg-rose-500/15 px-2 py-1 font-medium text-rose-600 dark:text-rose-400"
+              >
                 <AlertTriangle className="h-3.5 w-3.5" />
                 {failed.length} server{failed.length === 1 ? "" : "s"} could not
                 be pulled

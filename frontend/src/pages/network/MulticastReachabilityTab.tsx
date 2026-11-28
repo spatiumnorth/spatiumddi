@@ -40,7 +40,9 @@ export function MulticastReachabilityTab() {
         read-only, computed live on every load.
       </p>
       {error && (
-        <p className="text-sm text-destructive">Failed to load reachability.</p>
+        <p role="alert" className="text-sm text-destructive">
+          Failed to load reachability.
+        </p>
       )}
 
       <div>
