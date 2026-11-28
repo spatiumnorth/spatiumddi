@@ -98,7 +98,7 @@ async def test_change_password_revokes_other_sessions_spares_caller(
         json={"current_password": "OldPass123!", "new_password": "BrandNewPass1!"},
         headers=_bearer(user, caller_session),
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
 
     await db_session.refresh(other_session)
     await db_session.refresh(caller_session)
@@ -145,7 +145,7 @@ async def test_admin_reset_revokes_all_target_sessions(
         json={"new_password": "AdminSetPass1!"},
         headers=_bearer(admin),
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
 
     rows = (
         (await db_session.execute(select(UserSession).where(UserSession.user_id == target.id)))
@@ -197,7 +197,7 @@ async def test_force_change_allows_recovery_endpoints(
         json={"current_password": "OldPass123!", "new_password": "RecoverPass1!"},
         headers=headers,
     )
-    assert changed.status_code == 204, changed.text
+    assert changed.status_code == 200, changed.text
     await db_session.refresh(user)
     assert user.force_password_change is False
 

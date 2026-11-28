@@ -347,7 +347,7 @@ async def test_password_change_elsewhere_ends_the_rotated_session_at_once(
         json={"current_password": _PASSWORD, "new_password": "BrandNewPass1!"},
         headers={"Authorization": f"Bearer {other_token}"},
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
     await _assert_all_dead(client, cookie_a, token_a, cookie_b, token_b)
     assert await _me(client, other_token) == 200
 
@@ -363,7 +363,7 @@ async def test_password_change_from_the_old_token_spares_the_successor(
         json={"current_password": _PASSWORD, "new_password": "BrandNewPass1!"},
         headers={"Authorization": f"Bearer {token_a}"},
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
     assert (await _row(db_session, cookie_b)).revoked is False
     assert await _me(client, token_b) == 200
 
@@ -432,7 +432,7 @@ async def test_admin_password_reset_ends_the_rotated_session_at_once(
         json={"new_password": "AdminSetPass1!"},
         headers=_bearer(admin),
     )
-    assert r.status_code == 204, r.text
+    assert r.status_code == 200, r.text
     await _assert_all_dead(client, cookie_a, token_a, cookie_b, token_b)
 
 
