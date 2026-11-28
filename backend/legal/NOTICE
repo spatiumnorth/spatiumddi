@@ -177,6 +177,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - Radix UI primitives — MIT — https://www.radix-ui.com
 - Recharts — MIT — https://recharts.org
 - lucide-react (icons) — ISC — https://lucide.dev
+- Material Design Icons (@mdi/js, the Pictogrammers community set; device icons) — Pictogrammers Free License: icons Apache-2.0, code MIT — https://pictogrammers.com/library/mdi/
 - react-markdown / remark-gfm — MIT — https://github.com/remarkjs/react-markdown
 - dnd-kit — MIT — https://dndkit.com
 - clsx / tailwind-merge — MIT — https://github.com/lukeed/clsx

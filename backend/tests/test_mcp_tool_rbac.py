@@ -294,6 +294,8 @@ _SESSION_ONLY_TOOLS = {
     "global_search",
     "ask_yes_no",
     "help_write_permission",
+    # #5022: the icon catalog is open to any signed-in user, like GET /icons/catalog.
+    "find_icons",
 }
 
 

@@ -325,6 +325,7 @@ from app.services.dns_io import (
 from app.services.dns_io import spreadsheet as sheet_io
 from app.services.dns_io.parser import ParsedZone
 from app.services.feature_modules import require_module
+from app.services.icons import attach_record_icons, validate_icon
 from app.services.ipam.zone_binding import prune_group_ids, prune_zone_ids
 from app.services.lock_order import (
     address_ids_of_records,
@@ -2080,6 +2081,14 @@ class RecordCreate(BaseModel):
     port: int | None = None
     view_id: uuid.UUID | None = None
     tags: dict[str, Any] = Field(default_factory=dict)
+    # #5022 — explicit built-in icon (``mdi:<name>``). Null / omitted = automatic
+    # (follows the linked IPAM address).
+    icon: str | None = None
+
+    @field_validator("icon", mode="before")
+    @classmethod
+    def validate_icon(cls, v: Any) -> Any:
+        return validate_icon(v)
 
     @field_validator("record_type")
     @classmethod
@@ -2111,6 +2120,13 @@ class RecordUpdate(BaseModel):
     port: int | None = None
     view_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
+    # #5022 — explicit icon; null (or "") clears it back to automatic.
+    icon: str | None = None
+
+    @field_validator("icon", mode="before")
+    @classmethod
+    def validate_icon(cls, v: Any) -> Any:
+        return validate_icon(v)
 
     @field_validator("name")
     @classmethod
@@ -2140,6 +2156,14 @@ class RecordResponse(BaseModel):
     # pipeline. Operator edits / deletes are blocked while non-null.
     pool_member_id: uuid.UUID | None = None
     tags: dict[str, Any] = Field(default_factory=dict)
+    # #5022 — ``icon`` is the explicit choice; ``effective_icon`` is what to
+    # draw (explicit, else the linked IPAM address's effective icon) and
+    # ``icon_source`` says which. The list / create / update handlers fill the
+    # linked part (``attach_record_icons``); elsewhere only an explicit icon
+    # resolves.
+    icon: str | None = None
+    effective_icon: str | None = None
+    icon_source: str = "none"
     created_at: datetime
     modified_at: datetime
     # #1538 — set when the record's agentless provider op did not land on
@@ -2150,6 +2174,12 @@ class RecordResponse(BaseModel):
     provider_warning: str | None = None
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _explicit_icon(self) -> RecordResponse:
+        if self.icon:
+            self.effective_icon, self.icon_source = self.icon, "explicit"
+        return self
 
 
 class ServedApexSoa(BaseModel):
@@ -10241,6 +10271,7 @@ async def list_records(
     stmt = apply_tag_filter(stmt, DNSRecord.tags, tag)
     stmt = stmt.order_by(DNSRecord.name, DNSRecord.record_type)
     rows, total = await paginate(db, stmt, page=page, page_size=page_size)
+    await attach_record_icons(db, rows)
     return RecordPage(
         items=[RecordResponse.model_validate(r) for r in rows],
         total=total,
@@ -10607,6 +10638,7 @@ async def create_record(
             resource_type="dns_record",
             resource_id=str(record.id),
             resource_display=fqdn,
+            new_value={"icon": record.icon} if record.icon else None,
             result="error" if provider_warning else "success",
         )
     )
@@ -10616,6 +10648,7 @@ async def create_record(
     # outcome is only known now.
     provider_warning = provider_warning or _agentless_op_warning(op)
     record.provider_warning = provider_warning  # type: ignore[attr-defined]
+    await attach_record_icons(db, [record])
     return record
 
 
@@ -10645,7 +10678,7 @@ async def update_record(
     # (422, via _normalize_record_struct_fields), other types hold no value.
     changes = resolve_update_changes(
         body,
-        clearable={"view_id", "ttl", "priority", "weight", "port"},
+        clearable={"view_id", "ttl", "priority", "weight", "port", "icon"},
         non_nullable={"name", "value", "tags"},
     )
     if record.record_type.upper() == "MX" and "priority" in changes and changes["priority"] is None:
@@ -10656,8 +10689,34 @@ async def update_record(
     changes = {k: v for k, v in changes.items() if getattr(record, k) != v}
     if not changes:
         record.provider_warning = None  # type: ignore[attr-defined]
+        await attach_record_icons(db, [record])
         return record
-    if set(changes) - {"ttl"}:
+    before_icon = record.icon
+    if set(changes) == {"icon"}:
+        # #5022 — an icon is a display attribute, not DNS data: no zone serial
+        # bump, no op for the agent or provider, and no LUA gate.
+        record.icon = changes["icon"]
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="dns_record",
+                resource_id=str(record.id),
+                resource_display=record.fqdn,
+                changed_fields=["icon"],
+                old_value={"icon": before_icon},
+                new_value={"icon": record.icon},
+                result="success",
+            )
+        )
+        await db.commit()
+        await _refresh_record_or_404(db, record)
+        record.provider_warning = None  # type: ignore[attr-defined]
+        await attach_record_icons(db, [record])
+        return record
+    if set(changes) - {"ttl", "icon"}:
         await _require_superadmin_for_lua(
             db, current_user, [record.record_type], what="change a LUA record other than its TTL"
         )
@@ -10807,6 +10866,8 @@ async def update_record(
             resource_id=str(record.id),
             resource_display=record.fqdn,
             changed_fields=list(changes.keys()),
+            old_value={"icon": before_icon} if "icon" in changes else None,
+            new_value={"icon": record.icon} if "icon" in changes else None,
             result="error" if provider_warning else "success",
         )
     )
@@ -10818,6 +10879,7 @@ async def update_record(
         next((o for o in rename_ops if o.last_error), None) or op
     )
     record.provider_warning = provider_warning  # type: ignore[attr-defined]
+    await attach_record_icons(db, [record])
     return record
 
 

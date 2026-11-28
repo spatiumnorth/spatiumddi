@@ -1468,6 +1468,9 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("ip_address.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # #5022 — the operator's explicit icon (``mdi:<name>``). NULL = automatic:
+    # the effective icon follows the linked IPAM address.
+    icon: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )

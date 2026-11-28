@@ -101,6 +101,7 @@ from app.services.e911.delete_guard import (
     refuse_if_e911_bound,
 )
 from app.services.feature_modules import is_module_enabled, require_module
+from app.services.icons import resolve_ip_icon, validate_icon
 from app.services.ipam.address_create_rules import (
     assert_address_unallocated,
     assert_not_boundary_address,
@@ -5094,6 +5095,8 @@ class IPAddressCreate(BaseModel):
     # ``IP_ROLES_SHARED`` (anycast / vip / vrrp) bypass the
     # MAC-collision warning.
     role: str | None = None
+    # #5022 — explicit built-in icon (``mdi:<name>``). Null / omitted = automatic.
+    icon: str | None = None
     # Reservation TTL — only honoured when ``status='reserved'``.
     # When set, the ``sweep_expired_reservations`` Celery beat task
     # flips the row back to ``available`` after the timestamp passes.
@@ -5135,6 +5138,11 @@ class IPAddressCreate(BaseModel):
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
+    @field_validator("icon", mode="before")
+    @classmethod
+    def validate_icon(cls, v: Any) -> Any:
+        return validate_icon(v)
+
     @field_validator("dns_zone_id")
     @classmethod
     def _validate_dns_zone_id(cls, v: str | None) -> str | None:
@@ -5159,6 +5167,9 @@ class IPAddressUpdate(BaseModel):
     # the field to leave the existing list untouched.
     extra_zone_ids: list[str] | None = None
     role: str | None = None
+    # #5022 — explicit icon; null (or "") clears it back to automatic. Never
+    # stamps ``user_modified_at``.
+    icon: str | None = None
     reserved_until: datetime | None = None
     # Planned decommission date (issue #46). Explicit null clears it —
     # the update path uses exclude_unset so null-clear works directly.
@@ -5199,6 +5210,11 @@ class IPAddressUpdate(BaseModel):
     @classmethod
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
+
+    @field_validator("icon", mode="before")
+    @classmethod
+    def validate_icon(cls, v: Any) -> Any:
+        return validate_icon(v)
 
     @field_validator("dns_zone_id")
     @classmethod
@@ -5275,10 +5291,27 @@ class IPAddressResponse(BaseModel):
     device_type: str | None = None
     device_class: str | None = None
     device_manufacturer: str | None = None
+    # #5022 — ``icon`` is the explicit choice; ``effective_icon`` is what to
+    # draw (explicit, else the device-class default, else the IP-role default)
+    # and ``icon_source`` says which one it was.
+    icon: str | None = None
+    effective_icon: str | None = None
+    icon_source: str = "none"
     created_at: datetime
     modified_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _resolve_icon(self) -> "IPAddressResponse":
+        resolved = resolve_ip_icon(
+            icon=self.icon,
+            device_class=self.device_class,
+            device_type=self.device_type,
+            role=self.role,
+        )
+        self.effective_icon, self.icon_source = resolved.icon, resolved.source
+        return self
 
     @field_validator("address", "mac_address", mode="before")
     @classmethod
@@ -5353,6 +5386,8 @@ class NextIPRequest(BaseModel):
     extra_zone_ids: list[str] = []
     aliases: list[AliasInput] = []
     role: str | None = None
+    # #5022 — see ``IPAddressCreate.icon``.
+    icon: str | None = None
     reserved_until: datetime | None = None
     # Planned decommission date (issue #46). Null = no scheduled decom.
     # Mirrors ``IPAddressCreate.decom_date`` (#523).
@@ -5390,6 +5425,11 @@ class NextIPRequest(BaseModel):
     @classmethod
     def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
+
+    @field_validator("icon", mode="before")
+    @classmethod
+    def validate_icon(cls, v: Any) -> Any:
+        return validate_icon(v)
 
     @field_validator("dns_zone_id")
     @classmethod
@@ -11264,6 +11304,8 @@ async def update_address(
     # the reconcilers know to skip overwrites of those fields.
     soft_fields = {"hostname", "description", "status", "mac_address"}
     soft_field_actually_changed = False
+    if "icon" in changes:
+        old["icon"] = ip.icon
     for field, value in changes.items():
         if field in soft_fields and getattr(ip, field) != value:
             soft_field_actually_changed = True
@@ -12806,6 +12848,7 @@ async def allocate_next_ip(
         custom_fields=body.custom_fields,
         tags=body.tags,
         role=body.role,
+        icon=body.icon,
         reserved_until=body.reserved_until,
         extra_zone_ids=[] if no_dns else body.extra_zone_ids,
         decom_date=body.decom_date,
@@ -13638,7 +13681,14 @@ class IPAddressBulkChanges(BaseModel):
     # Field presence (model_dump exclude_none) is the opt-in signal,
     # so the client should omit fields it doesn't intend to change.
     role: str | None = None
+    # #5022 — "" clears the icon back to automatic, like ``role``.
+    icon: str | None = None
     reserved_until: datetime | None = None
+
+    @field_validator("icon", mode="before")
+    @classmethod
+    def _validate_icon(cls, v: Any) -> Any:
+        return validate_icon(v)
 
     @field_validator("status")
     @classmethod
@@ -13733,7 +13783,7 @@ async def bulk_edit_addresses(
     # Per-field opt-in: the change set carries ONLY the fields the
     # client explicitly set. ``role`` and ``reserved_until`` flow
     # through as scalars; an empty string on ``role`` clears.
-    scalar_field_names = ("status", "description", "role", "reserved_until")
+    scalar_field_names = ("status", "description", "role", "icon", "reserved_until")
     scalar_changes: dict[str, Any] = {}
     for k in scalar_field_names:
         if k not in changes:

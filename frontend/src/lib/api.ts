@@ -990,6 +990,13 @@ export interface IPAddress {
   device_type?: string | null;
   device_class?: string | null;
   device_manufacturer?: string | null;
+  // #5022 - optional built-in icon. ``icon`` is the explicit ``mdi:<name>``
+  // override (null = automatic); ``effective_icon`` is what to draw after the
+  // server's resolution (explicit, device class, IP role) and ``icon_source``
+  // says which rule won.
+  icon?: string | null;
+  effective_icon?: string | null;
+  icon_source?: "explicit" | "device_class" | "ip_role" | "linked_ip" | "none";
   created_at?: string;
   modified_at?: string;
 }
@@ -2120,6 +2127,8 @@ export const ipamApi = {
       role?: IPRole | "" | null;
       /** TTL on reservations. ``null`` clears, ISO 8601 string sets. */
       reserved_until?: string | null;
+      /** Built-in icon (``mdi:<name>``). Empty string clears (#5022). */
+      icon?: string;
     };
   }) =>
     api
@@ -2176,6 +2185,8 @@ export const ipamApi = {
       aliases?: { name: string; record_type: "CNAME" | "A" }[];
       role?: IPRole;
       reserved_until?: string;
+      /** Built-in icon, ``mdi:<name>`` (#5022). */
+      icon?: string;
       /** Re-submit flag after the user confirms a 409 collision warning. */
       force?: boolean;
     },
@@ -6510,6 +6521,10 @@ export interface DNSRecord {
   // Non-null when the record is rendered by the DNS pool health-check
   // pipeline. Operator edits / deletes are blocked while non-null.
   pool_member_id: string | null;
+  // #5022 - as on IPAddress; a record inherits its linked IP's icon.
+  icon?: string | null;
+  effective_icon?: string | null;
+  icon_source?: "explicit" | "device_class" | "ip_role" | "linked_ip" | "none";
   created_at: string;
   modified_at: string;
 }
@@ -22334,4 +22349,44 @@ export const otApi = {
     api
       .post<OTDeviceImportCommitResponse>("/ot/devices/import/commit", data)
       .then((r) => r.data),
+};
+
+// ── Built-in icons (#5022) ────────────────────────────────────────────────
+
+export type IconDefaultKind =
+  | "device_class"
+  | "ip_role"
+  | "network_device_type";
+
+export interface IconCatalogItem {
+  /** ``mdi:<name>`` */
+  name: string;
+  label: string;
+}
+
+export interface IconDefault {
+  kind: IconDefaultKind;
+  match_value: string;
+  icon: string;
+  /** The shipped mapping; null for a mapping an operator added. */
+  default_icon: string | null;
+  overridden: boolean;
+}
+
+export const iconsApi = {
+  catalog: (params?: { q?: string; page?: number; page_size?: number }) =>
+    api
+      .get<Page<IconCatalogItem>>("/icons/catalog", { params })
+      .then((r) => r.data),
+  listDefaults: () =>
+    api
+      .get<{ items: IconDefault[] }>("/icons/defaults")
+      .then((r) => r.data.items),
+  setDefault: (data: {
+    kind: IconDefaultKind;
+    match_value: string;
+    icon: string;
+  }) => api.put<IconDefault>("/icons/defaults", data).then((r) => r.data),
+  resetDefault: (kind: IconDefaultKind, match_value: string) =>
+    api.delete("/icons/defaults", { params: { kind, match_value } }),
 };

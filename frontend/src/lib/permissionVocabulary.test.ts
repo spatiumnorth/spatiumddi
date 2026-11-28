@@ -15,6 +15,7 @@ const BUILTIN_ROLE_TYPES = [
   "dicom_ae",
   "dnsbl",
   "e911_location",
+  "icon",
   "manage_asns",
   "manage_domains",
   "manage_block_sync",

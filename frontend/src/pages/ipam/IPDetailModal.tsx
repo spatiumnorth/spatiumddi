@@ -57,6 +57,7 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { RpkiPill } from "@/components/network/bgp-route-table";
 import { FormError } from "@/components/ui/form-error";
+import { IconCell } from "@/components/icons/IconCell";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -246,6 +247,11 @@ export function IPDetailModal({
         >
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
+              <IconCell
+                icon={addr.effective_icon}
+                source={addr.icon_source}
+                size={20}
+              />
               <h2 {...titleProps} className="font-mono text-xl font-semibold">
                 {addr.address}
               </h2>

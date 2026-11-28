@@ -217,6 +217,8 @@ describe("form labels use the shared Field (#4371)", () => {
       "components/ui/swatch-picker.tsx": "colour buttons, no select / input",
       "components/ui/filter-mode-picker.tsx": "radio group, names its own",
       "components/AgentLogScopePicker.tsx": "not placed in a Field",
+      "components/icons/IconPickerModal.tsx":
+        "a dialog whose search box names itself with aria-label",
     };
     const drawsControl = /<select\b|<input\b(?![^>]*type="(?:checkbox|radio)")/;
     const missing = files(join(SRC, "components"))

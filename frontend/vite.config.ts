@@ -5,6 +5,7 @@ import type { Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import license, { type Dependency } from "rollup-plugin-license";
+import { mdiVirtual } from "./vite-plugin-mdi.ts";
 
 const pkg = JSON.parse(
   readFileSync(new URL("./package.json", import.meta.url), "utf-8"),
@@ -129,6 +130,8 @@ function thirdPartyText(dependencies: Dependency[]): string {
 export default defineConfig({
   plugins: [
     react(),
+    // #5022 - virtual modules for the lazy Material Design Icons set.
+    mdiVirtual(),
     // #2895 — Vite strips licence comments from the minified bundle, so
     // MIT / BSD / ISC notices stop travelling with the copies we serve.
     // This lists exactly the packages that ended up in the bundle (not

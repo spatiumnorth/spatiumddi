@@ -100,6 +100,7 @@ from app.models.firewall import (
 )
 from app.models.firewall_feed import FirewallFeed
 from app.models.fortinet import FortinetFirewall
+from app.models.icon import IconDefault
 from app.models.influxdb import InfluxDBTarget
 from app.models.ipam import (
     CustomFieldDefinition,
@@ -307,6 +308,7 @@ __all__ = [
     "MulticastMembership",
     "NmapScan",
     "PacketCapture",
+    "IconDefault",
     "SavedView",
     "TLSCertTarget",
     "TLSCertProbe",

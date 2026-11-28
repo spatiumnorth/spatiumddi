@@ -55,6 +55,8 @@ from app.api.v1.firewall_feeds.router import router as firewall_feeds_router
 from app.api.v1.fortinet.router import router as fortinet_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.groups.time_bound_grants import router as time_bound_grants_router
+from app.api.v1.icons.deps import fresh_icon_overrides
+from app.api.v1.icons.router import router as icons_router
 from app.api.v1.ipam.integration_space_audit import router as integration_space_audit_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
@@ -305,7 +307,11 @@ include_token_scoped(
     # off (the gate answers 404, which re-bootstraps agents).
     # GHSA-46mq-mpwf-xxwv: a zone-scoped token is held to its zones on
     # every route keyed on {zone_id}, before any handler runs.
-    dependencies=[Depends(require_module("core.dns")), Depends(wake_publishing)],
+    dependencies=[
+        Depends(require_module("core.dns")),
+        Depends(wake_publishing),
+        Depends(fresh_icon_overrides),
+    ],
 )
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
 api_v1_router.include_router(
@@ -379,7 +385,7 @@ include_token_scoped(
     # #358 — IPAM→DNS auto-sync calls enqueue_record_op; publish on commit.
     # GHSA-46mq-mpwf-xxwv: a subnet-scoped token is held to its subnets on
     # every route keyed on {subnet_id} / {address_id}.
-    dependencies=[Depends(wake_publishing)],
+    dependencies=[Depends(wake_publishing), Depends(fresh_icon_overrides)],
 )
 api_v1_router.include_router(
     kubernetes_router,
@@ -536,6 +542,7 @@ api_v1_router.include_router(
     tags=["reports"],
     dependencies=[Depends(require_module("reports.top_n"))],
 )
+api_v1_router.include_router(icons_router, prefix="/icons", tags=["icons"])
 api_v1_router.include_router(roles_router, prefix="/roles", tags=["roles"])
 api_v1_router.include_router(
     saved_views_router,

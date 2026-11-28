@@ -27,6 +27,7 @@ import { Toggle } from "@/components/ui/toggle";
 import { AuditForwardTargets } from "@/components/AuditForwardTargets";
 import { InfluxDBTargets } from "@/components/InfluxDBTargets";
 import { TldRegistrySection } from "@/components/TldRegistrySection";
+import { IconDefaultsSection } from "@/components/icons/IconDefaultsSection";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
@@ -132,6 +133,7 @@ type SectionId =
   | "reverse-dns"
   | "dns-pull-from-server"
   | "dns-tld-registry"
+  | "icons"
   | "dhcp"
   | "dhcp-lease-sync"
   | "audit-forward"
@@ -239,6 +241,9 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // is its own singleton row with its own refresh endpoint, not a
   // PlatformSettings column, so the singleton Save button owns nothing here.
   "dns-tld-registry": [],
+  // Managed through the dedicated IconDefaultsSection (the mappings are rows
+  // of their own, #5022), so the singleton Save button owns nothing here.
+  icons: [],
   dhcp: [
     "dhcp_default_dns_servers",
     "dhcp_default_domain_name",
@@ -1062,6 +1067,25 @@ const SECTIONS: SectionDef[] = [
   },
 
   // ── IPAM ─────────────────────────────────────────────────────────────
+  {
+    id: "icons",
+    title: "Icons",
+    group: "IPAM",
+    description:
+      "Which built-in icon an IP address or DNS record shows when it has none of its own, by device class, IP role and network device type.",
+    keywords: [
+      "icon",
+      "icons",
+      "device",
+      "class",
+      "role",
+      "printer",
+      "camera",
+      "default",
+      "mapping",
+      "glyph",
+    ],
+  },
   {
     id: "ip-allocation",
     title: "IP Allocation",
@@ -2291,6 +2315,8 @@ export function SettingsPage() {
             {activeId === "audit-forward" && (
               <AuditForwardTargets isSuperadmin={!!isSuperadmin} />
             )}
+
+            {activeId === "icons" && <IconDefaultsSection />}
 
             {activeId === "dns-tld-registry" && (
               <TldRegistrySection isSuperadmin={!!isSuperadmin} />
