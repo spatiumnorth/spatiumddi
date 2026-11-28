@@ -10,6 +10,8 @@ import {
   type VRF,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ListReadError } from "@/components/ui/list-read-error";
+import { isRefused } from "@/lib/refusal";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
@@ -169,18 +171,44 @@ export function VRFDetailPage() {
     enabled: !!vrf?.asn_id,
   });
 
-  const { data: allSpaces = [] } = useQuery({
+  // #4636 — a role that reads VRFs but not IP spaces / blocks (the built-in
+  // Network Editor) is refused both lists. A refused read is said, not drawn
+  // as "linked to none"; the VRF's own space_count / block_count (which the
+  // role can read) still tell how many there are.
+  const {
+    data: allSpaces,
+    error: spacesError,
+    isError: spacesFailed,
+  } = useQuery({
     queryKey: ["ipam-spaces"],
     queryFn: () => ipamApi.listSpaces(),
+    retry: (n, err) => !isRefused(err) && n < 3,
   });
 
-  const { data: allBlocks = [] } = useQuery({
+  const {
+    data: allBlocks,
+    error: blocksError,
+    isError: blocksFailed,
+  } = useQuery({
     queryKey: ["ipam-blocks"],
     queryFn: () => ipamApi.listBlocks(),
+    retry: (n, err) => !isRefused(err) && n < 3,
   });
 
-  const spaces = allSpaces.filter((s) => s.vrf_id === id);
-  const blocks = allBlocks.filter((b) => b.vrf_id === id);
+  const spaces = (allSpaces ?? []).filter((s) => s.vrf_id === id);
+  const blocks = (allBlocks ?? []).filter((b) => b.vrf_id === id);
+  // The tab count: what the list holds once it answered, the server's own
+  // count when the list was refused, nothing while it has not answered.
+  const spacesCount = allSpaces
+    ? spaces.length
+    : spacesFailed
+      ? vrf?.space_count
+      : undefined;
+  const blocksCount = allBlocks
+    ? blocks.length
+    : blocksFailed
+      ? vrf?.block_count
+      : undefined;
 
   if (isLoading) {
     return (
@@ -251,8 +279,18 @@ export function VRFDetailPage() {
         <div className="mt-4 -mb-px flex gap-1">
           {(
             [
-              ["spaces", `IP Spaces (${spaces.length})`],
-              ["blocks", `IP Blocks (${blocks.length})`],
+              [
+                "spaces",
+                spacesCount === undefined
+                  ? "IP Spaces"
+                  : `IP Spaces (${spacesCount})`,
+              ],
+              [
+                "blocks",
+                blocksCount === undefined
+                  ? "IP Blocks"
+                  : `IP Blocks (${blocksCount})`,
+              ],
               ...(featureEnabled("network.looking_glass")
                 ? [["routes", "Routes"] as [Tab, string]]
                 : []),
@@ -319,7 +357,11 @@ export function VRFDetailPage() {
             {spaces.length === 0 ? (
               <div className="flex flex-col items-center gap-2 p-10 text-center">
                 <p className="text-sm text-muted-foreground">
-                  No IP spaces linked to this VRF
+                  {spacesFailed ? (
+                    <ListReadError error={spacesError} what="IP spaces" />
+                  ) : allSpaces ? (
+                    "No IP spaces linked to this VRF"
+                  ) : null}
                 </p>
               </div>
             ) : (
@@ -372,7 +414,11 @@ export function VRFDetailPage() {
             {blocks.length === 0 ? (
               <div className="flex flex-col items-center gap-2 p-10 text-center">
                 <p className="text-sm text-muted-foreground">
-                  No IP blocks linked to this VRF
+                  {blocksFailed ? (
+                    <ListReadError error={blocksError} what="IP blocks" />
+                  ) : allBlocks ? (
+                    "No IP blocks linked to this VRF"
+                  ) : null}
                 </p>
               </div>
             ) : (
@@ -392,7 +438,7 @@ export function VRFDetailPage() {
                 </thead>
                 <tbody>
                   {blocks.map((block) => {
-                    const space = allSpaces.find(
+                    const space = (allSpaces ?? []).find(
                       (s) => s.id === block.space_id,
                     );
                     return (

@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
@@ -14,6 +15,8 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { ZoneScopePill } from "@/components/ZoneScopePill";
@@ -82,7 +85,11 @@ function ExpiryBadge({ expiresAt }: { expiresAt: string | null }) {
           "rounded px-2 py-0.5 text-[11px] font-medium tabular-nums",
           cls,
         )}
-        title={`Expires in ${days} days`}
+        title={
+          days < 0
+            ? `Expired ${countNoun(Math.abs(days), "day")} ago`
+            : `Expires in ${countNoun(days, "day")}`
+        }
       >
         {label}
       </span>
@@ -170,7 +177,11 @@ function DomainEditorModal({
           customer_id: customerId,
           registrar_provider_id: registrarProviderId,
         };
-        return domainsApi.update(existing.id, body);
+        // Only what the operator changed against the row read when the dialog
+        // opened (#4379), so a field another client set since is kept.
+        const changed = changedFields(existing, body);
+        if (Object.keys(changed).length === 0) return existing;
+        return domainsApi.update(existing.id, changed);
       }
       const body: DomainCreate = {
         name,
@@ -199,10 +210,14 @@ function DomainEditorModal({
     >
       <div className="space-y-4">
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-apex-domain"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Apex domain
           </label>
           <input
+            id="domains-apex-domain"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -214,10 +229,14 @@ function DomainEditorModal({
           </p>
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-expected-nameservers"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Expected nameservers
           </label>
           <textarea
+            id="domains-expected-nameservers"
             className={cn(inputCls, "min-h-[90px] font-mono text-xs")}
             value={expectedNs}
             onChange={(e) => setExpectedNs(e.target.value)}
@@ -260,20 +279,28 @@ function DomainEditorModal({
           )}
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-tags-json-object"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Tags (JSON object)
           </label>
           <textarea
+            id="domains-tags-json-object"
             className={cn(inputCls, "min-h-[60px] font-mono text-xs")}
             value={tagsRaw}
             onChange={(e) => setTagsRaw(e.target.value)}
           />
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-custom-fields-json-object"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Custom fields (JSON object)
           </label>
           <textarea
+            id="domains-custom-fields-json-object"
             className={cn(inputCls, "min-h-[60px] font-mono text-xs")}
             value={cfRaw}
             onChange={(e) => setCfRaw(e.target.value)}
@@ -629,10 +656,19 @@ export function DomainsPage() {
         />
       )}
       {editing && (
-        <DomainEditorModal
-          existing={editing}
+        <FreshEdit
+          row={editing}
+          load={() => domainsApi.get(editing.id)}
+          title="Edit Domain"
           onClose={() => setEditing(null)}
-        />
+        >
+          {(fresh) => (
+            <DomainEditorModal
+              existing={fresh}
+              onClose={() => setEditing(null)}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );

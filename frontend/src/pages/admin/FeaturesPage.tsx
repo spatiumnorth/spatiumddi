@@ -125,6 +125,9 @@ export function FeaturesPage() {
       protectControls?: boolean;
     }) => featureModulesApi.toggle(id, enabled, protectControls),
     onSuccess: (resp) => {
+      // The Turn-off confirm stays open while a refusal is possible, so it
+      // closes here, queued (202) or not.
+      setDisableTarget(null);
       // #62: disabling governance.approvals while the lock is on returns 202
       // with a ChangeRequestQueued envelope instead of disabling inline.
       if (handleApprovalQueued(resp)) {
@@ -149,8 +152,11 @@ export function FeaturesPage() {
     // while the subsystem still owns servers, zones or scopes (#1068), and
     // that response body is the only place the counts are reported — the
     // toggle would otherwise just snap back with no explanation.
-    onError: (err) => {
-      setToggleError(formatApiError(err, "Could not change this feature."));
+    onError: (err, vars) => {
+      // A refused Turn-off is drawn inside its still-open confirm instead.
+      if (vars.enabled !== false) {
+        setToggleError(formatApiError(err, "Could not change this feature."));
+      }
       qc.invalidateQueries({ queryKey: ["feature-modules"] });
     },
   });
@@ -554,9 +560,19 @@ export function FeaturesPage() {
         onConfirm={() => {
           if (!disableTarget) return;
           toggleMutation.mutate({ id: disableTarget.id, enabled: false });
-          setDisableTarget(null);
         }}
-        onClose={() => setDisableTarget(null)}
+        error={
+          toggleMutation.error && toggleMutation.variables?.enabled === false
+            ? formatApiError(
+                toggleMutation.error,
+                "Could not change this feature.",
+              )
+            : null
+        }
+        onClose={() => {
+          setDisableTarget(null);
+          toggleMutation.reset();
+        }}
       />
 
       {/* #62 enable-time opt-in: when turning ON Approval workflows, offer to

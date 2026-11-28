@@ -1,5 +1,12 @@
 {{- if and .Values.postgresql.enabled (eq (.Values.postgresql.kind | default "standalone") "standalone") }}
 {{- $cmp := "postgresql" -}}
+{{- /* #3913 — ``postgresql.image.flavor: rhel`` runs Red Hat's rhel9/postgresql-16
+       (sclorg): POSTGRESQL_* variables, data under /var/lib/pgsql/data, uid 26.
+       The default (``docker``) is the official postgres image, byte for byte. */ -}}
+{{- $rhel := eq (.Values.postgresql.image.flavor | default "docker") "rhel" -}}
+{{- if not (has (.Values.postgresql.image.flavor | default "docker") (list "docker" "rhel")) }}
+{{- fail (printf "postgresql.image.flavor must be docker or rhel, got %q" .Values.postgresql.image.flavor) }}
+{{- end }}
 {{- $secretName := printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
 # ─────────────────────────────────────────────────────────────────────────────
 # In-chart Postgres — single-node StatefulSet using the official
@@ -46,8 +53,13 @@ spec:
         # Match the postgres image's UID — the Alpine ``postgres`` user
         # runs as 70:70. fsGroup makes the mounted PVC writable.
         {{- /* #3852: omitted on OpenShift — the SCC assigns an fsGroup from the namespace's range, refuses a pinned one, and that makes the PVC writable. */}}
-        fsGroup: 70
+        fsGroup: {{ if $rhel }}26{{ else }}70{{ end }}
         {{- end }}
+      {{- with .Values.image.pullSecrets }}
+      {{- /* #3913 — registry.redhat.io (the certified profile) needs a pull secret. */}}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: postgresql
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
@@ -56,6 +68,13 @@ spec:
           # (helper ``spatiumddi.postgresMaxConnections``); an explicit
           # ``postgresql.maxConnections`` wins. Changing it restarts Postgres.
           args:
+            {{- if $rhel }}
+            {{- /* #3913 — sclorg's image runs its default command only when
+                   no args are given; the args replace it, so name it first
+                   (run-postgresql passes the rest on to postgres). Found on
+                   OpenShift Local: without it the entrypoint execs "-c". */}}
+            - run-postgresql
+            {{- end }}
             - -c
             - max_connections={{ .Values.postgresql.maxConnections | default (include "spatiumddi.postgresMaxConnections" .) }}
             {{- /* #3932 — end a session whose client has gone (see
@@ -73,6 +92,17 @@ spec:
             - name: postgres
               containerPort: 5432
           env:
+            {{- if $rhel }}
+            - name: POSTGRESQL_USER
+              value: {{ .Values.postgresql.auth.username | quote }}
+            - name: POSTGRESQL_DATABASE
+              value: {{ .Values.postgresql.auth.database | quote }}
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "spatiumddi.postgresSecretName" . }}
+                  key: {{ include "spatiumddi.postgresSecretPasswordKey" . }}
+            {{- else }}
             - name: POSTGRES_USER
               value: {{ .Values.postgresql.auth.username | quote }}
             - name: POSTGRES_DB
@@ -89,9 +119,10 @@ spec:
             # a sub-path so initdb sees a clean tree.
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
+            {{- end }}
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql/data
+              mountPath: {{ if $rhel }}/var/lib/pgsql/data{{ else }}/var/lib/postgresql/data{{ end }}
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "{{ .Values.postgresql.auth.username }}", "-d", "{{ .Values.postgresql.auth.database }}"]

@@ -52,6 +52,11 @@ export function DNSSECPoliciesPage() {
       qc.invalidateQueries({ queryKey: ["dns-dnssec-policies"] });
     },
   });
+  // Closing the confirm also forgets a refusal, so the next one opens clean.
+  const closeDelete = () => {
+    setToDelete(null);
+    del.reset();
+  };
 
   const rows = policies.data ?? [];
   // The policy routes take a superadmin whatever the grants (#1879).
@@ -66,8 +71,18 @@ export function DNSSECPoliciesPage() {
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             Reusable BIND9 signing policies (algorithm, NSEC3, KSK/ZSK
-            lifetimes). Attach one to a zone from its DNSSEC card; leave a zone
-            on <code>default</code> for BIND&rsquo;s built-in policy.
+            lifetimes).{" "}
+            {gate.disabled ? (
+              <>
+                A zone on <code>default</code> uses BIND&rsquo;s built-in
+                policy.
+              </>
+            ) : (
+              <>
+                Attach one to a zone from its DNSSEC card; leave a zone on{" "}
+                <code>default</code> for BIND&rsquo;s built-in policy.
+              </>
+            )}
           </p>
         </div>
         <HeaderButton
@@ -175,6 +190,7 @@ export function DNSSECPoliciesPage() {
         title="Delete DNSSEC policy?"
         confirmLabel="Delete"
         loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
         message={
           <>
             Delete <strong>{toDelete?.name}</strong>? Zones using it fall back
@@ -183,7 +199,7 @@ export function DNSSECPoliciesPage() {
           </>
         }
         onConfirm={() => toDelete && del.mutate(toDelete.id)}
-        onClose={() => setToDelete(null)}
+        onClose={closeDelete}
       />
     </div>
   );

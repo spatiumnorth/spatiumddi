@@ -19,6 +19,9 @@ import {
   coreIpamNav,
   dnsSectionNav,
   filterNav,
+  integrationsNav,
+  networkInfrastructureNav,
+  networkLogicalNav,
   type NavEntry,
 } from "./navigation";
 
@@ -69,6 +72,30 @@ describe("module tags on sub-groups are live, not decorative", () => {
     expect(off.length).toBe(coreIpamNav.length - 1);
     expect(labels(coreIpamNav, new Set(["ipam.nat"]))).toContain(
       "NAT Mappings",
+    );
+  });
+});
+
+describe("Network Devices (SNMP) lives under Integrations (#4656)", () => {
+  const route = "/network/devices";
+  const find = (items: NavEntry[]) =>
+    items.find((i) => "to" in i && i.to === route);
+
+  it("is an integrationsNav entry on its own network.device gate", () => {
+    const e = find(integrationsNav);
+    expect(e?.label).toBe("Network Devices (SNMP)");
+    expect(e?.module).toBe("network.device");
+  });
+
+  it("is no longer in either Network list", () => {
+    expect(find(networkInfrastructureNav)).toBeUndefined();
+    expect(find(networkLogicalNav)).toBeUndefined();
+  });
+
+  it("sits in alphabetical order among the integrations", () => {
+    const ls = integrationsNav.map((i) => i.label);
+    expect(ls).toEqual(
+      [...ls].sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" })),
     );
   });
 });

@@ -63,6 +63,12 @@ function submit() {
       .nextElementSibling as HTMLInputElement,
     { target: { value: "web" } },
   );
+  // A TCP check needs a port (#4307); these tests are about the TTL.
+  fireEvent.change(
+    screen.getByText("Type", { selector: "label" })
+      .nextElementSibling as HTMLSelectElement,
+    { target: { value: "http" } },
+  );
   fireEvent.submit(ttlInput().form!);
 }
 

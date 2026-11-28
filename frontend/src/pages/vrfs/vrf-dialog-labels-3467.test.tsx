@@ -118,11 +118,17 @@ describe("the VRF dialog's labels (#3467)", () => {
   it("the Origin ASN and Customer pickers are named by their labels", async () => {
     await open(stored);
     for (const label of ["Origin ASN", "Customer"]) {
-      const el = named(label);
       // A picker component is named as a group around its select (#3340);
-      // a plain select is named itself.
-      const select = el.tagName === "SELECT" ? el : el.querySelector("select");
-      expect(select, label).not.toBeNull();
+      // a plain select is named itself. While a picker is still loading it
+      // can name both the group and the select inside it, so take every
+      // element the label names and require that one of them is, or holds,
+      // a select (getByLabelText refused the pair intermittently in CI).
+      const selects = screen
+        .getAllByLabelText(label)
+        .map((el) =>
+          el.tagName === "SELECT" ? el : el.querySelector("select"),
+        );
+      expect(selects.some(Boolean), label).toBe(true);
     }
   });
 

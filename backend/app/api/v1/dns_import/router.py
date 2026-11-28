@@ -28,6 +28,7 @@ from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
 from app.services.api_token_scopes import read_only_post, token_write
 from app.services.dns.name_scope import classify_zone_name
+from app.services.dns.powerdns_alias import group_can_resolve_alias
 from app.services.dns.tld_registry import effective_registry
 from app.services.dns_import import (
     CLOUD_DRIVERS,
@@ -107,6 +108,8 @@ class ImportedZoneOut(BaseModel):
     records: list[ImportedRecordOut]
     view_name: str | None = None
     forwarders: list[str] = Field(default_factory=list)
+    # #4259 — a secondary / stub zone's primaries (``ip`` / ``ip@port``).
+    masters: list[str] = Field(default_factory=list)
     skipped_record_types: dict[str, int] = Field(default_factory=dict)
     parse_warnings: list[str] = Field(default_factory=list)
     # #986 — TLD scope of the incoming zone name, so a bulk import is where
@@ -342,6 +345,7 @@ def _zone_to_pydantic(z: ImportedZone, tlds: frozenset[str] | None = None) -> Im
         records=[ImportedRecordOut(**r.__dict__) for r in z.records],
         view_name=z.view_name,
         forwarders=list(z.forwarders),
+        masters=list(z.masters),
         skipped_record_types=dict(z.skipped_record_types),
         parse_warnings=list(z.parse_warnings),
         foreign_apex_ns=list(z.foreign_apex_ns),
@@ -378,6 +382,7 @@ def _zone_from_pydantic(o: ImportedZoneOut) -> ImportedZone:
         records=[ImportedRecord(**r.model_dump()) for r in o.records],
         view_name=o.view_name,
         forwarders=list(o.forwarders),
+        masters=list(o.masters),
         skipped_record_types=dict(o.skipped_record_types),
         parse_warnings=list(o.parse_warnings),
     )
@@ -792,11 +797,16 @@ async def powerdns_preview(
     and asks the operator to split the migration.
     """
 
+    drivers_res = await db.execute(
+        select(DNSServer.driver).where(DNSServer.group_id == body.target_group_id)
+    )
     try:
         preview = await parse_powerdns_server(
             api_url=body.api_url,
             api_key=body.api_key,
             server_name=body.server_name,
+            target_drivers=frozenset(d for d in drivers_res.scalars().all() if d),
+            alias_resolvable=await group_can_resolve_alias(db, body.target_group_id),
         )
     except PowerDNSImportError as exc:
         raise HTTPException(status_code=502, detail=str(exc))

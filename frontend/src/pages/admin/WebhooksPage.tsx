@@ -3,13 +3,15 @@ import { useCredentialReask } from "@/hooks/useCredentialReask";
  * WebhooksPage — admin surface for typed-event subscriptions.
  *
  * Distinct from Settings → Audit Event Forwarding (which fires on
- * every audit row in the operator's chosen wire format). This page
+ * each audit row that passes the target's own minimum severity and
+ * resource type filters, in the operator's chosen wire format). This page
  * subscribes to **typed events** (``subnet.created``,
  * ``ip.allocated``, ``zone.modified``, …) shaped for downstream
  * automation, with HMAC signing and an outbox-backed delivery queue
  * (exponential-backoff retry + dead-letter state).
  */
 
+import { Field } from "@/components/ui/field";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -47,29 +49,10 @@ import {
 import { FormError } from "@/components/ui/form-error";
 import { FreshRowError } from "@/components/FreshRowError";
 import { changedFields, refetchRow, useFreshRow } from "@/hooks/useFreshRow";
+import { countNoun } from "@/lib/count-noun";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
-    </div>
-  );
-}
 
 // ── Subscription editor ────────────────────────────────────────────────────
 
@@ -568,7 +551,7 @@ function DeliveriesPanel({ subId }: { subId: string }) {
           Recent deliveries
         </span>
         <span className="text-[11px] text-muted-foreground">
-          {isFetching ? "refreshing…" : `${rows.length} rows`}
+          {isFetching ? "refreshing…" : countNoun(rows.length, "row")}
         </span>
       </div>
       {rows.length === 0 ? (
@@ -711,7 +694,10 @@ export function WebhooksPage() {
 
   const del = useMutation({
     mutationFn: (id: string) => webhooksApi.delete(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["webhooks"] });
+      setConfirm(null);
+    },
   });
 
   const test = useMutation({
@@ -735,11 +721,13 @@ export function WebhooksPage() {
             <h1 className="text-xl font-semibold">Webhooks</h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
               Typed-event subscriptions for downstream automation. Every enabled
-              subscription whose event-type filter matches receives one
-              HMAC-signed POST per event with exponential-backoff retry and a
+              subscription whose event-type filter matches receives one POST per
+              event, HMAC-signed when the subscription has a secret (unsigned
+              when it has none), with exponential-backoff retry and a
               dead-letter state. Distinct from the generic audit-forward webhook
-              under Settings — that ships every audit row in your chosen wire
-              format; this fires typed events shaped for code.
+              under Settings — that ships the audit rows that pass the target's
+              own minimum severity and resource type filters, in your chosen
+              wire format; this fires typed events shaped for code.
             </p>
           </div>
           <button
@@ -860,7 +848,7 @@ export function WebhooksPage() {
                   <span className="mr-3">
                     <strong>Events:</strong>{" "}
                     {s.event_types && s.event_types.length > 0
-                      ? `${s.event_types.length} types`
+                      ? countNoun(s.event_types.length, "type")
                       : "all"}
                   </span>
                   <span className="mr-3">
@@ -912,11 +900,13 @@ export function WebhooksPage() {
         message={`Delete subscription "${confirm?.name ?? ""}"? Pending and dead-letter deliveries are removed too.`}
         confirmLabel="Delete"
         tone="destructive"
-        onConfirm={() => {
-          confirm?.onConfirm();
+        loading={del.isPending}
+        error={del.error ? formatApiError(del.error, "Delete failed") : null}
+        onConfirm={() => confirm?.onConfirm()}
+        onClose={() => {
           setConfirm(null);
+          del.reset();
         }}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );

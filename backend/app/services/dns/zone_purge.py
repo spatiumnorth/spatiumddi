@@ -70,7 +70,13 @@ async def purge_trashed_zone(db: Any, zone: DNSZone) -> list[str]:
     from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
 
     kept: list[str] = []
-    await _push_zone_to_agentless_servers(db, zone, "delete", kept_notes=kept)
+    # #1771: an auto-generated zone is deleted only where SpatiumDDI created it.
+    from app.services.dns.record_ops import servers_not_created_by_us  # noqa: PLC0415
+
+    foreign = await servers_not_created_by_us(db, zone) if zone.is_auto_generated else None
+    await _push_zone_to_agentless_servers(
+        db, zone, "delete", skip_server_ids=foreign, kept_notes=kept
+    )
     # Ops queued before the soft-delete started sweeping them have no zone FK to
     # cascade through; sweep defensively so a pre-fix trash row leaves no failed
     # queue behind.

@@ -1,4 +1,7 @@
 import { useModuleOn } from "@/hooks/useModuleOn";
+import { Field } from "@/components/ui/field";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -18,6 +21,7 @@ import {
 import {
   cloudApi,
   dnsApi,
+  formatApiError,
   type CloudEndpoint,
   type CloudEndpointCreate,
   type CloudEndpointUpdate,
@@ -375,15 +379,32 @@ export function CloudPage() {
       </div>
 
       {showCreate && <EndpointModal onClose={() => setShowCreate(false)} />}
-      {edit && <EndpointModal endpoint={edit} onClose={() => setEdit(null)} />}
+      {edit && (
+        <FreshEdit
+          row={edit}
+          queryKeys={[["cloud-endpoints"]]}
+          title="Edit cloud account"
+          onClose={() => setEdit(null)}
+        >
+          {(fresh) => (
+            <EndpointModal endpoint={fresh} onClose={() => setEdit(null)} />
+          )}
+        </FreshEdit>
+      )}
       <ConfirmModal
         open={!!del}
         title="Delete cloud account"
         confirmLabel="Delete"
         tone="destructive"
         loading={delMut.isPending}
+        error={
+          delMut.error ? formatApiError(delMut.error, "Delete failed") : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
         message={
           del ? (
             <>
@@ -543,7 +564,12 @@ function EndpointModal({
           sync_interval_seconds: Number(syncInterval.trim()),
         };
         if (Object.keys(creds).length > 0) update.credentials = creds;
-        return cloudApi.updateEndpoint(endpoint!.id, update);
+        // Send only what the operator changed against the row read when the
+        // dialog opened (#4370), so a field another client set since is not
+        // put back. A secret left blank is never in `update`, so it is kept.
+        const body = changedFields(endpoint!, update);
+        if (Object.keys(body).length === 0) return Promise.resolve(endpoint!);
+        return cloudApi.updateEndpoint(endpoint!.id, body);
       }
       const create: CloudEndpointCreate = {
         name,
@@ -992,26 +1018,6 @@ function CopyablePre({ text, label }: { text: string; label: string }) {
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-      {hint && <p className="text-[11px] text-muted-foreground/70">{hint}</p>}
-    </div>
-  );
-}
 
 function errMsg(e: unknown, fallback: string): string {
   const ae = e as {

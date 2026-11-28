@@ -240,13 +240,13 @@ async def test_a_bind9_secondary_reporting_zero_holds_no_copy_3940(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("serial", "expected"), [(2026111302, True), (0, False)])
+@pytest.mark.parametrize(("serial", "expected"), [(2026111302, True), (0, True)])
 async def test_an_older_bind9_agent_reads_by_the_serial_it_reports_3940(
     client: AsyncClient, db_session: AsyncSession, serial: int, expected: bool
 ) -> None:
-    """An agent before #3940 reports named's real serial at start-up (so a
-    transferred secondary is in sync) and 0 otherwise (not reported, never
-    synced); the per-server verdict reaches the zone's server-state too."""
+    """An agent before #3940 reports the bundle's serial, 0, for every secondary
+    (rc.3 ``served_zone_serials``), so its 0 is unknown and reads in sync, not
+    "holds no copy" (#4440); the verdict reaches the zone's server-state too."""
     token = await _token(db_session)
     _, srv, zone = await _setup(db_session, "bind9", zone_type="secondary", serial=0)
     srv_id, zone_id, group_id = srv.id, zone.id, zone.group_id

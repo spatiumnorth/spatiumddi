@@ -206,10 +206,13 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     # #2782 — "nothing to deliver to" is cached per process on a monotonic
     # clock, so a test that ran with no subscription / target would keep the
     # next test's after-commit publish and forward from running.
-    from app.services import audit_forward, event_publisher
+    from app.services import audit_forward, event_publisher, log_stream_forward
 
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
+    # #4545 — the log-stream forwarder keeps its target list, queues and
+    # background tasks per process.
+    log_stream_forward.reset()
     # #3015 — the api-shutdown flag is process-global: a test that sets it
     # (or runs a lifespan to its end) would make every later long-poll on
     # the same worker answer at once.
@@ -220,6 +223,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     shutdown.reset()
     event_publisher.subscriptions_cache.invalidate()
     audit_forward.targets_cache.invalidate()
+    log_stream_forward.reset()
     maintenance_mode.invalidate_cache()
     session_idle.invalidate_cache()
     feature_modules.invalidate_cache()

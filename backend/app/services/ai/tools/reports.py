@@ -8,8 +8,8 @@ without leaving the chat drawer.
 Each tool reuses the exact aggregation helper the REST endpoint uses
 (``app.api.v1.reports.router.compute_*``) so the chat answer and the
 Reports page can never drift. All four are read-only and gated by the
-``reports.top_n`` feature module — disabling the module in Settings →
-Features strips them from the AI surface in lock-step with the sidebar
+``reports.top_n`` feature module — disabling the module in
+Features & Integrations strips them from the AI surface in lock-step with the sidebar
 entry, matching the router-level ``require_module`` gate.
 """
 

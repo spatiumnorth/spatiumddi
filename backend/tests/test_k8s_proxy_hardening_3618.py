@@ -166,3 +166,39 @@ async def test_valid_identifiers_still_reach_the_proxy(
     assert len(called) == 1
     assert called[0].startswith("/api/v1/namespaces/spatium/pods/dns-bind9-7c9f.x/log?tailLines=")
     assert called[0].endswith("&container=agent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ns", ["kube-system", "default", "spatiumddi"])
+async def test_other_namespaces_are_422_and_never_proxied_4481(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    ns: str,
+) -> None:
+    """The supervisor proxy only runs ``spatium`` (#3618); anything else is the
+    caller's error at the control plane, not a 502 from the proxy's 403."""
+    headers, appliance = await _setup(db_session)
+    called: list[str] = []
+
+    async def _never(_aid: uuid.UUID, _m: str, path: str, **_k: object) -> tuple[int, bytes]:
+        called.append(path)
+        return 200, b'{"items": []}'
+
+    monkeypatch.setattr(k8s_proxy, "k8s_call", _never)
+    base = f"/api/v1/appliance/appliances/{appliance.id}/k8s"
+    for route, params in (
+        ("pods", {"namespace": ns}),
+        ("logs", {"pod": "x", "namespace": ns}),
+        ("workloads", {"namespace": ns}),
+    ):
+        resp = await client.get(f"{base}/{route}", params=params, headers=headers)
+        assert resp.status_code == 422, (route, resp.text)
+        assert "spatium" in resp.json()["detail"]
+    resp = await client.post(
+        f"{base}/restart",
+        json={"kind": "Deployment", "namespace": ns, "name": "dns-bind9"},
+        headers=headers,
+    )
+    assert resp.status_code == 422, resp.text
+    assert called == []

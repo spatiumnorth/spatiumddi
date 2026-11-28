@@ -381,6 +381,15 @@ worker processes (`worker.concurrency: 2`), as the appliance does on nodes of
 12 GiB or less. Per node, plan as for the appliance: its figures include k3s
 itself (0.6 to 0.9 GiB; 0.55 GiB for the k3s server on the arm64 node).
 
+**Worker child recycling (#4306).** A prefork child is replaced after
+`worker.maxTasksPerChild` tasks (default 1000) or once it passes
+`worker.maxMemoryPerChildKiB` (default 409600, 400 MiB; Celery counts KiB).
+Compose and the plain manifests take `WORKER_MAX_TASKS_PER_CHILD` and
+`WORKER_MAX_MEMORY_PER_CHILD_KIB`; `0` turns either off. This bounds one
+child, not the pod: keep the cap well under the worker memory limit, which
+has to hold `concurrency` children plus the parent. The memory check runs
+after a task finishes, so a single task can still exceed it.
+
 ## Measure your own install
 
 Sample every 15 seconds or so through each kind of use you have (a quiet

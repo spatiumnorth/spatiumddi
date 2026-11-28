@@ -94,6 +94,9 @@ class ImportedZone:
     records: list[ImportedRecord]
     view_name: str | None = None
     forwarders: list[str] = field(default_factory=list)
+    # #4259: the primaries a secondary / stub zone transfers from, as the
+    # zone API stores them (``ip`` or ``ip@port``). Empty for other types.
+    masters: list[str] = field(default_factory=list)
     skipped_record_types: dict[str, int] = field(default_factory=dict)
     parse_warnings: list[str] = field(default_factory=list)
     # #1892: set by the commit when ``apex_ns_policy="replace"`` rewrote the
@@ -148,3 +151,47 @@ class ImportPreview:
     # ``None`` for file-based and API-endpoint sources. The commit uses it
     # to not push the records back to the server they came from (#1456).
     source_server_id: uuid.UUID | None = None
+
+
+REPLICA_ZONE_TYPES = frozenset({"secondary", "stub"})
+
+
+def settle_replica_zone(zone: ImportedZone) -> str | None:
+    """Hold a secondary / stub zone to the rule the zone API holds it to (#4259).
+
+    A secondary or stub zone takes its data from its masters, so it imports
+    with no records (#3838 refuses them there: nothing serves them), and it
+    needs at least one master (the zone API 422s without one). Drops the
+    records in place with a note on the zone. Returns the reason the zone
+    cannot be imported (no master), or None when it can.
+    """
+
+    if zone.zone_type not in REPLICA_ZONE_TYPES:
+        return None
+    if not zone.masters:
+        return (
+            f"Zone {zone.name!r} skipped: it is a {zone.zone_type} zone and the source "
+            "names no primary server (masters / primaries) to transfer it from, "
+            f"which a {zone.zone_type} zone needs. Add it by hand once you know its masters."
+        )
+    if zone.records:
+        zone.parse_warnings.append(
+            f"Zone {zone.name!r}: records come from the masters; "
+            f"{len(zone.records)} record(s) in the file were not imported"
+        )
+        zone.records = []
+    return None
+
+
+def settle_replica_zones(zones: list[ImportedZone], warnings: list[str]) -> list[ImportedZone]:
+    """:func:`settle_replica_zone` over a source's zones; the zones that cannot
+    be imported are left out and named in ``warnings``."""
+
+    kept: list[ImportedZone] = []
+    for z in zones:
+        reason = settle_replica_zone(z)
+        if reason is None:
+            kept.append(z)
+        else:
+            warnings.append(reason)
+    return kept

@@ -1632,7 +1632,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     # group flag can only ever tighten, never loosen, recursion.
     group_is_recursive = bool(getattr(grp, "is_recursive", True)) if grp else True
     opts_recursion_enabled = getattr(opts, "recursion_enabled", True) if opts else True
-    options_block = {
+    options_block: dict[str, Any] = {
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
         "recursion_enabled": opts_recursion_enabled and group_is_recursive,
@@ -1663,6 +1663,16 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
         "query_log_enabled": (bool(getattr(opts, "query_log_enabled", False)) if opts else False),
+        # #4594 — channel severity and print-* flags. The BIND9 agent reads
+        # them (``_query_log_channel_settings``); absent, every group rendered
+        # the historical defaults whatever the operator saved.
+        "query_log_severity": (getattr(opts, "query_log_severity", "info") if opts else "info"),
+        "query_log_print_category": (
+            bool(getattr(opts, "query_log_print_category", True)) if opts else True
+        ),
+        "query_log_print_severity": (
+            bool(getattr(opts, "query_log_print_severity", True)) if opts else True
+        ),
         # Response logging (#914) — same reasoning: it changes the rendered
         # named.conf, so it belongs in the fingerprint or a UI toggle would
         # not shift the etag and the agent would never re-render.
@@ -1725,6 +1735,11 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # an upgrade reloads nothing. BIND9-only: PowerDNS / Technitium have
         # no such setting and the API refuses a non-default value for them.
         options_block["allow_query_cache"] = list(opts.allow_query_cache or [])
+    # #4185 — the group's ``max-cache-size``. Shipped only when set, so a group
+    # that has not chosen one keeps the bundle (and etag) it had before; the
+    # BIND9 agent applies it to every recursive view's cache.
+    if grp is not None and grp.max_cache_size and server.driver == "bind9":
+        options_block["max_cache_size"] = grp.max_cache_size
     # #2263 — the group ``blackhole`` list. Accepted and validated since
     # #1244 and never shipped, so no agent could render it. Shipped only when
     # set: an absent key reads as empty on the agent, so a group that does not

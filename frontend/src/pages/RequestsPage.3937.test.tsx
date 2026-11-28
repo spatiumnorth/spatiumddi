@@ -54,6 +54,8 @@ function req(over: Partial<ProvisioningRequest>): ProvisioningRequest {
     executed_at: null,
     created_at: "2026-10-01T00:00:00Z",
     modified_at: "2026-10-01T00:00:00Z",
+    can_approve: true,
+    approve_blocked_reason: null,
     ...over,
   };
 }

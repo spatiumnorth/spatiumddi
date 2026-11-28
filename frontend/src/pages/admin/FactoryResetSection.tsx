@@ -310,7 +310,10 @@ function ResetModal({
               Computing impact…
             </div>
           ) : previewQ.isError ? (
-            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            <div
+              role="alert"
+              className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+            >
               Failed to compute preview:{" "}
               {formatApiError(previewQ.error, "unknown")}
             </div>
@@ -352,7 +355,12 @@ function ResetModal({
 
           {/* Confirm phrase */}
           <div className="space-y-1">
-            <label className="text-xs font-medium">Confirm phrase</label>
+            <label
+              htmlFor="factory-reset-section-confirm-phrase"
+              className="text-xs font-medium"
+            >
+              Confirm phrase
+            </label>
             <p className="text-[11px] text-muted-foreground">
               Type{" "}
               <code className="rounded bg-muted px-1 py-0.5 font-mono">
@@ -361,6 +369,7 @@ function ResetModal({
               exactly to unlock the password field.
             </p>
             <input
+              id="factory-reset-section-confirm-phrase"
               type="text"
               autoFocus
               value={phrase}
@@ -378,7 +387,10 @@ function ResetModal({
 
           {/* Password */}
           <div className="space-y-1">
-            <label className="text-xs font-medium">
+            <label
+              htmlFor="factory-reset-section-re-enter-your-password"
+              className="text-xs font-medium"
+            >
               Re-enter your password
             </label>
             <p className="text-[11px] text-muted-foreground">
@@ -386,6 +398,7 @@ function ResetModal({
               re-verifies your password for every reset.
             </p>
             <input
+              id="factory-reset-section-re-enter-your-password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}

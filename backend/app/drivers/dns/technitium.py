@@ -28,8 +28,8 @@ Scope (this driver):
   stub zones carry primaries to transfer from, no views).
 
 Landed after the v1 cut, so the sections below are no longer "deferred":
-online DNSSEC signing (#740; new signing withdrawn again by #1783, full
-support is #1767), native DNS-over-TLS/HTTPS/QUIC listeners plus
+online DNSSEC signing (#740; withdrawn by #1783, restored by #1767 with the
+agent reconciling signing state from every bundle), native DNS-over-TLS/HTTPS/QUIC listeners plus
 encrypted *upstream* forwarding over all three (#741 — a real differentiator
 over both PowerDNS, which needs a dnsdist sidecar and cannot forward at all,
 and BIND9, which forwards over DoT only), secondary / stub / catalog zones
@@ -407,16 +407,18 @@ class TechnitiumDriver(DNSDriver):
             "name": "technitium",
             "views": False,
             "rpz": False,
-            "dnssec_inline_signing": False,  # #1783; full support is #1767
+            # Applies blocklists through Technitium's own block list, not RPZ.
+            "blocklist": True,
+            "dnssec_inline_signing": True,  # #1767: agent reconciles signing state
             "incremental_updates": "rest_api",
             "zone_types": sorted(_SUPPORTED_ZONE_TYPES),
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
             "alias_records": False,
             "lua_records": False,
-            # #1782 — broken in both roles (producer members inherit the
-            # catalog's transfer Deny / notify None; consumer has no TSIG).
-            # Not claimed until #1766 (1.1.0).
-            "catalog_zones": False,
+            # #1766 — producer only (#3764 removed the consumer role). The
+            # agent overrides the catalog's transfer / notify on every member
+            # and configures the catalog zone itself.
+            "catalog_zones": True,
         }
 
     @property

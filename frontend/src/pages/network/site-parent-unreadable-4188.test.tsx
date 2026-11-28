@@ -93,11 +93,14 @@ describe("Edit site with an unreadable parent (#4188)", () => {
     expect(select.selectedOptions[0].textContent).toBe(
       "Linked (not visible to your role)",
     );
+    // A Save sends only what changed (#4379): the parent the role cannot see
+    // is neither cleared nor re-sent, it stays as stored.
+    fireEvent.change(screen.getByDisplayValue("child"), {
+      target: { value: "child 2" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(update).toHaveBeenCalled());
-    expect(update.mock.calls[0][1]).toMatchObject({
-      parent_site_id: "p-hidden",
-    });
+    expect(update.mock.calls[0][1]).toEqual({ name: "child 2" });
   });
 
   it("adds no such option when the parent is in the list", () => {

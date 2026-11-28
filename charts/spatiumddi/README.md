@@ -163,7 +163,11 @@ Pick one of these instead:
   `--disable servicelb` so the two do not both claim the Service, and set
   `service: { type: LoadBalancer }` with the pool / address annotations shown
   in `values.yaml`. MetalLB announces a dedicated VIP, so nothing binds :53 on
-  the node.
+  the node. The DNS Service takes `service.annotations`,
+  `service.loadBalancerIP`, `service.loadBalancerSourceRanges`,
+  `service.externalTrafficPolicy` (default `Local` on a LoadBalancer),
+  `service.ipFamilyPolicy` and `service.ipFamilies`; the DHCP Service takes
+  `service.type` and `service.nodePort` only.
 - **Another LoadBalancer implementation** with `--disable servicelb` (kube-vip,
   Cilium LB-IPAM, ...). The same rule applies: whatever implements the
   Service must not use hostPort 53.
@@ -178,6 +182,14 @@ On a node where only the resolver stub is the problem, never expose :53 with
 servicelb; if you already did, delete the Service and the `svclb-*` DaemonSet,
 then `iptables -t nat -S CNI-HOSTPORT-DNAT | grep 'dports 53'` should come back
 empty.
+
+A `LoadBalancer` Service is enough for DNS. It is not enough for DHCP: client
+broadcasts do not reach a pod behind a Service, so DHCP needs a relay pointed
+at the Service address, or `hostNetwork`. Ports and protocols, a values
+example for each, and how to check the result are in the deployment guide:
+[Exposing DNS to clients](https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/KUBERNETES.md#exposing-dns-to-clients)
+and
+[Exposing DHCP to clients](https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 
 ### Running managed DNS agents
 
@@ -204,9 +216,9 @@ dnsAgents:
       role: primary
       group: powerdns-edge
       service: { type: LoadBalancer }   # opt-in, see "Exposing DNS and DHCP to clients"
-    # Technitium (third DNS driver — online DNSSEC, catalog zones both
-    # ways, and native DoT/DoH/DoQ listeners plus encrypted upstream
-    # forwarding with no dnsdist-style sidecar). Own group, same rule.
+    # Technitium (third DNS driver — native DoT/DoH/DoQ listeners plus
+    # encrypted upstream forwarding with no dnsdist-style sidecar; no
+    # DNSSEC or catalog zones in 1.0). Own group, same rule.
     - name: tdx1
       flavor: technitium
       role: primary
@@ -246,9 +258,14 @@ dhcpAgents:
   servers:
     - name: dhcp1
       role: primary
-      # hostNetwork: true required for real DHCPv4 unless relay-only.
-      hostNetwork: true
+      # Behind a DHCP relay (ip helper-address pointed at the Service):
+      service: { type: LoadBalancer }
+      # Or, on a node attached to the client VLAN, with no relay:
+      # hostNetwork: true
 ```
+
+Pick one of the two; see
+[Exposing DHCP to clients](https://github.com/spatiumnorth/spatiumddi/blob/main/docs/deployment/KUBERNETES.md#exposing-dhcp-to-clients).
 
 ### GitOps with `helm template` (Argo CD)
 
@@ -287,8 +304,8 @@ them:
 | `auth.existingSecret` | `secret-key` (and optionally `metrics-token`) |
 | `postgresql.auth.existingSecret` | `password`. With `postgresql.kind: cnpg`, the Secret must be type `kubernetes.io/basic-auth` with both `username` and `password`, because CNPG bootstraps the database user from it |
 | `redis.auth.existingSecret` | `redis-password` (only when `redis.auth.enabled=true`) |
-| `dnsAgents.agentKey.existingSecret` | `DNS_AGENT_KEY` (when `dnsAgents.enabled`) |
-| `dhcpAgents.agentKey.existingSecret` | `SPATIUM_AGENT_KEY` (when `dhcpAgents.enabled`) |
+| `dnsAgents.agentKey.existingSecret` | `DNS_AGENT_KEY` (read by the api and worker even with `dnsAgents.enabled=false`, #4648) |
+| `dhcpAgents.agentKey.existingSecret` | `SPATIUM_AGENT_KEY` (read by the api and worker even with `dhcpAgents.enabled=false`, #4648) |
 
 ## Values reference
 
@@ -302,6 +319,7 @@ them:
 | `image.pullPolicy` | `IfNotPresent` |  |
 | `image.pullSecrets` | `[]` |  |
 | `auth.secretKey` | `""` | Fernet key; auto-generated on first install if empty |
+| `supervisorRegistration.initiallyEnabled` | `false` | Initial state of Appliance registration on a fresh install (#4659); never overrides a later choice. Turn on for an install meant to take appliance agent nodes |
 | `auth.existingSecret` | `""` | BYO secret with key `secret-key` |
 | `fullnameOverride` | `""` |  |
 | `nameOverride` | `""` |  |
@@ -368,13 +386,13 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dnsAgents.image.repository` | `ghcr.io/spatiumnorth/dns-bind9` | Default image (BIND9 flavor) |
 | `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumnorth/dns-powerdns` | Per-flavor image override (issue #127) |
 | `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumnorth/dns-technitium` | Per-flavor image override |
-| `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
+| `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors). Unset (and no `value`) = the chart generates `<fullname>-agent-keys` once and keeps it across upgrades (#4648); the api and worker always get the key, so appliance agent nodes can join with no in-cluster agents |
 | `dnsAgents.prefixWithFullname` | `false` | #3209 — name the StatefulSet and Services `<fullname>-dns-<flavor>-<name>` instead of `dns-<flavor>-<name>`. Flipping it on a live install recreates the StatefulSet with new PVCs; see [upgrade note](#agent-object-names-3209) |
 | `dnsAgents.storageClass` | `""` | #3206 — StorageClass of both claims (`agent-state`, `dns-state`); unset = cluster default. Per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
 | `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumnorth/dhcp-kea` |  |
-| `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |
+| `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY`; unset = chart-generated, as for `dnsAgents.agentKey.existingSecret` (#4648) |
 | `dhcpAgents.prefixWithFullname` | `false` | #3209 — as `dnsAgents.prefixWithFullname`, for the DHCP StatefulSet and Services |
 | `dhcpAgents.upgradeUnstickPods` | `true` | #3907 — a `pre-upgrade` hook deletes a DHCP agent StatefulSet (PVCs kept) holding a pod that is Running but not Ready for 2+ minutes, so Helm recreates it from the new template (needed coming from `2026.10.02-1` or older). Ready pods are never touched; `false` turns the hook off |
 | `dhcpAgents.storageClass` | `""` | #3206 — StorageClass of both claims; per server: `servers[].storageClass`. Setting it on an existing install needs a one-off step: [see below](#adopting-storageclass-on-an-existing-install) |
@@ -382,6 +400,10 @@ subcharts verbatim — any option those charts accept works here. See:
 
 Each server entry accepts `name`, `role`, `group`, `storage.agentState`,
 `storage.dnsState` (or `storage.keaState`), `service.type`,
+`service.annotations` / `service.loadBalancerIP` /
+`service.loadBalancerSourceRanges` / `service.externalTrafficPolicy` /
+`service.ipFamilyPolicy` / `service.ipFamilies` (DNS only),
+`dotPort` / `dohPort` / `doqPort` (DNS only; `doqPort` on `technitium` only),
 `service.nodePort` (DHCP only; pins the node-facing port of a NodePort
 DHCP Service, which is otherwise random. Only useful for a relay that can
 forward to a non-standard port: most, including `ip helper-address`, send
@@ -408,8 +430,8 @@ statefulset spec for fields other than ... are forbidden`. This happens even
 when the class you set is the cluster default. Changing a claim's storage size
 (`servers[].storage.*`) is refused for the same reason.
 
-Delete the StatefulSet object **without** its pod or PVCs, then upgrade or sync
-again; the new StatefulSet adopts the running pod and the existing claims:
+Delete **each** affected StatefulSet object (one per agent server, DNS and DHCP)
+**without** its pod or PVCs, then upgrade or sync again; the new StatefulSet adopts the running pod and the existing claims:
 
 ```bash
 kubectl delete sts <name> -n <namespace> --cascade=orphan
@@ -421,8 +443,8 @@ the application. `Replace=true` and `ServerSideApply=true` do not help: the
 field is immutable either way.
 
 On a real `helm install` / `helm upgrade` against a cluster, the chart looks up
-the live StatefulSet and stops with a message carrying this exact command
-before sending anything. `helm template` and Argo CD render without cluster
+the live StatefulSets and stops once, before sending anything, with a message
+listing one such command for every StatefulSet that needs it. `helm template` and Argo CD render without cluster
 access, so they cannot detect it; they print a note in `NOTES.txt` instead.
 
 This does not move any data. Existing PVCs keep the class they were created

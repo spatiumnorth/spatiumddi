@@ -428,3 +428,28 @@ def test_second_fire_reads_retrying_not_applying(
         appliance_state._fire_state_path(trigger), "h1", 2, datetime.now(UTC)
     )
     assert appliance_state.read_host_config_health()["ssh"]["state"] == "retrying"
+
+
+def test_timezone_plane_carries_the_runner_reason(tmp_path: Path, monkeypatch) -> None:
+    """#4416: a failing timezone plane reports the tz runner's own verdict."""
+    trigger = tmp_path / "tz-pending"
+    applied = tmp_path / "tz-hash"
+    status = tmp_path / "tz-status"
+    now = datetime.now(UTC)
+    appliance_state._write_fire_state(
+        appliance_state._fire_state_path(trigger), "US/Pacific", 3, now
+    )
+    status.write_text(
+        "state=failed\nreason=unknown_timezone\nrequested=US/Pacific\napplied_at=x\n"
+    )
+    monkeypatch.setattr(
+        appliance_state, "_HOST_CONFIG_PLANES", [("timezone", trigger, applied)]
+    )
+    monkeypatch.setattr(appliance_state, "_TZ_STATUS_SIDECAR", status)
+    h = appliance_state.read_host_config_health()["timezone"]
+    assert h["state"] == "failing"
+    assert h["reason"] == "unknown_timezone"
+    assert h["requested"] == "US/Pacific"
+    # A stale sidecar from a success must not read as a reason.
+    status.write_text("state=applied\ntz=UTC\n")
+    assert "reason" not in appliance_state.read_host_config_health()["timezone"]

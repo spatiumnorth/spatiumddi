@@ -504,3 +504,32 @@ async def test_commit_plan_source_mismatch_returns_400(
     )
     assert resp.status_code == 400
     assert "source mismatch" in resp.json()["detail"]
+
+
+def test_secondary_keeps_masters_and_no_records_4259() -> None:
+    from app.services.dns_import.canonical import settle_replica_zones
+    from app.services.dns_import.powerdns import _build_imported_zone
+
+    full = {
+        "name": "sec.example.com.",
+        "kind": "Slave",
+        "masters": ["192.0.2.1", "192.0.2.2:5300", "[2001:db8::1]:53", "junk"],
+        "rrsets": [
+            {
+                "name": "www.sec.example.com.",
+                "type": "A",
+                "ttl": 60,
+                "records": [{"content": "192.0.2.9", "disabled": False}],
+            },
+        ],
+    }
+    z = _build_imported_zone({"name": "sec.example.com.", "kind": "Slave"}, full)
+    assert z.masters == ["192.0.2.1", "192.0.2.2@5300", "2001:db8::1"]
+    warnings: list[str] = []
+    assert settle_replica_zones([z], warnings) == [z]
+    assert z.records == []
+    bare = _build_imported_zone(
+        {"name": "b.example.com.", "kind": "Slave"}, {"name": "b.example.com.", "kind": "Slave"}
+    )
+    out: list[str] = []
+    assert settle_replica_zones([bare], out) == [] and "no primary server" in out[0]

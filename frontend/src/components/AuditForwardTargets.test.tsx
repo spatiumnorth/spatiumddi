@@ -70,6 +70,12 @@ const TARGET: AuditForwardTarget = {
   smtp_reply_to: "",
   min_severity: null,
   resource_types: null,
+  stream_dns_query_log: false,
+  stream_dhcp_activity_log: false,
+  log_stream_filters: null,
+  dns_query_sample_percent: 100,
+  log_stream_dropped_total: 0,
+  log_stream_last_drop_at: null,
   created_at: "2026-10-01T00:00:00Z",
   modified_at: "2026-10-01T00:00:00Z",
 };

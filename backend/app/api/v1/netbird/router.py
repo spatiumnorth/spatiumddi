@@ -25,7 +25,10 @@ from app.core.demo_mode import forbid_in_demo_mode
 from app.core.header_credentials import header_secret
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
-from app.core.stored_secret_guard import require_secret_with_destination_change
+from app.core.stored_secret_guard import (
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -340,6 +343,7 @@ async def update_instance(
         changes,
         destination=["api_url"],
         secrets={"api_key": t.api_key_encrypted},
+        blank_keeps=("api_key",),
     )
     new_ipam = changes.get("ipam_space_id", t.ipam_space_id)
     new_dns = changes.get("dns_group_id", t.dns_group_id)
@@ -424,6 +428,12 @@ async def test_connection(
         stored = await db.get(NetbirdInstance, body.instance_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="NetBird instance not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"api_url": body.api_url, "api_key": body.api_key},
+            destination=("api_url",),
+            secrets={"api_key": stored.api_key_encrypted},
+        )
         api_url = api_url or stored.api_url
         if body.api_url is None:
             verify = stored.verify_tls

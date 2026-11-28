@@ -21,10 +21,10 @@ vi.mock("@/lib/api", async () => {
     authApi: { ...actual.authApi, me: async () => ({ id: "me" }) },
     changeRequestsApi: {
       ...actual.changeRequestsApi,
-      list: async () => [
-        cr("blocked", false, REASON),
-        cr("allowed", true, null),
-      ],
+      listPage: async () => ({
+        items: [cr("blocked", false, REASON), cr("allowed", true, null)],
+        total: 2,
+      }),
     },
   };
 });

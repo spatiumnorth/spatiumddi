@@ -43,6 +43,7 @@ from .canonical import (
     ImportedSOA,
     ImportedZone,
     ImportPreview,
+    settle_replica_zones,
 )
 
 
@@ -232,6 +233,10 @@ async def parse_windows_dns_server(server: Any) -> ImportPreview:
             "No zones reported by Get-DnsServerZone. Check that the WinRM "
             "service account has DnsAdmins read rights on the target server."
         )
+
+    # #4259 — the zone listing carries no master servers, so a Secondary / Stub
+    # zone is left out, named, rather than stored as one nothing can transfer.
+    zones = settle_replica_zones(zones, overall_warnings)
 
     total_records = sum(len(z.records) for z in zones)
     histogram: dict[str, int] = {}

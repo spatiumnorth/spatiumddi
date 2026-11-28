@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 
+import { useFieldControl } from "@/components/ui/field";
 import { customersApi, ipamApi, providersApi, sitesApi } from "@/lib/api";
 
 interface ResourceIdPickerProps {
@@ -97,6 +98,7 @@ export function ResourceIdPicker({
   className,
   disabled,
 }: ResourceIdPickerProps) {
+  const fieldControl = useFieldControl();
   const config = RESOURCE_TYPE_LIST_QUERY[resourceType];
 
   const { data } = useQuery({
@@ -113,6 +115,7 @@ export function ResourceIdPicker({
   if (!config) {
     return (
       <input
+        {...fieldControl}
         className={className}
         placeholder="resource_id (optional)"
         value={value ?? ""}
@@ -130,6 +133,7 @@ export function ResourceIdPicker({
 
   return (
     <select
+      {...fieldControl}
       className={className}
       value={value ?? ""}
       onChange={(e) => onChange(e.target.value || null)}

@@ -12,7 +12,7 @@
  * dashboard doesn't blink empty on first paint.
  */
 
-import type { PlatformSettings, Subnet } from "./api";
+import type { PlatformSettingsPublic, Subnet } from "./api";
 
 export function prefixOf(network: string): {
   prefix: number;
@@ -28,7 +28,12 @@ export function prefixOf(network: string): {
 
 export function includeInUtilization(
   subnet: Pick<Subnet, "network">,
-  settings: PlatformSettings | undefined,
+  settings:
+    | Pick<
+        PlatformSettingsPublic,
+        "utilization_max_prefix_ipv4" | "utilization_max_prefix_ipv6"
+      >
+    | undefined,
 ): boolean {
   if (!settings) return true;
   const parsed = prefixOf(subnet.network);

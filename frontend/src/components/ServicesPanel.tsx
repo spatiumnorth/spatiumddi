@@ -107,10 +107,8 @@ export function ServicesPanel() {
         3000,
       );
     },
-    onError: (e: unknown) => {
-      setPending(null);
-      setNote({ tone: "error", text: errorDetail(e, "Action failed") });
-    },
+    // A refusal stays in the open confirm (announced there); it is not
+    // moved to the page note behind the dialog.
   });
 
   const cap = query.data?.capability;
@@ -298,7 +296,13 @@ export function ServicesPanel() {
           confirmLabel={ACTION_LABEL[pending.action]}
           tone="destructive"
           loading={actMut.isPending}
-          onClose={() => setPending(null)}
+          error={
+            actMut.error ? errorDetail(actMut.error, "Action failed") : null
+          }
+          onClose={() => {
+            setPending(null);
+            actMut.reset();
+          }}
           onConfirm={() => actMut.mutate(pending)}
         />
       )}
