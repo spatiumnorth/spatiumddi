@@ -1,3 +1,4 @@
+import { recordTypeServable } from "@/lib/recordTypeGates";
 import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { handOffFocusOnRemove } from "@/components/ui/focus-return";
@@ -3792,9 +3793,20 @@ function RecordModalForm({
   // #3637 — a LUA snippet runs inside pdns_server, so writing one is
   // superadmin-only on the server (create and change of its value).
   const { isSuperadmin: canWriteLua } = usePermissions();
-  const recordTypes = canWriteLua
-    ? RECORD_TYPES
-    : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA");
+  const { data: groupListForTypes } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+    staleTime: 30_000,
+  });
+  const driversForTypes =
+    groupListForTypes?.find((g) => g.id === groupId)?.server_drivers ?? [];
+  // #1778 — don't offer a type the group's drivers can't serve (the API 422s
+  // it); the record's own type stays so an existing row can still be edited.
+  const recordTypes = (
+    canWriteLua
+      ? RECORD_TYPES
+      : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA")
+  ).filter((t) => t === type || recordTypeServable(t, driversForTypes));
   // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
   const nameErr = recordOwnerError(name, type, zoneName);
 

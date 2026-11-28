@@ -49,7 +49,7 @@ from app.services.technitium.rdata import (
     DNSSEC_RECORD_TYPES as _DNSSEC_RECORDS,
 )
 from app.services.technitium.rdata import (
-    SUPPORTED_RECORD_TYPES as _SUPPORTED_RECORD_TYPES,
+    MODELLED_RECORD_TYPES as _SUPPORTED_RECORD_TYPES,
 )
 from app.services.technitium.rdata import (
     classify_zone as _classify_zone,

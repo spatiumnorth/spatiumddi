@@ -1,0 +1,3 @@
+### Fixed
+
+- **Record types Technitium can never serve are refused or reported, not accepted and lost** ([#1778](https://github.com/spatiumnorth/spatiumddi/issues/1778)). `LOC` is now refused with a 422 on any group whose servers are not BIND9 or PowerDNS (it returned 201 on Technitium, Windows and the hosted providers, then the op failed forever), and the record form no longer offers it there. `URI`, which SpatiumDDI does not model, is no longer advertised by either Technitium driver, is reported as skipped by the Technitium importer, and is no longer pulled into drift as a permanent "extra on server".
