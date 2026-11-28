@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""spatiumddi-netif-reload — additional network interfaces (issue #4428).
+
+Host-side runner for the per-appliance "network interfaces" plane. The
+supervisor writes ``release-state/netif-config-pending`` when the control
+plane's desired set differs from the last one this node settled:
+
+    line 1:    "enabled" | "disabled" ("disabled" = remove everything managed)
+    line 2:    sha256 of the desired set
+    line 3+:   JSON {"interfaces": [...], "revert_seconds": N}
+
+and ``spatiumddi-netif-reload.path`` fires this script with no arguments.
+A timer (``spatiumddi-netif-tick.timer``) runs it with ``--tick`` every
+30 s to refresh the inventory the supervisor reports and to enforce the
+rollback below.
+
+WHAT IT MANAGES, AND WHAT IT NEVER TOUCHES
+------------------------------------------
+Only NetworkManager keyfiles named ``20-spatium-netif-<iface>.nmconnection``.
+The primary connection (``10-spatium-static`` / ``10-spatium-dhcp``) belongs
+to ``spatium-etc-render``; this script refuses a payload that names the
+interface STATE configured, or the one carrying the default route, whatever
+the control plane said. Neither side trusts the other: the control plane
+knows who the operator is, only this side knows what the host looks like at
+the moment of the change.
+
+ROLLBACK
+--------
+The one plane in this image whose wrong answer cuts the node off from the
+thing that would fix it. After an apply the previous profiles are kept in
+``netif-last-good/`` and a deadline is armed. The supervisor writes
+``netif-confirm`` once a heartbeat has round-tripped with the applied hash
+(the proof the node still reaches the control plane). No confirm by the
+deadline -> the previous profiles are restored and the status says
+``reverted``. Dependency-free on purpose (this file plus ``nmcli`` and
+``ip``): it is the safety net, so it must work when the supervisor stack is
+the thing that is broken. A reboot inside the window reverts too, since the
+deadline is on /var and the next tick sees it passed.
+
+The hash sidecar records the hash this node SETTLED — applied or rolled
+back — so a rolled-back config is not re-fired every backoff window (each
+retry would be a self-inflicted outage). The operator edits the config to
+try again.
+
+Set ``SPATIUM_NETIF_ROOT`` to run against a fake root (the tests do).
+"""
+
+from __future__ import annotations
+
+import fcntl
+import glob
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("SPATIUM_NETIF_ROOT", "/"))
+
+
+def _p(path: str) -> Path:
+    return ROOT / path.lstrip("/")
+
+
+STATE = _p("/var/lib/spatiumddi/release-state")
+TRIGGER = STATE / "netif-config-pending"
+HASH_SIDECAR = STATE / "netif-config-hash"
+STATUS = STATE / "netif-status.json"
+INVENTORY = STATE / "netif-inventory.json"
+DEADLINE = STATE / "netif-revert-deadline"
+CONFIRM = STATE / "netif-confirm"
+LAST_GOOD = STATE / "netif-last-good"
+NM_DIR = _p("/etc/NetworkManager/system-connections")
+NET_STATUS = _p("/etc/spatiumddi/network-status")
+LOG = _p("/var/log/spatiumddi/netif-reload.log")
+LOCK = _p("/run/spatiumddi-netif-reload.lock")
+
+PREFIX = "20-spatium-netif-"
+NAMESPACE = uuid.UUID("5a71c0de-4428-4000-8000-000000000000")
+IFNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$")
+NMCLI_TIMEOUT = 30
+
+
+def log(msg: str) -> None:
+    line = f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] {msg}"
+    print(line, flush=True)
+
+
+class Refused(Exception):
+    """The payload is not something this host will apply."""
+
+
+def run(argv: list[str], timeout: int = NMCLI_TIMEOUT) -> tuple[int, str]:
+    try:
+        p = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, str(exc)
+    return p.returncode, (p.stdout + p.stderr).strip()
+
+
+def state_write(path: Path, text: str, mode: int = 0o644) -> None:
+    """Atomic write that never follows a symlink planted at the name."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.{os.getpid()}"
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_status(state: str, cfg_hash: str, error: str | None = None,
+                 interfaces: dict[str, str] | None = None) -> None:
+    doc: dict[str, object] = {"state": state, "at": now_iso(), "hash": cfg_hash}
+    if error:
+        doc["error"] = error[:500]
+    if interfaces is not None:
+        doc["interfaces"] = interfaces
+    state_write(STATUS, json.dumps(doc))
+
+
+def read_status() -> dict:
+    try:
+        doc = json.loads(STATUS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+# ── host facts ───────────────────────────────────────────────────────
+
+
+def ip_json(*args: str) -> list:
+    rc, out = run(["ip", "-j", *args])
+    if rc != 0:
+        return []
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return []
+    return doc if isinstance(doc, list) else []
+
+
+def routes() -> list[dict]:
+    out: list[dict] = []
+    for fam in ("-4", "-6"):
+        for r in ip_json(fam, "route", "show"):
+            if isinstance(r, dict):
+                out.append(
+                    {
+                        "dst": str(r.get("dst") or ""),
+                        "gateway": r.get("gateway"),
+                        "dev": r.get("dev"),
+                        "metric": r.get("metric") if isinstance(r.get("metric"), int) else None,
+                        "protocol": r.get("protocol"),
+                    }
+                )
+    return out[:256]
+
+
+def default_devs() -> list[str]:
+    return sorted({str(r["dev"]) for r in routes() if r["dst"] == "default" and r["dev"]})
+
+
+def primary_interface() -> str | None:
+    try:
+        for line in NET_STATUS.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() == "INTERFACE" and value.strip():
+                return value.strip()
+    except OSError:
+        pass
+    return None
+
+
+_KIND = {"vlan": "vlan", "bond": "bond", "bridge": "bridge"}
+
+
+def inventory() -> dict:
+    nics = []
+    for e in ip_json("-d", "addr", "show"):
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("ifname") or "")
+        if not name or name == "lo" or name.startswith("veth"):
+            continue
+        link = e.get("linkinfo") if isinstance(e.get("linkinfo"), dict) else {}
+        info_kind = link.get("info_kind")
+        if info_kind:
+            kind = _KIND.get(str(info_kind), str(info_kind))
+        elif e.get("link_type") == "ether":
+            kind = "ethernet"
+        else:
+            kind = "other"
+        data = link.get("info_data") if isinstance(link.get("info_data"), dict) else {}
+        flags = e.get("flags") if isinstance(e.get("flags"), list) else []
+        nics.append(
+            {
+                "name": name,
+                "kind": kind,
+                "parent": e.get("link") if kind == "vlan" else None,
+                "vlan_id": data.get("id") if kind == "vlan" else None,
+                "master": e.get("master"),
+                "state": "up" if str(e.get("operstate")).upper() in ("UP", "UNKNOWN") and "UP" in flags else "down",
+                "carrier": "LOWER_UP" in flags,
+                "mtu": e.get("mtu"),
+                "mac": e.get("address"),
+                "addresses": [
+                    f"{a['local']}/{a['prefixlen']}"
+                    for a in e.get("addr_info") or []
+                    if isinstance(a, dict) and a.get("local") and a.get("scope") != "link"
+                ][:32],
+            }
+        )
+    return {
+        "at": now_iso(),
+        "at_epoch": int(time.time()),
+        "primary_interface": primary_interface(),
+        "default_devs": default_devs(),
+        "interfaces": nics[:64],
+        "routes": routes(),
+    }
+
+
+# ── validation (independent of the control plane's) ──────────────────
+
+
+def validate(interfaces: object) -> list[dict]:
+    if not isinstance(interfaces, list):
+        raise Refused("the interface list is not a list")
+    protected = {d for d in default_devs()}
+    primary = primary_interface()
+    if primary:
+        protected.add(primary)
+    out = []
+    seen: set[str] = set()
+    for e in interfaces:
+        if not isinstance(e, dict):
+            raise Refused("an interface entry is not an object")
+        name = str(e.get("name") or "")
+        if not IFNAME_RE.match(name):
+            raise Refused(f"{name!r} is not a usable interface name")
+        if name in seen:
+            raise Refused(f"{name} appears twice")
+        seen.add(name)
+        if name in protected:
+            raise Refused(
+                f"{name} is the primary interface or carries the default route; "
+                "this host will not rewrite it"
+            )
+        kind = e.get("kind")
+        if kind not in ("ethernet", "vlan"):
+            raise Refused(f"{name}: unsupported kind {kind!r}")
+        if kind == "vlan":
+            vid = e.get("vlan_id")
+            if isinstance(vid, bool) or not isinstance(vid, int) or not 1 <= vid <= 4094:
+                raise Refused(f"{name}: bad VLAN id {vid!r}")
+            if not IFNAME_RE.match(str(e.get("parent") or "")):
+                raise Refused(f"{name}: bad VLAN parent {e.get('parent')!r}")
+        addrs = e.get("addresses") or []
+        for a in addrs:
+            try:
+                ipaddress.ip_interface(a)
+            except ValueError as exc:
+                raise Refused(f"{name}: bad address {a!r}") from exc
+        mtu = e.get("mtu")
+        if mtu is not None and (isinstance(mtu, bool) or not isinstance(mtu, int) or not 576 <= mtu <= 9216):
+            raise Refused(f"{name}: bad MTU {mtu!r}")
+        for r in e.get("routes") or []:
+            try:
+                dest = ipaddress.ip_network(r.get("destination"), strict=False)
+                ipaddress.ip_address(r.get("gateway"))
+            except (ValueError, AttributeError, TypeError) as exc:
+                raise Refused(f"{name}: bad route {r!r}") from exc
+            if dest.prefixlen == 0:
+                raise Refused(f"{name}: a default route is not allowed on an additional interface")
+        out.append(e)
+    return out
+
+
+# ── rendering ────────────────────────────────────────────────────────
+
+
+def render(e: dict) -> str:
+    name = e["name"]
+    addrs = [ipaddress.ip_interface(a) for a in e.get("addresses") or []]
+    up = bool(e.get("up", True))
+    lines = [
+        "[connection]",
+        f"id=spatium-netif-{name}",
+        f"uuid={uuid.uuid5(NAMESPACE, name)}",
+        f"type={'vlan' if e['kind'] == 'vlan' else 'ethernet'}",
+        f"interface-name={name}",
+        f"autoconnect={'true' if up else 'false'}",
+        "",
+    ]
+    if e["kind"] == "vlan":
+        lines += ["[vlan]", f"id={e['vlan_id']}", f"parent={e['parent']}", ""]
+    if e.get("mtu"):
+        lines += ["[ethernet]", f"mtu={e['mtu']}", ""]
+    for version, section in ((4, "ipv4"), (6, "ipv6")):
+        mine = [a for a in addrs if a.version == version]
+        lines.append(f"[{section}]")
+        if mine:
+            lines.append("method=manual")
+            for i, a in enumerate(mine, 1):
+                lines.append(f"address{i}={a}")
+            n = 0
+            for r in e.get("routes") or []:
+                if ipaddress.ip_network(r["destination"], strict=False).version != version:
+                    continue
+                n += 1
+                metric = f",{r['metric']}" if r.get("metric") else ""
+                lines.append(f"route{n}={r['destination']},{r['gateway']}{metric}")
+            # An additional interface must never become the node's way out.
+            lines.append("never-default=true")
+        else:
+            lines.append("method=disabled")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def managed_files() -> dict[str, Path]:
+    return {
+        Path(f).name: Path(f) for f in sorted(glob.glob(str(NM_DIR / (PREFIX + "*.nmconnection"))))
+    }
+
+
+def snapshot() -> None:
+    """Keep what is on disk now so a failed or unconfirmed apply can undo it."""
+    shutil.rmtree(LAST_GOOD, ignore_errors=True)
+    LAST_GOOD.mkdir(parents=True, exist_ok=True)
+    for name, path in managed_files().items():
+        shutil.copy2(path, LAST_GOOD / name)
+
+
+def install_set(files: dict[str, str]) -> None:
+    NM_DIR.mkdir(parents=True, exist_ok=True)
+    for name, path in managed_files().items():
+        if name not in files:
+            path.unlink()
+    for name, body in files.items():
+        state_write(NM_DIR / name, body, 0o600)
+
+
+def activate(entries: list[dict]) -> dict[str, str]:
+    """Reload NetworkManager and bring the profiles up; parents first.
+
+    A link that will not come up (no cable) is NOT a failed apply: the
+    profile is in place and NM raises it when the carrier arrives. It is
+    reported per interface so the UI can say "no carrier".
+    """
+    rc, out = run(["nmcli", "connection", "reload"])
+    if rc != 0:
+        raise RuntimeError(f"nmcli connection reload failed: {out.splitlines()[0] if out else rc}")
+    verdicts: dict[str, str] = {}
+    for e in sorted(entries, key=lambda x: x["kind"] == "vlan"):
+        cid = f"spatium-netif-{e['name']}"
+        if not e.get("up", True):
+            run(["nmcli", "connection", "down", "id", cid])
+            verdicts[e["name"]] = "inactive: configured down"
+            continue
+        rc, out = run(["nmcli", "-w", "20", "connection", "up", "id", cid])
+        if rc == 0:
+            verdicts[e["name"]] = "active"
+        else:
+            reason = out.splitlines()[0] if out else f"exit {rc}"
+            verdicts[e["name"]] = f"inactive: {reason}"
+    return verdicts
+
+
+def restore_last_good(why: str) -> None:
+    saved = {p.name: p.read_text(encoding="utf-8") for p in sorted(LAST_GOOD.glob(PREFIX + "*"))}
+    install_set(saved)
+    rc, out = run(["nmcli", "connection", "reload"])
+    if rc != 0:
+        log(f"  ! reload after restore failed: {out}")
+    for name in saved:
+        cid = name[: -len(".nmconnection")][len("20-") :]
+        run(["nmcli", "-w", "20", "connection", "up", "id", cid])
+    log(f"  restored {len(saved)} previous profile(s): {why}")
+
+
+# ── modes ────────────────────────────────────────────────────────────
+
+
+def consume(suffix: str) -> None:
+    try:
+        TRIGGER.rename(TRIGGER.with_name(f"{TRIGGER.name}.{suffix}.{int(time.time())}"))
+    except OSError:
+        pass
+
+
+def apply_trigger() -> int:
+    if not TRIGGER.is_file():
+        log("no trigger, nothing to do")
+        return 0
+    lines = TRIGGER.read_text(encoding="utf-8").splitlines()
+    marker = lines[0].strip() if lines else ""
+    cfg_hash = lines[1].strip() if len(lines) > 1 else ""
+    try:
+        if marker not in ("enabled", "disabled") or not cfg_hash:
+            raise Refused(f"unrecognised trigger (marker {marker!r})")
+        body = json.loads("\n".join(lines[2:]) or "{}")
+        entries = validate(body.get("interfaces") if marker == "enabled" else [])
+        revert_seconds = body.get("revert_seconds")
+        if isinstance(revert_seconds, bool) or not isinstance(revert_seconds, int):
+            revert_seconds = 180
+        revert_seconds = max(30, min(revert_seconds, 900))
+        if shutil.which("nmcli") is None:
+            raise Refused("NetworkManager (nmcli) is not available on this host")
+    except (Refused, ValueError) as exc:
+        log(f"  refused: {exc}")
+        write_status("failed", cfg_hash, str(exc))
+        consume("failed")
+        return 1
+
+    wanted = {f"{PREFIX}{e['name']}.nmconnection": render(e) for e in entries}
+    current = {n: p.read_text(encoding="utf-8") for n, p in managed_files().items()}
+    if wanted == current:
+        # Idempotent re-apply: nothing on disk changes, so no reload, no
+        # re-activation, no rollback window.
+        log("  already in place — nothing to change")
+        state_write(HASH_SIDECAR, cfg_hash + "\n")
+        prev = read_status()
+        write_status("applied", cfg_hash, interfaces=prev.get("interfaces") if prev.get("hash") == cfg_hash else {})
+        consume("done")
+        return 0
+
+    if not DEADLINE.exists():
+        snapshot()  # an unconfirmed earlier apply keeps ITS snapshot
+    try:
+        install_set(wanted)
+        verdicts = activate(entries) if entries else _reload_only()
+    except (OSError, RuntimeError) as exc:
+        log(f"  apply failed: {exc}")
+        restore_last_good("the apply failed")
+        write_status("failed", cfg_hash, str(exc))
+        consume("failed")
+        return 1
+
+    CONFIRM.unlink(missing_ok=True)
+    state_write(DEADLINE, f"{int(time.time()) + revert_seconds}\n")
+    state_write(HASH_SIDECAR, cfg_hash + "\n")
+    write_status("pending-confirm", cfg_hash, interfaces=verdicts)
+    consume("done")
+    log(f"  applied {len(entries)} interface(s); rolls back in {revert_seconds}s unless confirmed")
+    return 0
+
+
+def _reload_only() -> dict[str, str]:
+    rc, out = run(["nmcli", "connection", "reload"])
+    if rc != 0:
+        raise RuntimeError(f"nmcli connection reload failed: {out.splitlines()[0] if out else rc}")
+    return {}
+
+
+def own_file(path: Path) -> bool:
+    try:
+        st = path.lstat()
+    except OSError:
+        return False
+    return path.is_file() and not path.is_symlink() and st.st_uid == os.geteuid()
+
+
+def tick() -> int:
+    try:
+        state_write(INVENTORY, json.dumps(inventory()))
+    except OSError as exc:
+        log(f"inventory write failed: {exc}")
+    if not DEADLINE.exists():
+        return 0
+    if not own_file(DEADLINE):
+        DEADLINE.unlink(missing_ok=True)
+        log("ignored a revert deadline not written by this host's runner")
+        return 0
+    settled = HASH_SIDECAR.read_text(encoding="utf-8").strip() if HASH_SIDECAR.exists() else ""
+    if CONFIRM.exists():
+        confirmed = ""
+        try:
+            confirmed = CONFIRM.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        CONFIRM.unlink(missing_ok=True)
+        if confirmed and confirmed == settled:
+            DEADLINE.unlink(missing_ok=True)
+            prev = read_status()
+            write_status("applied", settled, interfaces=prev.get("interfaces") or {})
+            log("apply confirmed — keeping the new configuration")
+            return 0
+        # A confirm for some OTHER hash (the operator replaced the config
+        # while one was in flight) keeps nothing: the deadline stands.
+        log("ignored a confirm that does not match the config in force")
+    try:
+        deadline = int(DEADLINE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        deadline = 0
+    if time.time() < deadline:
+        return 0
+    DEADLINE.unlink(missing_ok=True)
+    log("apply NOT confirmed before the deadline — restoring the previous configuration")
+    restore_last_good("the control plane was not reachable after the change")
+    write_status(
+        "reverted",
+        settled,
+        "The node could not reach the control plane after the change, so the previous "
+        "network configuration was restored. Review the interface, addresses and routes.",
+    )
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK, "w")  # noqa: SIM115 - held for the process lifetime
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another run is in progress, deferring")
+        return 0
+    if "--tick" in argv:
+        return tick()
+    with open(LOG, "a", encoding="utf-8") as fh:
+        sys.stdout = fh
+        log("=== spatiumddi-netif-reload fired ===")
+        try:
+            return apply_trigger()
+        finally:
+            sys.stdout = sys.__stdout__
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

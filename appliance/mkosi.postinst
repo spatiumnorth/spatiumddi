@@ -68,6 +68,8 @@ for unit in chrony.service ssh.service \
             spatiumddi-storage-action.path \
             spatiumddi-removable-reload.path \
             spatiumddi-removable-boot.service \
+            spatiumddi-netif-reload.path \
+            spatiumddi-netif-tick.timer \
             spatiumddi-optin-services-boot.service \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
@@ -351,6 +353,13 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-removable-reload.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-removable-prepare.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-removable-boot.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-removable-reload"
+# #4428 — additional network interfaces: runner, its .path trigger, and the
+# tick timer that refreshes the inventory + enforces the rollback.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-netif-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-netif-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-netif-reload.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-netif-tick.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-netif-tick.timer"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-host-migrate"

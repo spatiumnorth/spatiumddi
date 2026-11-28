@@ -1,0 +1,17 @@
+[Unit]
+Description=Apply pending SpatiumDDI additional network interface config (issue #4428)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4428
+# The runner writes NetworkManager keyfiles into /etc, which on the
+# appliance is the /var-backed overlay upper layer — so it needs etc.mount
+# up — and drives NetworkManager.
+After=etc.mount local-fs.target NetworkManager.service
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+# GHSA-h2j9-qrg7-grfw — act only on a trigger written by root, the
+# supervisor or the api; anything else is renamed aside and the unit skips
+# cleanly. See spatiumddi-trigger-guard.
+ExecCondition=/usr/local/bin/spatiumddi-trigger-guard /var/lib/spatiumddi/release-state/netif-config-pending
+ExecStart=/usr/local/bin/spatiumddi-netif-reload
+# No Install section — only invoked by the matching .path unit.

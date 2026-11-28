@@ -12702,6 +12702,34 @@ export const applianceApi = {
         `/appliance/appliances/${applianceId}/removable/${encodeURIComponent(name)}`,
       )
       .then((r) => r.data),
+  /**
+   * #4428 — additional network interfaces on one appliance (addresses,
+   * 802.1Q VLANs, static routes). Desired state lives on the appliance
+   * row; the node applies it with a rollback if it loses the control
+   * plane, and reports the verdict on its heartbeat.
+   */
+  getNetworkInterfaces: (applianceId: string) =>
+    api
+      .get<NetworkInterfacesResponse>(
+        `/appliance/appliances/${applianceId}/network-interfaces`,
+      )
+      .then((r) => r.data),
+  putNetworkInterfaces: (
+    applianceId: string,
+    interfaces: NetworkInterfaceInput[],
+  ) =>
+    api
+      .put<NetworkInterfacesResponse>(
+        `/appliance/appliances/${applianceId}/network-interfaces`,
+        { interfaces },
+      )
+      .then((r) => r.data),
+  deleteNetworkInterface: (applianceId: string, name: string) =>
+    api
+      .delete<NetworkInterfacesResponse>(
+        `/appliance/appliances/${applianceId}/network-interfaces/${encodeURIComponent(name)}`,
+      )
+      .then((r) => r.data),
 };
 
 // ── Fleet firewall (issue #285 Phase 3) ──────────────────────────────
@@ -14674,6 +14702,89 @@ export interface RemovableResponse {
 export interface RemovableMountRequest {
   fs_uuid: string;
   name: string;
+}
+
+/** #4428 — one static route on an additional interface. */
+export interface NetworkRoute {
+  destination: string;
+  gateway: string | null;
+  metric: number | null;
+}
+
+/** #4428 — what the operator submits for one additional interface. */
+export interface NetworkInterfaceInput {
+  kind: "ethernet" | "vlan";
+  name?: string | null;
+  parent?: string | null;
+  vlan_id?: number | null;
+  addresses: string[];
+  mtu?: number | null;
+  up: boolean;
+  routes: { destination: string; gateway: string; metric?: number | null }[];
+  description?: string | null;
+}
+
+/**
+ * `active` — applied and up. `inactive` — applied, link down (no cable).
+ * `confirming` — applied; the node rolls back unless the control plane is
+ * still reachable. `pending` — not applied yet. `reverted` — the node lost
+ * contact after applying and restored the previous config, so the desired
+ * set is NOT in force. `failed` — the runner refused or failed it.
+ * `unreported` — the node has not said.
+ */
+export type NetworkInterfaceState =
+  | "active"
+  | "inactive"
+  | "confirming"
+  | "pending"
+  | "reverted"
+  | "failed"
+  | "unreported";
+
+export interface NetworkInterface {
+  name: string;
+  kind: "ethernet" | "vlan";
+  parent: string | null;
+  vlan_id: number | null;
+  addresses: string[];
+  mtu: number | null;
+  up: boolean;
+  routes: NetworkRoute[];
+  description: string | null;
+  state: NetworkInterfaceState;
+  detail: string | null;
+  live_addresses: string[];
+  live_state: string | null;
+  live_carrier: boolean | null;
+}
+
+/** One interface the node reports, managed or not. */
+export interface NetworkNic {
+  name: string;
+  kind: string;
+  parent: string | null;
+  vlan_id: number | null;
+  master: string | null;
+  state: string;
+  carrier: boolean | null;
+  mtu: number | null;
+  mac: string | null;
+  addresses: string[];
+  managed: boolean;
+  /** Why this one cannot be managed here (primary, default route …). */
+  protected_reason: string | null;
+}
+
+export interface NetworkInterfacesResponse {
+  /** False = the node has not reported its interfaces: unknown, not "none". */
+  reported: boolean;
+  hostname: string;
+  interfaces: NetworkInterface[];
+  nics: NetworkNic[];
+  /** `applied` | `pending-confirm` | `reverted` | `failed` | null. */
+  apply_state: string | null;
+  apply_error: string | null;
+  revert_seconds: number;
 }
 
 /** #999 Part B — an md / multipath management action. */

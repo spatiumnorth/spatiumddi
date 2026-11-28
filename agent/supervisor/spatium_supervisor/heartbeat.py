@@ -1901,6 +1901,13 @@ def heartbeat_once(
     # appliance row rather than from platform settings.
     if appliance_state.maybe_fire_removable_reload(body_out.get("removable_settings")):
         log.info("supervisor.heartbeat.removable_trigger_fired")
+    # #4428 — additional network interfaces (per-appliance). Applied with
+    # a rollback: the heartbeat response we are handling right now is the
+    # proof the node still reaches the control plane, so it also confirms.
+    if appliance_state.maybe_fire_netif_reload(body_out.get("netif_settings")):
+        log.info("supervisor.heartbeat.netif_trigger_fired")
+    if appliance_state.maybe_confirm_netif(body_out.get("netif_settings")):
+        log.info("supervisor.heartbeat.netif_confirmed")
 
     # #272 Phase 7b — control-plane promote/demote. The host-side runner
     # (spatium-cluster-join) reconfigures k3s + reports back via the

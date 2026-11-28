@@ -75,6 +75,7 @@ import { fmtDiskBytes } from "./clusterShared";
 import { LLDPTab } from "./LLDPTab";
 import { VarDiskWarning } from "./VarDiskWarning";
 import { AptTab } from "./AptTab";
+import { ApplianceNetworkInterfacesSection } from "./NetworkInterfacesSection";
 import { NTPTab } from "./NTPTab";
 import { PairingTab } from "./PairingTab";
 import { ResolverTab } from "./ResolverTab";
@@ -2870,6 +2871,10 @@ export function ApplianceDrilldownModal({
 
         {row.state === "approved" && <ApplianceRemovableSection row={row} />}
 
+        {row.state === "approved" && (
+          <ApplianceNetworkInterfacesSection applianceId={row.id} />
+        )}
+
         {row.state === "approved" &&
           Object.keys(row.host_config_health ?? {}).length > 0 && (
             <ApplianceHostConfigHealthSection row={row} />
@@ -4137,6 +4142,7 @@ const HOSTCFG_PLANE_LABELS: Record<string, string> = {
   firewall: "Firewall",
   timezone: "Timezone",
   removable: "Removable disks",
+  netif: "Network interfaces",
   apt: "APT",
   console_mode: "Console mode",
 };
@@ -4154,6 +4160,7 @@ const HOSTCFG_PLANE_LOGS: Record<string, string> = {
   resolver: "resolved-reload.log",
   timezone: "tz-reload.log",
   removable: "removable-reload.log",
+  netif: "netif-reload.log",
   apt: "apt-reload.log",
   console_mode: "verbose-boot-reload.log",
 };

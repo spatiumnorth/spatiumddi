@@ -513,6 +513,178 @@ async def find_appliance_removable(
     }
 
 
+# ── find_appliance_network_interfaces ──────────────────────────────
+
+
+class FindApplianceNetworkInterfacesArgs(BaseModel):
+    appliance_id: str | None = Field(
+        default=None,
+        description="Restrict to one appliance (UUID). Omit to list every appliance.",
+    )
+    configured_only: bool = Field(
+        default=True,
+        description=(
+            "Return only appliances with at least one managed interface. "
+            "False also lists nodes that merely report their NICs."
+        ),
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+@register_tool(
+    name="find_appliance_network_interfaces",
+    permission="superadmin",
+    description=(
+        "Report the additional (non-primary) network interfaces managed on "
+        "appliances — static addresses, 802.1Q VLAN sub-interfaces, static "
+        "routes, MTU — with what each node actually runs (superadmin only, "
+        "#4428). Each interface carries a state: 'active', 'inactive' (link "
+        "down), 'pending' (not applied yet), 'confirming' (applied, waiting "
+        "for the control plane to confirm it can still be reached), "
+        "'reverted' (the node LOST contact after applying and restored the "
+        "previous config, so the desired set is NOT in force) or 'failed'. "
+        "Say 'reverted' plainly: it means the change would have cut the node "
+        "off. Also lists the node's NICs and, for each one that cannot be "
+        "managed (the primary interface, the one carrying the default "
+        "route), the reason. IMPORTANT: a node in `not_reporting` has not "
+        "reported its interfaces — that is unknown, not 'none configured'. "
+        "Use to answer 'is the VLAN 100 interface on ddi2 up?' or 'which "
+        "route lets Kea reach the relay?'. Read-only."
+    ),
+    args_model=FindApplianceNetworkInterfacesArgs,
+    category="admin",
+    default_enabled=True,
+)
+async def find_appliance_network_interfaces(
+    db: AsyncSession, user: User, args: FindApplianceNetworkInterfacesArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+
+    from app.services.appliance import netif as netif_svc  # noqa: PLC0415
+
+    stmt = select(Appliance).where(Appliance.revoked_at.is_(None)).order_by(Appliance.hostname)
+    if args.appliance_id:
+        try:
+            stmt = stmt.where(Appliance.id == uuid.UUID(args.appliance_id))
+        except ValueError:
+            return {"error": f"{args.appliance_id!r} is not a valid appliance UUID."}
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    out: list[dict[str, Any]] = []
+    not_reporting: list[str] = []
+    for row in rows:
+        reported = netif_svc.has_inventory(row.cluster_health)
+        if not reported:
+            not_reporting.append(row.hostname)
+        interfaces = netif_svc.merge_state(row.desired_network_interfaces, row.cluster_health)
+        if args.configured_only and not interfaces:
+            continue
+        status = netif_svc.apply_status(row.cluster_health) or {}
+        out.append(
+            {
+                "appliance_id": str(row.id),
+                "hostname": row.hostname,
+                "state": row.state,
+                "reported": reported,
+                "apply_state": status.get("state"),
+                "apply_error": status.get("error") or None,
+                "interfaces": interfaces,
+                "nics": netif_svc.inventory_nics(row.cluster_health) if reported else [],
+            }
+        )
+    out = out[: args.limit]
+    return {
+        "appliances": out,
+        "count": len(out),
+        "not_reporting": not_reporting,
+        "not_reporting_count": len(not_reporting),
+    }
+
+
+# ── propose_appliance_network_interfaces ───────────────────────────
+
+
+class ProposeApplianceNetworkInterfacesArgs(BaseModel):
+    appliance_id: str = Field(
+        description="UUID of the appliance. Use find_appliance_network_interfaces to discover it."
+    )
+    interfaces: list[dict[str, Any]] = Field(
+        description=(
+            "The COMPLETE desired set of additional interfaces (it replaces what is "
+            "configured; use find_appliance_network_interfaces first and edit that). Each: "
+            "{kind: 'ethernet'|'vlan', name, parent, vlan_id, addresses: ['10.9.0.2/24'], "
+            "mtu, up, routes: [{destination, gateway, metric}]}. A VLAN's name defaults to "
+            "<parent>.<vlan_id>. The primary interface and default routes are refused."
+        )
+    )
+
+
+@register_tool(
+    name="propose_appliance_network_interfaces",
+    permission="superadmin",
+    description=(
+        "Propose a new set of additional network interfaces for an appliance "
+        "(superadmin only, #4428): static addresses, VLAN sub-interfaces, static "
+        "routes. Runs the SAME validation as the REST endpoint — a change that "
+        "would overlap another subnet, cover the cluster's own addresses, add a "
+        "default route, or touch the primary interface is refused here with the "
+        "reason — and returns a PROPOSAL for a human to apply. It never changes "
+        "anything. Applied changes roll back on the node if it loses contact "
+        "with the control plane."
+    ),
+    args_model=ProposeApplianceNetworkInterfacesArgs,
+    category="admin",
+    # Default OFF per non-negotiable #13's exception for broad-blast-radius
+    # writes: this edits host networking on a box that may be reachable only
+    # through it, and the safety net (rollback) is a last resort, not a
+    # reason to drive it from a chat window.
+    default_enabled=False,
+)
+async def propose_appliance_network_interfaces(
+    db: AsyncSession, user: User, args: ProposeApplianceNetworkInterfacesArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+
+    from app.api.v1.appliance.netif import validate_for  # noqa: PLC0415
+    from app.services.appliance import netif as netif_svc  # noqa: PLC0415
+
+    try:
+        appliance_uuid = uuid.UUID(args.appliance_id)
+    except (ValueError, AttributeError):
+        return {"error": f"{args.appliance_id!r} is not a valid appliance UUID."}
+    row = await db.get(Appliance, appliance_uuid)
+    if row is None or row.revoked_at is not None:
+        return {"error": f"No appliance with id {args.appliance_id}."}
+    if args.interfaces and not netif_svc.has_inventory(row.cluster_health):
+        return {
+            "error": f"{row.hostname} has not reported its network interfaces yet; "
+            "nothing can be validated against an unknown network."
+        }
+    try:
+        rows = validate_for(row, args.interfaces)
+    except netif_svc.NetifError as exc:
+        return {"error": str(exc)}
+    names = ", ".join(r["name"] for r in rows) or "none"
+    return {
+        "kind": "proposal",
+        "operation": "appliance_network_interfaces",
+        "appliance_id": str(row.id),
+        "hostname": row.hostname,
+        "interfaces": rows,
+        "preview_text": (
+            f"On {row.hostname}: manage {len(rows)} additional interface(s) ({names}). "
+            f"Rolls back on the node if the control plane is unreachable for "
+            f"{netif_svc.REVERT_SECONDS} s after the apply."
+        ),
+        "how_to_apply": (
+            "PUT /api/v1/appliance/appliances/{id}/network-interfaces with "
+            "{interfaces: [...]} — or Appliance → Fleet → the node → Network interfaces."
+        ),
+    }
+
+
 # ── propose_storage_action ─────────────────────────────────────────
 
 
@@ -1319,6 +1491,8 @@ __all__ = [
     "find_pending_appliances",
     "find_appliance_fleet",
     "find_appliance_storage",
+    "find_appliance_network_interfaces",
+    "propose_appliance_network_interfaces",
     "propose_storage_action",
     "find_upgrade_images",
     "find_available_upgrade_images",
