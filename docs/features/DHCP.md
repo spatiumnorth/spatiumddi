@@ -440,6 +440,40 @@ fine" gets produced:
 lease rows, so its freshness follows the last lease pull rather than
 being instantaneous.
 
+### Suggest a range for a nearly-full pool (issue #4489)
+
+```
+GET /api/v1/dhcp/pools/{pool_id}/expansion-suggestions?limit=5&min_size=1
+```
+
+When `dhcp_pool_exhaustion` fires, this answers "which addresses can I
+add?". It is **read-only** and needs only the permission to view the pool
+(`read` on `dhcp_pool`); nothing is changed. Candidates come back in this
+order: the free range directly above the pool (`extends_after`), the one
+directly below it (`extends_before`), then the other free runs of the
+subnet, largest first (`separate`). The extend kinds carry
+`resulting_start` / `resulting_end`, the pool's range if merged.
+
+A run is free only if none of its addresses is held by an IPAM row whose
+status is anything but `available`, a static reservation, an active lease,
+another pool of a scope on the subnet (any type), the gateway, or the
+network / broadcast address (a /31 and /32 hold none back). Each candidate
+lists the addresses in it that discovery has last seen answering
+(`seen_answering`, first ten, plus `seen_answering_count`) — an `available`
+address that answers is probably in use outside IPAM, so check it first.
+
+* **IPv4 dynamic pools only.** Other pool types and DHCPv6 pools return 422
+  with the reason: a v6 pool is a slice of a /64 whose free space cannot be
+  enumerated meaningfully (SLAAC hosts never register).
+* **Applying stays the ordinary pool create / update.** The pool list's
+  lightbulb button opens the suggestions; picking one opens the existing
+  pool dialog pre-filled (an extension edits the pool's range, a separate
+  run is a new pool). Overlap checks, audit, the Windows write-through and
+  the agent wake are exactly those of a manual edit, so a write the server
+  refuses (for example a Windows DHCP scope that cannot take the change)
+  fails there with its reason.
+* Copilot: `find_dhcp_pool_expansion` (read, enabled by default).
+
 ### Fleet-wide lease lookup (issue #917)
 
 ```
