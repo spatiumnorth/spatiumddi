@@ -7,7 +7,8 @@ column that no longer exists — so the whole selective restore rolls back. A
 full restore is unaffected: it recreates the archive's schema and the
 post-restore ``alembic upgrade`` runs the contract migration over it.
 
-For the plaintext secret columns listed here, the selective prelude re-adds
+For the columns listed here (the plaintext secret columns, and the unmapped
+``DROPPED_UNMAPPED_COLUMNS``), the selective prelude re-adds
 each one (nullable, ``IF NOT EXISTS``) to the tables it reloads, so the
 archive's rows load as they were; after the post-restore migration step,
 :func:`fold_dropped_plaintext_columns` encrypts any value left in one into its
@@ -52,15 +53,56 @@ DROPPED_PLAINTEXT_SECRET_COLUMNS: tuple[tuple[str, str, str, str], ...] = (
 )
 
 
+# (table, dropped column, SQL type) for columns a contract migration dropped
+# that hold nothing to carry forward: nothing reads them, so a selective
+# restore re-adds them only so the archive's ``COPY`` loads, then drops them
+# again (:func:`drop_unmapped_columns`). ``gss_tsig_*`` is #3592 (migration
+# ``d4a7c18e6b92``); every one is nullable here whatever it was, so an
+# archive that omits a value still loads.
+DROPPED_UNMAPPED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("dns_server_options", "gss_tsig_enabled", "boolean"),
+    ("dns_server_options", "gss_tsig_keytab_path", "varchar(500)"),
+    ("dns_server_options", "gss_tsig_realm", "varchar(255)"),
+    ("dns_server_options", "gss_tsig_principal", "varchar(500)"),
+)
+
+
 def selective_readd_sql(tables: list[str]) -> str:
     """``ALTER TABLE … ADD COLUMN IF NOT EXISTS`` for every dropped column on a
     table the selective restore reloads, so an older archive's ``COPY`` loads."""
     wanted = set(tables)
-    return "".join(
-        f'ALTER TABLE "public"."{table}" ADD COLUMN IF NOT EXISTS "{plain}" {sql_type};\n'
+    statements = [
+        (table, plain, sql_type)
         for table, plain, _enc, sql_type in DROPPED_PLAINTEXT_SECRET_COLUMNS
+    ] + list(DROPPED_UNMAPPED_COLUMNS)
+    return "".join(
+        f'ALTER TABLE "public"."{table}" ADD COLUMN IF NOT EXISTS "{column}" {sql_type};\n'
+        for table, column, sql_type in statements
         if table in wanted
     )
+
+
+def drop_unmapped_columns(sync_conn: Connection) -> int:
+    """Drop whichever :data:`DROPPED_UNMAPPED_COLUMNS` a selective restore
+    re-added. Returns how many it dropped. Runs in the caller's transaction."""
+    tables = sorted({t for t, _c, _ty in DROPPED_UNMAPPED_COLUMNS})
+    present = _existing_columns(sync_conn, tables)
+    dropped = 0
+    for table, column, _type in DROPPED_UNMAPPED_COLUMNS:
+        if column in present[table]:
+            sync_conn.execute(text(f'ALTER TABLE "{table}" DROP COLUMN "{column}"'))
+            dropped += 1
+    return dropped
+
+
+async def drop_readded_unmapped_columns(db_url: str) -> int:
+    """:func:`drop_unmapped_columns` over ``db_url`` in one transaction."""
+    engine = create_async_engine(db_url, poolclass=NullPool, connect_args=task_connect_args())
+    try:
+        async with engine.begin() as conn:
+            return await conn.run_sync(drop_unmapped_columns)
+    finally:
+        await engine.dispose()
 
 
 def _existing_columns(sync_conn: Connection, tables: list[str]) -> dict[str, set[str]]:
