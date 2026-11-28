@@ -456,19 +456,6 @@ async def test_put_rejects_a_double_quote_in_unattended_entries(client: AsyncCli
 _PROXY_WITH_CREDS = "http://bob:hunter2@proxy.lan:3128/"
 
 
-async def _viewer(db: AsyncSession) -> str:
-    u = User(
-        username=f"viewer-{uuid.uuid4().hex[:8]}",
-        email=f"{uuid.uuid4().hex[:6]}@x.com",
-        display_name="Viewer",
-        hashed_password=hash_password("x"),
-        is_superadmin=False,
-    )
-    db.add(u)
-    await db.flush()
-    return create_access_token(str(u.id))
-
-
 async def _store_proxy(db: AsyncSession, http: str, https: str = "") -> PlatformSettings:
     settings = await db.get(PlatformSettings, 1)
     if settings is None:
@@ -482,7 +469,8 @@ async def _store_proxy(db: AsyncSession, http: str, https: str = "") -> Platform
 
 async def test_get_settings_masks_proxy_credentials(client: AsyncClient, db_session):
     await _store_proxy(db_session, _PROXY_WITH_CREDS, "https://tok3n@proxy.lan:3129")
-    r = await client.get("/api/v1/settings", headers=_hdr(await _viewer(db_session)))
+    _, token = await _superadmin(db_session)
+    r = await client.get("/api/v1/settings", headers=_hdr(token))
     assert r.status_code == 200, r.text
     assert "hunter2" not in r.text and "bob" not in r.text and "tok3n" not in r.text
     body = r.json()

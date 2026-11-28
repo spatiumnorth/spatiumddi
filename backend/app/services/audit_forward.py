@@ -64,7 +64,7 @@ from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
 from app.services import dispatch_db
 from app.services.after_commit_dispatch import dispatch
-from app.services.audit_redact import redact_audit_payload
+from app.services.audit_redact import redact_audit_payload, redact_audit_value
 from app.services.forward_secrets import redact, reveal, secret_url_in_flight, url_display
 
 logger = structlog.get_logger(__name__)
@@ -270,14 +270,19 @@ def _hostname() -> str:
 # ── Formatters ─────────────────────────────────────────────────────────────
 
 
-def _render_rfc5424_prefix(facility: int, severity: int, ts: str) -> str:
+# MSGID of the log-stream events (#4545); audit rows and alerts keep ``AUDIT``.
+_STREAM_MSG_IDS = {"dns_query_log": "DNSQUERY", "dhcp_activity_log": "DHCPLOG"}
+
+
+def _render_rfc5424_prefix(facility: int, severity: int, ts: str, msg_id: str = _MSG_ID) -> str:
     pri = (facility << 3) | severity
-    return f"<{pri}>1 {ts} {_hostname()} {_APP_NAME} - {_MSG_ID} -"
+    return f"<{pri}>1 {ts} {_hostname()} {_APP_NAME} - {msg_id} -"
 
 
 def _render_rfc5424_json(facility: int, payload: dict[str, Any]) -> str:
     severity = _payload_syslog_severity(payload)
-    prefix = _render_rfc5424_prefix(facility, severity, _payload_timestamp(payload))
+    msg_id = _STREAM_MSG_IDS.get(str(payload.get("stream")), _MSG_ID)
+    prefix = _render_rfc5424_prefix(facility, severity, _payload_timestamp(payload), msg_id)
     return prefix + " " + json.dumps(payload, separators=(",", ":"), default=str)
 
 
@@ -493,6 +498,32 @@ def render_for_target(fmt: str, facility: int, payload: dict[str, Any]) -> str:
     return formatter(facility, payload)
 
 
+def render_log_stream_lines(target: dict[str, Any], events: list[dict[str, Any]]) -> list[str]:
+    """Syslog lines for DNS query / DHCP activity log events (#4545). The raw
+    log line is the only free text in them; it is redacted on a copy like every
+    other forwarded payload (#2015), so a credential-shaped string a daemon
+    logged is not shipped to a collector."""
+    fmt = target.get("format") or "rfc5424_json"
+    facility = int(target.get("facility", 16))
+    return [
+        render_for_target(fmt, facility, {**e, "raw": redact_audit_value(e.get("raw"))})
+        for e in events
+    ]
+
+
+async def _deliver_log_stream_batch(target: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    """Render and send one batch of log-stream events to a syslog target.
+    Raises on a transport failure; the caller owns retry and drop accounting
+    (``log_stream_forward``)."""
+    await _send_syslog_batch(
+        target["host"],
+        int(target["port"]),
+        target.get("protocol", "udp"),
+        render_log_stream_lines(target, events),
+        ca_cert_pem=target.get("ca_cert_pem"),
+    )
+
+
 # Legacy single-format helper — kept so alerts.py doesn't break mid-refactor.
 def _render_rfc5424(facility: int, row: Any, payload: dict[str, Any]) -> str:
     return _render_rfc5424_json(facility, payload)
@@ -508,6 +539,19 @@ async def _send_syslog(
     message: str,
     ca_cert_pem: str | None = None,
 ) -> None:
+    await _send_syslog_batch(host, port, protocol, [message], ca_cert_pem=ca_cert_pem)
+
+
+async def _send_syslog_batch(
+    host: str,
+    port: int,
+    protocol: str,
+    messages: list[str],
+    ca_cert_pem: str | None = None,
+) -> None:
+    """Send ``messages`` to one syslog collector: one datagram per message
+    over UDP, one connection carrying newline-framed messages over TCP / TLS
+    (the log streams, #4545, send a batch per connection)."""
     if protocol == "udp":
         # Resolve via the event loop (#1583): an ``AF_INET`` socket
         # hardcoded here meant an IPv6-literal host — or a hostname
@@ -521,7 +565,8 @@ async def _send_syslog(
             raise OSError(f"could not resolve syslog host {host!r}")
         family, _socktype, _proto, _canonname, sockaddr = infos[0]
         with socket.socket(family, socket.SOCK_DGRAM) as sock:
-            sock.sendto((message + "\n").encode("utf-8"), sockaddr)
+            for message in messages:
+                sock.sendto((message + "\n").encode("utf-8"), sockaddr)
         return
 
     ssl_ctx: ssl.SSLContext | None = None
@@ -536,7 +581,7 @@ async def _send_syslog(
         timeout=5.0,
     )
     try:
-        writer.write((message + "\n").encode("utf-8"))
+        writer.write("".join(m + "\n" for m in messages).encode("utf-8"))
         await writer.drain()
     finally:
         writer.close()

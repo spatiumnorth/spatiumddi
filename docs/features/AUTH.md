@@ -538,7 +538,7 @@ the ACS reports `/login?error=saml_requires_https` instead of
 the signature of a cross-site IdP and the fix is TLS, not a retry.
 
 The URL whose scheme decides all this is the admin-set **External URL**
-(Settings → General, `platform_settings.app_base_url`) when configured,
+(Settings → Application → Branding & URL, `platform_settings.app_base_url`) when configured,
 otherwise the incoming request URL — the same value the SP metadata
 advertises as the ACS, i.e. the origin the IdP actually posts to.
 **Behind a TLS-terminating proxy, set the External URL to the public

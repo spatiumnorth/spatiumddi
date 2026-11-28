@@ -119,10 +119,17 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
   const [deleteScope, setDeleteScope] = useState(false);
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
 
-  const { data: pools = [] } = useQuery({
+  // #4637 — the Auditor and Compliance Editor read scopes but not pools, so
+  // a refused read is told, not drawn as "0 pools".
+  const {
+    data: poolsData,
+    error: poolsError,
+    isSuccess: poolsRead,
+  } = useQuery({
     queryKey: ["dhcp-pools", scope.id],
     queryFn: () => dhcpApi.listPools(scope.id),
   });
+  const pools = poolsData ?? [];
   // #2446 — the delete takes the scope's reservations too; count them.
   const { data: statics = [] } = useQuery({
     queryKey: ["dhcp-statics", scope.id],
@@ -178,8 +185,9 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
               )}
             </div>
             <p className="text-xs text-muted-foreground">
-              Lease {scope.lease_time}s · {pools.length} pool
-              {pools.length !== 1 ? "s" : ""}
+              Lease {scope.lease_time}s
+              {poolsRead &&
+                ` · ${pools.length} pool${pools.length !== 1 ? "s" : ""}`}
             </p>
           </div>
         </div>
@@ -231,7 +239,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             ) : (
               <ChevronRight className="h-3.5 w-3.5" />
             )}
-            Pools ({pools.length})
+            Pools{poolsRead && ` (${pools.length})`}
           </button>
           <button
             onClick={() => setShowAddPool(true)}
@@ -244,6 +252,11 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             <Plus className="h-3 w-3" /> Add Pool
           </button>
         </div>
+        {showPools && poolsError && (
+          <p className="px-4 py-2 text-xs">
+            <ListReadError error={poolsError} what="this scope's pools" />
+          </p>
+        )}
         {showPools && pools.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[560px]">

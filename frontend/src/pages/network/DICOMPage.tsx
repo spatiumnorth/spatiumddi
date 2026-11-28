@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
 import { FreshEdit } from "@/components/FreshEdit";
 import { changedFields } from "@/hooks/useFreshRow";
@@ -1021,7 +1022,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
                     {committed.skipped} skipped
                   </span>
                   <span className={ACTION_CLS.error}>
-                    {committed.errors} errors
+                    {countNoun(committed.errors, "error")}
                   </span>
                 </>
               ) : (
@@ -1037,7 +1038,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
                       {preview.skip_count} to skip
                     </span>
                     <span className={ACTION_CLS.error}>
-                      {preview.error_count} errors
+                      {countNoun(preview.error_count, "error")}
                     </span>
                   </>
                 )

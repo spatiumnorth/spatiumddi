@@ -108,6 +108,19 @@ describe("withCustomFieldDefaults (#1303)", () => {
     const values = { owner: "helpdesk", managed: false };
     expect(withCustomFieldDefaults(defs, values)).toBe(values);
   });
+
+  it("leaves a field the parent chain gives a value unset (#4556)", () => {
+    expect(withCustomFieldDefaults(defs, {}, { owner: "team-a" })).toEqual({
+      managed: true,
+    });
+  });
+
+  it("still applies the default when the inherited value is blank", () => {
+    expect(withCustomFieldDefaults(defs, {}, { owner: "" })).toEqual({
+      owner: "netops",
+      managed: true,
+    });
+  });
 });
 
 describe("multi_select and date (#4288)", () => {

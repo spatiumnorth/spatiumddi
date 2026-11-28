@@ -407,7 +407,9 @@ celery_app.conf.update(
             "task": "app.tasks.dns.check_all_dns_servers_health",
             "schedule": schedule(run_every=60.0),
         },
-        # Every 60s, fan-out health checks to every registered DHCP server.
+        # Every 60s tick, fan-out health checks to the DHCP servers. Agent-based
+        # servers every tick; agentless ones (one WinRM / REST session each)
+        # gate on ``PlatformSettings.dhcp_health_interval_seconds`` (#4759).
         "dhcp-health-sweep": {
             "task": "app.tasks.dhcp_health.check_all_dhcp_servers_health",
             "schedule": schedule(run_every=60.0),
@@ -484,7 +486,8 @@ celery_app.conf.update(
             "task": "app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases",
             "schedule": schedule(run_every=10.0),
         },
-        # Every 60 s, reconcile the Windows DHCP server-level deny
+        # Every 60 s tick (task gates on ``dhcp_mac_blocks_sync_interval_seconds``,
+        # #4759), reconcile the Windows DHCP server-level deny
         # filter list against each group's active MAC blocks. Kea is
         # driven by the ConfigBundle DROP class render and needs no
         # periodic push. Windows has no built-in expiry so this tick

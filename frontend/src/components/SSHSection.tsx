@@ -518,8 +518,8 @@ export function SSHSection({
               <code>{doors.caller_ip ?? "unknown"}</code>). Enforcing an SSH
               scope that excludes that address as well leaves the appliance
               console as the only way in, unless you can reach one of those
-              networks another way. Change it under Fleet &rarr; Firewall &rarr;
-              Web UI access, or add your network to the list above.
+              networks another way. Change it under Appliance &rarr; Firewall
+              &rarr; Web UI access, or add your network to the list above.
             </span>
           </div>
         )}

@@ -2846,6 +2846,11 @@ export const aiToolCatalogApi = {
     api
       .put<AIToolCatalog>("/ai/tools/catalog", { enabled })
       .then((r) => r.data),
+  /** Switch only the named tools; the server merges into the stored list. */
+  change: (changes: Record<string, boolean>) =>
+    api
+      .put<AIToolCatalog>("/ai/tools/catalog", { changes })
+      .then((r) => r.data),
 };
 
 // ── Feature modules ──────────────────────────────────────────────────
@@ -3081,6 +3086,13 @@ export interface BackupRestoreResponse {
   warnings?: string[];
 }
 
+/** GET /backup/restore/last: the same card the POST returns, read back from
+ *  the restore's audit row after the restore signed the operator out (#4676). */
+export interface LastBackupRestoreResponse extends BackupRestoreResponse {
+  performed_at: string;
+  performed_by: string | null;
+}
+
 export interface BackupSection {
   key: string;
   label: string;
@@ -3204,6 +3216,13 @@ export const backupApi = {
     });
     return res.data;
   },
+
+  /** Outcome of the most recent restore, from its audit row (#4676). 404
+   *  when none has been recorded. */
+  lastRestore: () =>
+    api
+      .get<LastBackupRestoreResponse>("/backup/restore/last")
+      .then((r) => r.data),
 
   /** Backup-section catalog (Phase 2a). Drives the selective-
    *  restore checklist. */
@@ -3873,6 +3892,41 @@ export interface BrandingLogoInfo {
   media_type: string;
 }
 
+/** What `GET /settings` returns to a caller without `read` on `settings`: only
+ *  these fields (the API's `SettingsPublicResponse`). Everything outside
+ *  Settings → read only these; the rest of `PlatformSettings` is present for
+ *  a holder of `read:settings`, and absent otherwise. */
+export type PlatformSettingsPublic = Pick<
+  PlatformSettings,
+  | "app_title"
+  | "session_timeout_minutes"
+  | "auto_logout_minutes"
+  | "utilization_warn_threshold"
+  | "utilization_critical_threshold"
+  | "utilization_max_prefix_ipv4"
+  | "utilization_max_prefix_ipv6"
+  | "subnet_tree_default_expanded_depth"
+  | "dns_default_ttl"
+  | "dns_default_zone_type"
+  | "dns_recursive_by_default"
+  | "dhcp_default_dns_servers"
+  | "dhcp_default_domain_name"
+  | "dhcp_default_domain_search"
+  | "dhcp_default_ntp_servers"
+  | "dhcp_default_lease_time"
+  | "integration_kubernetes_enabled"
+  | "integration_docker_enabled"
+  | "integration_proxmox_enabled"
+  | "integration_tailscale_enabled"
+  | "integration_unifi_enabled"
+  | "integration_cloud_enabled"
+  | "integration_opnsense_enabled"
+  | "integration_netbird_enabled"
+  | "integration_panos_enabled"
+  | "integration_fortinet_enabled"
+  | "integration_meraki_enabled"
+>;
+
 export interface PlatformSettings {
   app_title: string;
   app_base_url: string;
@@ -3906,6 +3960,8 @@ export interface PlatformSettings {
   dhcp_pull_leases_enabled: boolean;
   dhcp_pull_leases_interval_seconds: number;
   dhcp_pull_leases_last_run_at: string | null;
+  dhcp_health_interval_seconds: number;
+  dhcp_mac_blocks_sync_interval_seconds: number;
   audit_forward_syslog_enabled: boolean;
   audit_forward_syslog_host: string;
   audit_forward_syslog_port: number;
@@ -4269,6 +4325,9 @@ export interface OUIStatus {
   interval_hours: number;
   last_updated_at: string | null;
   vendor_count: number;
+  /** #4800 — newest failed refresh since the last success. */
+  last_error?: string | null;
+  last_error_at?: string | null;
 }
 
 export interface OUITaskStatus {
@@ -4407,9 +4466,28 @@ export interface AuditForwardTarget {
   smtp_reply_to: string;
   min_severity: AuditForwardSeverity | null;
   resource_types: string[] | null;
+  // #4545 — DNS query log / DHCP activity log streams (syslog targets only).
+  stream_dns_query_log: boolean;
+  stream_dhcp_activity_log: boolean;
+  log_stream_filters: AuditForwardLogFilters | null;
+  dns_query_sample_percent: number;
+  log_stream_dropped_total: number;
+  log_stream_last_drop_at: string | null;
   created_at: string;
   modified_at: string;
 }
+
+export type AuditForwardLogFilterKey =
+  | "dns_server_group_ids"
+  | "dns_server_ids"
+  | "dns_rcodes"
+  | "dns_qtypes"
+  | "dhcp_server_group_ids"
+  | "dhcp_server_ids"
+  | "dhcp_codes";
+export type AuditForwardLogFilters = Partial<
+  Record<AuditForwardLogFilterKey, string[]>
+>;
 
 export interface AuditForwardTargetWrite {
   name: string;
@@ -4438,6 +4516,10 @@ export interface AuditForwardTargetWrite {
   smtp_reply_to?: string;
   min_severity?: AuditForwardSeverity | null;
   resource_types?: string[] | null;
+  stream_dns_query_log?: boolean;
+  stream_dhcp_activity_log?: boolean;
+  log_stream_filters?: AuditForwardLogFilters | null;
+  dns_query_sample_percent?: number;
 }
 
 /** Unauthenticated branding reads (issues #885–#888). Kept separate from
@@ -4455,6 +4537,9 @@ export const publicSettingsApi = {
 };
 
 export const settingsApi = {
+  /** The full row for a holder of `read:settings`; anyone else gets only
+   *  the `PlatformSettingsPublic` fields. Readers outside Settings must use
+   *  no others. */
   get: () => api.get<PlatformSettings>("/settings").then((r) => r.data),
   update: (data: Partial<PlatformSettings>) =>
     api.put<PlatformSettings>("/settings", data).then((r) => r.data),
@@ -5303,6 +5388,14 @@ export interface ZoneMovePreview {
    *  refuses — not waivable by acknowledgement. */
   technitium_acl_refusal?: string | null;
   classless_refusal?: string | null;
+  /** #4570 — a forward / stub zone landing in a PowerDNS group. Refused. */
+  powerdns_refusal?: string | null;
+  /** #4623 — the zone's custom DNSSEC policy would land on a PowerDNS group,
+   *  which ignores it. Non-null means the commit refuses. */
+  dnssec_policy_refusal?: string | null;
+  /** #4565 — the zone or a record of it would keep a view in a target group
+   *  that cannot serve views. Non-null means the commit refuses. */
+  views_refusal?: string | null;
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */
@@ -5345,8 +5438,12 @@ export interface DNSServerGroup {
   catalog_unsupported_warning?: string | null;
   /** #1784 — set for a group holding the experimental `technitium_api`
    *  driver; says where an existing group falls outside its supported scope
-   *  (second server, pools). Empty for every other group. */
+   *  (second server, pools). #4565 — also set for a group holding views its
+   *  servers cannot serve. Empty for every other group. */
   scope_warnings?: string[];
+  /** #4562 — group fields (`is_recursive`) a driver in the group does not
+   *  apply, from the same table as the options response. */
+  unapplied_fields?: Record<string, DNSOptionSupport>;
   /** #3551 — estimated named memory against the agents' limit. Filled by
    *  `getGroup` only (null on the list, and for a group with no BIND9
    *  server); `getMemoryEstimate` returns the same object. */
@@ -5947,6 +6044,22 @@ export interface DNSServerOptions {
   forwarder_warnings?: string[];
   // #2266: dnssec_validation "yes" with no trust anchor validates nothing.
   dnssec_warnings?: string[];
+  // #4562: the group's slice of the API's per-driver option table. Absent
+  // field = applied by every driver in the group.
+  option_support?: Record<string, DNSOptionSupport>;
+  // Set when a driver in the group applies no option at all.
+  options_unmanaged_note?: string | null;
+  // Stored non-default values a (non-Technitium) driver does not apply.
+  unapplied_warnings?: string[];
+}
+
+/** One row of the per-driver option table for one group (#4562). `locked`:
+ *  not applied and the stored value already does nothing, so disable it. */
+export interface DNSOptionSupport {
+  state: "partial" | "not_applied";
+  drivers: string[];
+  note: string;
+  locked: boolean;
 }
 
 /** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
@@ -6504,6 +6617,9 @@ export interface ZoneDnssecInfo {
   dnssec_policy_id: string | null;
   dnssec_ds_records: string[];
   dnssec_synced_at: string | null;
+  // #4566 — when the DS set replaced an earlier one (keys regenerated or
+  // rolled on the server); null for the first DS after signing.
+  dnssec_ds_changed_at?: string | null;
   keys: DNSKeyState[];
   // #1762 — see Zone.dnssec_multi_signer; signing_servers is the group's count.
   dnssec_multi_signer?: boolean;
@@ -6511,6 +6627,8 @@ export interface ZoneDnssecInfo {
   // The group runs the agentless Technitium API driver; sign / re-sign are refused.
   signing_unmanaged?: boolean;
   dnssec_unmanaged_warning?: boolean;
+  /** #4623 — a stored custom policy the group's PowerDNS servers ignore. */
+  unapplied_warning?: string | null;
 }
 
 /** A reusable BIND9 dnssec-policy definition (issue #49). */
@@ -6849,10 +6967,27 @@ export const dnsApi = {
       .then((r) => r.data),
 
   // Zones
-  listZones: (groupId: string, params?: { tag?: string[] }) =>
+  // #4854 — a picker names the subnet it serves: a caller scoped to one
+  // subnet and one zone is refused the group's zone list (a type-level DNS
+  // read), so on a 403 it is given the zones it may write there instead.
+  listZones: (
+    groupId: string,
+    params?: { tag?: string[] },
+    subnetId?: string,
+  ) =>
     api
       .get<DNSZone[]>(`/dns/groups/${groupId}/zones`, { params })
-      .then((r) => r.data),
+      .then((r) => r.data)
+      .catch((e: unknown) => {
+        const status = (e as { response?: { status?: number } })?.response
+          ?.status;
+        if (status !== 403 || !subnetId) throw e;
+        return api
+          .get<DNSZone[]>(`/ipam/subnets/${subnetId}/writable-zones`, {
+            params: { group_id: groupId },
+          })
+          .then((r) => r.data);
+      }),
   createZone: (groupId: string, data: Partial<DNSZone>) =>
     api.post<DNSZone>(`/dns/groups/${groupId}/zones`, data).then((r) => r.data),
   updateZone: (groupId: string, zoneId: string, data: Partial<DNSZone>) =>
@@ -6895,6 +7030,12 @@ export const dnsApi = {
   unsignZoneDnssec: (groupId: string, zoneId: string) =>
     api
       .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
+      .then((r) => r.data),
+  ackZoneDnssecDsChange: (groupId: string, zoneId: string) =>
+    api
+      .post<ZoneDnssecInfo>(
+        `/dns/groups/${groupId}/zones/${zoneId}/dnssec/ack-ds-change`,
+      )
       .then((r) => r.data),
   rolloverZoneDnssecKey: (groupId: string, zoneId: string, keyTag: number) =>
     api
@@ -7369,6 +7510,9 @@ export interface DNSBlockList {
   /** #3551 — set when a BIND9 group this list is applied to is estimated at
    *  80 % or more of its agents' memory limit. */
   memory_warning?: string | null;
+  /** #4573 / #4608 — set when a group the list is applied to has no server
+   *  that renders a blocklist (PowerDNS, Windows DNS, cloud DNS). */
+  unapplied_warning?: string | null;
 }
 
 export interface DNSBlockListFeedSkipped {
@@ -12119,17 +12263,12 @@ export interface ChangeRequestListParams {
   offset?: number;
 }
 
-// Threshold actions an approval policy can gate (mirror the backend
-// ``APPROVAL_POLICY_ACTIONS`` frozenset).
-export const APPROVAL_POLICY_ACTIONS = [
-  "delete",
-  "bulk_delete",
-  "bulk_edit",
-  "bulk_allocate",
-  "factory_reset",
-  "import_commit",
-] as const;
-export type ApprovalPolicyAction = (typeof APPROVAL_POLICY_ACTIONS)[number];
+// What the server can gate (#4910): the (action, resource_type) pairs a policy
+// may be saved for, read from the server, not kept here.
+export interface GateablePair {
+  action: string;
+  resource_type: string;
+}
 
 export interface ApprovalPolicy {
   id: string;
@@ -12222,6 +12361,10 @@ export const changeRequestsApi = {
       .then((r) => r.data),
   listPolicies: () =>
     api.get<ApprovalPolicy[]>("/change-requests/policies").then((r) => r.data),
+  gateablePairs: () =>
+    api
+      .get<GateablePair[]>("/change-requests/policies/gateable")
+      .then((r) => r.data),
   createPolicy: (body: ApprovalPolicyWrite) =>
     api
       .post<ApprovalPolicy>("/change-requests/policies", body)
@@ -12485,6 +12628,9 @@ export interface VersionInfo {
   latest_checked_at: string | null;
   release_check_enabled: boolean;
   latest_check_error: string | null;
+  // "unreachable" = no route to GitHub (DNS / connect / timeout; normal for
+  // an air-gapped install), "http" = GitHub answered with an error. #4799
+  latest_check_error_kind?: "unreachable" | "http" | null;
   // Appliance mode — true when the API runs on the SpatiumDDI OS
   // appliance ISO. Gates the "Appliance" sidebar entry and the
   // /appliance route. Phase 4 (issue #134).
@@ -12891,6 +13037,11 @@ export const applianceTlsApi = {
     api
       .get<ApplianceCertificateDetail>(`/appliance/tls/${id}`)
       .then((r) => r.data),
+  // Public certificate PEM, for a standalone agent's TLS_CA_PATH (#4660).
+  downloadPem: (id: string) =>
+    api
+      .get<string>(`/appliance/tls/${id}/pem`, { responseType: "text" })
+      .then((r) => r.data),
   upload: (body: CertificateUploadPayload) =>
     api
       .post<ApplianceCertificate>("/appliance/tls/upload", body)
@@ -13070,6 +13221,8 @@ export interface ApplianceRelease {
 export interface ApplianceReleasesResponse {
   installed_version: string;
   releases: ApplianceRelease[];
+  // Why `releases` is empty when the GitHub fetch failed (#4799).
+  fetch_error?: "unreachable" | "rate_limited" | "error" | null;
 }
 
 // #294 — read-only. The old one-click `apply` (+ `log` poll) drove a
@@ -13531,6 +13684,9 @@ export interface PairingCodeCreated {
   max_claims: number | null;
   note: string | null;
   created_at: string;
+  // #4659 — set when the code was minted while appliance registration is
+  // off, so an appliance using it cannot register yet.
+  warning?: string | null;
 }
 
 export interface PairingCodeRow {
@@ -13707,8 +13863,9 @@ export interface ApplianceRow {
   resolver_status: string | null;
   /** Issue #155 — per-host APT host-config state the supervisor reported:
    *  "synced" / "proxy-failed" / "mirror-unreachable" / "signature-mismatch"
-   *  / "no-sources" / "unmanaged", or null on non-appliance / pre-#155 /
-   *  never-reported rows. */
+   *  / "no-sources" / "unmanaged", or "update-stale" (#4800: the last
+   *  apt-get update is over 3 days old or never succeeded), or null on
+   *  non-appliance / pre-#155 / never-reported rows. */
   apt_state: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
@@ -13760,6 +13917,10 @@ export interface ApplianceRow {
   // or null on the first heartbeat / before any role assignment.
   role_switch_state: string | null;
   role_switch_reason: string | null;
+  // #4646 — assigned roles the supervisor did not start because the control
+  // plane has no agent key for them (``dns-bind9``, ``dhcp`` …). Empty =
+  // nothing waiting.
+  roles_awaiting_key?: string[];
   // #170 Wave E — supervisor's service-container watchdog. Free-form
   // map keyed by compose service name (``dns-bind9`` / ``dns-powerdns``
   // / ``dns-technitium`` / ``dhcp-kea``); each value carries the
@@ -13820,6 +13981,13 @@ export interface ApplianceRow {
     nodes_ready?: number;
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
+    // #4707 — present when a trial slot was committed although its control
+    // chart never applied (a revert was unsafe: the migrate Job had run).
+    control_plane_not_converged?: {
+      version?: string;
+      at?: string;
+      detail?: string;
+    };
     // #999 Part A — raw md / multipath reading, with NO verdict attached
     // (the appliance row carries that in `storage_findings` below). Typed
     // as the reading rather than as `NodeStorage` on purpose: `findings`

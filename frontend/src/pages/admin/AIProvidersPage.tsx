@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useState } from "react";
 import { useCredentialReask } from "@/hooks/useCredentialReask";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -243,10 +244,14 @@ function ProviderEditor({
         {tab === "connection" && (
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-name"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Name
               </label>
               <input
+                id="aiproviders-name"
                 value={form.name}
                 onChange={(e) => set("name", e.target.value)}
                 placeholder="e.g. local-ollama"
@@ -254,10 +259,14 @@ function ProviderEditor({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-kind"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Kind
               </label>
               <select
+                id="aiproviders-kind"
                 value={form.kind}
                 onChange={(e) => set("kind", e.target.value as AIProviderKind)}
                 disabled={mode === "edit"}
@@ -276,10 +285,14 @@ function ProviderEditor({
               )}
             </div>
             <div className="col-span-2">
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-base-url"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Base URL
               </label>
               <input
+                id="aiproviders-base-url"
                 value={form.base_url}
                 onChange={(e) => set("base_url", e.target.value)}
                 placeholder="http://host.docker.internal:11434/v1"
@@ -307,7 +320,10 @@ function ProviderEditor({
               </p>
             </div>
             <div className="col-span-2">
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-api-key"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 API key{" "}
                 <span className="text-muted-foreground/60">
                   {mode === "edit"
@@ -320,6 +336,7 @@ function ProviderEditor({
                 </span>
               </label>
               <input
+                id="aiproviders-api-key"
                 type="password"
                 value={form.api_key ?? ""}
                 // Blank = leave the stored key alone; removing it is the
@@ -354,10 +371,14 @@ function ProviderEditor({
               )}
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-default-model"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Default model
               </label>
               <input
+                id="aiproviders-default-model"
                 value={form.default_model}
                 onChange={(e) => set("default_model", e.target.value)}
                 placeholder="e.g. llama3.1:8b or gpt-4o-mini"
@@ -387,13 +408,17 @@ function ProviderEditor({
               )}
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-priority"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Priority{" "}
                 <span className="text-muted-foreground/60">
                   (lower = preferred)
                 </span>
               </label>
               <input
+                id="aiproviders-priority"
                 value={form.priority}
                 onChange={(e) => set("priority", e.target.value)}
                 className={inputCls}
@@ -410,13 +435,17 @@ function ProviderEditor({
               </label>
             </div>
             <div className="col-span-2">
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-options-json"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Options (JSON){" "}
                 <span className="text-muted-foreground/60">
                   — temperature, max_tokens, request_timeout_seconds, num_ctx, …
                 </span>
               </label>
               <textarea
+                id="aiproviders-options-json"
                 value={form.optionsJson}
                 onChange={(e) => set("optionsJson", e.target.value)}
                 rows={4}
@@ -479,7 +508,10 @@ function ProviderEditor({
             </div>
 
             <div>
-              <label className="mb-1 flex items-center justify-between text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="aiproviders-field"
+                className="mb-1 flex items-center justify-between text-xs font-medium text-muted-foreground"
+              >
                 <span>Override (leave blank to use default)</span>
                 {form.system_prompt_override &&
                   form.system_prompt_override.length > 0 && (
@@ -494,6 +526,7 @@ function ProviderEditor({
                   )}
               </label>
               <textarea
+                id="aiproviders-field"
                 value={form.system_prompt_override ?? ""}
                 onChange={(e) => set("system_prompt_override", e.target.value)}
                 rows={14}
@@ -505,7 +538,7 @@ function ProviderEditor({
                 <p className="text-[11px] text-muted-foreground">
                   {form.system_prompt_override &&
                   form.system_prompt_override.length > 0
-                    ? `${form.system_prompt_override.length.toLocaleString()} characters`
+                    ? `${form.system_prompt_override.length.toLocaleString()} ${pluralize(form.system_prompt_override.length, "character")}`
                     : "Empty — Copilot will use the baked-in default."}
                 </p>
                 {defaultPrompt && (

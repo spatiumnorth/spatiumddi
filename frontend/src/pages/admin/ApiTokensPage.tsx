@@ -27,6 +27,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { ReauthFields } from "@/components/ReauthFields";
+import { ListReadError } from "@/components/ui/list-read-error";
 import { copyToClipboard } from "@/lib/clipboard";
 import {
   buildEnrolmentUri,
@@ -78,10 +79,24 @@ export function CreateTokenModal({
     "none",
   );
   const [bindAction, setBindAction] = useState<"read" | "write" | "admin">(
-    "write",
+    "read",
   );
+  // #4846: offer only the access the caller holds on the picked type; the
+  // server stays the authority (a binding never exceeds its creator).
+  // Instance-scoped grants count: check the picked resource once there is
+  // one, and any grant of the action on the type before that.
+  const { can, hasAnyGrantFor } = usePermissions();
   const [bindGroupId, setBindGroupId] = useState("");
   const [bindResourceId, setBindResourceId] = useState("");
+  const mayBind = (action: "write" | "admin") =>
+    bindResourceId
+      ? can(action, bindType, bindResourceId)
+      : hasAnyGrantFor(action, bindType);
+  // A level picked before the resource falls back to read when the picked
+  // resource turns out not to allow it, so the select never shows (and the
+  // request never sends) a disabled option.
+  const effectiveBindAction =
+    bindAction !== "read" && !mayBind(bindAction) ? "read" : bindAction;
   const [stepPassword, setStepPassword] = useState("");
   const [stepTotp, setStepTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -109,12 +124,17 @@ export function CreateTokenModal({
     bindType !== "none" && bindResourceId
       ? [
           {
-            action: bindAction,
+            action: effectiveBindAction,
             resource_type: bindType,
             resource_id: bindResourceId,
           },
         ]
       : [];
+
+  // #4857: a binding type with nothing picked would send no grant, and a
+  // token with no grant carries its owner's whole permissions. Hold Create
+  // until the resource is picked (or the binding is set back to none).
+  const bindingIncomplete = bindType !== "none" && !bindResourceId;
 
   const mut = useMutation({
     mutationFn: () =>
@@ -144,6 +164,7 @@ export function CreateTokenModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
+          if (bindingIncomplete) return;
           setError(null);
           mut.mutate();
         }}
@@ -255,6 +276,7 @@ export function CreateTokenModal({
                 value={bindType}
                 onChange={(e) => {
                   setBindType(e.target.value as "none" | "subnet" | "dns_zone");
+                  setBindAction("read");
                   setBindResourceId("");
                   setBindGroupId("");
                 }}
@@ -269,14 +291,18 @@ export function CreateTokenModal({
                 <select
                   aria-label="Binding access"
                   className={inputCls}
-                  value={bindAction}
+                  value={effectiveBindAction}
                   onChange={(e) =>
                     setBindAction(e.target.value as "read" | "write" | "admin")
                   }
                 >
                   <option value="read">read</option>
-                  <option value="write">write</option>
-                  <option value="admin">admin</option>
+                  <option value="write" disabled={!mayBind("write")}>
+                    write
+                  </option>
+                  <option value="admin" disabled={!mayBind("admin")}>
+                    admin
+                  </option>
                 </select>
               )}
               {bindType === "subnet" && (
@@ -294,6 +320,13 @@ export function CreateTokenModal({
                     </option>
                   ))}
                 </select>
+              )}
+              {bindType === "subnet" && subnetsQ.isError && (
+                <ListReadError
+                  error={subnetsQ.error}
+                  what="subnets"
+                  className="text-xs"
+                />
               )}
               {bindType === "dns_zone" && (
                 <>
@@ -313,6 +346,21 @@ export function CreateTokenModal({
                       </option>
                     ))}
                   </select>
+                  {/* #4858: a refused read is not an empty list. */}
+                  {dnsGroupsQ.isError && (
+                    <ListReadError
+                      error={dnsGroupsQ.error}
+                      what="DNS groups"
+                      className="text-xs"
+                    />
+                  )}
+                  {bindGroupId && zonesQ.isError && (
+                    <ListReadError
+                      error={zonesQ.error}
+                      what="DNS zones"
+                      className="text-xs"
+                    />
+                  )}
                   {bindGroupId && (
                     <select
                       aria-label="DNS zone to bind"
@@ -360,7 +408,17 @@ export function CreateTokenModal({
           </button>
           <button
             type="submit"
-            disabled={!name || (!stepPassword && !stepTotp) || mut.isPending}
+            disabled={
+              !name ||
+              (!stepPassword && !stepTotp) ||
+              bindingIncomplete ||
+              mut.isPending
+            }
+            title={
+              bindingIncomplete
+                ? "Pick the resource to bind, or choose No resource binding"
+                : undefined
+            }
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mut.isPending ? "Creating…" : "Create"}
@@ -664,7 +722,10 @@ export function RevealTokenModal({
             token and create a new one.
           </div>
           {copyFailed && (
-            <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+            <div
+              role="alert"
+              className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300"
+            >
               Automatic copy failed (browser blocked the clipboard API — usually
               because the page is served over plain HTTP on a non-localhost
               host). The token is now visible below — select it manually and

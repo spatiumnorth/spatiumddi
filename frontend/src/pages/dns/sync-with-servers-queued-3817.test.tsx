@@ -15,7 +15,12 @@ afterEach(cleanup);
 
 const group = { id: "g1", name: "cloud" } as unknown as DNSServerGroup;
 
-function show(queued: boolean) {
+function show(
+  queued: boolean,
+  pushErrors: string[] = [],
+  zoneError: string | null = null,
+  extraZone = false,
+) {
   const result = {
     servers_attempted: 1,
     servers_succeeded: 1,
@@ -32,7 +37,7 @@ function show(queued: boolean) {
         driver: "technitium_api",
         error: null,
         result: {
-          zones_attempted: 1,
+          zones_attempted: extraZone ? 2 : 1,
           zones_succeeded: 1,
           zones_failed: 0,
           total_imported: 0,
@@ -51,16 +56,28 @@ function show(queued: boolean) {
               imported: 0,
               pushed: 250,
               server_records: 0,
-              push_errors: [],
+              push_errors: pushErrors,
               queued_for_agent: queued,
-              error: null,
+              error: zoneError,
             },
+            ...(extraZone
+              ? [
+                  {
+                    zone: "ok.example.com",
+                    imported: 0,
+                    pushed: 0,
+                    server_records: 1,
+                    push_errors: [],
+                    error: null,
+                  },
+                ]
+              : []),
           ],
         },
       },
     ],
   };
-  render(
+  return render(
     <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
         <SyncWithServersResultModal
@@ -87,5 +104,32 @@ describe("Sync with servers modal queued push (#3817)", () => {
     show(false);
     expect(screen.queryByText("Queued for delivery")).toBeNull();
     expect(screen.getByText("ok")).toBeTruthy();
+  });
+
+  it("announces records a server refused inside a synced zone (#4942)", () => {
+    show(false, ["A www: REFUSED"]);
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("A www: REFUSED");
+    expect(alert.textContent).toContain("big.example.com");
+    expect(document.querySelector("details")?.hasAttribute("open")).toBe(true);
+  });
+
+  it("opens the section and says so when a zone failed (#4953)", () => {
+    show(false, [], "AXFR refused", true);
+    expect(document.querySelector("details")?.hasAttribute("open")).toBe(true);
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("AXFR refused");
+    expect(screen.getByText("2 zones, 1 failed")).toBeTruthy();
+    const fig = screen.getByText("Zones failed").parentElement;
+    expect(fig?.textContent).toContain("1");
+  });
+
+  it("shows no failure text for a clean sync (#4953)", () => {
+    show(false);
+    expect(screen.queryByText(/\d+ failed/)).toBeNull();
+    expect(
+      screen.getByText("Zones failed").parentElement?.textContent,
+    ).toContain("0");
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

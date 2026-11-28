@@ -663,7 +663,7 @@ time — check NTP on both rather than looking at Celery.
 
 Appliance only. Tracked in [#3169](https://github.com/spatiumnorth/spatiumddi/issues/3169).
 
-**Symptom.** After rolling an appliance back to its previous slot (`spatium-upgrade-slot rollback` / `set-default`, or Fleet → OS Versions), the `spatium-supervisor` and the DNS / DHCP agent pods on that node (and the control plane, on a control-plane node) sit in `ErrImageNeverPull` at the old tag. `kubectl get pods -A` shows them; `kubectl describe pod` names an image that `k3s crictl images` does not list.
+**Symptom.** After rolling an appliance back to its previous slot (`spatium-upgrade-slot rollback` / `set-default`, or Appliance → Fleet → Appliances), the `spatium-supervisor` and the DNS / DHCP agent pods on that node (and the control plane, on a control-plane node) sit in `ErrImageNeverPull` at the old tag. `kubectl get pods -A` shows them; `kubectl describe pod` names an image that `k3s crictl images` does not list.
 
 **Cause.** k3s imports image tarballs from one directory on the shared `/var` (`/var/lib/rancher/k3s/agent/images`), not from the running slot. A slot upgrade copies the *new* slot's tarballs into it, and k3s's import cache (`.cache.json`, keyed on path, size and mtime) records them as imported. After a rollback the old slot's k3s therefore imports nothing, and every SpatiumDDI pod is `imagePullPolicy: Never`, so it only starts if containerd still holds the old images. A cluster join, promote or demote made on the newer slot, or kubelet image GC, removes them. The old slot's own tarballs are still on its root filesystem, but at the same path, so the `/var` mount hides them.
 

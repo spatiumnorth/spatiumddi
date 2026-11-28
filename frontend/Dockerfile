@@ -35,7 +35,7 @@ RUN npm run build
 
 
 # ── Stage 2: serve via nginx ──────────────────────────────────────────────────
-FROM nginx:1.31.8-alpine AS runtime
+FROM nginx:1.31.9-alpine AS runtime
 
 # Refresh the Alpine package set against the current index before copying
 # anything in. The nginx-alpine tag is rebuilt on nginx's cadence, not on

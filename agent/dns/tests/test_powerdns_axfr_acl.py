@@ -7,7 +7,10 @@ so a BIND9 (or second PowerDNS) secondary was told about every change and then
 REFUSED the transfer (``NOTAUTH``) — checked against a live pdns-auth 5.0.7
 and BIND 9.20 secondary. The grants come from the same source the BIND9 agent
 renders ``allow-transfer`` from (#734): the zone's ``allow_transfer`` override,
-else the server options', plus every bundle TSIG key.
+else the server options'. A TSIG key is granted only when that list names it
+(#4568): PowerDNS signs its outgoing NOTIFY with the first key in
+``TSIG-ALLOW-AXFR``, so granting every bundle key made a secondary without the
+key reject each NOTIFY and catch up only at its SOA refresh.
 """
 
 from __future__ import annotations
@@ -42,20 +45,57 @@ def _zone(name: str, **extra: Any) -> dict[str, Any]:
     }
 
 
-def test_the_server_transfer_policy_and_the_group_keys_reach_the_payload(
-    tmp_path: Path,
-) -> None:
+def test_the_server_transfer_policy_reaches_the_payload(tmp_path: Path) -> None:
     zones = _render(
         tmp_path,
         {
             "zones": [_zone("a.test")],
-            "options": {"allow_transfer": ["198.51.100.0/24", "any"]},
+            "options": {"allow_transfer": ["198.51.100.0/24", "any", "key spatium-xfr"]},
             "tsig_keys": [KEY],
         },
     )
     a = zones["a.test."]
     assert a["axfr_from"] == ["198.51.100.0/24", "0.0.0.0/0", "::/0"]
     assert [k["name"] for k in a["axfr_tsig_keys"]] == ["spatium-xfr"]
+
+
+def test_a_secondary_granted_by_address_gets_an_unsigned_notify(tmp_path: Path) -> None:
+    # #4568: PowerDNS signs NOTIFY with the first TSIG-ALLOW-AXFR key. A zone
+    # whose transfer policy names no key must carry none, or a secondary that
+    # does not hold the group key rejects every NOTIFY.
+    zones = _render(
+        tmp_path,
+        {
+            "zones": [
+                _zone("a.test", allow_transfer=["192.0.2.53"], also_notify=["192.0.2.53"]),
+                _zone("b.test"),
+                _zone("c.test", allow_transfer=["192.0.2.53", "key spatium-xfr"]),
+            ],
+            "options": {"allow_transfer": ["none"]},
+            "tsig_keys": [KEY, {**KEY, "name": "other"}],
+        },
+    )
+    assert zones["a.test."]["axfr_from"] == ["192.0.2.53/32"]
+    assert zones["a.test."]["axfr_tsig_keys"] == []
+    assert zones["b.test."]["axfr_tsig_keys"] == []
+    # Only the key the zone names, not every key in the bundle.
+    assert [k["name"] for k in zones["c.test."]["axfr_tsig_keys"]] == ["spatium-xfr"]
+
+
+def test_the_catalog_zone_carries_no_key_the_server_policy_does_not_name(
+    tmp_path: Path,
+) -> None:
+    zones = _render(
+        tmp_path,
+        {
+            "zones": [_zone("a.test")],
+            "options": {"allow_transfer": ["198.51.100.7"]},
+            "tsig_keys": [KEY],
+            "catalog": {"mode": "producer", "zone_name": "catalog.test", "members": []},
+        },
+    )
+    assert zones["catalog.test."]["axfr_from"] == ["198.51.100.7/32"]
+    assert zones["catalog.test."]["axfr_tsig_keys"] == []
 
 
 def test_a_zone_override_shadows_the_server_policy(tmp_path: Path) -> None:
@@ -71,16 +111,17 @@ def test_a_zone_override_shadows_the_server_policy(tmp_path: Path) -> None:
     assert zones["b.test."]["axfr_from"] == ["0.0.0.0/0", "::/0"]
 
 
-def test_none_grants_only_the_keys() -> None:
-    cidrs, keys = _axfr_grants(["none"], {"spatium-xfr": KEY}, "a.test.")
-    assert cidrs == []
-    assert [k["name"] for k in keys] == ["spatium-xfr"]
+def test_none_grants_nothing() -> None:
+    assert _axfr_grants(["none"], {"spatium-xfr": KEY}, "a.test.") == ([], [])
+    assert _axfr_grants(None, {"spatium-xfr": KEY}, "a.test.") == ([], [])
 
 
 def test_a_negated_entry_drops_every_address_grant_rather_than_widening() -> None:
     # Dropping only "!10.0.0.5" would grant 10.0.0.5 through the /8 — the
     # opposite of what the operator wrote.
-    cidrs, keys = _axfr_grants(["!10.0.0.5", "10.0.0.0/8"], {"spatium-xfr": KEY}, "a.test.")
+    cidrs, keys = _axfr_grants(
+        ["!10.0.0.5", "10.0.0.0/8", "key spatium-xfr"], {"spatium-xfr": KEY}, "a.test."
+    )
     assert cidrs == []
     assert [k["name"] for k in keys] == ["spatium-xfr"]
 

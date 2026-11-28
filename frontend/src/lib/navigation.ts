@@ -235,12 +235,6 @@ export const networkInfrastructureNav: NavEntry[] = [
     module: "network.e911",
   },
   {
-    label: "Devices",
-    icon: Cable,
-    to: "/network/devices",
-    module: "network.device",
-  },
-  {
     label: "Looking Glass",
     icon: Binoculars,
     to: "/network/looking-glass",
@@ -368,6 +362,12 @@ export const integrationsNav: NavEntry[] = [
     icon: Bird,
     to: "/netbird",
     module: "integrations.netbird",
+  },
+  {
+    label: "Network Devices (SNMP)",
+    icon: Cable,
+    to: "/network/devices",
+    module: "network.device",
   },
   {
     label: "OPNsense",
