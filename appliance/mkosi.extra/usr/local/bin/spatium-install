@@ -5910,29 +5910,31 @@ EOF
         if [ "$SET_ROOT_PASSWORD" != "yes" ]; then
             chroot "$MOUNT" passwd -l root >> "$INSTALL_LOG" 2>&1 || \
                 log "WARN: could not lock the root account"
-            # ...and make the rescue path this would otherwise remove work
-            # again. rescue.target / emergency.target run sulogin, which
-            # loops "Login incorrect" forever on a locked account — and
-            # spatium-grub-render ships a "(rescue / single-user)"
-            # menuentry, so without this the documented recovery route is a
-            # dead end on every appliance installed with the new default.
-            # SYSTEMD_SULOGIN_FORCE is a PHYSICAL-console escalation only,
-            # which is the same threat model as "sshd refuses root either
-            # way": someone at the console can already boot from anything.
-            mkdir -p "$MOUNT/etc/systemd/system/rescue.service.d" \
-                     "$MOUNT/etc/systemd/system/emergency.service.d"
-            for _u in rescue emergency; do
+            # emergency.target runs sulogin, which loops "Login incorrect"
+            # forever on a locked account, so give emergency.service
+            # SYSTEMD_SULOGIN_FORCE. That is a PHYSICAL-console escalation
+            # only, the same threat model as "sshd refuses root either way":
+            # someone at the console can already boot from anything.
+            #
+            # rescue.service no longer gets it (#5027): the image ships its
+            # own rescue.service drop-in (spatium-recovery-login.conf) that
+            # replaces sulogin with a login for the admin account on every
+            # slot, so a force drop-in here would be dead config. It only
+            # ever reached the slot this installer writes anyway, since the
+            # /etc overlay is mounted after systemd loads the unit.
+            mkdir -p "$MOUNT/etc/systemd/system/emergency.service.d"
+            for _u in emergency; do
                 cat > "$MOUNT/etc/systemd/system/$_u.service.d/10-spatium-sulogin.conf" <<EOF
 # Written by spatium-install (issue #995 item 12).
 # Root has no password (passwd -l), and sulogin cannot authenticate a
-# locked account — so without this the shipped rescue menuentry drops to
-# a prompt that can never be satisfied. Physical-console only.
+# locked account — so without this emergency mode drops to a prompt that
+# can never be satisfied. Physical-console only.
 [Service]
 Environment=SYSTEMD_SULOGIN_FORCE=1
 EOF
             done
             log "Root account locked (no console password); use sudo from $ADMIN_USER"
-            log "  rescue/emergency targets set SYSTEMD_SULOGIN_FORCE=1 so the console recovery path still works"
+            log "  emergency target sets SYSTEMD_SULOGIN_FORCE=1; the recovery menu entry asks for the admin account"
         else
             log "Root account password set from the admin password (operator opted in)"
         fi

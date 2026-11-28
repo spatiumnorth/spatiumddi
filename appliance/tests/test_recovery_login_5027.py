@@ -193,3 +193,15 @@ def test_pkill_comes_from_procps_which_the_image_lists() -> None:
     accident of openssh-server / cloud-init depending on it."""
     pkgs = (APPLIANCE / "mkosi.conf").read_text().split()
     assert "procps" in pkgs
+
+
+def test_installer_writes_no_rescue_service_drop_in() -> None:
+    """The installer's SYSTEMD_SULOGIN_FORCE drop-in reached only the slot it
+    wrote, and for rescue.service it is superseded by the image's own
+    spatium-recovery-login.conf on every slot. It must no longer be written for
+    rescue; emergency.service keeps it (emergency mode is not on any GRUB entry
+    and still runs sulogin)."""
+    installer = (APPLIANCE / "mkosi.extra/usr/local/bin/spatium-install").read_text()
+    assert "rescue.service.d" not in installer
+    assert "for _u in emergency; do" in installer
+    assert "Environment=SYSTEMD_SULOGIN_FORCE=1" in installer
