@@ -88,6 +88,7 @@ from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
 from app.api.v1.sessions.router import router as sessions_router
 from app.api.v1.settings.router import router as settings_router
+from app.api.v1.summary import router as summary_router
 from app.api.v1.system import router as system_router
 from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
@@ -586,6 +587,7 @@ api_v1_router.include_router(
 )
 api_v1_router.include_router(upgrades_router, prefix="/upgrades", tags=["upgrades"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
+api_v1_router.include_router(summary_router, prefix="/summary", tags=["summary"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
 # #2895 — the About page's data sources; signed-in callers only (see the module).
 api_v1_router.include_router(about_router, prefix="/about", tags=["about"])

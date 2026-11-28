@@ -840,6 +840,9 @@ _SERVES_A_BOUND_TOKEN = {
     "/api/v1/search",
     "/api/v1/search/types",
     "/api/v1/ai/mcp",
+    # @honours_token_binding: withholds every section the token cannot read
+    # with a type-wide grant (reason ``token_scoped``), never instance data.
+    "/api/v1/summary",
 }
 
 #: Responses that stream until the client goes away.

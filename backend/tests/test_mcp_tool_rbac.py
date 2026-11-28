@@ -294,6 +294,8 @@ _SESSION_ONLY_TOOLS = {
     "global_search",
     "ask_yes_no",
     "help_write_permission",
+    # GET /api/v1/summary is session-only too; build_summary gates each section (#2143).
+    "get_platform_summary",
 }
 
 
