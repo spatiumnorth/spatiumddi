@@ -13943,6 +13943,9 @@ export interface ApplianceRow {
     // is added by the cluster-health merge and is absent here, so the
     // wider type would let a caller read `undefined` and type-check.
     storage?: NodeStorageReading;
+    // #4731 — per-disk SMART / wear reading. Absent = the supervisor shipped
+    // none (old, or no collector): UNKNOWN, never healthy.
+    disk_health?: DiskHealthReading;
   };
   // #999 Part A — storage redundancy, classified server-side by the same
   // function that backs the `appliance_storage_degraded` alert and the
@@ -13953,6 +13956,16 @@ export interface ApplianceRow {
   // False = the supervisor never looked (too old to collect it), which is
   // UNKNOWN — distinct from "looked and found no arrays".
   storage_reported: boolean;
+  // #4731 — per-disk SMART / wear verdict, classified server-side by the
+  // function behind the `appliance_disk_smart_failing` and
+  // `appliance_disk_wear_high` alerts. `disk_reported` false = no current
+  // reading (UNKNOWN); a reported node with `disk_smart_available_count`
+  // 0 has only disks that hide SMART ("not available").
+  disk_findings: DiskFinding[];
+  disk_worst_severity: string | null;
+  disk_reported: boolean;
+  disk_smart_available_count: number;
+  disk_count: number;
   // #2400 — /var low or under the kubelet eviction headroom. Null = fine
   // or unknown (no reading, or a stale one).
   var_disk_finding?: VarDiskFinding | null;
@@ -14717,6 +14730,39 @@ export interface StorageFinding {
  * rides in an `ApplianceRow`'s `cluster_health` JSONB — no verdict, and
  * the row carries the classification in its own `storage_findings`.
  */
+export interface DiskReading {
+  name: string;
+  model: string | null;
+  serial: string | null;
+  firmware: string | null;
+  protocol: string | null;
+  size_bytes: number | null;
+  // False = the disk hides SMART (virtual disk, RAID volume).
+  smart_available: boolean;
+  smart_passed: boolean | null;
+  temperature_c: number | null;
+  power_on_hours: number | null;
+  percentage_used: number | null;
+  available_spare: number | null;
+  available_spare_threshold: number | null;
+  media_errors: number | null;
+  reallocated_sectors: number | null;
+  pending_sectors: number | null;
+}
+
+export interface DiskHealthReading {
+  smartctl_available: boolean;
+  collected_at: number;
+  disks: DiskReading[];
+}
+
+export interface DiskFinding {
+  severity: string;
+  kind: string;
+  disk: string;
+  detail: string;
+}
+
 export interface NodeStorageReading {
   md_supported: boolean;
   md_arrays: MdArray[];

@@ -2452,6 +2452,33 @@ trigger: release tag push (CalVer up to the bridge, SemVer from 1.0.0)
 >   "the ESP has no bootloader" before rebooting is far better off than
 >   one who reboots into a grub prompt.
 
+### Disk health — SMART and wear (#4731)
+
+A node on a single disk has no RAID to absorb a failure, and a disk that is
+about to fail says so well beforehand. `spatiumddi-smart-collect.timer` runs
+`smartctl --json -a` (smartmontools ships in the image) against every
+physical disk two minutes after boot and then hourly, at idle I/O priority
+(`-n standby` leaves a spun-down disk asleep), and writes the result to
+`release-state/disk-smart.json`. The supervisor reduces it into
+`cluster_health["disk_health"]` on its heartbeat; the field is optional, so
+an older supervisor or control plane simply never sees it. Nothing leaves the
+node.
+
+| Surface | What you see |
+|---|---|
+| Fleet row | A chip beside the cluster chip: `disk: ok`, `disk: attention`, `disk: failing`, or `disk: n/a`. No chip on a node that has not reported. |
+| Fleet drilldown | A **Disk health** block: the findings, then a per-disk table (model / serial, SMART status, temperature, percentage used, reallocated / pending sectors, media errors, power-on hours). |
+| Alerts | `appliance_disk_smart_failing` (SMART overall-health failed, pending or reallocated sectors, media errors, exhausted NVMe spare) and `appliance_disk_wear_high` (percentage of rated life used, threshold default 90%, critical at 100%). Both are seeded **disabled**. |
+| Copilot | `find_appliance_disk_health` (read-only, superadmin). |
+
+**A disk that hides SMART is "not available", never healthy.** A VM's
+virtual disk and a RAID controller's volume give smartctl nothing to report;
+the chip reads `disk: n/a` and the table says "not available". A reading
+older than about three hours (the timer stopped) is treated as no reading,
+and an open alert is held rather than resolved. The reallocated-sector alert
+fires while the count is above zero; it does not track growth between
+readings.
+
 ### Storage redundancy monitoring (#999 Part A)
 
 Every appliance now reports the state of its **software RAID (md)

@@ -754,6 +754,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_appliance_disk_health_alert_rules,
             seed_appliance_disk_usage_alert_rule,
             seed_appliance_heartbeat_alert_rule,
             seed_appliance_storage_alert_rule,
@@ -770,6 +771,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # /var filling (#2240): silent below 80%, and on a supervisor that
         # does not report /var.
         await seed_appliance_disk_usage_alert_rule()
+        # Disk SMART / wear (#4731) — seeded DISABLED.
+        await seed_appliance_disk_health_alert_rules()
         # Silent supervisor (#2259) — cannot fire with no appliances.
         await seed_appliance_heartbeat_alert_rule()
         # PostgreSQL instance not Ready / not streaming (#2856) — inert off

@@ -1,0 +1,141 @@
+#!/usr/bin/python3 -I
+"""spatiumddi-smart-collect — hourly SMART / wear snapshot of the host's disks (#4731).
+
+Runs as root from spatiumddi-smart-collect.timer, because reading SMART
+needs a raw-device ioctl that the supervisor pod's unprivileged uid does
+not have. For every physical disk it runs ``smartctl --json -a`` and writes
+one trimmed JSON document to
+
+    /var/lib/spatiumddi/release-state/disk-smart.json
+
+which the supervisor reads and folds into its heartbeat. The supervisor
+does the interpretation; this only collects, so a change to what counts as
+"worn" never needs a host-side release.
+
+  * smartmontools missing: write ``{"smartctl": false, ...}`` — the
+    supervisor reports "not available" rather than nothing, and rather
+    than a clean bill of health.
+  * a disk that hides SMART (a VM's virtual disk, a RAID controller): it is
+    still listed, with whatever smartctl said, so the control plane can
+    show "not available" for it. smartctl exit codes are a bit mask and
+    most of the bits are findings, not failures, so the exit status is
+    recorded and never treated as an error.
+  * ``-n standby`` keeps a spun-down disk asleep, and one smartctl call per
+    disk per hour is a handful of reads, so there is no effect on boot or
+    on the OS disk's I/O.
+
+The directory is writable by the api and the supervisor, and this runs as
+root: the document is created with a fresh mkstemp name next to the target
+and renamed over it (os.replace), which replaces whatever is at the name —
+a planted symlink included — and never writes through it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+STATE_DIR = Path("/var/lib/spatiumddi/release-state")
+OUT_NAME = "disk-smart.json"
+SYS_BLOCK = Path("/sys/block")
+# Block devices that are not physical disks: loop, ram, device-mapper, md,
+# optical, zram, network block, floppy.
+_SKIP = re.compile(r"^(loop|ram|dm-|md|sr|zram|nbd|fd)")
+_TIMEOUT = 60
+
+# What the supervisor reads. Anything else smartctl prints (the full
+# attribute table's names and flags, the error / self-test logs) is dropped.
+_KEEP = (
+    "device",
+    "model_name",
+    "model_family",
+    "serial_number",
+    "firmware_version",
+    "user_capacity",
+    "rotation_rate",
+    "smart_support",
+    "smart_status",
+    "temperature",
+    "power_on_time",
+    "ata_smart_attributes",
+    "nvme_smart_health_information_log",
+)
+
+
+def _disks() -> list[str]:
+    try:
+        names = sorted(p.name for p in SYS_BLOCK.iterdir())
+    except OSError:
+        return []
+    return [n for n in names if not _SKIP.match(n) and (SYS_BLOCK / n / "device").exists()]
+
+
+def _trim(doc: dict) -> dict:
+    out = {k: doc[k] for k in _KEEP if k in doc}
+    attrs = out.get("ata_smart_attributes")
+    if isinstance(attrs, dict):
+        out["ata_smart_attributes"] = {
+            "table": [
+                {"id": a.get("id"), "name": a.get("name"), "value": a.get("value"),
+                 "raw": {"value": (a.get("raw") or {}).get("value")}}
+                for a in attrs.get("table", [])
+                if isinstance(a, dict)
+            ]
+        }
+    sm = doc.get("smartctl")
+    if isinstance(sm, dict):
+        out["smartctl"] = {
+            "exit_status": sm.get("exit_status"),
+            "messages": [
+                {"string": m.get("string")}
+                for m in (sm.get("messages") or [])
+                if isinstance(m, dict)
+            ][:3],
+        }
+    return out
+
+
+def _collect(smartctl: str, name: str) -> dict:
+    entry: dict = {"name": name}
+    try:
+        proc = subprocess.run(
+            [smartctl, "--json", "-a", "-n", "standby", f"/dev/{name}"],
+            capture_output=True, text=True, timeout=_TIMEOUT, check=False,
+        )
+        entry["smart"] = _trim(json.loads(proc.stdout))
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        entry["error"] = f"{type(exc).__name__}"
+    return entry
+
+
+def main() -> int:
+    smartctl = shutil.which("smartctl")
+    doc: dict = {"collected_at": int(time.time()), "smartctl": smartctl is not None, "disks": []}
+    if smartctl:
+        doc["disks"] = [_collect(smartctl, n) for n in _disks()]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{OUT_NAME}.", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(doc, fh, separators=(",", ":"))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE_DIR / OUT_NAME)
+    except OSError as exc:
+        print(f"spatiumddi-smart-collect: {exc}", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

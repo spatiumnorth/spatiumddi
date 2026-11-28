@@ -1,0 +1,14 @@
+[Unit]
+Description=Hourly SMART and wear snapshot of the host's disks (issue #4731)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4731
+ConditionKernelCommandLine=!boot=live
+
+[Timer]
+# Two minutes after boot, so the first reading does not wait an hour and
+# does not compete with boot.
+OnBootSec=2min
+OnUnitActiveSec=1h
+Persistent=false
+
+[Install]
+WantedBy=timers.target

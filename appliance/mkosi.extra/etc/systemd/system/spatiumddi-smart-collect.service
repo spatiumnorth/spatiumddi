@@ -1,0 +1,13 @@
+[Unit]
+Description=Collect SMART and wear data for the host's disks (issue #4731)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4731
+After=local-fs.target
+ConditionKernelCommandLine=!boot=live
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-smart-collect
+# Lowest priority: the OS disk's I/O is never made to wait on this.
+Nice=19
+IOSchedulingClass=idle
+# Driven by spatiumddi-smart-collect.timer — no [Install].

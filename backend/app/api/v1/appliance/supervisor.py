@@ -4175,6 +4175,18 @@ class ApplianceRow(BaseModel):
     storage_findings: list[dict[str, str]] = []
     storage_worst_severity: str | None = None
     storage_reported: bool = False
+    # #4731 — per-disk SMART / wear, CLASSIFIED server-side from
+    # ``cluster_health["disk_health"]`` by the function the two disk alert
+    # rules and the copilot tool also call. ``disk_reported`` False = the
+    # supervisor shipped no reading (old, or the host has no collector);
+    # a reported node whose disks hide SMART has ``disk_smart_available_count``
+    # 0 and renders "not available", never healthy. The per-disk table reads
+    # ``cluster_health.disk_health.disks``.
+    disk_findings: list[dict[str, str]] = []
+    disk_worst_severity: str | None = None
+    disk_reported: bool = False
+    disk_smart_available_count: int = 0
+    disk_count: int = 0
     # #2400 — /var headroom against kubelet eviction, judged by the function
     # behind the ``appliance_disk_usage`` alert. ``None`` = fine or unknown.
     # The raw numbers are in ``cluster_health.host_disk_partitions``.
@@ -4263,6 +4275,29 @@ def _storage_findings(row: Appliance) -> list[StorageFinding]:
     """Classified storage findings for one appliance row (#999 Part A)."""
     ch = row.cluster_health if isinstance(row.cluster_health, dict) else {}
     return evaluate_storage(ch.get("storage"))
+
+
+def _disk_health_fields(row: Appliance) -> dict[str, Any]:
+    """The #4731 disk-health verdict for one appliance row."""
+    from app.services.appliance import disk_health  # noqa: PLC0415
+
+    ch = row.cluster_health if isinstance(row.cluster_health, dict) else {}
+    block = ch.get("disk_health")
+    # A stale reading is not a verdict about now: reported, but judged on
+    # nothing, which the UI shows as "not available".
+    current = disk_health.is_current(block)
+    findings = disk_health.evaluate_disks(block) if current else []
+    summary = disk_health.summarise(block if current else None)
+    return {
+        "disk_findings": [
+            {"severity": f.severity, "kind": f.kind, "disk": f.disk, "detail": f.detail}
+            for f in findings
+        ],
+        "disk_worst_severity": disk_health.worst_severity(findings),
+        "disk_reported": current,
+        "disk_smart_available_count": summary["smart_available_count"],
+        "disk_count": summary["disk_count"],
+    }
 
 
 def _storage_worst_severity(row: Appliance) -> str | None:
@@ -4389,6 +4424,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         ],
         storage_worst_severity=_storage_worst_severity(row),
         storage_reported=has_storage_report(row.cluster_health),
+        **_disk_health_fields(row),
         var_disk_finding=_var_disk_finding(row),
         **mtu_fields(row.cluster_health),
         k3s_version=row.k3s_version,
