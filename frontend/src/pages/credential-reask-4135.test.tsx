@@ -25,6 +25,7 @@ import type {
 } from "@/lib/api";
 
 const updateDevice = vi.fn();
+const DEVICE_ROW = vi.hoisted(() => ({}) as Record<string, unknown>);
 const updateServer = vi.fn();
 const updateSub = vi.fn();
 const updateTarget = vi.fn();
@@ -39,6 +40,8 @@ vi.mock("@/lib/api", async () => {
     networkApi: {
       ...actual.networkApi,
       updateDevice: (...a: unknown[]) => updateDevice(...a),
+      // Edit reads the device when it opens (#4370).
+      getDevice: (id: string) => Promise.resolve({ ...DEVICE_ROW, id }),
       listSpaces: () => Promise.resolve([]),
     },
     ipamApi: { ...actual.ipamApi, listSpaces: () => Promise.resolve([]) },
@@ -137,13 +140,15 @@ describe("SNMP device (community)", () => {
     auto_create_discovered: false,
     is_active: true,
   } as unknown as NetworkDeviceRead;
+  Object.assign(DEVICE_ROW, DEVICE);
 
   const addr = () => screen.getByDisplayValue("192.0.2.10") as HTMLInputElement;
   const community = () =>
     screen.getByPlaceholderText(/unchanged|re-enter/) as HTMLInputElement;
 
-  it("editing the address requires the community before Save", () => {
+  it("editing the address requires the community before Save", async () => {
     wrap(<DeviceFormModal device={DEVICE} onClose={() => {}} />);
+    await screen.findByDisplayValue("192.0.2.10");
     expect(saveBtn().disabled).toBe(false);
     expect(community().placeholder).toMatch(/unchanged/);
     type(addr(), "192.0.2.99");
@@ -155,8 +160,9 @@ describe("SNMP device (community)", () => {
     expect(saveBtn().disabled).toBe(false);
   });
 
-  it("changing the address back restores stored", () => {
+  it("changing the address back restores stored", async () => {
     wrap(<DeviceFormModal device={DEVICE} onClose={() => {}} />);
+    await screen.findByDisplayValue("192.0.2.10");
     const a = addr();
     type(a, "192.0.2.99");
     type(community(), "typed-for-the-new-address");
@@ -166,8 +172,9 @@ describe("SNMP device (community)", () => {
     expect(saveBtn().disabled).toBe(false);
   });
 
-  it("editing only the description does not ask", () => {
+  it("editing only the description does not ask", async () => {
     wrap(<DeviceFormModal device={DEVICE} onClose={() => {}} />);
+    await screen.findByDisplayValue("192.0.2.10");
     const desc = screen
       .getAllByRole("textbox")
       .find((e) => e.tagName === "TEXTAREA");

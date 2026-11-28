@@ -37,6 +37,7 @@ from app.models.ipam import CustomFieldDefinition, IPAddress, IPBlock, IPSpace, 
 from app.models.network import NetworkDevice
 from app.models.ownership import Site
 from app.models.vlans import VLAN
+from app.services.custom_field_text import custom_field_text
 from app.services.search.ranking import (
     EXACT,
     escape_like,
@@ -990,7 +991,10 @@ def _custom_field_hit(q: str, values: dict | None, names: list[str]) -> tuple[in
     return pick_match(
         q,
         [
-            (f"custom_field:{name}={values[name]}", str(values[name]))
+            (
+                f"custom_field:{name}={custom_field_text(values[name])}",
+                custom_field_text(values[name]),
+            )
             for name in names
             if (values or {}).get(name) is not None
         ],

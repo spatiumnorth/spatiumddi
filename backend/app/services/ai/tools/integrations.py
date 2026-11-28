@@ -9,7 +9,7 @@ to UI navigation.
 
 Each tool is gated by the matching feature_module
 (``integrations.kubernetes`` etc.) so disabling the integration in
-Settings → Features removes the tool from the AI surface in lock-step
+Features & Integrations removes the tool from the AI surface in lock-step
 with the sidebar entry.
 
 Output is intentionally narrow — name / endpoint / enabled state /

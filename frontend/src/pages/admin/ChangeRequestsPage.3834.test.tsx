@@ -19,7 +19,10 @@ vi.mock("@/lib/api", async () => {
     authApi: { ...actual.authApi, me: async () => ({ id: "me" }) },
     changeRequestsApi: {
       ...actual.changeRequestsApi,
-      list: async () => [cr("own", "me"), cr("other", "someone")],
+      listPage: async () => ({
+        items: [cr("own", "me"), cr("other", "someone")],
+        total: 2,
+      }),
     },
   };
 });

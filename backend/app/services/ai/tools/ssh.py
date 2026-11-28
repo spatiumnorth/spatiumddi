@@ -8,7 +8,7 @@ public key, which is safe to surface) — there is nothing to redact, unlike
 the SNMP community / syslog CA PEM.
 
 There is NO ``propose_*`` write tool — SSH config is changed through the
-Appliance → SSH form, same as SNMP / syslog (those writes carry a lockout-
+Appliance → Fleet → SSH form, same as SNMP / syslog (those writes carry a lockout-
 safety cross-check the form path enforces).
 
 Also home to ``find_remote_access_doors`` (#1013), which reports the SSH
@@ -43,7 +43,7 @@ class FindSshSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_ssh_settings",
-    permission="authenticated",
+    permission=("read", "settings"),
     description=(
         "Return the appliance SSH configuration: whether password "
         "authentication is enabled, whether root login is permitted, the sshd "

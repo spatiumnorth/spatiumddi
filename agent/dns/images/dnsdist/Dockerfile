@@ -21,11 +21,11 @@ ARG APK_SNAPSHOT=dev
 RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
     && apk upgrade --no-cache \
     && apk add --no-cache 'dnsdist>=2.0.8-r0' libcap bash tini \
-    # uid/gid PINNED (#50) — must match the powerdns image, whose agent
-    # writes the DoT/DoH listener key at mode 0600 into the volume this
+    # uid/gid PINNED (#50) — must match the powerdns image (10002:10002), whose
+    # agent writes the DoT/DoH listener key at mode 0600 into the volume this
     # container mounts read-only. See the matching note there.
-    && addgroup -S -g 102 spatium \
-    && adduser -S -u 101 -G spatium -h /var/lib/dnsdist spatium \
+    && addgroup -S -g 10002 spatium \
+    && adduser -S -u 10002 -G spatium -h /var/lib/dnsdist spatium \
     # dnsdist binds :53 as the unprivileged spatium user.
     && setcap cap_net_bind_service=+ep /usr/sbin/dnsdist 2>/dev/null \
        || setcap cap_net_bind_service=+ep /usr/bin/dnsdist

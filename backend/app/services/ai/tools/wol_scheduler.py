@@ -178,7 +178,7 @@ class FindWolSchedulesArgs(BaseModel):
 
 @register_tool(
     name="find_wol_schedules",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_schedule", "use_network_tools")),
     description=(
         "List scheduled Wake-on-LAN jobs. Each row carries the target mode, "
         "cron + timezone (or manual-only), next/last fire and last run status. "
@@ -212,7 +212,7 @@ class GetWolScheduleArgs(BaseModel):
 
 @register_tool(
     name="get_wol_schedule",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_schedule", "use_network_tools")),
     description=(
         "Get one Wake-on-LAN schedule in full — target selector, cron + "
         "timezone, the built-in holiday gate (blackout dates + active term "
@@ -241,7 +241,7 @@ class CountWolSchedulesArgs(BaseModel):
 
 @register_tool(
     name="count_wol_schedules",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_schedule", "use_network_tools")),
     description=(
         "Count Wake-on-LAN schedules, optionally filtered by enabled state. "
         "Returns {total, enabled, disabled, manual_only}. Read-only."
@@ -291,7 +291,7 @@ class FindWolRunsArgs(BaseModel):
 
 @register_tool(
     name="find_wol_runs",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_schedule", "use_network_tools")),
     description=(
         "List Wake-on-LAN execution history — one row per fire (scheduled OR "
         "manual), INCLUDING gated-skip runs so 'skipped because holiday' is "
@@ -328,7 +328,7 @@ class PreviewWolScheduleTargetsArgs(BaseModel):
 
 @register_tool(
     name="preview_wol_schedule_targets",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_schedule", "use_network_tools")),
     description=(
         "Resolve a saved Wake-on-LAN schedule's target fleet against its "
         "owner's read scope (what will actually fire), plus report the next "
@@ -476,7 +476,7 @@ class FindWolCalendarsArgs(BaseModel):
 
 @register_tool(
     name="find_wol_calendars",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_calendar", "use_network_tools")),
     description=(
         "List Wake-on-LAN calendar subscriptions (iCal .ics URL or CalDAV) whose "
         "all-day events gate scheduled wakes. Each row carries kind, refresh "
@@ -508,7 +508,7 @@ class GetWolCalendarArgs(BaseModel):
 
 @register_tool(
     name="get_wol_calendar",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_calendar", "use_network_tools")),
     description=(
         "Get one Wake-on-LAN calendar subscription in full — kind, URL, refresh "
         "cadence, cached event_count, last sync status/error, and whether a "
@@ -536,7 +536,7 @@ class FindWolCalendarEventsArgs(BaseModel):
 
 @register_tool(
     name="find_wol_calendar_events",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_calendar", "use_network_tools")),
     description=(
         "Preview a Wake-on-LAN calendar's upcoming cached all-day event spans "
         "(recurrence already expanded) within the next N days — the "
@@ -618,7 +618,7 @@ def _wake_failure_row(run: WolRun, schedule_name: str | None) -> dict[str, Any]:
 
 @register_tool(
     name="find_wol_wake_failures",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_schedule", "use_network_tools")),
     description=(
         "List Wake-on-LAN runs whose post-wake verify finished with hosts that "
         "never came up (unverified_count > 0), newest first. Covers both "
@@ -662,7 +662,7 @@ class CountWolWakeFailuresArgs(BaseModel):
 
 @register_tool(
     name="count_wol_wake_failures",
-    permission=("read", "use_network_tools"),
+    permission=("read", ("wol_schedule", "use_network_tools")),
     description=(
         "Count Wake-on-LAN runs whose verify finished with unconfirmed hosts, "
         "over the last N days. Returns {runs_with_failures, hosts_unverified, "

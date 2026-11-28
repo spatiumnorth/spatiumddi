@@ -173,6 +173,7 @@ BLOCKER_ZONE_IS_AD_INTEGRATED = "zone_is_ad_integrated"
 BLOCKER_TARGET_ZONE_VIEW_SCOPED = "target_zone_view_scoped"
 BLOCKER_SOURCE_SCOPE_INACTIVE = "source_scope_inactive"
 BLOCKER_LEASE_HANDOVER_PENDING = "lease_handover_pending"
+BLOCKER_POOL_CLASS_UNAVAILABLE = "pool_class_unavailable"
 
 
 @dataclass

@@ -1,0 +1,162 @@
+# Run Red Hat's `preflight check container` (#3913), in one of two modes.
+#
+# mode `check` (default): against a locally built image, CHECK ONLY, never
+# submitting. The image is pushed to a throwaway registry (below).
+#
+# mode `submit`: against the PUBLISHED reference ghcr.io/<owner>/<name>:<tag>,
+# with `--submit` to the Partner Connect certification component given by
+# `component-id`, authenticated with `pyxis-api-token`. Red Hat records the
+# repository path from what preflight checks, so a submission must never come
+# from the localhost registry. The GHCR images are public, so no docker auth
+# file is passed. A caller with no token should not run this mode.
+#
+# In check mode preflight pulls the image from a registry (it does not read the Docker
+# daemon), and its HasUniqueTag check lists the repository's tags, so the image
+# is pushed to a throwaway registry:2 on localhost under the tag it will ship
+# with. The preflight binary is pinned in versions.json (component `preflight`)
+# and verified against the sha256 GitHub publishes for the release asset; the
+# step fails closed on a mismatch.
+name: Preflight check
+description: Run a pinned `preflight check container`; check a local image, or submit a published one to Red Hat.
+inputs:
+  mode:
+    description: '`check` (local image, never submits) or `submit` (published image, submits to Red Hat).'
+    required: false
+    default: check
+  image:
+    description: Check mode only. Docker image reference present in the local daemon.
+    required: false
+    default: ''
+  registry-ref:
+    description: Submit mode only. Published repository prefix, e.g. ghcr.io/spatiumnorth.
+    required: false
+    default: ''
+  component-id:
+    description: Submit mode only. Partner Connect certification component id (a public identifier).
+    required: false
+    default: ''
+  pyxis-api-token:
+    description: Submit mode only. Red Hat Pyxis API token (pass a secret; it is only ever put in the environment).
+    required: false
+    default: ''
+  name:
+    description: Repository name to check it under (the image's published name).
+    required: true
+  tag:
+    description: The unique tag the image ships with (never just `latest`).
+    required: true
+  platform:
+    description: Architecture of the image (amd64 or arm64).
+    required: false
+    default: amd64
+  version:
+    description: preflight version.
+    required: false
+    default: '1.22.0'
+  sha256-amd64:
+    description: sha256 of the preflight-linux-amd64 release asset.
+    required: false
+    default: '1451ed8763f209f4d4a63848d9d62d1d40653a247db43d7606feb28eadbbd99b'
+runs:
+  using: composite
+  steps:
+    - name: Install preflight from the GitHub release
+      shell: bash
+      env:
+        PREFLIGHT_VERSION: ${{ inputs.version }}
+        PREFLIGHT_SHA256: ${{ inputs.sha256-amd64 }}
+      run: |
+        set -euo pipefail
+        if [ "${RUNNER_ARCH}" != "X64" ]; then
+          echo "::error::preflight-check: the pinned checksum is for the linux-amd64 binary; run it on an x86-64 runner"
+          exit 1
+        fi
+        bin="${RUNNER_TEMP}/preflight-bin"
+        mkdir -p "${bin}"
+        curl -fsSL --retry 3 --retry-all-errors -o "${bin}/preflight" \
+          "https://github.com/redhat-openshift-ecosystem/openshift-preflight/releases/download/${PREFLIGHT_VERSION}/preflight-linux-amd64"
+        echo "${PREFLIGHT_SHA256}  ${bin}/preflight" | sha256sum -c -
+        chmod +x "${bin}/preflight"
+        echo "${bin}" >> "${GITHUB_PATH}"
+        "${bin}/preflight" --version
+
+    - name: Submit the published image's results to Red Hat
+      if: inputs.mode == 'submit'
+      shell: bash
+      env:
+        REGISTRY_REF: ${{ inputs.registry-ref }}
+        NAME: ${{ inputs.name }}
+        TAG: ${{ inputs.tag }}
+        PLATFORM: ${{ inputs.platform }}
+        COMPONENT_ID: ${{ inputs.component-id }}
+        PYXIS_API_TOKEN: ${{ inputs.pyxis-api-token }}
+      run: |
+        set -euo pipefail
+        if [ -z "${REGISTRY_REF}" ] || [ -z "${COMPONENT_ID}" ] || [ -z "${PYXIS_API_TOKEN}" ]; then
+          echo "::error::preflight-check: submit mode needs registry-ref, component-id and pyxis-api-token"
+          exit 1
+        fi
+        out="${RUNNER_TEMP}/preflight-submit-${NAME}-${PLATFORM}"
+        mkdir -p "${out}"
+        ref="${REGISTRY_REF}/${NAME}:${TAG}"
+        rc=0
+        # The token is read from PYXIS_API_TOKEN, never echoed; no xtrace here.
+        preflight check container "${ref}" --platform "${PLATFORM}" --submit \
+          --pyxis-api-token "${PYXIS_API_TOKEN}" \
+          --certification-component-id "${COMPONENT_ID}" \
+          --artifacts "${out}/artifacts" --logfile "${out}/preflight.log" \
+          > "${out}/results.json" 2> "${out}/stderr.txt" || rc=$?
+        echo "── preflight submit ${ref} (${PLATFORM}), exit ${rc}"
+        if [ "${rc}" -ne 0 ]; then
+          # stderr can carry the request URL; scrub the token defensively.
+          sed "s|${PYXIS_API_TOKEN}|***|g" "${out}/stderr.txt" >&2 || true
+          exit 1
+        fi
+
+    - name: Push to a local registry and check
+      if: inputs.mode != 'submit'
+      shell: bash
+      env:
+        SRC: ${{ inputs.image }}
+        NAME: ${{ inputs.name }}
+        TAG: ${{ inputs.tag }}
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+        out="${RUNNER_TEMP}/preflight-${NAME}"
+        mkdir -p "${out}"
+        reg="preflight-registry-${NAME}"
+        docker rm -f "${reg}" >/dev/null 2>&1 || true
+        docker run -d --name "${reg}" -p 127.0.0.1:5000:5000 registry:2 >/dev/null
+        for _ in $(seq 1 20); do
+          curl -fsS http://127.0.0.1:5000/v2/ >/dev/null 2>&1 && break
+          sleep 1
+        done
+        ref="localhost:5000/${NAME}:${TAG}"
+        docker tag "${SRC}" "${ref}"
+        docker push --quiet "${ref}"
+        rc=0
+        preflight check container "${ref}" --insecure --platform "${PLATFORM}" \
+          --artifacts "${out}/artifacts" --logfile "${out}/preflight.log" \
+          > "${out}/results.json" 2> "${out}/stderr.txt" || rc=$?
+        docker rm -f "${reg}" >/dev/null 2>&1 || true
+        echo "── preflight ${NAME}:${TAG} (${PLATFORM}), exit ${rc}"
+        python3 - "${out}/results.json" <<'PY'
+        import json, sys
+        try:
+            data = json.load(open(sys.argv[1]))
+        except (OSError, ValueError) as exc:
+            print(f"   no results.json ({exc})")
+            raise SystemExit(0)
+        for bucket in ("passed", "failed", "errors"):
+            for check in data.get("results", {}).get(bucket, []) or []:
+                line = f"   {bucket[:-2] if bucket == 'passed' else bucket:7} {check.get('name')}"
+                if bucket != "passed":
+                    line += f" -- {check.get('help') or check.get('suggestion') or ''}"
+                print(line)
+        PY
+        if [ "${rc}" -ne 0 ]; then
+          echo "::error::preflight check container failed for ${NAME}:${TAG} (see the log above)"
+          cat "${out}/stderr.txt" >&2 || true
+          exit 1
+        fi

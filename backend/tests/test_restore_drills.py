@@ -636,6 +636,23 @@ async def test_enabling_drills_without_a_cron_is_rejected(
 
 
 @pytest.mark.asyncio
+async def test_blanking_cron_of_an_enabled_drill_is_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#4450: the payload carries only ``drill_cron``, but the stored
+    ``drill_enabled`` is true, so the edit would leave a dead schedule."""
+    _, token = await _make_user(db_session, username="drillblank")
+    target = await _make_target(db_session, name="blank-cron", drill_enabled=True)
+    res = await client.patch(
+        f"/api/v1/backup/targets/{target.id}",
+        json={"drill_cron": None},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 422
+    assert "drill_cron" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_setting_drill_cron_stamps_next_run(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

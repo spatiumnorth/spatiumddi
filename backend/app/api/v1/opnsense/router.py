@@ -24,7 +24,11 @@ from app.core.demo_mode import forbid_in_demo_mode
 from app.core.exc_text import describe_exc
 from app.core.permissions import require_resource_permission
 from app.core.ssrf import assert_safe_target
-from app.core.stored_secret_guard import require_secret_with_destination_change
+from app.core.stored_secret_guard import (
+    release_block_sync_credentials,
+    require_secret_for_changed_connection,
+    require_secret_with_destination_change,
+)
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
 from app.models.ipam import IPSpace
@@ -381,18 +385,29 @@ async def update_router(
         changes,
         destination=["host", "port"],
         secrets={"api_secret": r.api_secret_encrypted},
+        blank_keeps=("api_secret",),
     )
     new_ipam = changes.get("ipam_space_id", r.ipam_space_id)
     new_dns = changes.get("dns_group_id", r.dns_group_id)
     if "ipam_space_id" in changes or "dns_group_id" in changes:
         await _validate_bindings(db, new_ipam, new_dns)
 
+    block_sync_cleared = release_block_sync_credentials(
+        r,
+        changes,
+        destination=["host", "port"],
+        credentials={"block_sync_api_key": "", "block_sync_api_secret_encrypted": b""},
+        label="host",
+    )
     for k, v in changes.items():
         if k == "api_secret":
             if v:
                 r.api_secret_encrypted = encrypt_str(v)
         else:
             setattr(r, k, v)
+
+    if block_sync_cleared:
+        changes["block_sync_credentials_cleared"] = True
 
     _audit(
         db,
@@ -493,6 +508,12 @@ async def test_connection(
         stored = await db.get(OPNsenseRouter, body.router_id)
         if stored is None:
             raise HTTPException(status_code=404, detail="OPNsense firewall not found")
+        require_secret_for_changed_connection(
+            stored,
+            {"host": body.host, "port": body.port, "api_secret": body.api_secret},
+            destination=("host", "port"),
+            secrets={"api_secret": stored.api_secret_encrypted},
+        )
         host = host or stored.host
         port = body.port or stored.port
         verify_tls = body.verify_tls if body.verify_tls is not None else stored.verify_tls

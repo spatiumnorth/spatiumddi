@@ -1,4 +1,8 @@
+import { countNoun } from "@/lib/count-noun";
 import { ListEmpty, ListReadError } from "@/components/ui/list-read-error";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
+import { Field } from "@/components/ui/field";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -536,12 +540,20 @@ export function DICOMPage() {
         </section>
       </div>
 
-      {modal && (
-        <AEModal
-          mode={modal.mode}
-          ae={modal.mode === "edit" ? modal.ae : null}
+      {modal && modal.mode === "create" && (
+        <AEModal mode="create" ae={null} onClose={() => setModal(null)} />
+      )}
+      {modal && modal.mode === "edit" && (
+        <FreshEdit
+          row={modal.ae}
+          load={() => dicomApi.getAe(modal.ae.id)}
+          title="Edit Application Entity"
           onClose={() => setModal(null)}
-        />
+        >
+          {(fresh) => (
+            <AEModal mode="edit" ae={fresh} onClose={() => setModal(null)} />
+          )}
+        </FreshEdit>
       )}
       {impactOf && (
         <ImpactModal ae={impactOf} onClose={() => setImpactOf(null)} />
@@ -564,8 +576,16 @@ export function DICOMPage() {
         tone="destructive"
         confirmLabel="Delete"
         loading={delPeerMut.isPending}
+        error={
+          delPeerMut.error
+            ? formatApiError(delPeerMut.error, "Failed to delete association")
+            : null
+        }
         onConfirm={() => delPeer && delPeerMut.mutate(delPeer.id)}
-        onClose={() => setDelPeer(null)}
+        onClose={() => {
+          setDelPeer(null);
+          delPeerMut.reset();
+        }}
       />
       <ConfirmModal
         open={del !== null}
@@ -582,8 +602,19 @@ export function DICOMPage() {
         tone="destructive"
         confirmLabel="Delete"
         loading={delMut.isPending}
+        error={
+          delMut.error
+            ? formatApiError(
+                delMut.error,
+                "Failed to delete application entity",
+              )
+            : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
       />
     </div>
   );
@@ -991,7 +1022,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
                     {committed.skipped} skipped
                   </span>
                   <span className={ACTION_CLS.error}>
-                    {committed.errors} errors
+                    {countNoun(committed.errors, "error")}
                   </span>
                 </>
               ) : (
@@ -1007,7 +1038,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
                       {preview.skip_count} to skip
                     </span>
                     <span className={ACTION_CLS.error}>
-                      {preview.error_count} errors
+                      {countNoun(preview.error_count, "error")}
                     </span>
                   </>
                 )
@@ -1074,7 +1105,7 @@ function ImportModal({ onClose }: { onClose: () => void }) {
 
 // ── Create / edit ────────────────────────────────────────────────────
 
-function AEModal({
+export function AEModal({
   mode,
   ae,
   onClose,
@@ -1104,7 +1135,6 @@ function AEModal({
   const mut = useMutation({
     mutationFn: () => {
       const shared = {
-        ae_title: aeTitle.trim(),
         // Parse defensively: a non-numeric field would otherwise become
         // NaN, serialise to null, and hit the column's NOT NULL as an
         // opaque server error rather than a fixable form message.
@@ -1124,10 +1154,24 @@ function AEModal({
         // explicit null is how a retired host demotes its title to a
         // reservation, and omitting it would make "clear the anchor"
         // indistinguishable from "don't touch it".
-        const body: DICOMAEUpdate = { ...shared, ip_address_id: ipAddressId };
+        // An unchanged stored title is omitted: a legacy row may hold one
+        // the server now refuses, and re-sending it would block every edit.
+        const full: DICOMAEUpdate = {
+          ...shared,
+          ...(aeTitle === ae.ae_title ? {} : { ae_title: aeTitle.trim() }),
+          ip_address_id: ipAddressId,
+        };
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const body = changedFields(ae, full);
+        if (Object.keys(body).length === 0) return Promise.resolve(ae);
         return dicomApi.updateAe(ae.id, body);
       }
-      const body: DICOMAECreate = { ...shared, ip_address_id: ipAddressId };
+      const body: DICOMAECreate = {
+        ...shared,
+        ae_title: aeTitle.trim(),
+        ip_address_id: ipAddressId,
+      };
       return dicomApi.createAe(body);
     },
     onSuccess: () => {
@@ -1139,10 +1183,17 @@ function AEModal({
       setError(formatApiError(e, "Failed to save application entity")),
   });
 
-  // The AE value representation is capped at 16 *bytes*, and a non-ASCII
-  // character costs more than one — so measure bytes, like the server.
-  const titleBytes = new TextEncoder().encode(aeTitle.trim()).length;
-  const titleValid = titleBytes >= 1 && titleBytes <= 16;
+  // The AE value representation is 1-16 printable ASCII characters
+  // (0x20-0x7E) excluding backslash; only ASCII space is padding. Mirrors
+  // app.services.dicom.titles.validate_ae_title, which is authoritative.
+  const trimmedTitle = aeTitle.replace(/^ +| +$/g, "");
+  const titleLength = trimmedTitle.length;
+  const titleUnchanged = mode === "edit" && !!ae && aeTitle === ae.ae_title;
+  const titleValid =
+    titleUnchanged ||
+    (titleLength >= 1 &&
+      titleLength <= 16 &&
+      /^[\x20-\x5b\x5d-\x7e]+$/.test(trimmedTitle));
   const parsedPort = /^\d+$/.test(port.trim()) ? Number(port.trim()) : null;
   const portValid =
     port.trim() === "" ||
@@ -1174,10 +1225,18 @@ function AEModal({
             placeholder="e.g. CT1_RADIOLOGY"
             required
           />
+          {titleUnchanged &&
+            !/^[\x20-\x5b\x5d-\x7e]{1,16}$/.test(aeTitle.trim()) && (
+              <p className="text-[11px] text-amber-600 dark:text-amber-400">
+                This title has characters DICOM does not allow; rename it when
+                you can.
+              </p>
+            )}
           <p className="text-[11px] text-muted-foreground">
-            Unique across the whole institution. Up to 16 bytes ({titleBytes}{" "}
-            used); spaces are legal padding, backslash and control characters
-            are not. Case is significant — peers match the title exactly.
+            Unique across the whole institution. Up to 16 printable ASCII
+            characters ({titleLength} used); spaces are legal padding,
+            backslash, control characters and non-ASCII characters are not. Case
+            is significant — peers match the title exactly.
           </p>
         </Field>
 
@@ -1358,20 +1417,3 @@ const inputCls =
 
 const filterCls =
   "rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring";
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="block text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}

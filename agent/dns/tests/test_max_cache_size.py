@@ -123,3 +123,47 @@ def test_views_with_recursion_off_take_no_share(
     conf = (tmp_path / "rendered.new" / "named.conf").read_text()
     assert "max-cache-size 256m;" in conf
     assert conf.count("max-cache-size") == 1  # options-level, inherited per view
+
+
+# ── #4185 — the server group's own setting ───────────────────────────────────
+
+
+def test_group_setting_beats_env_and_the_derived_default() -> None:
+    env = {"NAMED_MAX_CACHE_SIZE": "256m"}
+    assert _render_max_cache_size(env, 2 * GIB, group_value="64m") == ("    max-cache-size 64m;\n")
+    assert _render_max_cache_size({}, 2 * GIB, caches=2, group_value="1g") == (
+        "    max-cache-size 1g;\n"
+    )
+
+
+def test_group_setting_applies_with_no_container_limit() -> None:
+    assert _render_max_cache_size({}, None, group_value="128m") == "    max-cache-size 128m;\n"
+
+
+@pytest.mark.parametrize("bad", ["unlimited", "0", "1g; };", "64mb"])
+def test_unusable_group_setting_falls_through(bad: str) -> None:
+    env = {"NAMED_MAX_CACHE_SIZE": "256m"}
+    assert _render_max_cache_size(env, 2 * GIB, group_value=bad) == "    max-cache-size 256m;\n"
+    assert _render_max_cache_size({}, 2 * GIB, group_value=bad) == "    max-cache-size 512m;\n"
+    assert _render_max_cache_size({}, 2 * GIB, group_value="") == "    max-cache-size 512m;\n"
+
+
+def test_rendered_conf_uses_the_group_setting_for_every_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One options-level value is each recursive view's own ceiling, so two
+    recursive views each get 64m, not a share of the derived default."""
+    monkeypatch.setenv("NAMED_MAX_CACHE_SIZE", "256m")
+    monkeypatch.setattr(bind9, "_cgroup_memory_limit_bytes", lambda *a, **k: 2 * GIB)
+    bundle = _bundle()
+    bundle["options"] = {"max_cache_size": "64m"}
+    bundle["views"] = [
+        {"name": "internal", "match_clients": ["10.0.0.0/8"], "recursion": True},
+        {"name": "kids", "match_clients": ["192.168.0.0/16"], "recursion": True},
+    ]
+    Bind9Driver(state_dir=tmp_path).render(bundle)
+    conf = (tmp_path / "rendered.new" / "named.conf").read_text()
+    opts = conf[conf.index("options {") : conf.index("\n};\n", conf.index("options {"))]
+    assert "max-cache-size 64m;" in opts
+    assert "max-cache-size 256m" not in conf
+    assert conf.count("max-cache-size") == 1  # inherited by both views

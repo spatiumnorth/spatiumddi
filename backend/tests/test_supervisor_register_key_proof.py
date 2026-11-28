@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.appliance import supervisor as supervisor_mod
 from app.config import settings
 from app.models.appliance import Appliance
+from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
 from app.services.appliance import cert_auth
 
@@ -152,6 +153,8 @@ async def test_registration_signed_by_another_key_is_refused(
     before = await _token_hash(db_session, aid)
     r = await client.post(URL, json=k.body("00000000", **k.proof(key=Ed25519PrivateKey.generate())))
     assert r.status_code == 403
+    assert r.headers["X-Register-Refusal"] == "bad_signature"
+    assert r.json()["detail"]["reason"] == "bad_signature"
     assert await _token_hash(db_session, aid) == before
 
 
@@ -163,7 +166,9 @@ async def test_a_registration_signature_is_accepted_once(
     body = k.body("00000000", **k.proof())
     assert (await client.post(URL, json=body)).status_code == 200
     before = await _token_hash(db_session, aid)
-    assert (await client.post(URL, json=body)).status_code == 403
+    again = await client.post(URL, json=body)
+    assert again.status_code == 403
+    assert again.headers["X-Register-Refusal"] == "replayed"
     assert await _token_hash(db_session, aid) == before
 
 
@@ -173,7 +178,21 @@ async def test_stale_registration_signature_is_refused(
 ) -> None:
     k, _, _ = await _registered(db_session, client, signed=True)
     r = await client.post(URL, json=k.body("00000000", **k.proof(age_s=3600)))
+    # Still a 403 (older supervisors read it as before), now with the reason.
     assert r.status_code == 403
+    assert r.headers["X-Register-Refusal"] == "clock_skew"
+    assert r.json()["detail"]["reason"] == "clock_skew"
+    assert "clock" in r.json()["detail"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_future_dated_proof_is_clock_skew_too(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    k, _, _ = await _registered(db_session, client, signed=True)
+    r = await client.post(URL, json=k.body("00000000", **k.proof(age_s=-3600)))
+    assert r.status_code == 403
+    assert r.headers["X-Register-Refusal"] == "clock_skew"
 
 
 @pytest.mark.asyncio
@@ -196,9 +215,151 @@ async def test_unsigned_reregister_refused_once_the_allowance_is_off(
     db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     k, _, _ = await _registered(db_session, client, signed=False)
-    monkeypatch.setattr(settings, "appliance_legacy_signature_allowed", False)
-    assert (await client.post(URL, json=k.body("00000000"))).status_code == 403
+    monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "never")
+    r = await client.post(URL, json=k.body("00000000"))
+    assert r.status_code == 403
+    assert "upgrade" in r.json()["detail"].lower()
     assert (await client.post(URL, json=k.body("00000000", **k.proof()))).status_code == 200
+
+
+async def _set_version(db: AsyncSession, aid: str, version: str | None) -> None:
+    import uuid
+
+    await db.rollback()
+    row = await db.get(Appliance, uuid.UUID(aid))
+    assert row is not None
+    row.supervisor_version = version
+    await db.commit()
+
+
+async def _unsigned_audit_rows(db: AsyncSession) -> list[AuditLog]:
+    await db.rollback()
+    return list(
+        (
+            await db.execute(
+                select(AuditLog).where(AuditLog.action == "appliance.supervisor_register_unsigned")
+            )
+        ).scalars()
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_version", ["2026.09.04-1", "1.0.0", "1.0.1-rc.1", None, "dev"])
+async def test_legacy_unsigned_reregister_of_old_version_is_audited_and_spends_budget(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    old_version: str | None,
+) -> None:
+    k, aid, tok = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, old_version)
+    claims: list[str] = []
+
+    async def _claim(ip: str) -> tuple[bool, int, int]:
+        claims.append(ip)
+        return True, 1, 1
+
+    monkeypatch.setattr(supervisor_mod, "claim_pairing_attempt", _claim)
+    r = await client.post(URL, json=k.body("00000000"))
+    assert r.status_code == 200, r.text
+    assert r.json()["session_token"] != tok
+    assert len(claims) == 1
+    rows = await _unsigned_audit_rows(db_session)
+    assert len(rows) == 1
+    assert rows[0].resource_id == aid
+    assert rows[0].result == "success"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", ["1.0.1", "1.0.2", "1.1.0", "2.0.0"])
+async def test_legacy_unsigned_reregister_of_signing_version_is_refused(
+    db_session: AsyncSession, client: AsyncClient, version: str
+) -> None:
+    k, aid, _ = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, version)
+    before = await _token_hash(db_session, aid)
+    r = await client.post(URL, json=k.body("00000000"))
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert "upgrade" in detail.lower() and "Fleet" in detail
+    assert "APPLIANCE_UNSIGNED_REGISTER_ALLOWED" in detail
+    assert await _token_hash(db_session, aid) == before
+    assert await _unsigned_audit_rows(db_session) == []
+
+
+async def _stored(db: AsyncSession, aid: str) -> tuple[str | None, dict[str, Any]]:
+    import uuid
+
+    await db.rollback()
+    row = await db.get(Appliance, uuid.UUID(aid))
+    assert row is not None
+    await db.refresh(row)
+    return row.supervisor_version, dict(row.capabilities or {})
+
+
+@pytest.mark.asyncio
+async def test_unsigned_reregister_keeps_the_stored_version_and_capabilities(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    k, aid, _ = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, "1.0.0")
+    version, caps = await _stored(db_session, aid)
+    r = await client.post(
+        URL,
+        json=k.body(
+            "00000000",
+            supervisor_version="1.0.1",
+            capabilities={"supervisor_version": "1.0.1", "register_proof": True},
+        ),
+    )
+    assert r.status_code == 200, r.text
+    assert await _stored(db_session, aid) == (version, caps)
+    assert len(await _unsigned_audit_rows(db_session)) == 1
+    # The row stays in the legacy window: a second unsigned call still works.
+    assert (await client.post(URL, json=k.body("00000000"))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_signed_reregister_updates_version_and_capabilities(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    k, aid, _ = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, "1.0.0")
+    r = await client.post(
+        URL,
+        json=k.body("00000000", supervisor_version="1.0.1", **k.proof()),
+    )
+    assert r.status_code == 200, r.text
+    version, caps = await _stored(db_session, aid)
+    assert version == "1.0.1"
+    assert caps.get("register_proof") is True
+
+
+@pytest.mark.asyncio
+async def test_unsigned_reregister_stops_when_the_attempt_budget_is_spent(
+    db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    k, aid, _ = await _registered(db_session, client, signed=False)
+    await _set_version(db_session, aid, "1.0.0")
+
+    async def _claim(_ip: str) -> tuple[bool, int, int]:
+        return False, 99, 99
+
+    monkeypatch.setattr(supervisor_mod, "claim_pairing_attempt", _claim)
+    before = await _token_hash(db_session, aid)
+    assert (await client.post(URL, json=k.body("00000000"))).status_code == 429
+    assert await _token_hash(db_session, aid) == before
+
+
+@pytest.mark.asyncio
+async def test_register_setting_leaves_the_heartbeat_legacy_flag_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two settings are independent: one default, one flag, each its own."""
+    assert settings.appliance_unsigned_register_allowed == "legacy"
+    assert settings.appliance_legacy_signature_allowed is True
+    monkeypatch.setattr(settings, "appliance_unsigned_register_allowed", "never")
+    assert settings.appliance_legacy_signature_allowed is True
 
 
 @pytest.mark.asyncio

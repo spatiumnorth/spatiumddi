@@ -59,6 +59,13 @@ _CACHE_TTL_S = 30.0
 _cache: dict[str, tuple[float, tuple[str, frozenset[str]], dict[str, str]]] = {}
 
 
+def leaf_pem(cert_pem: str) -> str:
+    """The FIRST certificate in ``cert_pem`` re-encoded as its own PEM: the
+    leaf a supervisor pins, without the chain an uploaded certificate carries."""
+    leaf = x509.load_pem_x509_certificates(cert_pem.encode("ascii"))[0]
+    return leaf.public_bytes(Encoding.PEM).decode("ascii")
+
+
 def cert_sha256(cert_pem: str) -> str:
     """SHA-256 of the DER of the FIRST certificate in ``cert_pem`` (the leaf;
     an uploaded or ACME certificate is stored with its chain after it)."""
@@ -66,7 +73,8 @@ def cert_sha256(cert_pem: str) -> str:
     return hashlib.sha256(leaf.public_bytes(Encoding.DER)).hexdigest()
 
 
-async def _active_row_fingerprints(db: AsyncSession) -> set[str]:
+async def _active_row_certs(db: AsyncSession) -> dict[str, str]:
+    """fingerprint -> leaf PEM for every active certificate row."""
     rows = (
         (
             await db.execute(
@@ -76,20 +84,20 @@ async def _active_row_fingerprints(db: AsyncSession) -> set[str]:
         .scalars()
         .all()
     )
-    fingerprints: set[str] = set()
+    certs: dict[str, str] = {}
     for row in rows:
         if not row.cert_pem:
             continue
         try:
-            fingerprints.add(cert_sha256(row.cert_pem))
+            certs[cert_sha256(row.cert_pem)] = leaf_pem(row.cert_pem)
         except ValueError:
             # An unparseable row vouches for nothing. It must not 500 the
             # endpoint, or every supervisor loses the ability to re-pin.
             continue
-    return fingerprints
+    return certs
 
 
-async def _deployed_fingerprint() -> str | None:
+async def _deployed_cert() -> tuple[str, str] | None:
     """The certificate in the TLS Secret, listed ALONGSIDE the active row.
 
     The active ``ApplianceCertificate`` is what the api deploys into the
@@ -107,7 +115,7 @@ async def _deployed_fingerprint() -> str | None:
     if deployed is None:
         return None
     try:
-        return cert_sha256(deployed[0])
+        return cert_sha256(deployed[0]), leaf_pem(deployed[0])
     except ValueError:
         return None  # an unparseable Secret vouches for nothing; the rows still count
 
@@ -119,18 +127,23 @@ async def signed_pin_set(db: AsyncSession) -> dict[str, str] | None:
     ca = await db.get(ApplianceCA, 1)
     if ca is None:
         return None
-    rows = await _active_row_fingerprints(db)
-    key = (ca.cert_pem, frozenset(rows))
+    certs = await _active_row_certs(db)
+    key = (ca.cert_pem, frozenset(certs))
     hit = _cache.get("pin_set")
     if hit is not None and hit[1] == key and time.monotonic() - hit[0] < _CACHE_TTL_S:
         return hit[2]
-    deployed = await _deployed_fingerprint()
+    deployed = await _deployed_cert()
     if deployed is not None:
-        rows.add(deployed)
+        certs[deployed[0]] = deployed[1]
     payload = json.dumps(
         {
             "version": 1,
-            "certs_sha256": sorted(rows),
+            "certs_sha256": sorted(certs),
+            # #4223: the certificates themselves, so a supervisor whose pin
+            # went stale can adopt a vouched one without an https call that
+            # fails first. Inside the signed payload, so it is exactly as
+            # trustworthy as the fingerprints; an older supervisor ignores it.
+            "certs_pem": [certs[fp] for fp in sorted(certs)],
             "issued_at": datetime.now(UTC).isoformat(),
         },
         sort_keys=True,

@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -41,6 +42,7 @@ import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 import { DaemonStateBanner } from "@/components/DaemonStateChip";
 import { DuplicateAgentChip } from "@/components/DuplicateAgentChip";
+import { AgentMemoryPanel } from "@/components/AgentMemoryPanel";
 import { SpoolChip } from "@/components/SpoolChip";
 import { syncCard } from "@/lib/dhcp-sync-label";
 import {
@@ -310,9 +312,23 @@ function OverviewTab({
       <div className="grid grid-cols-2 gap-3">
         <OverviewInfo server={server} />
       </div>
+      <AgentMemoryPanel
+        serverId={server.id}
+        status={server.memory_status}
+        daemonLabel={daemonRssLabel(server.driver)}
+        fetchHistory={(id) => dnsApi.getMemoryHistory(id)}
+        queryKeyPrefix="dns-server"
+      />
       {isBind9 && <RndcStatusPanel serverId={server.id} />}
     </div>
   );
+}
+
+/** What the daemon RSS row is called for each agent-managed driver. */
+function daemonRssLabel(driver: string): string {
+  if (driver === "powerdns") return "pdns_server";
+  if (driver === "technitium") return "Technitium";
+  return "named";
 }
 
 function OverviewInfo({ server }: { server: DNSServer }) {
@@ -1068,7 +1084,8 @@ function StatsTab({ serverId }: { serverId: string }) {
       {analytics.data && (
         <p className="text-[11px] text-muted-foreground">
           Top-N rollups computed against the parsed BIND9 query log (24&nbsp;h
-          retention) — {analytics.data.total_queries.toLocaleString()} queries
+          retention) — {analytics.data.total_queries.toLocaleString()}{" "}
+          {pluralize(analytics.data.total_queries, "query", "queries")}
           in window.
         </p>
       )}
@@ -1305,7 +1322,10 @@ function ErrorBlock({ error, what }: { error?: unknown; what?: string }) {
     );
   }
   return (
-    <div className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive">
+    <div
+      role="alert"
+      className="flex items-center justify-center gap-2 rounded-md border border-destructive/40 bg-destructive/5 py-8 text-sm text-destructive"
+    >
       <Activity className="h-4 w-4" />
       Failed to load — try again
     </div>

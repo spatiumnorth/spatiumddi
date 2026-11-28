@@ -189,6 +189,61 @@ _DNSSEC_RECORD_TYPES = frozenset(
 # Verified live: ECDSA/P256/RSA/EDDSA and NSEC/NSEC3 all sign successfully.
 _DNSSEC_SIGN_DEFAULTS = {"algorithm": "ECDSA", "curve": "P256", "nxProof": "NSEC"}
 
+# DNSSECPolicy ``algorithm`` token → ``zones/dnssec/sign`` parameters and the
+# IANA algorithm number the resulting keys carry (used to tell a signed zone
+# whose policy has since changed). RSA key sizes are not on the policy, so 2048
+# bits (what BIND's rsasha256/512 policies use).
+_DNSSEC_POLICY_ALGORITHMS: dict[str, tuple[dict[str, str], int]] = {
+    "ecdsap256sha256": ({"algorithm": "ECDSA", "curve": "P256"}, 13),
+    "ecdsap384sha384": ({"algorithm": "ECDSA", "curve": "P384"}, 14),
+    "ed25519": ({"algorithm": "EDDSA", "curve": "ED25519"}, 15),
+    "ed448": ({"algorithm": "EDDSA", "curve": "ED448"}, 16),
+    "rsasha256": (
+        {"algorithm": "RSA", "hashAlgorithm": "SHA256", "kskKeySize": "2048", "zskKeySize": "2048"},
+        8,
+    ),
+    "rsasha512": (
+        {"algorithm": "RSA", "hashAlgorithm": "SHA512", "kskKeySize": "2048", "zskKeySize": "2048"},
+        10,
+    ),
+}
+
+
+def _dnssec_sign_spec(policy: dict[str, Any] | None) -> dict[str, Any]:
+    """Map a bundle ``dnssec_policies`` entry onto Technitium's sign call.
+
+    ``policy`` None is the built-in ``default`` (ECDSA P256, NSEC, Technitium's
+    own 30-day ZSK roll). Returns ``{"params", "algorithm_number", "nsec3",
+    "ignored"}``: ``params`` goes to ``zones/dnssec/sign`` as is,
+    ``algorithm_number`` / ``nsec3`` describe what a zone signed from it looks
+    like, and ``ignored`` lists the policy settings Technitium cannot express
+    (reported, never silently dropped): a KSK lifetime (its ``rolloverDays`` is
+    set per key at creation, so a KSK never rolls on its own here) and NSEC3
+    opt-out.
+    """
+    algo = str((policy or {}).get("algorithm") or "ecdsap256sha256").lower()
+    base, number = _DNSSEC_POLICY_ALGORITHMS.get(
+        algo, _DNSSEC_POLICY_ALGORITHMS["ecdsap256sha256"]
+    )
+    params: dict[str, str] = dict(base)
+    ignored: list[str] = []
+    if algo not in _DNSSEC_POLICY_ALGORITHMS:
+        ignored.append(f"algorithm {algo!r} (signed ecdsap256sha256 instead)")
+    nsec3 = bool((policy or {}).get("nsec3"))
+    params["nxProof"] = "NSEC3" if nsec3 else "NSEC"
+    if nsec3:
+        params["iterations"] = str(int((policy or {}).get("nsec3_iterations") or 0))
+        params["saltLength"] = str(int((policy or {}).get("nsec3_salt_length") or 0))
+        if (policy or {}).get("nsec3_optout"):
+            ignored.append("NSEC3 opt-out")
+    if policy is not None and policy.get("zsk_lifetime_days") is not None:
+        # Technitium: 0 disables the automatic ZSK roll, 1-365 is the period.
+        params["zskRolloverDays"] = str(min(max(int(policy["zsk_lifetime_days"]), 0), 365))
+    if (policy or {}).get("ksk_lifetime_days"):
+        ignored.append("KSK lifetime")
+    return {"params": params, "algorithm_number": number, "nsec3": nsec3, "ignored": ignored}
+
+
 # DS digest-type name → the number that goes in a DS record's presentation
 # form (RFC 4034 §5.1.3 / RFC 8624).
 _DS_DIGEST_TYPES = {"SHA1": 1, "SHA256": 2, "GOST": 3, "SHA384": 4}
@@ -1726,7 +1781,7 @@ def _transfer_access(
 #: Zone types whose NOTIFY the group / zone settings govern (#2267). Technitium
 #: accepts ``notify`` on Primary and Secondary zones; a Stub or Forwarder zone
 #: has nothing to notify (BIND renders no notify for them either).
-_NOTIFY_ZONE_TYPES = frozenset({"Primary", "Secondary"})
+_NOTIFY_ZONE_TYPES = frozenset({"Primary", "Secondary", "Catalog"})
 
 #: BIND's ``notify`` choices that notify from Primary zones only.
 _NOTIFY_PRIMARY_ONLY = frozenset({"master-only", "primary-only"})
@@ -1785,6 +1840,12 @@ def _notify_options(
         notify = "SpecifiedNameServers" if targets else "None"
     else:
         notify = "BothZoneAndSpecifiedNameServers" if targets else "ZoneNameServers"
+    if ztype == "Catalog":
+        # A catalog zone's own NS set is not a real server (RFC 9432 §4.2
+        # says to use ``invalid.``), so notifying "the zone's name servers"
+        # only wastes lookups. Only the operator's also-notify addresses —
+        # the consumers — are ever notified (#1766).
+        notify = "None" if mode == "no" or not targets else "SpecifiedNameServers"
     if notify in ("None", "ZoneNameServers"):
         targets = []
     return {"notify": notify, "notifyNameServers": targets}, unapplied
@@ -1890,7 +1951,7 @@ def _zone_options_payload(
         notify, notify_unapplied = _notify_options(ztype, bundle, zone)
         payload.update(notify)
         unapplied.extend(notify_unapplied)
-    if ztype != "Primary":
+    if ztype not in ("Primary", "Catalog"):
         if unapplied:
             payload["_unapplied"] = unapplied
         return payload
@@ -2418,6 +2479,9 @@ class TechnitiumDriver(DriverBase):
     _unapplied_acl: dict[str, list[str]] | None = None
     # Zone names in the ledger before the current pass; see _retire_dropped_zones.
     _owned_before: frozenset[str] | None = None
+    # The ledger file did not exist this pass (lost / replaced state dir, or
+    # a first run), so an absent name is "not recorded", not "not ours" (#4441).
+    _ledger_lost: bool = False
 
     def _note_apply_failure(self, what: str) -> None:
         if self._apply_failures is not None:
@@ -2504,6 +2568,9 @@ class TechnitiumDriver(DriverBase):
             log.warning("technitium_transfer_key_not_installed", where=where, key=wanted)
             return None
 
+        policies_by_name = {
+            p.get("name"): p for p in (bundle.get("dnssec_policies") or []) if p.get("name")
+        }
         zones_payload = []
         for zone in raw_zones or []:
             zname = (zone.get("name") or "").rstrip(".")
@@ -2633,6 +2700,11 @@ class TechnitiumDriver(DriverBase):
                 apex = _zone_apex(zname, zone)
                 if apex is not None:
                     entry["apex"] = apex
+            if ztype == "Primary" and zone.get("dnssec_enabled"):
+                # #1767 — signing state is structural: the zone is signed (with
+                # the policy's parameters) on every apply that finds it unsigned.
+                pname = zone.get("dnssec_policy_name")
+                entry["dnssec"] = _dnssec_sign_spec(policies_by_name.get(pname) if pname else None)
             zones_payload.append(entry)
 
 
@@ -2642,6 +2714,12 @@ class TechnitiumDriver(DriverBase):
         # Written to its own file, and 0600: unlike zones.json this one
         # carries TSIG shared secrets.
         catalog = bundle.get("catalog") or bundle.get("catalog_block") or None
+        if catalog and catalog.get("mode") == "producer":
+            # The Catalog zone is created with transfer Deny / notify None
+            # and is not in the bundle's zone list, so its own options are
+            # resolved here the way a member's are: an external secondary
+            # has to be able to AXFR the catalog itself (#1766).
+            catalog = {**catalog, "options": _zone_options_payload("Catalog", bundle)}
         server_payload = {
             # Encrypted transports + forwarders (#741). Carried verbatim so
             # swap_and_reload can apply them without re-reading the bundle.
@@ -2861,11 +2939,13 @@ class TechnitiumDriver(DriverBase):
         # the reconcile meets a zone that already exists on the daemon the
         # file can no longer say whether we put it there. ``None`` = unknown.
         self._owned_before = None
+        self._ledger_lost = False
         try:
             managed = {str(n).lower() for n in json.loads(path.read_text())}
             self._owned_before = frozenset(managed)
         except FileNotFoundError:
             self._owned_before = frozenset()
+            self._ledger_lost = True
             managed = set()
             try:
                 previous = json.loads(previous_render.read_text())
@@ -2891,7 +2971,7 @@ class TechnitiumDriver(DriverBase):
                     reason="bundle_has_no_zone_list",
                     zones=sorted(managed - desired),
                 )
-            self._write_secret(path, json.dumps(sorted(managed | desired)))
+            self._write_secret(path, json.dumps(sorted(managed | self._already_owned(desired))))
             return
 
         named = {str(n).lower() for n in bundle_zone_names}
@@ -2915,7 +2995,37 @@ class TechnitiumDriver(DriverBase):
                 kept.add(zone)
                 log.warning("technitium_zone_retire_failed", zone=zone, error=error)
 
-        self._write_secret(path, json.dumps(sorted(desired | held | kept)))
+        # A zone new to the ledger is added by ``_ensure_zone_exists`` once the
+        # agent has created it or it passed the ownership check, never here
+        # (#4431): a pass that aborts before reaching a hand-made zone would
+        # otherwise leave it in the ledger, and the next pass would read it
+        # as ours and delete its records.
+        self._write_secret(path, json.dumps(sorted(self._already_owned(desired) | held | kept)))
+
+    def _already_owned(self, names: set[str]) -> set[str]:
+        """The names in ``names`` the ledger held before this pass.
+
+        An unreadable ledger (``_owned_before`` is ``None``) cannot say, and
+        does not block (see ``_zone_is_ours``), so every name counts.
+        """
+        if self._owned_before is None:
+            return set(names)
+        return {n for n in names if n in self._owned_before}
+
+    def _claim_zone(self, zone: str) -> None:
+        """Record a zone in the ledger: this agent created it or it passed the
+        ownership check (#1775, #4431)."""
+        path = self._managed_zones_path()
+        try:
+            names = {str(n).lower() for n in json.loads(path.read_text())}
+        except FileNotFoundError:
+            names = set()
+        except (OSError, ValueError, TypeError):
+            return
+        if zone.lower() in names:
+            return
+        names.add(zone.lower())
+        self._write_secret(path, json.dumps(sorted(names)))
 
     def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
         """Publish the bundle's TSIG keys into Technitium's global settings.
@@ -2980,8 +3090,12 @@ class TechnitiumDriver(DriverBase):
     ) -> None:
         """Apply the group's catalog-zone role.
 
-        **Producer** creates the ``Catalog`` zone and stamps
-        ``catalog=<name>`` onto each primary this server owns.
+        **Producer** creates the ``Catalog`` zone, applies its transfer /
+        notify options (``catalog["options"]``, from ``render``), and stamps
+        ``catalog=<name>`` onto each primary this server owns together with
+        the ``overrideCatalog*`` flags, so a member keeps its own transfer,
+        notify and query-access settings instead of the catalog zone's
+        (#1766).
 
         **Consumer** is not a role (#3764). Every agent in a group already
         gets every zone in its bundle, so a ``SecondaryCatalog`` would only
@@ -3016,6 +3130,12 @@ class TechnitiumDriver(DriverBase):
 
         if mode == "producer" and cat_name:
             self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
+            # A new Catalog zone is created with zoneTransfer=Deny and
+            # notify=None, so without its own options no consumer can read
+            # the catalog (#1766).
+            catalog_options = (catalog or {}).get("options")
+            if catalog_options:
+                self._apply_zone_options(token, cat_name, catalog_options)
 
         # Producer stamps the name on; disabled clears it. Empty string is
         # how Technitium clears the field (verified — it reads back null).
@@ -3024,9 +3144,20 @@ class TechnitiumDriver(DriverBase):
             if entry.get("type") != "Primary":
                 continue
             zone = entry["zone"]
-            resp = self._call(
-                token, "POST", "zones/options/set", {"zone": zone, "catalog": desired}
-            )
+            params: dict[str, Any] = {"zone": zone, "catalog": desired}
+            if desired:
+                # A member otherwise takes its transfer, notify and query
+                # access from the catalog zone (``DnsServer`` /
+                # ``AuthZoneInfo``), whose own are Deny / None: that undid
+                # the #734 transfer grant on every zone of the producer.
+                # The zone's own options, already applied by the reconcile
+                # above, stay in force (#1766).
+                params.update(
+                    overrideCatalogZoneTransfer="true",
+                    overrideCatalogNotify="true",
+                    overrideCatalogQueryAccess="true",
+                )
+            resp = self._call(token, "POST", "zones/options/set", params)
             body = resp.json()
             if body.get("status") != "ok":
                 log.warning(
@@ -3205,6 +3336,8 @@ class TechnitiumDriver(DriverBase):
             return {"dnssec_state": self._dnssec_sign(token, zone)}
         if op_kind == "dnssec_unsign":
             return {"dnssec_state": self._dnssec_unsign(token, zone)}
+        if op_kind == "dnssec_rollover":
+            return self._dnssec_rollover(token, op)
 
         rec = op["record"]
         rtype = (rec.get("type") or "").upper()
@@ -3932,6 +4065,88 @@ class TechnitiumDriver(DriverBase):
 
     # ── DNSSEC (issue #740) ─────────────────────────────────────────────
 
+    # Signing parameters of each zone, from the applied bundle (#1767). The
+    # ``dnssec_sign`` op carries no policy, so it signs with what the last
+    # reconcile derived from the bundle (defaults for a zone not seen yet).
+    _dnssec_specs: dict[str, dict[str, Any]] | None = None
+
+    def _reconcile_dnssec(self, token: str, zone_payload: dict[str, Any]) -> None:
+        """Make a zone flagged signed in the bundle signed on this daemon (#1767).
+
+        The one-shot ``dnssec_sign`` op is never re-sent, so a zone created
+        fresh on a new server, re-created after a retire, or restored on an
+        empty data volume came back unsigned under a DS the control plane
+        still showed. Every apply now compares the daemon with the bundle.
+
+        Deliberately one-directional: a zone the bundle does not flag is left
+        as it is (the ``dnssec_unsign`` op is the operator's explicit action;
+        unsigning on a missing flag would destroy keys on a guess). A zone
+        already signed with a different algorithm / NSEC mode than its policy
+        now says is reported, not re-signed: that needs unsign + sign, which
+        changes the keys and so the DS the operator published.
+        """
+        spec = zone_payload.get("dnssec")
+        if not spec:
+            return
+        zone = zone_payload["zone"]
+        if self._dnssec_specs is None:
+            self._dnssec_specs = {}
+        self._dnssec_specs[zone] = spec
+        if spec.get("ignored"):
+            log.warning(
+                "technitium_dnssec_policy_not_expressible", zone=zone, ignored=spec["ignored"]
+            )
+        try:
+            props = self._call(
+                token, "GET", "zones/dnssec/properties/get", {"zone": zone}
+            ).json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("technitium_dnssec_status_unreadable", zone=zone, error=str(exc))
+            self._note_apply_failure(f"{zone}: DNSSEC status unreadable: {exc}")
+            return
+        if props.get("status") != "ok":
+            log.warning(
+                "technitium_dnssec_status_unreadable", zone=zone, error=props.get("errorMessage")
+            )
+            self._note_apply_failure(f"{zone}: DNSSEC status: {props.get('errorMessage')}")
+            return
+        info = props.get("response") or {}
+        status = str(info.get("dnssecStatus") or "")
+        if status == "Unsigned":
+            try:
+                self._sign_zone(token, zone, spec["params"])
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                log.error("technitium_dnssec_sign_failed", zone=zone, error=str(exc))
+                self._note_apply_failure(f"{zone}: DNSSEC sign: {exc}")
+            return
+        mismatches: list[str] = []
+        keys = info.get("dnssecPrivateKeys") or []
+        live_algos = {int(k.get("algorithmNumber") or 0) for k in keys}
+        if live_algos and live_algos != {spec["algorithm_number"]}:
+            mismatches.append("algorithm")
+        if (status == "SignedWithNSEC3") != bool(spec["nsec3"]):
+            mismatches.append("NSEC/NSEC3")
+        if mismatches:
+            log.warning("technitium_dnssec_policy_mismatch", zone=zone, differs=mismatches)
+            self._note_apply_failure(
+                f"{zone}: signed with a different {' and '.join(mismatches)} than its DNSSEC "
+                "policy; unsign and re-sign the zone to apply it (this changes the keys, so "
+                "re-publish the DS)"
+            )
+
+    def _sign_zone(self, token: str, zone: str, params: dict[str, str]) -> bool:
+        """``zones/dnssec/sign``; True when it signed, False when already signed."""
+        resp = self._call(token, "POST", "zones/dnssec/sign", {"zone": zone, **params})
+        body = resp.json()
+        if body.get("status") != "ok":
+            msg = (body.get("errorMessage") or "").lower()
+            if "already signed" not in msg:
+                raise RuntimeError(f"Technitium sign {zone} failed: {body.get('errorMessage')}")
+            log.info("technitium_dnssec_already_signed", zone=zone)
+            return False
+        log.info("technitium_dnssec_signed", zone=zone)
+        return True
+
     def _dnssec_sign(self, token: str, zone: str) -> dict[str, Any]:
         """Sign the zone, then report its DS rrset + per-key state.
 
@@ -3939,22 +4154,77 @@ class TechnitiumDriver(DriverBase):
         zone" clicks should converge on "signed", not error. Technitium
         answers an already-signed zone with ``Cannot sign zone: the zone
         is already signed.`` (verified live), which is treated as success
-        so the collect below still reports current state.
+        so the collect below still reports current state. Signs with the
+        zone's policy as last read from the bundle (#1767).
         """
+        spec = (self._dnssec_specs or {}).get(zone)
+        params = spec["params"] if spec else _DNSSEC_SIGN_DEFAULTS
+        self._sign_zone(token, zone, params)
+        return self._collect_dnssec_state(token, zone)
+
+    def _dnssec_rollover(self, token: str, op: dict[str, Any]) -> dict[str, Any] | None:
+        """Roll one key now (``zones/dnssec/properties/rolloverDnsKey``, #1767).
+
+        Technitium generates and publishes the replacement and retires the old
+        key once it is active. A KSK's ``rolloverDays`` defaults to 0 (never),
+        so this is the only way a KSK rolls. The new key set is read back so
+        the control plane (and the DS to publish) follow.
+        """
+        zone = op["zone_name"].rstrip(".")
+        key_tag = (op.get("record") or {}).get("key_tag")
         resp = self._call(
-            token, "POST", "zones/dnssec/sign", {"zone": zone, **_DNSSEC_SIGN_DEFAULTS}
+            token,
+            "POST",
+            "zones/dnssec/properties/rolloverDnsKey",
+            {"zone": zone, "keyTag": key_tag},
         )
         body = resp.json()
         if body.get("status") != "ok":
-            msg = (body.get("errorMessage") or "").lower()
-            if "already signed" not in msg:
-                raise RuntimeError(
-                    f"Technitium sign {zone} failed: {body.get('errorMessage')}"
-                )
-            log.info("technitium_dnssec_already_signed", zone=zone)
-        else:
-            log.info("technitium_dnssec_signed", zone=zone)
-        return self._collect_dnssec_state(token, zone)
+            raise RuntimeError(
+                f"Technitium rollover {zone} key {key_tag} failed: {body.get('errorMessage')}"
+            )
+        log.info("technitium_dnssec_rollover_triggered", zone=zone, key_tag=key_tag)
+        return {"dnssec_state": self._collect_dnssec_state(token, zone)}
+
+    def collect_dnssec_state(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        """Report entries for every signed primary zone in ``bundle`` (#1767).
+
+        The sync loop calls this after each structural apply and on its
+        periodic refresh, which is what carries a ZSK auto-rollover, or a KSK
+        moving from Ready to Active once the DS lands, back to the control
+        plane. (It used to exist only as the private per-zone helper below,
+        reached from the sign op, so state was reported once and never again.)
+        A zone whose keys cannot be read is left out and ``dnssec_incomplete``
+        set, so the sync loop retries soon instead of reporting an empty key
+        set that would wipe the control plane's rows.
+        """
+        self.dnssec_incomplete = False
+        out: list[dict[str, Any]] = []
+        zones = [
+            (z.get("name") or "").rstrip(".")
+            for z in bundle.get("zones") or []
+            if z.get("dnssec_enabled") and (z.get("type") or "primary").lower() in {"primary", "master"}
+        ]
+        if not zones:
+            return out
+        token = self._get_api_token()
+        if token is None:
+            self.dnssec_incomplete = True
+            return out
+        for zname in dict.fromkeys(zones):
+            if not zname:
+                continue
+            try:
+                state = self._collect_dnssec_state(token, zname)
+            except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+                log.warning("dnssec_state_collect_failed", zone=zname, error=str(exc))
+                self.dnssec_incomplete = True
+                continue
+            if not state["keys"]:
+                self.dnssec_incomplete = True
+                continue
+            out.append(state)
+        return out
 
     def _dnssec_unsign(self, token: str, zone: str) -> dict[str, Any]:
         """Unsign, and report empty DS + no keys so the control plane
@@ -4112,6 +4382,7 @@ class TechnitiumDriver(DriverBase):
             self._save_held_zone_now(zone)
         if not held:
             self._reconcile_zone_body(token, zone, zone_payload, options)
+            self._reconcile_dnssec(token, zone_payload)
             if is_primary:
                 self._stamp_owner_marker(token, zone)
             return False
@@ -4119,6 +4390,7 @@ class TechnitiumDriver(DriverBase):
             # The zone's options, query access among them, are what release
             # the hold, so they are applied last rather than first.
             self._reconcile_zone_body(token, zone, zone_payload, None)
+            self._reconcile_dnssec(token, zone_payload)
         finally:
             released = self._release_zone(token, zone, options)
         if is_primary:
@@ -4533,7 +4805,7 @@ class TechnitiumDriver(DriverBase):
                 ns_retimed=retimed,
             )
 
-    def _zone_is_ours(self, token: str, zone: str) -> bool:
+    def _zone_is_ours(self, token: str, zone: str, ztype: str = "Primary") -> bool:
         """May this agent take over a zone that already exists on the daemon?
 
         Only a zone from its own ledger, one carrying the owner marker on
@@ -4541,8 +4813,14 @@ class TechnitiumDriver(DriverBase):
         opted in with ``TECHNITIUM_ADOPT_EXISTING_ZONES``. An unknown ledger
         (unreadable, or the retire step never ran) does not block: refusing
         there would stop every zone on a guess. Only a Primary can carry the
-        marker; a Secondary / Stub / Forwarder rests on the ledger alone.
+        marker; a Secondary / Stub / Forwarder rests on the ledger alone, so
+        when the ledger file is missing altogether those are not refused: they
+        hold no operator-authored records for a takeover to delete (a secondary
+        re-transfers, a forwarder has only the FWD records the bundle names),
+        and refusing them on a lost state dir would never converge (#4441).
         """
+        if self._ledger_lost and ztype != "Primary":
+            return True
         return self._zone_owned(token, zone, self._owned_before)
 
     def _ledger_names(self) -> frozenset[str] | None:
@@ -4629,9 +4907,10 @@ class TechnitiumDriver(DriverBase):
             log.warning("technitium_owner_marker_failed", zone=zone, error=body.get("errorMessage"))
 
     def _disown_zone(self, zone: str) -> None:
-        """Drop a refused zone from the ledger ``_retire_dropped_zones`` just wrote.
+        """Drop a refused zone from the ledger.
 
-        Left in, the next pass would read it as ours and wipe its records.
+        Left in (an adopted zone from an older agent, say), the next pass
+        would read it as ours and wipe its records.
         """
         path = self._managed_zones_path()
         try:
@@ -4690,7 +4969,7 @@ class TechnitiumDriver(DriverBase):
         body = resp.json()
         if body.get("status") == "error":
             if _is_zone_exists(body.get("errorMessage")):
-                if check_owned and not self._zone_is_ours(token, zone):
+                if check_owned and not self._zone_is_ours(token, zone, ztype):
                     # #1775: a zone the operator made on the daemon. Taking
                     # it over deletes every record the bundle lacks, and
                     # retiring it later deletes the zone, so leave it alone.
@@ -4704,6 +4983,8 @@ class TechnitiumDriver(DriverBase):
                         "TECHNITIUM_ADOPT_EXISTING_ZONES=true on the agent to take it over"
                     )
                     raise _ZoneNotOwned(zone)
+                if check_owned:
+                    self._claim_zone(zone)
                 # The create params carry the zone's UPSTREAM (a
                 # secondary/stub's primaries, a forwarder's target), and
                 # create is a no-op once the zone exists. Without this,
@@ -4733,6 +5014,8 @@ class TechnitiumDriver(DriverBase):
                 f"{zone}: zone create: {body.get('errorMessage')}"
             )
             return False
+        if check_owned:
+            self._claim_zone(zone)
         if ztype == "Forwarder":
             # The create carried the first upstream only.
             self._sync_forwarder_records(token, zone, forwarder_specs, dnssec)

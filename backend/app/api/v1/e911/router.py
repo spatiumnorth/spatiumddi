@@ -800,7 +800,10 @@ async def list_bindings(
     rows = (
         await db.execute(
             stmt.order_by(
-                ordering.asc(), EmergencyResponseLocation.name.asc(), EmergencyResponseLocation.id
+                ordering.asc(),
+                EmergencyResponseLocation.name.asc(),
+                EmergencyResponseLocation.id,
+                ERLBinding.id,
             )
             .limit(limit)
             .offset(offset)

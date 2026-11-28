@@ -128,6 +128,11 @@ async def test_settings_response_carries_set_flags_not_credential_values(
         assert value not in resp.text
 
     data = resp.json()
+    if not superadmin:
+        # A caller without read on settings gets only the reduced shape, which
+        # carries none of these fields (see test_settings_read_scope.py).
+        assert "snmp_v3_users" not in data
+        return
     for raw_field in (
         "audit_forward_webhook_url",
         "audit_forward_webhook_auth_header",

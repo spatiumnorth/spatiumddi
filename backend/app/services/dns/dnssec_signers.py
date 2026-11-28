@@ -1,7 +1,7 @@
 """Single-signer rule for DNSSEC on a multi-server group (#1762).
 
-Every agent engine (BIND9 inline-signing, PowerDNS, and Technitium for zones
-signed before #1783 withdrew it) signs a zone *independently on each server*
+Every agent engine (BIND9 inline-signing, PowerDNS and Technitium) signs a zone
+*independently on each server*
 with keys that server generated and holds.
 SpatiumDDI has no shared key custody, so a signed zone on a group with two
 agent servers is served with two different DNSKEY sets: a validating
@@ -11,11 +11,12 @@ server A's report) that does not match B's keys, and gets SERVFAIL.
 **Every agent server in the group counts, enabled or not.** ``is_enabled``
 only pauses the record-op fan-out (``record_ops``); a disabled agent still
 long-polls and receives the full bundle (nothing in the bundle path reads
-``is_enabled``), so a disabled BIND9 server renders ``inline-signing`` and
-serves the zone signed with ITS OWN keys, and a disabled PowerDNS /
-Technitium server serves it unsigned under the parent's DS (no sign op
-reaches it) — bogus either way. A ``pending_approval`` server counts too:
-approving it hands it the bundle.
+``is_enabled``), so a disabled server still signs the zone with ITS OWN
+keys: BIND9 renders ``inline-signing``, and the PowerDNS (#4566) and
+Technitium (#1767) agents sign a flagged zone they hold no key for on every
+reconcile. Before those two it was served unsigned under the parent's DS (no
+sign op reaches a disabled server) — bogus either way. A ``pending_approval``
+server counts too: approving it hands it the bundle.
 
 Agentless drivers (``technitium_api``, Windows, cloud) are outside the rule:
 the cloud providers hold one key set per hosted zone whatever the number of
@@ -43,36 +44,53 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable
+from datetime import datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.audit import AuditLog
 from app.models.dns import DNSServer, DNSServerGroup, DNSZone
 
 #: Agent drivers SpatiumDDI signs on: the single source for the router's
 #: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` and ``zone_move``'s
-#: ``DNSSEC_SIGN_DRIVERS``, which both read it from here.
-SIGNING_DRIVERS: frozenset[str] = frozenset({"bind9", "powerdns"})
+#: ``DNSSEC_SIGN_DRIVERS``, which both read it from here. Technitium is in it
+#: since #1767: the agent reconciles a zone's signing state from every bundle
+#: (a new server, a re-created zone or a lost volume is signed again), maps the
+#: zone's ``DNSSECPolicy`` onto the sign parameters and reports key state back.
+#: The PowerDNS agent reconciles the same way since #4566.
+SIGNING_DRIVERS: frozenset[str] = frozenset({"bind9", "powerdns", "technitium"})
 
-#: Agent drivers that may still serve a zone signed before SpatiumDDI stopped
-#: offering signing there (#1783). Technitium signs once and never re-signs
-#: on a new server, a re-created zone or a lost volume, so new signing is
-#: refused; full support is #1767. A zone already signed keeps serving and
-#: can be unsigned, and the zone response flags it ``dnssec_unmanaged_warning``.
-UNMANAGED_SIGNING_DRIVERS: frozenset[str] = frozenset({"technitium"})
+#: Agent drivers that SpatiumDDI no longer signs on but may still serve a
+#: zone signed earlier. Empty since #1767 re-enabled Technitium; kept as the
+#: seam a future withdrawal would use.
+UNMANAGED_SIGNING_DRIVERS: frozenset[str] = frozenset()
 
 #: Agent drivers whose servers hold their own per-server keys for a signed
-#: zone: everything the single-signer rule counts. Technitium stays in it for
-#: zones signed before #1783: a second Technitium server would serve such a
-#: zone unsigned under the parent's DS, which is just as bogus.
+#: zone: everything the single-signer rule counts.
 PER_SERVER_SIGNING_DRIVERS: frozenset[str] = SIGNING_DRIVERS | UNMANAGED_SIGNING_DRIVERS
 
-#: Every driver on which a new signing request is refused with the Technitium
-#: explanation: the agent-managed ``technitium`` plus the agentless
-#: ``technitium_api`` (#3806). The latter is outside the single-signer count
-#: (it holds no per-server keys SpatiumDDI created) but is the same daemon, and
-#: a sign op against it would be one-shot in exactly the same way.
-SIGN_REFUSED_TECHNITIUM_DRIVERS: frozenset[str] = UNMANAGED_SIGNING_DRIVERS | {"technitium_api"}
+#: Drivers on which a new signing request is refused with the Technitium
+#: explanation: the agentless ``technitium_api`` (#3806). It holds no
+#: per-server keys SpatiumDDI created and has no agent to reconcile signing
+#: state from the bundle, so a sign op against it would be one-shot.
+SIGN_REFUSED_TECHNITIUM_DRIVERS: frozenset[str] = frozenset({"technitium_api"})
+
+#: Audit action written when an agent reports a different DS set for a zone
+#: that already had one (#4566): its keys were regenerated (a zone re-created
+#: after a lost volume, on a replaced node) or rolled.
+DS_CHANGED_AUDIT_ACTION = "dns.zone.dnssec_ds_changed"
+DS_CHANGED_WARNING = (
+    "The server reported a different DS set for this signed zone: its keys were "
+    "regenerated or rolled. Publish the current DS records at the parent zone; "
+    "validating resolvers fail the zone while the parent holds only a DS that "
+    "no longer matches."
+)
+
+#: Written when the operator says the current DS set is published at the
+#: parent (#4566); it carries that set, so a later change shows the warning
+#: again.
+DS_ACK_AUDIT_ACTION = "dns.zone.dnssec_ds_acknowledged"
 
 WORKAROUND = (
     "Keep a single DNS server in the group (delete it or move the others to "
@@ -276,3 +294,46 @@ def register_warning_message(group_name: str, server_name: str, signed: int, n: 
         f"its own keys, so resolvers that reach a server whose keys the published DS does "
         f"not match will SERVFAIL. Move the agent to another group (or unsign the zones)."
     )
+
+
+async def ds_changed_at(db: AsyncSession, zone: DNSZone) -> datetime | None:
+    """When the zone's current DS set replaced an earlier one, or None.
+
+    Read from the newest :data:`DS_CHANGED_AUDIT_ACTION` row, and only while
+    that row still describes the DS on the zone: after an unsign and a fresh
+    sign the zone has a first DS again, not a changed one. An operator's
+    acknowledgement of this DS set (:data:`DS_ACK_AUDIT_ACTION`) clears it.
+    """
+    current = {str(d) for d in zone.dnssec_ds_records or []}
+    if not zone.dnssec_enabled or not current:
+        return None
+    rows = (
+        await db.execute(
+            select(AuditLog.action, AuditLog.timestamp, AuditLog.new_value)
+            .where(
+                AuditLog.resource_type == "dns_zone",
+                AuditLog.resource_id == str(zone.id),
+                AuditLog.action.in_((DS_CHANGED_AUDIT_ACTION, DS_ACK_AUDIT_ACTION)),
+            )
+            .order_by(AuditLog.timestamp.desc())
+        )
+    ).all()
+    changed = next(
+        (
+            r.timestamp
+            for r in rows
+            if r.action == DS_CHANGED_AUDIT_ACTION
+            and {str(d) for d in (r.new_value or {}).get("ds_records") or []} == current
+        ),
+        None,
+    )
+    if changed is None:
+        return None
+    # Acknowledged: the operator confirmed this very DS set is at the parent.
+    for r in rows:
+        if (
+            r.action == DS_ACK_AUDIT_ACTION
+            and {str(d) for d in (r.new_value or {}).get("ds_records") or []} == current
+        ):
+            return None
+    return changed

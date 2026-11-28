@@ -16,9 +16,10 @@ from __future__ import annotations
 import uuid
 from collections.abc import Collection
 
-from sqlalchemy import case, func, select, update
+from sqlalchemy import String, case, cast, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.dhcp import DHCPStaticAssignment
 from app.models.e911 import ERLBinding
 from app.models.ipam import IPAddress
 
@@ -87,3 +88,25 @@ async def carry_ip_bindings(db: AsyncSession, old_id: uuid.UUID, new_id: uuid.UU
         .execution_options(synchronize_session=False)
     )
     return True
+
+
+async def bound_static_mirror_ids(
+    db: AsyncSession, scope_ids: Collection[uuid.UUID]
+) -> list[uuid.UUID]:
+    """The address rows of these scopes' reservations that an ``ip`` binding names (#4286).
+
+    Trashed reservations count: a scope's mirror rows are found by the
+    reservation's back-link, whatever the reservation's own stamp.
+    """
+    if not scope_ids:
+        return []
+    reservations = select(cast(DHCPStaticAssignment.id, String)).where(
+        DHCPStaticAssignment.scope_id.in_(list(scope_ids))
+    )
+    res = await db.execute(
+        select(IPAddress.id)
+        .join(ERLBinding, ERLBinding.ip_address_id == IPAddress.id)
+        .where(IPAddress.static_assignment_id.in_(reservations))
+        .execution_options(include_deleted=True)
+    )
+    return list(res.scalars().all())

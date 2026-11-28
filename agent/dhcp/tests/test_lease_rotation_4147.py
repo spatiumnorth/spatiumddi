@@ -124,3 +124,28 @@ def test_tail_posts_every_row_across_rotation(tmp_path: Path) -> None:
         assert [e["ip_address"] for e in w._pending] == [
             gen(n).split(",")[0] for n in (1, 2, 3)
         ]
+
+
+def test_row_appended_between_drain_and_rotation_is_read(tmp_path: Path) -> None:
+    """#4437: Kea appends after our drain and renames before our stat."""
+    live = tmp_path / "kea-leases4.csv"
+    w = _watcher(tmp_path)
+    live.write_text(_v4(1))
+    assert len(w._read_new_rows(live)) == 1
+
+    real = w._drain_handle
+    calls = {"n": 0}
+
+    def racing(path: Path, fh):  # type: ignore[no-untyped-def]
+        out = real(path, fh)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            with live.open("a") as f:
+                f.write(_v4(2))
+            os.rename(live, tmp_path / "kea-leases4.csv.1")
+            live.write_text(_v4(3))
+        return out
+
+    w._drain_handle = racing  # type: ignore[method-assign]
+    seen = _ips(w._read_new_rows(live))
+    assert sorted(seen) == ["10.0.0.2", "10.0.0.3"]

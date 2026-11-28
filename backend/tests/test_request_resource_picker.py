@@ -269,7 +269,11 @@ async def test_scope_picker_active_only_and_labeled_with_range(
     await db_session.flush()
     _, token = await _user(
         db_session,
-        permissions=REQUESTER_PERMS + [{"action": "read", "resource_type": "dhcp_scope"}],
+        permissions=REQUESTER_PERMS
+        + [
+            {"action": "read", "resource_type": "dhcp_scope"},
+            {"action": "read", "resource_type": "subnet"},
+        ],
     )
     await db_session.commit()
 

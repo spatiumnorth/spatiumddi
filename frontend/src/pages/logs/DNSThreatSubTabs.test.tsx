@@ -47,6 +47,8 @@ const offender = (ip: string) => ({
 });
 const hit = (id: string) => ({
   id,
+  server_id: id === "c" ? null : "srv-1",
+  server_name: id === "c" ? "ns-gone" : "ns-live",
   ts: "2026-10-22T10:00:00Z",
   client_ip: "192.0.2.5",
   qname: `${id}.blocked.example`,
@@ -134,6 +136,16 @@ describe("DNS Threat sub-tabs (#4172)", () => {
     expect(
       screen.queryByText("Clients reaching for blocked domains"),
     ).toBeNull();
+  });
+
+  it("names the server on each blocked hit, a deleted one marked (#4173)", async () => {
+    renderTab();
+    fireEvent.click(await screen.findByRole("tab", { name: /Recent blocked/ }));
+    await screen.findByText("a.blocked.example");
+    expect(screen.getByRole("columnheader", { name: "Server" })).toBeTruthy();
+    expect(screen.getAllByText("ns-live").length).toBe(2);
+    const gone = screen.getByText("ns-gone");
+    expect(gone.textContent).toContain("(deleted)");
   });
 
   it("remembers the selection in session state", async () => {

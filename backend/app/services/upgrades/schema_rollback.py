@@ -344,3 +344,68 @@ async def record_this_release() -> None:
         names.append(booted)
     async with AsyncSessionLocal() as db:
         await record_running_release(db, names)
+
+
+#: The 409 ``detail.code`` for a restore refused in the post-rollback mixed state.
+RESTORE_REFUSAL_CODE = "restore_refused_mixed_release"
+
+
+def mixed_release_state(booted: str | None, version: str | None) -> bool:
+    """True when the booted slot's release is not the release serving this api.
+
+    That is what an acknowledged schema rollback (#1227) leaves behind: the
+    host booted the older slot, whose pods wait on a migration they cannot
+    run, while the newer release's api and worker keep serving. Unknown on
+    either side is not mixed: only a pair of names that disagree counts.
+    """
+    booted = (booted or "").strip()
+    version = (version or "").strip()
+    if booted.lower() in _UNNAMED_VERSIONS or version.lower() in _UNNAMED_VERSIONS:
+        return False
+    return not _slot_is_this_build(booted, version)
+
+
+def assert_restore_allowed_for_release() -> None:
+    """Refuse a backup restore while the booted slot and the serving api differ (#4678).
+
+    A Full restore replays the archive's schema, so the older release's
+    waiting worker and beat read the old head, pass their migration wait
+    before the restore migrates up, and then stay running on the newer
+    schema. Its DNS renderer revision is lower than the api's, so no DNS
+    change reaches the DNS servers again. No acknowledgement lifts this: the
+    way back is to boot the release that is serving, then restore there.
+    """
+    from app.config import settings  # noqa: PLC0415
+    from app.services.appliance.slot import get_slot_status  # noqa: PLC0415
+
+    slots = get_slot_status()
+    if not slots.appliance_mode:
+        return
+    booted = (
+        slots.slot_a_version
+        if slots.current_slot == "slot_a"
+        else slots.slot_b_version if slots.current_slot == "slot_b" else None
+    )
+    if not mixed_release_state(booted, settings.version):
+        return
+    logger.warning(
+        "restore_refused_mixed_release", booted_slot_version=booted, serving=settings.version
+    )
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        {
+            "code": RESTORE_REFUSAL_CODE,
+            "booted_slot_version": booted,
+            "serving_version": settings.version,
+            "message": (
+                f"Refusing to restore: the host is booted into {booted}, but the "
+                f"console you are using is {settings.version}. That is the state "
+                "after a schema rollback, and a restore now would leave the "
+                f"{booted} worker and beat running on a schema they do not match, "
+                "so DNS changes would stop reaching the DNS servers. Boot "
+                f"{settings.version} again from the console ('spatium-upgrade-slot "
+                "set-next-boot' and a reboot), then restore. See 'Rolling back' in "
+                "docs/deployment/APPLIANCE.md."
+            ),
+        },
+    )

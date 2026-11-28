@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { Fragment, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -27,7 +28,11 @@ const ACTION_COLORS: Record<string, string> = {
   logout: "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400",
 };
 
-const ACTION_OPTIONS = [
+// Action / Resource options come from the log itself (`/audit/facets`, #4482):
+// the build writes hundreds of actions and resource types, so a fixed list
+// could not reach most of them. These seed the dropdowns until it answers
+// (and if the read is refused or fails); the API filters on any string.
+const BASE_ACTIONS = [
   "create",
   "update",
   "delete",
@@ -35,8 +40,7 @@ const ACTION_OPTIONS = [
   "login",
   "logout",
 ];
-
-const RESOURCE_TYPE_OPTIONS = [
+const BASE_RESOURCE_TYPES = [
   "user",
   "ip_space",
   "ip_block",
@@ -52,9 +56,36 @@ const RESOURCE_TYPE_OPTIONS = [
   "dhcp_static_assignment",
 ];
 
-// `failure` is what a rejected sign-in is audited with, and `forbidden`
-// what a refused break-glass or secret reveal is (#1874).
-const RESULT_OPTIONS = ["success", "failure", "denied", "forbidden", "error"];
+function mergeOptions(base: string[], live: string[] | undefined, sel: string) {
+  return Array.from(
+    new Set([...base, ...(live ?? []), ...(sel ? [sel] : [])]),
+  ).sort();
+}
+
+// Every `result` the backend writes to audit_log. `failure` is what a
+// rejected sign-in is audited with, `forbidden` a refused break-glass or
+// secret reveal (#1874); `ok`, `failed`, `accepted` and `skipped` come from
+// the appliance, sync and agent paths (#4293). The API filters on any string.
+const RESULT_OPTIONS = [
+  "success",
+  "ok",
+  "accepted",
+  "failure",
+  "failed",
+  "error",
+  "denied",
+  "forbidden",
+  "skipped",
+];
+
+const SUCCESS_RESULTS = new Set(["success", "ok", "accepted"]);
+const FAILURE_RESULTS = new Set([
+  "failure",
+  "failed",
+  "error",
+  "denied",
+  "forbidden",
+]);
 
 function ActionBadge({ action }: { action: string }) {
   const cls =
@@ -72,14 +103,17 @@ function ActionBadge({ action }: { action: string }) {
 }
 
 function ResultBadge({ result }: { result: string }) {
-  const ok = result === "success";
+  // Colour by meaning: anything not known to fail (e.g. `skipped`) is neutral.
+  const cls = SUCCESS_RESULTS.has(result)
+    ? "bg-green-500/15 text-green-600 dark:text-green-400"
+    : FAILURE_RESULTS.has(result)
+      ? "bg-red-500/15 text-red-600 dark:text-red-400"
+      : "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400";
   return (
     <span
       className={cn(
         "inline-flex rounded px-1.5 py-0.5 text-xs font-medium",
-        ok
-          ? "bg-green-500/15 text-green-600 dark:text-green-400"
-          : "bg-red-500/15 text-red-600 dark:text-red-400",
+        cls,
       )}
     >
       {result}
@@ -141,6 +175,22 @@ export function AuditPage() {
     queryKey: ["audit", queryParams],
     queryFn: () => auditApi.list(queryParams),
   });
+
+  const { data: facets } = useQuery({
+    queryKey: ["audit-facets"],
+    queryFn: () => auditApi.facets(),
+    staleTime: 60_000,
+  });
+  const actionOptions = mergeOptions(
+    BASE_ACTIONS,
+    facets?.actions,
+    colFilters.action,
+  );
+  const resourceOptions = mergeOptions(
+    BASE_RESOURCE_TYPES,
+    facets?.resource_types,
+    colFilters.resource,
+  );
 
   const total = data?.total ?? 0;
   const items = data?.items ?? [];
@@ -255,7 +305,7 @@ export function AuditPage() {
                     className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                   >
                     <option value="">All</option>
-                    {ACTION_OPTIONS.map((a) => (
+                    {actionOptions.map((a) => (
                       <option key={a} value={a}>
                         {a}
                       </option>
@@ -271,7 +321,7 @@ export function AuditPage() {
                     className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                   >
                     <option value="">All</option>
-                    {RESOURCE_TYPE_OPTIONS.map((r) => (
+                    {resourceOptions.map((r) => (
                       <option key={r} value={r}>
                         {r}
                       </option>
@@ -548,8 +598,8 @@ function ChainIntegrityBadge() {
         className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
         title={
           data.partial
-            ? `Newest ${data.rows_checked.toLocaleString()} rows verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify checks the rows added since its last run, and the whole chain again once its last full pass is more than 7 days old.`
-            : `Whole chain verified (${data.rows_checked.toLocaleString()} rows)`
+            ? `Newest ${data.rows_checked.toLocaleString()} ${pluralize(data.rows_checked, "row")} verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify checks the rows added since its last run, and the whole chain again once its last full pass is more than 7 days old.`
+            : `Whole chain verified (${data.rows_checked.toLocaleString()} ${pluralize(data.rows_checked, "row")})`
         }
       >
         <ShieldCheck className="h-3 w-3" />

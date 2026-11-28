@@ -97,6 +97,25 @@ const SIGNED_NO_DS: ZoneDnssecInfo = {
   signing_unmanaged: false,
 };
 
+describe("the DNSSEC card shows a stored policy the group ignores (#4623)", () => {
+  it("renders unapplied_warning", async () => {
+    dnssecInfo = {
+      ...SIGNED_NO_DS,
+      unapplied_warning:
+        "The custom DNSSEC policy 'x' is stored but not applied",
+    };
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <ZoneModal groupId="grp-1" views={[]} zone={ZONE} onClose={() => {}} />
+      </QueryClientProvider>,
+    );
+    await screen.findByText(/stored but not applied/);
+  });
+});
+
 afterEach(() => {
   cleanup();
   dnssecInfo = null;

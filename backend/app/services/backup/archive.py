@@ -237,7 +237,7 @@ Source install:
   hostname       {manifest.get("hostname", "?")}
 
 To restore: open SpatiumDDI on the destination install as a superadmin,
-go to Administration -> Platform -> Backup, click "Restore from file",
+go to Administration -> Backup, on the Manual tab click "Restore from file",
 upload this zip, supply your passphrase, type the confirmation phrase,
 and click Apply. Restoring overwrites the destination install's data.
 

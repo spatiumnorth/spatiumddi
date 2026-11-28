@@ -20,6 +20,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { pollUnlessRefused } from "@/lib/refusal";
 import { Modal } from "@/components/ui/modal";
+import { changedFields } from "@/hooks/useFreshRow";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Field, errMsg, humanDuration, humanTime, inputCls } from "../_shared";
@@ -279,9 +280,6 @@ export function SessionsTab({
           deleteTarget ? (
             <>
               {`Delete the BGP session to "${deleteTarget.name}" (AS${deleteTarget.peer_asn} at ${deleteTarget.peer_address})? Its learned routes are removed too. This only tears down the receive-only session on the collector — it does not affect the router on the other end.`}
-              {deleteErr && (
-                <span className="mt-2 block text-destructive">{deleteErr}</span>
-              )}
             </>
           ) : (
             ""
@@ -290,6 +288,7 @@ export function SessionsTab({
         confirmLabel="Delete"
         tone="destructive"
         loading={deleteM.isPending}
+        error={deleteErr}
         onClose={() => {
           setDeleteTarget(null);
           setDeleteErr(null);
@@ -493,7 +492,25 @@ export function PeerFormModal({
       // "" explicitly clears the stored password; omitting (undefined)
       // leaves it untouched; a typed value rotates it.
       const md5_password = clearMd5 ? "" : md5Password || undefined;
-      updateM.mutate({ ...shared, md5_password });
+      // Only what the operator changed, against the row read when the dialog
+      // opened (#4379). An accept-all filter the row stores with a stale
+      // prefix list is still accept-all.
+      const stored = existing!.import_filter;
+      const body: BGPLGPeerUpdate = {
+        ...shared,
+        import_filter:
+          shared.import_filter.mode === "accept_all" &&
+          stored.mode === "accept_all"
+            ? stored
+            : shared.import_filter,
+        md5_password,
+      };
+      const diff = changedFields(existing!, body);
+      if (Object.keys(diff).length === 0) {
+        onClose();
+        return;
+      }
+      updateM.mutate(diff);
     } else {
       createM.mutate({ ...shared, md5_password: md5Password || undefined });
     }

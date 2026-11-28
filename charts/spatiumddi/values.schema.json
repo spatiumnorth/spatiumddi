@@ -46,6 +46,14 @@
     "sharedEnv": {
       "type": "array"
     },
+    "supervisorRegistration": {
+      "type": "object",
+      "properties": {
+        "initiallyEnabled": {
+          "type": "boolean"
+        }
+      }
+    },
     "applianceVersion": {
       "type": [
         "string",

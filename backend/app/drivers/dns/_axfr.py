@@ -76,6 +76,26 @@ def resolve_server_address(host: str, port: int, *, what: str) -> list[str]:
     return addrs
 
 
+def send_rfc2136_update(update: Any, addr: str, port: int, *, what: str) -> None:
+    """Send an RFC 2136 UPDATE over TCP and raise unless the server said NOERROR.
+
+    ``dns.query.tcp`` returns the server's reply and raises only on transport
+    errors, so a REFUSED / NOTAUTH / SERVFAIL reply used to be discarded and
+    the write counted as applied (#4939). Blocking: call via
+    ``asyncio.to_thread``. A RuntimeError so the callers' existing failure
+    paths (provider_warning, push_errors, op retry) take it.
+    """
+    import dns.query  # noqa: PLC0415
+    import dns.rcode  # noqa: PLC0415
+
+    reply = dns.query.tcp(update, addr, port=port, timeout=10)
+    rcode = reply.rcode()
+    if rcode != dns.rcode.NOERROR:
+        raise RuntimeError(
+            f"{what} at {addr}:{port} was rejected by the server: {dns.rcode.to_text(rcode)}."
+        )
+
+
 def _hint(exc: BaseException, port: int) -> str:
     """Return a next-step hint matched to *why* the transfer failed.
 
@@ -146,6 +166,7 @@ async def axfr_zone_records(
     port: int,
     zone_name: str,
     timeout: int = 20,
+    connect_timeout: float | None = None,
     log_driver: str = "dns",
     server_id: str | None = None,
     tsig: TsigKey | None = None,
@@ -164,6 +185,12 @@ async def axfr_zone_records(
     also skipped, as are DNSSEC signing artefacts (RRSIG / NSEC* / DNSKEY /
     CDS / CDNSKEY / BIND9's private TYPE65534), which the signing server owns
     and rotates itself.
+
+    ``connect_timeout`` bounds the TCP connect on its own (#4823):
+    ``timeout`` only bounds each read, so a connect to an address that
+    answers nothing waits for the kernel (~135 s). When set, each candidate
+    address is probed with a connection of that budget before the transfer
+    starts; ``None`` skips the probe.
 
     ``tsig`` signs the transfer (#734). Agent-managed BIND9 and Technitium
     grant ``allow-transfer`` to the group's TSIG key rather than to a source
@@ -274,6 +301,8 @@ async def axfr_zone_records(
         last: Exception | None = None
         for addr in addrs:
             try:
+                if connect_timeout is not None:
+                    socket.create_connection((addr, port), timeout=connect_timeout).close()
                 return dns.zone.from_xfr(
                     dns.query.xfr(addr, zone_origin, port=port, timeout=timeout, **sign_kwargs)
                 )

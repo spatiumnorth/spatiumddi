@@ -1,3 +1,4 @@
+import { pluralize } from "./count-noun";
 /**
  * The request portal's words (#3252, #3253).
  *
@@ -193,9 +194,9 @@ function errorWords(e: FieldError, field: string | null): string {
     case "less_than":
       return `must be less than ${String(ctx.lt)}`;
     case "string_too_short":
-      return `must be at least ${String(ctx.min_length)} characters`;
+      return `must be at least ${String(ctx.min_length)} ${pluralize(Number(ctx.min_length), "character")}`;
     case "string_too_long":
-      return `must be at most ${String(ctx.max_length)} characters`;
+      return `must be at most ${String(ctx.max_length)} ${pluralize(Number(ctx.max_length), "character")}`;
     case "string_type":
       return "must be text";
   }

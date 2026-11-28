@@ -855,12 +855,13 @@ async def test_signed_zone_refused_on_a_group_that_cannot_sign(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("driver", ["technitium", "technitium_api"])
+@pytest.mark.parametrize("driver", ["technitium_api"])
 async def test_signed_zone_refused_into_a_technitium_group(
     client: AsyncClient, db_session: AsyncSession, driver: str
 ) -> None:
     """#3806: consistent with the sign gate, a signed zone cannot be moved
-    into a group whose servers cannot keep it signed. Not waivable."""
+    into a group whose servers cannot keep it signed (the agentless API
+    driver; the agent-managed one signs since #1767). Not waivable."""
     token = await _superadmin(db_session)
     src = await _group(db_session, "src")
     dst = await _group(db_session, "dst")
@@ -886,6 +887,35 @@ async def test_signed_zone_refused_into_a_technitium_group(
     assert "cannot sign" in resp.json()["detail"]
     await db_session.refresh(zone)
     assert zone.group_id == src.id
+
+
+@pytest.mark.asyncio
+async def test_signed_zone_moves_into_an_agent_managed_technitium_group(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """#1767: the agent signs the zone again from the bundle, so the
+    agent-managed Technitium driver is a valid move target."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    await _server(db_session, src, "ns1")
+    db_session.add(
+        DNSServer(
+            group_id=dst.id,
+            name="tn1",
+            driver="technitium",
+            host="tn1",
+            port=53,
+            roles=["authoritative"],
+            status="active",
+        )
+    )
+    await db_session.flush()
+    zone = await _zone(db_session, src, dnssec_enabled=True)
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["dnssec_unsupported_drivers"] == []
+    assert (await _commit(client, token, zone, dst, acks=["dnssec_rollover"])).status_code == 200
 
 
 @pytest.mark.asyncio

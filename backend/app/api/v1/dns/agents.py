@@ -59,6 +59,7 @@ from app.models.dns import (
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
+from app.services import log_stream_forward
 from app.services.agents.config_apply import apply_reported_status
 from app.services.agents.container_oom import (
     container_oom_kill,
@@ -72,6 +73,7 @@ from app.services.agents.ingest_receipt import (
     claim_batch,
     duplicate_response,
 )
+from app.services.agents.memory_status import apply_reported_memory
 from app.services.agents.server_gone import refresh_agent_server
 from app.services.agents.spool_status import apply_reported_spool
 from app.services.appliance.ownership import (
@@ -111,7 +113,11 @@ from app.services.dns.row_locks import (
     lock_server_key_share,
     lock_zone_state_rows,
 )
-from app.services.dns.server_move import CATALOG_UNSUPPORTED_DRIVERS
+from app.services.dns.server_move import (
+    CATALOG_UNSUPPORTED_DRIVERS,
+    group_view_names,
+    views_unsupported_drivers,
+)
 from app.services.dns.soa_timers import (
     AGENT_FEATURES_HEADER,
     reconcile_soa_timers,
@@ -288,6 +294,12 @@ class AgentHeartbeatRequest(BaseModel):
     # the container has none. Absent on an older agent, which leaves the
     # stored value untouched (an explicit null clears it).
     memory_limit_bytes: int | None = Field(default=None, ge=0)
+    # #4193 — the agent's actual memory use: container used / peak / limit and
+    # the daemon's and the agent's RSS. Loose dict at the edge like ``spool``:
+    # ``apply_reported_memory`` validates it and ignores a malformed report
+    # rather than 422-ing the heartbeat. Absent on an older agent, which
+    # clears the stored report.
+    memory: dict[str, Any] | None = None
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
     # Cumulative failed APPLY ATTEMPTS since the agent started, retries
@@ -384,7 +396,9 @@ async def _agent_from_authorization(
     if not server_id:
         raise HTTPException(status_code=401, detail="Token missing subject")
     server = await db.get(DNSServer, uuid.UUID(server_id))
-    if server is None:
+    if server is None or server.removing_at is not None:
+        # A server being deleted (#4173) answers like a gone one: 404 is what
+        # makes an agent discard its token, and its re-register is refused (409).
         raise HTTPException(status_code=404, detail="Server not found")
     # Defence-in-depth: verify hash match if we have one stored
     if server.agent_jwt_hash and server.agent_jwt_hash != hash_token(token):
@@ -496,6 +510,11 @@ async def agent_register(
     agent_instance: str | None = Header(default=None, alias=AGENT_INSTANCE_HEADER),
 ) -> AgentRegisterResponseV2 | JSONResponse:
     """Bootstrap registration: PSK-authenticated; returns a per-server JWT."""
+    # #4677 — not while a restore is replaying: the fingerprint compared below
+    # would be the archive's (see dhcp/agents.py).
+    from app.core.restore_gate import defer_if_restoring  # noqa: PLC0415
+
+    await defer_if_restoring(db, "registration")
     # #1068 — see the matching guard in dhcp/agents.py. Registration is
     # the one agent call that creates a server row, so without this an
     # agent re-registers moments after the operator empties DNS and
@@ -636,6 +655,13 @@ async def agent_register(
         db.add(server)
         await db.flush()
         await _warn_if_second_signer(db, group, server)
+    elif server.removing_at is not None:
+        # #4173 — the operator is deleting this server. Re-registering would
+        # revive a row a worker is about to drop; refuse until it is gone, then
+        # the same call creates a fresh server.
+        raise HTTPException(
+            status_code=409, detail="Server is being removed; retry once the removal finishes"
+        )
     else:
         # Anti-hijack: fingerprint change → force approval IFF the
         # operator has opted into the approval gate. Otherwise the
@@ -703,6 +729,20 @@ async def agent_register(
             driver=body.driver,
             issue="#1766",
         )
+
+    # #4565 — and for views: only BIND9 serves them. The group's
+    # ``scope_warnings`` shows it, and the agent refuses to merge the copies
+    # of a zone that differs between views.
+    if views_unsupported_drivers({body.driver}):
+        if stranded_views := await group_view_names(db, group.id):
+            logger.warning(
+                "dns_agent_views_unsupported_driver",
+                server_id=str(server.id),
+                group=group.name,
+                driver=body.driver,
+                views=stranded_views[:5],
+                issue="#4565",
+            )
 
     # #1858 — same posture for a key Technitium cannot use (hmac-sha224): the
     # agent skips installing it, the group's keys page shows why.
@@ -1384,6 +1424,14 @@ async def agent_heartbeat(
         # #3551 — the container's memory limit, for the group memory estimate.
         if "memory_limit_bytes" in body.model_fields_set:
             server.memory_limit_bytes = body.memory_limit_bytes or None
+        # #4193 — actual memory use, plus a sample for the history.
+        await apply_reported_memory(
+            db,
+            server,
+            body.memory,
+            sample_model=DNSMetricSample,
+            agent_kind="dns",
+        )
         # #1067 — the daemon state. ``body.daemon`` has been declared on this model
         # since it was written and read by nothing: an agent whose ``named`` never
         # started (no bundle yet — #1061 says ``degraded`` on every heartbeat) was
@@ -1721,7 +1769,8 @@ class DNSSECStateReport(BaseModel):
     ``ds_records`` is the zone-level DS rrset the operator copies into the
     parent registrar verbatim (empty = unsigned). ``keys`` is the optional
     per-key breakdown BIND9 agents report from ``rndc dnssec -status``
-    (issue #49); PowerDNS agents omit it.
+    (issue #49) and PowerDNS agents from ``GET .../cryptokeys`` (#4604).
+    An agent that does not report keys omits the field.
     """
 
     zone_name: str
@@ -2052,6 +2101,37 @@ async def agent_dnssec_state(
         zone = zones_by_name.get(entry.zone_name.rstrip("."))
         if zone is None:
             continue
+        # #4566 — a signed zone whose DS set moved: the server generated new
+        # keys (a zone re-created after a lost volume or on a replaced node
+        # is signed afresh; a KSK rollover). The parent still holds the old
+        # DS, so the change is recorded for the DNSSEC card and the audit
+        # log. The first DS after signing, and an unsign, are not a change.
+        old_ds = [str(d) for d in zone.dnssec_ds_records or []]
+        if old_ds and entry.ds_records and set(old_ds) != set(entry.ds_records):
+            logger.warning(
+                "dns_zone_dnssec_ds_changed",
+                zone=zone.name,
+                server_id=str(reporter.id),
+                replaced=not set(old_ds) & set(entry.ds_records),
+            )
+            db.add(
+                AuditLog(
+                    user_display_name="system:dns-agent",
+                    auth_source="system",
+                    action=dnssec_signers.DS_CHANGED_AUDIT_ACTION,
+                    resource_type="dns_zone",
+                    resource_id=str(zone.id),
+                    resource_display=zone.name,
+                    old_value={"ds_records": old_ds},
+                    new_value={
+                        "ds_records": list(entry.ds_records),
+                        "server_id": str(reporter.id),
+                        "server": reporter.name,
+                        "warning": dnssec_signers.DS_CHANGED_WARNING,
+                    },
+                    result="success",
+                )
+            )
         zone.dnssec_ds_records = entry.ds_records or None
         zone.dnssec_synced_at = now
         # Per-key state (issue #49) — replace the zone's DNSKey rows wholesale
@@ -2278,6 +2358,9 @@ async def agent_query_log_entries(
     # the overwhelming majority of responses are matched here without
     # touching the database at all.
     pending: dict[tuple[str | None, int | None, str | None, str | None], DNSQueryLogEntry] = {}
+    # Every query row this batch adds, in order: the log stream (#4545)
+    # forwards them once the batch is committed.
+    new_entries: list[DNSQueryLogEntry] = []
     # Responses whose question landed in an EARLIER batch — only possible
     # when the 1000-line cap or the shipper's own batch boundary fell
     # between the two lines. Resolved against the DB after the loop.
@@ -2301,6 +2384,7 @@ async def agent_query_log_entries(
                 db.add(
                     DNSRPZHit(
                         server_id=server.id,
+                        server_name=server.name,
                         ts=rpz.ts,
                         client_ip=rpz.client_ip,
                         qname=rpz.qname,
@@ -2339,6 +2423,7 @@ async def agent_query_log_entries(
             continue
         entry = DNSQueryLogEntry(
             server_id=server.id,
+            server_name=server.name,
             ts=parsed.ts,
             client_ip=parsed.client_ip,
             client_port=parsed.client_port,
@@ -2350,6 +2435,7 @@ async def agent_query_log_entries(
             raw=parsed.raw,
         )
         db.add(entry)
+        new_entries.append(entry)
         if response_capable:
             # Last writer wins: an ephemeral source port is effectively
             # unique per query, but a client that retries the identical
@@ -2359,7 +2445,17 @@ async def agent_query_log_entries(
         inserted += 1
 
     deferred_matched = await _stamp_deferred_responses(db, server.id, deferred)
+    # Built before the commit (which expires the rows), after the in-batch
+    # response correlation, so ``rcode`` is set where this batch knew it. A
+    # response that arrives in a LATER batch stamps the stored row only: the
+    # query was forwarded already, with ``rcode`` null.
+    stream_events = (
+        [log_stream_forward.dns_event(e, server.group_id) for e in new_entries]
+        if new_entries and log_stream_forward.wants(log_stream_forward.DNS_QUERY_LOG)
+        else []
+    )
     await db.commit()
+    log_stream_forward.submit(stream_events)
     return {
         "status": "ok",
         "inserted": inserted,

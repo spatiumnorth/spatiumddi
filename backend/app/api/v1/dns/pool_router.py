@@ -33,7 +33,11 @@ from app.models.dns import DNSPool, DNSPoolMember, DNSZone
 from app.models.ownership import Site
 from app.services.api_token_scopes import token_write
 from app.services.dns import technitium_api_scope
-from app.services.dns.pool_apply import apply_pool_state, withdraw_member_records
+from app.services.dns.pool_apply import (
+    apply_pool_state,
+    pool_name_refusal,
+    withdraw_member_records,
+)
 from app.services.dns.pool_health_staleness import (
     is_member_check_stale,
     member_check_age_seconds,
@@ -433,6 +437,13 @@ async def create_pool(
             status_code=409,
             detail=f"A pool already owns the record name {body.record_name!r} in this zone",
         )
+
+    # #4260 — the record API's rules for an A / AAAA owner, not just the general
+    # one: a refused name would make BIND hold the whole zone (underscore, 422;
+    # a CNAME at the name, 409).
+    refusal = await pool_name_refusal(db, zone, body.record_name, body.record_type)
+    if refusal is not None:
+        raise HTTPException(status_code=refusal[0], detail=refusal[1])
 
     for m in body.members or []:
         await _assert_site_exists(db, m.site_id)
