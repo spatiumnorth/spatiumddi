@@ -74,6 +74,7 @@ vi.mock("@/hooks/usePermissions", async () => {
     ...actual,
     usePermissions: () => ({
       can: () => true,
+      canExplicit: () => false,
       isSuperadmin: true,
       isLoading: false,
     }),

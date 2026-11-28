@@ -15,6 +15,14 @@ returns the same provenance the REST surface does — confidence, the rule
 that matched, and why a more precise answer was refused — so the copilot
 cannot present a degraded answer as a confident one.
 
+``find_e911_resolutions`` / ``count_e911_resolutions`` (#3598) read the
+lookup trail. They are **default-disabled**: the trail is per-person location
+history (which desk a named person's phone was reported at, and who asked), the
+shape non-negotiable #13 keeps off until an operator opts in. They need
+``read`` on ``e911_resolution_log``, a different grant from the
+``e911_location`` the lookup tools take, and each call writes an ``audit_log``
+row like the REST read does.
+
 One thing this module deliberately does NOT do: write an
 ``e911_resolution_log`` row. The log records third-party lookups against
 the HTTP surface; a copilot answer is already captured in the chat
@@ -25,6 +33,7 @@ than to whoever asked.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -39,6 +48,7 @@ from app.models.e911 import (
 )
 from app.models.ipam import Subnet
 from app.services.ai.tools.base import register_tool
+from app.services.e911.resolution_trail import TrailFilters, audit_trail_read, list_trail
 from app.services.e911.resolver import resolve_location
 from app.services.search.ranking import escape_like
 
@@ -353,3 +363,102 @@ async def count_e911_unbound_voice_subnets(
             for s in unbound[:100]
         ],
     }
+
+
+class FindE911ResolutionsArgs(BaseModel):
+    identity: str | None = Field(
+        default=None, description="Substring of the IP, MAC or chassis/port that was looked up."
+    )
+    since: datetime | None = Field(default=None, description="ISO 8601; lookups at or after.")
+    until: datetime | None = Field(default=None, description="ISO 8601; lookups before.")
+    actor_id: str | None = Field(default=None, description="User or API token id that asked.")
+    confidence: str | None = Field(default=None, description="observed / degraded / none.")
+    erl_id: str | None = Field(default=None, description="Only lookups answered with this ERL.")
+    kind: str | None = Field(
+        default=None,
+        description="lookup (one row each) or counter (an aggregated 'N not logged' row).",
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+def _trail_filters(args: FindE911ResolutionsArgs) -> TrailFilters:
+    return TrailFilters(
+        identity=args.identity or None,
+        since=args.since,
+        until=args.until,
+        actor_id=_as_uuid(args.actor_id),
+        confidence=args.confidence or None,
+        erl_id=_as_uuid(args.erl_id),
+        kind=args.kind if args.kind in ("lookup", "counter") else None,
+    )
+
+
+@register_tool(
+    name="find_e911_resolutions",
+    permission=("read", "e911_resolution_log"),
+    description=(
+        "Read the E911 resolution trail: every location lookup that was made, "
+        "with who asked (user or API token), the identity looked up, which ERL "
+        "and rule answered, the confidence, and how old the evidence was. Use "
+        "this for 'what was this phone told when it called 911', 'who has "
+        "looked up 10.20.3.44', or 'which lookups were degraded last week'. "
+        "Newest first. Rows with `kind: counter` stand for several lookups "
+        "that were not individually logged. This is location history about "
+        "people; the read is itself audited."
+    ),
+    args_model=FindE911ResolutionsArgs,
+    category="network",
+    module=_MODULE,
+    # Per-person location history: opt-in, not discoverable-by-default.
+    default_enabled=False,
+)
+async def find_e911_resolutions(
+    db: AsyncSession, user: User, args: FindE911ResolutionsArgs
+) -> list[dict[str, Any]]:
+    f = _trail_filters(args)
+    rows, _total = await list_trail(db, f, limit=args.limit, offset=0)
+    audit_trail_read(db, user, action="read", filters=f, returned=len(rows))
+    await db.commit()
+    return [
+        {
+            "queried_at": t.row.queried_at.isoformat(),
+            "kind": t.kind,
+            "identity_kind": t.row.identity_kind,
+            "identity_value": t.row.identity_value,
+            "actor_kind": t.row.actor_kind,
+            "actor": t.actor_label or (str(t.row.actor_id) if t.row.actor_id else None),
+            "source_ip": str(t.row.source_ip) if t.row.source_ip is not None else None,
+            "erl": t.erl_name,
+            "erl_id": str(t.row.erl_id) if t.row.erl_id else None,
+            "rule_matched": t.row.rule_matched,
+            "confidence": t.row.confidence,
+            "degraded_reason": t.row.degraded_reason,
+            "evidence_age_seconds": t.row.evidence_age_seconds,
+            "lookups_not_individually_logged": t.row.suppressed_count,
+        }
+        for t in rows
+    ]
+
+
+@register_tool(
+    name="count_e911_resolutions",
+    permission=("read", "e911_resolution_log"),
+    description=(
+        "Count E911 lookups in the resolution trail matching the same filters "
+        "as find_e911_resolutions (counts trail rows; a `counter` row counts "
+        "once). Use for 'how many degraded lookups this month'. The read is "
+        "audited."
+    ),
+    args_model=FindE911ResolutionsArgs,
+    category="network",
+    module=_MODULE,
+    default_enabled=False,
+)
+async def count_e911_resolutions(
+    db: AsyncSession, user: User, args: FindE911ResolutionsArgs
+) -> dict[str, Any]:
+    f = _trail_filters(args)
+    _rows, total = await list_trail(db, f, limit=1, offset=0)
+    audit_trail_read(db, user, action="read", filters=f, returned=0)
+    await db.commit()
+    return {"count": total}
