@@ -1,0 +1,4 @@
+{
+  "error_type": "NOT_ALLOWED_IN_CURRENT_STATE",
+  "messages": [{"default_message": "VMware Tools is not running."}]
+}

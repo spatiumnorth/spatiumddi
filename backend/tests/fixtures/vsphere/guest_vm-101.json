@@ -1,0 +1,13 @@
+[
+  {
+    "mac_address": "00:50:56:AA:BB:01",
+    "nic": "4000",
+    "ip": {
+      "ip_addresses": [
+        {"ip_address": "10.20.1.10", "prefix_length": 24, "state": "PREFERRED"},
+        {"ip_address": "fe80::250:56ff:feaa:bb01", "prefix_length": 64, "state": "UNKNOWN"},
+        {"ip_address": "10.20.1.99", "prefix_length": 24, "state": "TENTATIVE"}
+      ]
+    }
+  }
+]

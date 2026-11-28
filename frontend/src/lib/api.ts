@@ -1270,7 +1270,8 @@ export interface BlockMoveIntegrationBlocker {
     | "netbird"
     | "paloalto"
     | "fortinet"
-    | "meraki";
+    | "meraki"
+    | "vsphere";
 }
 
 export interface BlockMovePreviewResponse {
@@ -3922,6 +3923,7 @@ export type PlatformSettingsPublic = Pick<
   | "integration_cloud_enabled"
   | "integration_opnsense_enabled"
   | "integration_netbird_enabled"
+  | "integration_vsphere_enabled"
   | "integration_panos_enabled"
   | "integration_fortinet_enabled"
   | "integration_meraki_enabled"
@@ -4005,6 +4007,7 @@ export interface PlatformSettings {
   integration_fortinet_enabled: boolean;
   integration_meraki_enabled: boolean;
   integration_netbird_enabled: boolean;
+  integration_vsphere_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
    *  effect on the next tick without restarting beat. 1–168 h range
@@ -11790,7 +11793,8 @@ export type IntegrationDashboardKind =
   | "paloalto"
   | "fortinet"
   | "meraki"
-  | "netbird";
+  | "netbird"
+  | "vsphere";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;
@@ -16604,6 +16608,127 @@ export const netbirdApi = {
         status: string;
         task_id: string;
       }>(`/netbird/instances/${id}/sync`)
+      .then((r) => r.data),
+};
+
+export interface VSphereDiscoveryVM {
+  vm: string;
+  name: string;
+  power_state: string;
+  guest_state: string;
+  nic_count: number;
+  ips: string[];
+  issue: string | null;
+  hint: string | null;
+}
+
+export interface VSphereDiscovery {
+  summary: {
+    vm_total: number;
+    vm_reporting: number;
+    vm_tools_not_running: number;
+    vm_powered_off: number;
+    vm_unreadable: number;
+    vm_no_ip: number;
+    host_total: number;
+    host_with_ip_name: number;
+    addresses_skipped_no_subnet: number;
+  };
+  vms: VSphereDiscoveryVM[];
+  generated_at: string;
+}
+
+export interface VSphereTarget {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  host: string;
+  port: number;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  username: string;
+  password_present: boolean;
+  ipam_space_id: string;
+  mirror_vms: boolean;
+  mirror_hosts: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  vcenter_version: string | null;
+  host_count: number | null;
+  vm_count: number | null;
+  last_discovery: VSphereDiscovery | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface VSphereTargetCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  host: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  username: string;
+  password: string;
+  ipam_space_id: string;
+  mirror_vms?: boolean;
+  mirror_hosts?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface VSphereTargetUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  username?: string;
+  password?: string;
+  ipam_space_id?: string;
+  mirror_vms?: boolean;
+  mirror_hosts?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface VSphereTestResult {
+  ok: boolean;
+  message: string;
+  vcenter_version: string | null;
+  host_count: number | null;
+  vm_count: number | null;
+}
+
+export const vsphereApi = {
+  listTargets: () =>
+    api.get<VSphereTarget[]>("/vsphere/targets").then((r) => r.data),
+  createTarget: (data: VSphereTargetCreate) =>
+    api.post<VSphereTarget>("/vsphere/targets", data).then((r) => r.data),
+  updateTarget: (id: string, data: VSphereTargetUpdate) =>
+    api.put<VSphereTarget>(`/vsphere/targets/${id}`, data).then((r) => r.data),
+  deleteTarget: (id: string) => api.delete(`/vsphere/targets/${id}`),
+  testConnection: (body: {
+    target_id?: string;
+    host?: string;
+    port?: number;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    username?: string;
+    password?: string;
+  }) =>
+    api
+      .post<VSphereTestResult>("/vsphere/targets/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/vsphere/targets/${id}/sync`)
       .then((r) => r.data),
 };
 

@@ -202,6 +202,7 @@ class SettingsResponse(BaseModel):
     integration_panos_enabled: bool
     integration_fortinet_enabled: bool
     integration_meraki_enabled: bool
+    integration_vsphere_enabled: bool
     domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
@@ -1158,6 +1159,7 @@ class SettingsUpdate(BaseModel):
     integration_panos_enabled: bool | None = None
     integration_fortinet_enabled: bool | None = None
     integration_meraki_enabled: bool | None = None
+    integration_vsphere_enabled: bool | None = None
     domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
@@ -2193,6 +2195,7 @@ class SettingsPublicResponse(BaseModel):
     integration_panos_enabled: bool
     integration_fortinet_enabled: bool
     integration_meraki_enabled: bool
+    integration_vsphere_enabled: bool
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

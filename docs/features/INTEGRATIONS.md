@@ -320,6 +320,48 @@ Same shape as Tailscale's Phase 2: a synthetic `DNSZone` materialised by the rec
 
 ---
 
+## VMware vSphere (#4740)
+
+Gated by the `integrations.vsphere` feature module (default off). One `VSphereTarget` row per vCenter Server, polled read-only over the vSphere Automation REST API. SpatiumDDI never writes to vCenter.
+
+| Field | Notes |
+|---|---|
+| `host` / `port` | vCenter host without scheme, default port `443`. The operator-configured address is the only endpoint contacted ([Privacy](../PRIVACY.md)). |
+| `verify_tls` | Default `true`. Untick only for a self-signed lab vCenter, or paste the CA in `ca_bundle_pem`. |
+| `username` / `password` | A read-only account (the built-in **Read-only** role, propagated from the vCenter root). The password is Fernet-encrypted at rest and never returned. |
+| `ipam_space_id` | Required. |
+| `mirror_vms` / `mirror_hosts` | Default `true`. |
+| `sync_interval_seconds` | Default `120`, minimum `30`. |
+
+Each pass opens a session (`POST /api/session`, HTTP Basic), reads `GET /api/vcenter/host`, `GET /api/vcenter/vm` and, for every powered-on VM, `GET /api/vcenter/vm/{vm}/guest/networking/interfaces` (bounded concurrency, at most 4000 guest calls), then closes the session (`DELETE /api/session`). Timeouts are 20 s per request.
+
+### Mirror semantics
+
+- **VM guest addresses** → `IPAddress` with `status="vsphere-vm"`, hostname = the VM name (folded to a legal host name), MAC from VMware Tools. Only `PREFERRED` global / private addresses of powered-on VMs; link-local, loopback, tentative and deprecated addresses are skipped.
+- **ESXi hosts** → `IPAddress` with `status="vsphere-host"` for a host whose vCenter inventory name is an IP literal (the REST API reports no management address otherwise).
+- **No subnets or blocks are created.** vCenter reports a guest's prefix length but no network plan, so an address lands in the subnet that already encloses it in the target's IP space; one with no enclosing subnet is counted as `skipped_no_subnet` and listed in Discovery. Create the subnet in IPAM and the next pass mirrors it.
+- **Guest IPs need VMware Tools.** A powered-on VM whose Tools is not running has NICs but no guest data. That is *unknown, not empty*: its existing rows are kept untouched and it is listed in Discovery as `tools_not_running`. A powered-off VM is not mirrored; its rows go like any other vanished source.
+- **Incomplete reads delete nothing.** A guest call that failed, a wrong-shape answer, or a VM list at vCenter's 4000-row cap (the list is not paged and does not say it was cut) skips the address pass, so nothing is absence-deleted over a hiccup.
+- **Same ownership rules as Proxmox:** an operator row at a mirrored address is claimed and locked (`user_modified_at`); a row another integration owns is never claimed; a vanished source deletes its mirror row unless the operator edited it, in which case the row is released (FK cleared) and kept; rows are only read and written inside the target's own IP space.
+- **Trash.** A target whose IP space is in Trash syncs nothing. A subnet in Trash is invisible to the sync: nothing is written into it, and after restore the next pass resumes against it.
+- **Delete** hands operator-made rows back first (#2287), like every integration.
+
+### Discovery
+
+The reconciler stores a per-VM snapshot (`last_discovery`) on each successful pass; the Eye button on the target row opens it: counters, then each VM with its power state, addresses and an issue code (`tools_not_running`, `no_ip`, `no_nic`, `no_subnet`, `powered_off`, `unreadable`) with a hint.
+
+### Setup
+
+1. Create a service user (for example `svc-spatium@vsphere.local`).
+2. On the vCenter root object add a permission for it with the **Read-only** role and *Propagate to children*.
+3. Add the vCenter on the vSphere page, hit **Test Connection**, then bind an IPAM space.
+
+### Operator Copilot
+
+`list_vsphere_targets` (module-gated, read-only, no secrets).
+
+---
+
 ## UniFi Network Application
 
 **Phase status**: read-only mirror shipped. Gated behind the `integrations.unifi` feature module (**default off** — Features & Integrations).
@@ -691,8 +733,10 @@ Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](https://github.com/s
 
 The **enterprise-firewall family** has since shipped on the same reconciler shape — **Palo Alto PAN-OS / Panorama** (#605) plus **Fortinet FortiGate** and **Cisco Meraki MX** (#606, Phase 1), each with its own section above. Check Point and Cisco FTD / FMC are the remaining Phase 2 vendors.
 
+**VMware vSphere** (#4740) has shipped on the same shape through the vSphere Automation REST API (vCenter 7.0 Update 2 or later; no SOAP, no `pyVmomi`), see [VMware vSphere](#vmware-vsphere-4740) below.
+
 Tier 2 (narrower): MikroTik RouterOS 7, Incus / LXD, HashiCorp Nomad, NetBox one-shot import.
 
 Tier 3 (cloud VPC family): AWS / Azure / GCP **shipped** (see [Cloud](#cloud-aws--azure--gcp) above). The token-only providers (Hetzner / DigitalOcean / Linode / Vultr) are reserved in the `CloudEndpoint` provider enum for a future phase.
 
-**Explicit non-goals**: VMware vCenter / ESXi (SOAP-heavy, enterprise effort), SNMP polling (tracked as a separate IPAM discovery line item), WireGuard raw config (no API).
+**Explicit non-goals**: SNMP polling (tracked as a separate IPAM discovery line item), WireGuard raw config (no API).

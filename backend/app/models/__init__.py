@@ -156,6 +156,7 @@ from app.models.tls_cert import TLSCertProbe, TLSCertTarget
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
+from app.models.vsphere import VSphereTarget
 from app.models.wol_schedule import (
     WolCalendar,
     WolCalendarEvent,
@@ -292,6 +293,7 @@ __all__ = [
     "OPNsenseRouter",
     "PANOSFirewall",
     "ProxmoxNode",
+    "VSphereTarget",
     "ReleaseSchemaHead",
     "SystemUpgradeRun",
     "TailscaleTenant",

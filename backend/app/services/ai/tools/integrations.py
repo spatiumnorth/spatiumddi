@@ -41,6 +41,7 @@ from app.models.panos import FirewallObject, PANOSFirewall
 from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
+from app.models.vsphere import VSphereTarget
 from app.services.ai.tools.base import register_tool
 from app.services.integration_credentials import credential_status
 from app.services.ipam.integration_space_audit import find_cross_space_adoptions, suspect_to_dict
@@ -254,6 +255,66 @@ async def list_proxmox_targets(
                 row[opt] = val
         out.append(row)
     return out
+
+
+# ── list_vsphere_targets ──────────────────────────────────────────────
+
+
+class ListVSphereTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_vsphere_targets",
+    permission=("read", "vsphere_target"),
+    module="integrations.vsphere",
+    description=(
+        "List configured VMware vCenter targets that SpatiumDDI mirrors "
+        "into IPAM. Each row carries id, name, description, host, enabled "
+        "flag, ipam_space_id, sync_interval_seconds, last_synced_at, "
+        "last_sync_error, vcenter_version and the host / VM counts of the "
+        "last pass. Use for 'which vCenters are configured?' or 'is vSphere "
+        "syncing?'. Passwords never appear."
+    ),
+    args_model=ListVSphereTargetsArgs,
+    category="integrations",
+)
+async def list_vsphere_targets(
+    db: AsyncSession, user: User, args: ListVSphereTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(VSphereTarget)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(VSphereTarget.name).like(like),
+                func.lower(VSphereTarget.description).like(like),
+                func.lower(VSphereTarget.host).like(like),
+            )
+        )
+    if args.enabled is not None:
+        stmt = stmt.where(VSphereTarget.enabled.is_(args.enabled))
+    stmt = stmt.order_by(VSphereTarget.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "name": r.name,
+            "description": r.description or "",
+            "host": r.host,
+            "enabled": r.enabled,
+            "ipam_space_id": str(r.ipam_space_id),
+            "sync_interval_seconds": r.sync_interval_seconds,
+            "last_synced_at": r.last_synced_at.isoformat() if r.last_synced_at else None,
+            "last_sync_error": r.last_sync_error,
+            "vcenter_version": r.vcenter_version,
+            "host_count": r.host_count,
+            "vm_count": r.vm_count,
+        }
+        for r in rows
+    ]
 
 
 # ── list_tailscale_targets ────────────────────────────────────────────

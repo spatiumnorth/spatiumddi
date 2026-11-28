@@ -99,6 +99,7 @@ from app.api.v1.users.router import router as users_router
 from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
 from app.api.v1.vrfs import router as vrfs_router
+from app.api.v1.vsphere import router as vsphere_router
 from app.api.v1.webhooks import router as webhooks_router
 from app.api.v1.wol_schedules import router as wake_scheduler_router
 from app.core.agent_wake import wake_publishing
@@ -529,6 +530,12 @@ api_v1_router.include_router(
     prefix="/proxmox",
     tags=["proxmox"],
     dependencies=[Depends(require_module("integrations.proxmox"))],
+)
+api_v1_router.include_router(
+    vsphere_router,
+    prefix="/vsphere",
+    tags=["vsphere"],
+    dependencies=[Depends(require_module("integrations.vsphere"))],
 )
 api_v1_router.include_router(
     reports_router,

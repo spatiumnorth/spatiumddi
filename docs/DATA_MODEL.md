@@ -381,6 +381,7 @@ an endpoint cleans up its mirrored rows).
 | `KubernetesCluster` | `kubernetes_cluster` | nodes / services / LB IPs |
 | `DockerHost` | `docker_host` | container network IPs |
 | `ProxmoxNode` | `proxmox_node` | bridges / SDN VNets / guest IPs |
+| `VSphereTarget` | `vsphere_target` | vCenter VM guest IPs + ESXi hosts named by IP (#4740) |
 | `TailscaleTenant` | `tailscale_tenant` | tailnet device IPs |
 | `UnifiController` | `unifi_controller` | UniFi networks + clients |
 | `CloudEndpoint` | `cloud_endpoint` | AWS / Azure / GCP instance / public / LB IPs |
@@ -388,7 +389,7 @@ an endpoint cleans up its mirrored rows).
 
 The reconciler FKs live on the IPAM rows: e.g.
 `IPAddress.kubernetes_cluster_id`, `docker_host_id`, `proxmox_node_id`,
-`tailscale_tenant_id`, `unifi_controller_id`, `cloud_endpoint_id`,
+`tailscale_tenant_id`, `vsphere_target_id`, `unifi_controller_id`, `cloud_endpoint_id`,
 `opnsense_router_id` (all `CASCADE`), with parallel columns on `IPBlock`
 and `Subnet` where the mirror creates structure.
 

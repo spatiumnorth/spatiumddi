@@ -193,6 +193,9 @@ backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_tab
 backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_table:340
 backend/alembic/versions/a7c3e9f1b405_console_mode.py:drop_column:48
 backend/alembic/versions/a7c3e9f1b405_console_mode.py:drop_column:65
+backend/alembic/versions/a7d3f9c1e268_vsphere_integration.py:drop_column:104
+backend/alembic/versions/a7d3f9c1e268_vsphere_integration.py:drop_column:107
+backend/alembic/versions/a7d3f9c1e268_vsphere_integration.py:drop_table:109
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:54
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:55
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:56

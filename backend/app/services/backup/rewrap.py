@@ -118,6 +118,7 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("unifi_controller", "id", "block_sync_api_key_encrypted"),
     ("unifi_controller", "id", "block_sync_password_encrypted"),
     ("unifi_controller", "id", "block_sync_username_encrypted"),
+    ("vsphere_target", "id", "password_encrypted"),
     ("unifi_controller", "id", "password_encrypted"),
     ("unifi_controller", "id", "username_encrypted"),
     ('"user"', "id", "password_history_encrypted"),

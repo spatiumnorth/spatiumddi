@@ -52,6 +52,7 @@ DEMO_RESTRICTED_MODULES: Final[frozenset[str]] = frozenset(
         "integrations.tailscale",
         "integrations.unifi",
         "integrations.cloud",
+        "integrations.vsphere",
     }
 )
 

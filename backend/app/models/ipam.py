@@ -49,6 +49,10 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
         "kubernetes-service",
         "proxmox-vm",
         "proxmox-lxc",
+        # VMware vSphere mirror (issue #4740): a VM guest address / an ESXi host
+        # whose vCenter inventory name is its IP.
+        "vsphere-vm",
+        "vsphere-host",
         "tailscale-node",
         # NetBird peer mirror (issue #603). One row per NetBird peer's
         # overlay IP, mirrored from the management API. Read-only — the
@@ -394,6 +398,14 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     meraki_org_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("meraki_org.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # VMware vSphere provenance (issue #4740) — IP rows mirrored from a vCenter
+    # VM guest address or ESXi host. Cascades on target delete.
+    vsphere_target_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vsphere_target.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -942,6 +954,14 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # VMware vSphere provenance (issue #4740) — IP rows mirrored from a vCenter
+    # VM guest address or ESXi host. Cascades on target delete.
+    vsphere_target_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vsphere_target.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -1201,6 +1221,14 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     meraki_org_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("meraki_org.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # VMware vSphere provenance (issue #4740) — IP rows mirrored from a vCenter
+    # VM guest address or ESXi host. Cascades on target delete.
+    vsphere_target_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vsphere_target.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

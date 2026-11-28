@@ -62,6 +62,7 @@ INTEGRATION_OWNERSHIP: dict[str, str] = {
     "panos_firewall_id": "paloalto",
     "fortinet_firewall_id": "fortinet",
     "meraki_org_id": "meraki",
+    "vsphere_target_id": "vsphere",
 }
 
 INTEGRATION_OWNERSHIP_FKS: frozenset[str] = frozenset(INTEGRATION_OWNERSHIP)
