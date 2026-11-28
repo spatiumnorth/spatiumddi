@@ -3137,6 +3137,17 @@ def _serial_at_least(got: int, want: int) -> bool:
     return got == want or 0 < (got - want) % 2**32 < 2**31
 
 
+def _op_size(op: dict[str, Any]) -> int:
+    """A rough upper bound of the wire size of one RRset op's changes."""
+    rec = op.get("record") or {}
+    members = (rec.get("rrset") or {}).get("members") or []
+    name = len(str(rec.get("name") or "@"))
+    return 64 + sum(
+        name + len(str(m.get("value") or "")) + 2 * len(str(m.get("name") or "")) + 32
+        for m in members
+    )
+
+
 def _serial_later(new: int, old: int) -> bool:
     """RFC 1982 serial comparison: ``new`` is strictly later than ``old``."""
     return 0 < (new - old) % 2**32 < 2**31
@@ -6362,26 +6373,36 @@ class Bind9Driver(DriverBase):
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 
-    def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
-        # DNSSEC ops (issue #49). BIND9 signs from the rendered config
-        # (inline-signing), so sign/unsign need no per-op action here — the
-        # zone's dnssec_enabled flip already reshaped the bundle + triggered a
-        # reload. A manual rollover is the one thing that needs an rndc call.
-        op_kind = op.get("op")
-        # #2835 — forget what the last op left this zone at before anything
-        # else, DNSSEC ops included: the sync loop asks ``reached_serial``
-        # after every op, and a value left from an earlier one is stale.
-        self._op_reached_map().pop(
-            str(op.get("zone_name") or "").rstrip(".").lower(), None
-        )
-        if op_kind == "dnssec_rollover":
-            return self._dnssec_rollover(op)
-        if op_kind in ("dnssec_sign", "dnssec_unsign"):
+    def _ddns_keyring(self) -> Any:
+        """The loopback TSIG keyring, parsed once and again only when the key
+        file changes (#5025: it was read and parsed for every op)."""
+        tsig_path = self.state_dir / self.rendered_dir_name / "tsig" / "ddns.key"
+        if not tsig_path.exists():
+            # Upgrade: the live named.conf still includes the pre-#2648 path
+            # until the next apply swaps a new tree in.
+            tsig_path = self.state_dir / "tsig" / "ddns.key"
+        try:
+            st = tsig_path.stat()
+        except OSError:
             return None
+        sig = (str(tsig_path), st.st_mtime_ns, st.st_size, st.st_ino)
+        cached = getattr(self, "_ddns_keyring_cache", None)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        keyring = None
+        # Very small parser — supports the one-line key we render above.
+        m = re.search(
+            r'key\s+"([^"]+)".*?secret\s+"([^"]+)"', tsig_path.read_text(), re.DOTALL
+        )
+        if m:
+            keyring = dns.tsigkeyring.from_text({m.group(1): m.group(2)})
+        self._ddns_keyring_cache = (sig, keyring)
+        return keyring
 
-        if dns is None:
-            raise RuntimeError("dnspython not installed — cannot apply record ops")
-        zone = op["zone_name"].rstrip(".") + "."
+    def _fill_op_update(self, upd: Any, op: dict[str, Any], zone: str) -> None:
+        """Put the RR changes of record / RRset op ``op`` for zone ``zone`` into
+        ``upd``, with the apex bookkeeping that goes with them. Neither a serial
+        nor sending: the one-op path and the batch path (#5025) add their own."""
         rec = op["record"]
         name = rec.get("name") or "@"
         rtype = rec["type"]
@@ -6390,21 +6411,6 @@ class Bind9Driver(DriverBase):
         # is the common case from JSON), so fall back explicitly.
         ttl_value = rec.get("ttl")
         ttl = ttl_value if ttl_value is not None else 3600
-
-        tsig_path = self.state_dir / self.rendered_dir_name / "tsig" / "ddns.key"
-        if not tsig_path.exists():
-            # Upgrade: the live named.conf still includes the pre-#2648 path
-            # until the next apply swaps a new tree in.
-            tsig_path = self.state_dir / "tsig" / "ddns.key"
-        keyring = None
-        if tsig_path.exists():
-            # Very small parser — supports the one-line key we render above.
-            content = tsig_path.read_text()
-            import re
-
-            m = re.search(r'key\s+"([^"]+)".*?secret\s+"([^"]+)"', content, re.DOTALL)
-            if m:
-                keyring = dns.tsigkeyring.from_text({m.group(1): m.group(2)})
 
         wire_value = _wire_value(rtype, value, rec)
 
@@ -6422,7 +6428,6 @@ class Bind9Driver(DriverBase):
         rrset = rec.get("rrset") if isinstance(rec.get("rrset"), dict) else None
         members = rrset.get("members") if rrset is not None else None
 
-        upd = dns.update.Update(zone, keyring=keyring)
         if rrset is not None and members is not None and op["op"] in RRSET_OP_KINDS:
             # ``or ttl`` would swallow a legitimate TTL of 0 (RFC 2181 allows
             # it and it is how "never cache this" is expressed), so test for
@@ -6487,6 +6492,146 @@ class Bind9Driver(DriverBase):
                     upd.delete(name, rtype)
             else:
                 raise ValueError(f"unknown op: {op['op']}")
+        if rrset is not None and members is not None and op["op"] in RRSET_OP_KINDS:
+            self._reconcile_apex(upd, zone, name, rtype.upper(), wire_members)
+
+    def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        # DNSSEC ops (issue #49). BIND9 signs from the rendered config
+        # (inline-signing), so sign/unsign need no per-op action here — the
+        # zone's dnssec_enabled flip already reshaped the bundle + triggered a
+        # reload. A manual rollover is the one thing that needs an rndc call.
+        op_kind = op.get("op")
+        # #2835 — forget what the last op left this zone at before anything
+        # else, DNSSEC ops included: the sync loop asks ``reached_serial``
+        # after every op, and a value left from an earlier one is stale.
+        self._op_reached_map().pop(
+            str(op.get("zone_name") or "").rstrip(".").lower(), None
+        )
+        if op_kind == "dnssec_rollover":
+            return self._dnssec_rollover(op)
+        if op_kind in ("dnssec_sign", "dnssec_unsign"):
+            return None
+
+        if dns is None:
+            raise RuntimeError("dnspython not installed — cannot apply record ops")
+        zone = op["zone_name"].rstrip(".") + "."
+        rec = op["record"]
+        name = rec.get("name") or "@"
+        rtype = rec["type"]
+        upd = dns.update.Update(zone, keyring=self._ddns_keyring())
+        self._fill_op_update(upd, op, zone)
+        self._send_update(
+            upd,
+            zone,
+            op.get("target_serial"),
+            f"op={op['op']} name={name} type={rtype}",
+        )
+        # Explicit None so the record-op path matches the dict|None return
+        # type the DNSSEC branches use (no implicit fall-through).
+        return None
+
+    # #5025 — a run of ops for one zone shares one RFC 2136 message (one
+    # connection, one pair of SOA reads, one zone transaction in named) up to
+    # these bounds; the message stays well under the 64 KiB TCP limit.
+    _BATCH_MAX_OPS = 200
+    _BATCH_MAX_BYTES = 40_000
+
+    def plan_op_batches(self, ops: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Group consecutive RRset ops of one zone (#5025); order is untouched.
+
+        Only an op whose whole effect is its own RRset batches. Anything else
+        is a run of one, applied exactly as before: DNSSEC ops, the older
+        per-value payloads, and an op that can change the zone's apex (the apex
+        NS set, or an address the apex glue depends on), whose bookkeeping
+        reads what named serves between ops."""
+        batches: list[list[dict[str, Any]]] = []
+        run: list[dict[str, Any]] = []
+        run_zone: str | None = None
+        run_bytes = 0
+        apex_cache: dict[str, tuple[str, set[str]] | None] = {}
+        for op in ops:
+            zone = self._batchable_zone(op, apex_cache)
+            size = _op_size(op) if zone is not None else 0
+            if run and (
+                zone is None
+                or zone != run_zone
+                or len(run) >= self._BATCH_MAX_OPS
+                or run_bytes + size > self._BATCH_MAX_BYTES
+            ):
+                batches.append(run)
+                run, run_zone, run_bytes = [], None, 0
+            if zone is None:
+                batches.append([op])
+                continue
+            run.append(op)
+            run_zone = zone
+            run_bytes += size
+        if run:
+            batches.append(run)
+        return batches
+
+    def _batchable_zone(
+        self, op: dict[str, Any], apex_cache: dict[str, tuple[str, set[str]] | None]
+    ) -> str | None:
+        """The zone key of ``op`` when it may share a message, else None."""
+        rec = op.get("record")
+        if op.get("op") not in RRSET_OP_KINDS or not isinstance(rec, dict):
+            return None
+        rrset = rec.get("rrset")
+        if not isinstance(rrset, dict) or rrset.get("members") is None:
+            return None
+        if not op.get("zone_name") or not rec.get("type"):
+            return None
+        key = str(op["zone_name"]).rstrip(".").lower()
+        if key not in apex_cache:
+            state = self._apex_state(key)
+            apex_cache[key] = (
+                None
+                if state is None
+                else (key + ".", _apex_address_names(key + ".", state.get("primary_ns")))
+            )
+        apex = apex_cache[key]
+        if apex is not None:
+            origin, addresses = apex
+            owner = _zone_file_name(str(rec.get("name") or "@"), origin).lower()
+            rtype = str(rec["type"]).upper()
+            if (rtype == "NS" and owner == origin) or (
+                rtype in {"A", "AAAA"} and owner in addresses
+            ):
+                return None
+        return key
+
+    def apply_record_op_batch(self, ops: list[dict[str, Any]]) -> list[dict[str, Any] | None]:
+        """Apply a run from ``plan_op_batches`` as one UPDATE message (#5025).
+
+        RFC 2136 applies a message's changes in order and all or none, so the
+        zone ends as it would after the ops one by one. The message carries one
+        serial, the latest of the ops' targets. Raises on any failure and
+        leaves the caller to apply the ops singly (they are idempotent)."""
+        if dns is None:
+            raise RuntimeError("dnspython not installed — cannot apply record ops")
+        zone = ops[0]["zone_name"].rstrip(".") + "."
+        key = zone.rstrip(".").lower()
+        # #2835 — see apply_record_op: forget the last op's serial first.
+        self._op_reached_map().pop(key, None)
+        upd = dns.update.Update(zone, keyring=self._ddns_keyring())
+        target: int | None = None
+        for op in ops:
+            if str(op["zone_name"]).rstrip(".").lower() != key:
+                raise ValueError("a batch is one zone")
+            self._fill_op_update(upd, op, zone)
+            t = op.get("target_serial")
+            if isinstance(t, int) and not isinstance(t, bool):
+                if target is None or _serial_later(t, target):
+                    target = t
+        self._send_update(upd, zone, target, f"batch of {len(ops)} ops")
+        return [None] * len(ops)
+
+    def _send_update(self, upd: Any, zone: str, target: Any, what: str) -> None:
+        """Number ``upd`` (when ``target`` is a later serial than the zone
+        serves), send it, and record what named serves afterwards for
+        ``reached_serial``. Raises when named refuses it. ``what`` names the
+        change in the error."""
         # #2835 — named numbers an update with no SOA in it itself
         # (``serial-update-method increment``: 1, 2, 3, …), so a zone that took
         # its records over this path served a serial the control plane never
@@ -6497,13 +6642,10 @@ class Bind9Driver(DriverBase):
         # that serial, with no +1 on top; one that is not later is ignored and
         # named increments as usual — so it is only sent when it is later, and
         # never moves the served serial backwards.
-        if rrset is not None and members is not None and op["op"] in RRSET_OP_KINDS:
-            self._reconcile_apex(upd, zone, name, rtype.upper(), wire_members)
         apex_after = None
         state = self._apex_state(zone.rstrip(".").lower())
         if state is not None:
             apex_after = _zone_apex(_apex_zone(state))
-        target = op.get("target_serial")
         has_target = isinstance(target, int) and not isinstance(target, bool)
         key = zone.rstrip(".").lower()
         refused = getattr(self, "_soa_refused_zones", None)
@@ -6555,7 +6697,7 @@ class Bind9Driver(DriverBase):
         if rcode != 0:  # NOERROR
             raise RuntimeError(
                 f"nsupdate returned rcode={rcode} "
-                f"(zone={zone} op={op['op']} name={name} type={rtype})"
+                f"(zone={zone} {what})"
             )
         if has_target:
             # Read back, never assumed from what was sent: a third-party
@@ -6567,9 +6709,6 @@ class Bind9Driver(DriverBase):
             else:
                 served = self._served_soa(zone)[2]
             self._op_reached_map()[key] = served if served is not None else SERIAL_UNREAD
-        # Explicit None so the record-op path matches the dict|None return
-        # type the DNSSEC branches use (no implicit fall-through).
-        return None
 
     def _remember_apex(self, zone: dict[str, Any]) -> None:
         """Note what ``_zone_apex`` reads for this zone (#2835, D5).
@@ -6608,7 +6747,7 @@ class Bind9Driver(DriverBase):
         }
         lines.append(f"{key}\t{json.dumps(state, separators=(',', ':'))}")
 
-    def periodic_served_serials(self) -> dict[str, int]:
+    def periodic_served_serials(self, exclude: Collection[str] = ()) -> dict[str, int]:
         """Zone name (lowercase, no trailing dot) → the serial named serves,
         for every primary zone the last render wrote in a group without
         views (#2835) and every secondary / stub zone in any group (#4065);
@@ -6619,7 +6758,8 @@ class Bind9Driver(DriverBase):
         transfer from the primary into a secondary. A zone that cannot be
         read (a secondary not transferred yet) is left out. A primary zone of
         a group with views reports as it always did, from its renders, and is
-        not read here. The reads run on the bounded apply pool.
+        not read here. The reads run on the bounded apply pool. ``exclude``
+        names zones to leave out (#5025).
         """
         keys: list[str] = []
         if not getattr(self, "_rendered_has_views", True):
@@ -6631,6 +6771,12 @@ class Bind9Driver(DriverBase):
             ]
         have = set(keys)
         keys += [k for k in getattr(self, "_rendered_secondaries", []) if k not in have]
+        if exclude:
+            # #5025 — zones a record op touched since the last sweep: the op
+            # read the serial back and reported it, so reading it again is a
+            # query per zone for nothing.
+            skip = {str(z).rstrip(".").lower() for z in exclude}
+            keys = [k for k in keys if k not in skip]
         served = _parallel_map(lambda k: self._served_soa(k + ".")[2], keys)
         return {k: v for k, v in zip(keys, served) if v is not None}
 

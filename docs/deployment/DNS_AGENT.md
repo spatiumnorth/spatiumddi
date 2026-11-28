@@ -367,8 +367,33 @@ the body shape / the "200 while ops are pending" fast path /
 ETag is the stored body's and no longer folds the ops page in, so a page
 does not rotate it — the fast path answers 200 with the same ETag and the
 next page, and the poll after the last ack answers 304 instead of
-re-sending the whole body. The agent never short-circuits on an unchanged
-ETag (it saves, compares `structural_etag`, drains the ops).
+re-sending the whole body. An agent of an older release never short-circuits
+on an unchanged ETag (it saves, compares `structural_etag`, drains the ops);
+one of this release does, as below.
+
+*Draining a long queue ([#5025](https://github.com/spatiumnorth/spatiumddi/issues/5025)).*
+Re-sending, re-parsing and re-saving the body for every 5,000-op page was most
+of the time a bulk load took to drain (250 MB per page at 1M devices, and the
+queue fell at 61 to 76 ops/s whatever the hardware). Three changes:
+
+- **Ops-only replies.** An agent whose live, cleanly applied bundle is the one
+  it presents in `If-None-Match` also sends `X-Spatium-Ops-Only: 1`. When that
+  ETag is the stored bundle's and ops are pending, the control plane answers
+  `200` with the same head (`etag`, `pending_record_ops`,
+  `pending_ops_remaining`) plus `"ops_only": true` and no body: the body is not
+  loaded or streamed. The agent applies the page against the bundle it holds
+  and does not touch `config/current.json`, so the invariant that every body
+  an agent holds covers every op it applied still stands, and a restart still
+  serves from a valid cache (non-negotiable #5). Without the header (every
+  agent of an older release), with another ETag, or with nothing pending, the
+  answer is exactly what it was. The agent withholds the header while a
+  bundle is quarantined, zones are held back or refused, the verdict is not
+  healthy, a startup hold is on, or its cache is not the live ETag.
+- **A full reply with the ETag already held** (a new agent against an older
+  control plane) is read only as far as its head: the agent closes the
+  connection, and neither spools, parses nor re-saves the body.
+- **Ops of one zone share an UPDATE** and the served-serial sweep stays off the
+  page cycle; see the BIND9 driver ([DNS_DRIVERS.md](../drivers/DNS_DRIVERS.md#batched-record-ops-5025)).
 
 *The newest render is served, current or not.* A long-poll serves the
 newest bundle the running release stored, even when changes have been

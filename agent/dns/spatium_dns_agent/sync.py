@@ -52,7 +52,7 @@ from .config_apply import (
     truncate_error,
 )
 from .drivers.base import SERIAL_UNREAD, DriverBase, HeldZone
-from .fetch import get_config
+from .fetch import OPS_ONLY_HEADER, get_config
 from .instance import (
     AGENT_INSTANCE,
     AGENT_INSTANCE_HEADER,
@@ -102,6 +102,16 @@ DNSSEC_REFRESH_SECONDS = 300.0
 # secondary's transfer is the same (#4065): named takes a newer serial, or a
 # first one, with no apply here.
 SERVED_REPORT_SECONDS = 60.0
+# #5025 — while record ops are still being drained the sweep waits (it ran on
+# the sync loop between pages and cost about 22 s of every page at 20,000
+# zones), but never longer than this: a zone named moved some other way is
+# still reported within this bound, drain or no drain. The sweep that does run
+# leaves out the zones an op touched since the last one — their serial was read
+# back and reported by the op itself.
+SERVED_REPORT_MAX_DEFER_SECONDS = 600.0
+
+# What ``_applied_in_batches`` yields for an op no batch covered.
+_UNBATCHED = object()
 
 # #2309 — how often the key directory is re-checked between structural
 # applies, so a zone's key files go when its grace period ends.
@@ -240,6 +250,10 @@ class SyncLoop:
     # Class default so a loop built without __init__ (tests) reads "not known".
     _live_etag: str | None = None
     _retire_held = False
+    # #5025 — see ``_report_served_serials``.
+    _draining = False
+    _served_deferred_since: float | None = None
+    _ops_touched_zones: set[str] | None = None
 
     def __init__(
         self,
@@ -1128,6 +1142,16 @@ class SyncLoop:
             self._current_etag = None
         if self._current_etag:
             headers["If-None-Match"] = self._current_etag
+        # #5025 — say so when the body for that ETag is already here: the
+        # control plane then answers pending ops without it, and a control
+        # plane that sends it anyway is read only as far as its head
+        # (``get_config``). Withheld whenever what is held is not the live,
+        # cleanly applied bundle, so every other poll is exactly as before.
+        hold_etag = self._current_etag if self._holds_live_body() else None
+        fetch_kw: dict[str, Any] = {}
+        if hold_etag:
+            headers[OPS_ONLY_HEADER] = "1"
+            fetch_kw["hold_etag"] = hold_etag
         try:
             if self._boot_hold is not None and not self._current_etag:
                 # #2019 — nothing is serving while the cache is held, and with
@@ -1135,10 +1159,10 @@ class SyncLoop:
                 # than holding the long-poll, so a short timeout decides
                 # "unreachable" quickly and the fallback below can serve.
                 with self._client(timeout=BOOT_FETCH_TIMEOUT) as c:
-                    resp = get_config(c, headers, self.cfg.state_dir)
+                    resp = get_config(c, headers, self.cfg.state_dir, **fetch_kw)
             else:
                 with self._client() as c:
-                    resp = get_config(c, headers, self.cfg.state_dir)
+                    resp = get_config(c, headers, self.cfg.state_dir, **fetch_kw)
         # #2029 — OSError: the body is spooled to the state dir, and a full
         # disk there fails this fetch exactly as an unreachable control plane
         # does (the partial spool is already removed, the cache untouched)
@@ -1150,6 +1174,7 @@ class SyncLoop:
             return
 
         if resp.status_code == 304:
+            self._draining = False
             if self._live_etag is not None and self._live_etag == self._current_etag:
                 self._confirm_live_bundle()
             return
@@ -1216,6 +1241,16 @@ class SyncLoop:
             log.warning("sync_bundle_missing_etag")
             return
 
+        # #5025 — a reply with no body: the ops page of the bundle this agent
+        # holds. It means something only for the bundle it asked about; any
+        # other is a reply nothing here can apply, and its ops go back.
+        head_only = bool(bundle.get("head_only") or bundle.get("ops_only"))
+        if head_only and (etag != self._current_etag or not self._holds_live_body()):
+            log.warning("sync_head_only_reply_unusable", etag=etag, held=self._current_etag)
+            self._return_unapplied_ops(bundle, "the reply carried no bundle to apply them to")
+            self._current_etag = None
+            return
+
         # #882 — the quarantine names ONE bundle. If the control plane is no
         # longer serving it, the operator has saved something else and the
         # record is moot: drop it now rather than let ``retry_due`` keep
@@ -1229,7 +1264,10 @@ class SyncLoop:
             self._quarantine.clear()
 
         # Atomic-swap cache always (cache is the source of truth for restarts)
-        save_config(self.cfg.state_dir, bundle, etag)
+        # A reply that carried the body it already holds is not parsed and
+        # saved again (#5025): ``current.json`` is that body.
+        if not head_only:
+            save_config(self.cfg.state_dir, bundle, etag)
 
         # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP trigger
         # writes moved to the supervisor's heartbeat loop. The
@@ -1244,7 +1282,7 @@ class SyncLoop:
         # Record CRUD bumps the full etag but not structural_etag, so the
         # daemon stays running and ops are applied incrementally below.
         new_structural = bundle.get("structural_etag")
-        if new_structural != self._current_structural_etag:
+        if not head_only and new_structural != self._current_structural_etag:
             # #882 — a bundle that already failed is not retried on every
             # poll. Advancing ``_current_etag`` parks the long-poll on a 304
             # until either the operator saves something different or the
@@ -1313,9 +1351,15 @@ class SyncLoop:
         # and the zones an op failed for in this pass.
         reached: dict[str, int] = {}
         failed_zones: set[str] = set()
-        for op in bundle.get("pending_record_ops", []):
+        pending_ops = bundle.get("pending_record_ops", [])
+        touched = self._ops_touched_zones
+        if touched is None:
+            touched = self._ops_touched_zones = set()
+        for op, batched in self._applied_in_batches(pending_ops):
             try:
-                result = self.driver.apply_record_op(op)
+                result = (
+                    self.driver.apply_record_op(op) if batched is _UNBATCHED else batched
+                )
                 # #2850 — what the op gave the control plane (or took from
                 # it), so a later render tells its deletions from records a
                 # third party wrote by RFC 2136.
@@ -1330,6 +1374,7 @@ class SyncLoop:
                     zone=op.get("zone_name"),
                 )
                 _note_reached(reached, op)
+                touched.add(_zone_key(op.get("zone_name")))
                 # A driver that can serve a zone at a serial of its own
                 # (PowerDNS never goes backwards from the one it serves,
                 # #1968; BIND9 numbers an update itself when the op's serial
@@ -1353,6 +1398,7 @@ class SyncLoop:
                 self.heartbeat.pending_acks.append(_ack(op, "error", str(e)))
                 self.heartbeat.failed_ops_count += 1
                 failed_zones.add(_zone_key(op.get("zone_name")))
+        self._draining = bool(pending_ops) or int(bundle.get("pending_ops_remaining") or 0) > 0
         if dnssec_states:
             self._report_dnssec_state(dnssec_states)
             # #1934 — a manual rollover (``rndc dnssec -rollover``) makes BIND
@@ -1433,6 +1479,66 @@ class SyncLoop:
         # confirmed-in-sync state). A failed apply returns early above
         # so we never reach this point on error.
         _touch_ready_marker(self.cfg.state_dir)
+
+    def _holds_live_body(self) -> bool:
+        """True when ``current.json`` is the bundle this agent is serving, whole
+        and cleanly applied (#5025): the one case where a reply need not carry
+        the body again. Anything short of that (a quarantine, a held-back or
+        refused zone, an unhealthy verdict, a startup hold, a cache that is not
+        the live etag) reads the body in full, as before."""
+        etag = self._current_etag
+        if (
+            not etag
+            or etag != self._live_etag
+            or self._current_structural_etag is None
+            or self._quarantine.etag is not None
+            or not self.apply_status.healthy
+            or self.driver.held_back
+            or self._zones_refused
+            or self._boot_hold is not None
+        ):
+            return False
+        cfg_dir = self.cfg.state_dir / "config"
+        try:
+            return (cfg_dir / "current.json").is_file() and (
+                (cfg_dir / "current.etag").read_text().strip() == etag
+            )
+        except OSError:
+            return False
+
+    def _applied_in_batches(self, ops: Sequence[dict[str, Any]]) -> Any:
+        """Yield ``(op, result)`` for each op, in order, applying runs the
+        driver says can share one message as one batch (#5025).
+
+        ``result`` is what ``apply_record_op`` would have returned, or
+        ``_UNBATCHED`` for an op to apply on its own. A batch that fails is not
+        reported as failed: its ops are yielded unbatched, so each one is
+        applied, acked and errored exactly as if there had been no batching,
+        in the same order."""
+        plan = getattr(self.driver, "plan_op_batches", None)
+        batches: list[list[dict[str, Any]]] = [[op] for op in ops]
+        if callable(plan) and len(ops) > 1:
+            try:
+                batches = plan(list(ops))
+            except Exception:  # noqa: BLE001 — planning is an optimisation
+                log.exception("op_batch_plan_failed")
+        for batch in batches:
+            results: Sequence[Any] | None = None
+            if len(batch) > 1:
+                try:
+                    results = self.driver.apply_record_op_batch(batch)
+                    if len(results) != len(batch):
+                        raise RuntimeError("driver returned a result per op, not per batch")
+                except Exception as e:  # noqa: BLE001 — fall back to one op at a time
+                    log.warning(
+                        "op_batch_failed_applying_singly",
+                        zone=batch[0].get("zone_name"),
+                        ops=len(batch),
+                        error=str(e)[:200],
+                    )
+                    results = None
+            for i, op in enumerate(batch):
+                yield op, (_UNBATCHED if results is None else results[i])
 
     def _apply_with_revert(self, bundle: dict[str, Any], etag: str) -> bool:
         """Apply ``bundle``; on failure fall back to the last-known-good (#882).
@@ -1814,12 +1920,24 @@ class SyncLoop:
         (never reported at a serial it was not seen serving), and so is a zone
         the last apply held back or left partly refused.
         """
-        self._served_report_at = time.monotonic() + SERVED_REPORT_SECONDS
+        now = time.monotonic()
+        self._served_report_at = now + SERVED_REPORT_SECONDS
         hook = getattr(self.driver, "periodic_served_serials", None)
         if not callable(hook):
             return
+        if self._draining:
+            # #5025 — the sweep reads every zone, and on the sync thread that
+            # holds the next page back. Not while ops are being drained, until
+            # the bound; the zones the ops touch report themselves.
+            if self._served_deferred_since is None:
+                self._served_deferred_since = now
+            if now - self._served_deferred_since < SERVED_REPORT_MAX_DEFER_SECONDS:
+                return
+        self._served_deferred_since = None
+        skip_zones = self._ops_touched_zones or set()
+        self._ops_touched_zones = set()
         try:
-            served = hook()
+            served = hook(exclude=skip_zones) if skip_zones else hook()
         except Exception as e:  # noqa: BLE001 — reporting is best-effort
             log.warning("served_serials_read_failed", error=str(e))
             return

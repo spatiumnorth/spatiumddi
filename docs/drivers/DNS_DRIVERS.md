@@ -189,7 +189,7 @@ What the table drives:
 
 | Operation | Mechanism | Notes |
 |---|---|---|
-| Add/update/delete record | RFC 2136 `nsupdate` (via `dnspython`) | Incremental, instant, TSIG-signed |
+| Add/update/delete record | RFC 2136 `nsupdate` (via `dnspython`) | Incremental, instant, TSIG-signed; consecutive ops of a zone share one message ([batching](#batched-record-ops-5025)) |
 | Create zone | A `zone` stanza in the rendered `named.conf`, then `rndc reconfig` | No restart; no `rndc addzone` |
 | Delete zone | The stanza is dropped from the rendered `named.conf`, then `rndc reconfig` | No restart; no `rndc delzone` |
 | Update zone options (SOA, TTL) | `nsupdate` SOA record replacement | Incremental |
@@ -198,6 +198,33 @@ What the table drives:
 | Update RPZ (blocking), small change | RFC 2136 update of the added / removed names to the RPZ zone ([#4191](https://github.com/spatiumnorth/spatiumddi/issues/4191)) | No reload, no second copy of the zone in memory |
 | Update RPZ (blocking), large change | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: initial install, major version upgrade |
+
+### Batched record ops (#5025)
+
+The agent drains the op queue a page (5,000 ops) at a time. For each page the
+BIND9 driver's `plan_op_batches` groups **consecutive** ops of the same zone
+into runs (never reordering across zones), and `apply_record_op_batch` sends a
+run as **one** RFC 2136 UPDATE: each op's whole-RRset write (delete the RRset,
+add its members) in order, one SOA serial (the latest `target_serial`), one
+connection and one pair of SOA reads for the run, instead of one of each per
+op. A message applies in order and all-or-nothing, so the zone ends as it
+would after the ops one by one. A run is at most 200 ops and about 40 KB.
+
+An op applies on its own, exactly as before, when it is a DNSSEC op, carries
+the older per-value payload (no `rrset`), or can change the zone's apex (an
+apex NS RRset, or the address of the placeholder or `primary_ns` name server):
+the apex bookkeeping reads what `named` serves between ops. A run that fails
+(named refuses the message, a value will not parse, the message is too large)
+is not reported as failed: its ops are applied one at a time, so each op's ack,
+error text and order are what they always were. Other drivers keep the per-op
+path (`plan_op_batches` on the driver base returns one run per op). The TSIG key
+file is parsed once and re-read only when it changes.
+
+The served-serial sweep (every 60 s, one SOA read per primary zone, #2835) no
+longer holds the next page back: while ops are being drained it waits, for at
+most 10 minutes, and the sweep that then runs leaves out the zones an op
+touched since the last one, whose serial the op already read back and
+reported.
 
 ### RPZ zones are updated incrementally ([#4191](https://github.com/spatiumnorth/spatiumddi/issues/4191))
 
