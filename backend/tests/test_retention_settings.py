@@ -36,6 +36,15 @@ RETENTION: dict[str, tuple[int, int, int, int]] = {
     "metric_retention_days": (30, 7, 1, 365),
     "log_retention_hours": (72, 24, 1, 168),
     "e911_resolution_log_retention_days": (180, 90, 7, 3650),
+    "alert_event_retention_days": (181, 180, 0, 3650),
+    "ip_mac_history_retention_days": (366, 365, 0, 3650),
+    "nmap_scan_retention_days": (91, 90, 0, 3650),
+    "conformity_result_retention_days": (366, 365, 0, 3650),
+    "event_outbox_retention_days": (8, 7, 0, 3650),
+    "user_session_retention_days": (31, 30, 0, 3650),
+    "ai_chat_retention_days": (91, 90, 0, 3650),
+    "change_request_retention_days": (366, 365, 0, 3650),
+    "run_log_retention_days": (91, 90, 0, 3650),
 }
 
 

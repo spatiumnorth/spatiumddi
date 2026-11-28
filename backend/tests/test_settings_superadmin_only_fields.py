@@ -139,6 +139,15 @@ SUPERADMIN_ONLY_VALUES: dict[str, Any] = {
     # E911 lookup trail bounds (#3514).
     "e911_resolution_log_retention_days": 180,
     "e911_lookup_log_budget_per_minute": 60,
+    "alert_event_retention_days": 181,
+    "ip_mac_history_retention_days": 366,
+    "nmap_scan_retention_days": 91,
+    "conformity_result_retention_days": 366,
+    "event_outbox_retention_days": 8,
+    "user_session_retention_days": 31,
+    "ai_chat_retention_days": 91,
+    "change_request_retention_days": 366,
+    "run_log_retention_days": 91,
 }
 
 # One valid value per delegate-writable field.

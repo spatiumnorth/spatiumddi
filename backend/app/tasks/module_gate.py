@@ -133,6 +133,10 @@ UNGATED_BEAT_TASKS: Final[dict[str, str]] = {
     "app.tasks.upgrade_orchestrator.release_lingering_shared_tag_hold": (
         "core appliance upgrade orchestration"
     ),
+    "app.tasks.prune_unbounded_tables.prune_unbounded_tables": (
+        "core: retention sweep over platform tables (#2274); windows are "
+        "PlatformSettings columns and 0 keeps forever, so there is no module to gate on"
+    ),
     "app.tasks.firewall_lint_scan.scan_firewall_extra": (
         "one-time advisory audit of stored firewall_extra values; DB-only, writes "
         "audit rows, never touches a host"
