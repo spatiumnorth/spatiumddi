@@ -382,3 +382,25 @@ async def test_merge_target_wins_comparison_and_rendering_3326(
     assert any("disagree on dns_servers:" in w for w in preview.warnings)
     cf = next(w for w in preview.warnings if "disagree on custom_fields:" in w)
     assert "x" * 200 not in cf and len(cf) < 600
+
+
+@pytest.mark.asyncio
+async def test_merge_preview_values_are_not_python_syntax_4831(
+    db_session: AsyncSession,
+) -> None:
+    """#4831: dates, dicts and no-value read as plain text, not repr()."""
+    import datetime
+
+    a, b = await _make_pair(db_session)
+    a.decom_date, b.decom_date = datetime.date(2031, 6, 30), None
+    a.tags, b.tags = {"xit9": "a"}, {"xit9": "b"}
+    a.custom_fields, b.custom_fields = {"n": "keep-a"}, {"o": {"k": "v-b"}}
+    a.vlan_id, b.vlan_id = 77, None
+    await db_session.flush()
+    preview = await preview_subnet_merge(db_session, a, [b.id])
+    text = " ".join(preview.warnings + [c.detail for c in preview.conflicts])
+    assert "datetime" not in text and "{'" not in text
+    assert "None" not in text
+    assert "decom_date: 2031-06-30, none." in text
+    assert 'tags: {"xit9":"a"}, {"xit9":"b"}' in text
+    assert "vlan_id: 77, none." in text

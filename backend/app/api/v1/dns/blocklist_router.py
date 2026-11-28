@@ -44,6 +44,7 @@ from app.core.safe_fetch import (
     mask_url_credentials,
 )
 from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
+from app.drivers.dns import blocklist_capable
 from app.models.audit import AuditLog
 from app.models.dns import (
     FEED_WILDCARD_MODES,
@@ -363,8 +364,9 @@ class BlockListResponse(BaseModel):
     # through a view) is estimated at 80 % or more of its agents' memory
     # limit. Each view that applies a list loads its own copy of it.
     memory_warning: str | None = None
-    # #4573 — set when a group this list is applied to (directly or through a
-    # view) runs only PowerDNS, which has no RPZ: the list blocks nothing there.
+    # #4573 / #4608 — set when a group this list is applied to (directly or
+    # through a view) has no server that renders a blocklist (PowerDNS, Windows
+    # DNS, a cloud driver): the list blocks nothing there.
     unapplied_warning: str | None = None
 
     model_config = {"from_attributes": True}
@@ -559,25 +561,22 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
     )
 
 
-# Drivers that render a blocklist (RPZ / the Technitium block list). PowerDNS
-# authoritative has no RPZ, so a list assigned only to PowerDNS servers blocks
-# nothing (#4573).
-_BLOCKLIST_DRIVERS = frozenset({"bind9", "technitium"})
-
-
+# Which drivers render a blocklist is the driver's ``blocklist`` capability
+# (``app.drivers.dns.blocklist_capable``). A group whose servers all lack it
+# applies nothing (#4573, #4608).
 async def _refuse_blocklist_inert_groups(db: DB, group_ids: set[uuid.UUID]) -> None:
-    """422 when a newly assigned group has a PowerDNS server and no server
-    that renders a blocklist. Transition-only, like the Technitium refusal
-    above: the caller passes the NEWLY assigned groups, so a stored assignment
-    stays editable and removable (its response carries ``unapplied_warning``).
+    """422 when a newly assigned group has servers and none renders a
+    blocklist. Transition-only, like the Technitium refusal: the caller passes
+    the NEWLY assigned groups, so a stored assignment stays editable and
+    removable (its response carries ``unapplied_warning``).
     """
     for name in sorted((await _inert_group_names(db, group_ids)).values()):
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Group {name!r} runs PowerDNS, which has no RPZ and cannot apply a "
-                "blocklist, and it has no BIND9 or Technitium server that can. "
-                "Assign the list to a BIND9 group."
+                f"Group {name!r} has no server that can apply a blocklist: only BIND9 "
+                "and agent-managed Technitium do, and its servers use drivers with no "
+                "RPZ (PowerDNS, Windows DNS, cloud DNS). Assign the list to a BIND9 group."
             ),
         )
 
@@ -590,10 +589,10 @@ async def _inert_group_names(db: DB, group_ids: set[uuid.UUID]) -> dict[uuid.UUI
             select(DNSServer.group_id, DNSServer.driver).where(DNSServer.group_id.in_(group_ids))
         )
     ).all()
-    drivers: dict[uuid.UUID, set[str]] = {}
+    capable: dict[uuid.UUID, bool] = {}
     for gid, driver in rows:
-        drivers.setdefault(gid, set()).add(driver)
-    inert = {gid for gid, ds in drivers.items() if "powerdns" in ds and not ds & _BLOCKLIST_DRIVERS}
+        capable[gid] = capable.get(gid, False) or blocklist_capable(driver)
+    inert = {gid for gid, ok in capable.items() if not ok}
     if not inert:
         return {}
     rows = (
@@ -621,7 +620,7 @@ async def _with_memory_warnings(db: DB, lists: list[DNSBlockList]) -> list[Block
         inert = {n for g, n in inert_by_id.items() if g in _blocklist_group_ids(bl)}
         if inert:
             resp.unapplied_warning = (
-                "PowerDNS has no RPZ, so this list blocks nothing on: "
+                "No server in these groups renders a blocklist, so this list blocks nothing on: "
                 + ", ".join(sorted(inert))
                 + "."
             )

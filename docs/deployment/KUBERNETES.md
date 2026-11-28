@@ -347,7 +347,7 @@ in the UI, so do them in this order.
 2. **Turn on supervisor registration.** `supervisor_registration_enabled` is
    **off** on a Helm control plane. While it is off the supervisor logs
    `supervisor_registration_enabled=false` and idles, and nothing appears in
-   Fleet. Turn it on under **Appliance → Pairing → Enable registration**, or:
+   Fleet. Turn it on under **Appliance → Fleet → Pairing codes → Enable registration**, or:
 
    ```bash
    curl -sk -X PUT https://<host>/api/v1/settings \
@@ -538,6 +538,25 @@ externalRedis:
 
 ---
 
+### Joining appliance agent nodes (#4659)
+
+Appliance registration (`supervisor_registration_enabled`) is **off** on a
+Helm install, on OpenShift too. An appliance that joins with a pairing code
+while it is off cannot register and idles, with nothing in Fleet. Turn it on
+before the first pairing, either from the UI (**Appliance → Fleet → Pairing →
+Enable registration**) or at install time:
+
+```yaml
+supervisorRegistration:
+  initiallyEnabled: true
+```
+
+The value is read only when the settings row is first created, so it sets a
+fresh install's starting state and never overrides a later choice. Minting a
+pairing code while registration is off shows a warning in the UI and returns
+`warning` in the API response. Docker Compose has the same switch as
+`INITIAL_SUPERVISOR_REGISTRATION=true` in `.env`.
+
 ## 3. Managed DNS / DHCP agents
 
 The chart can optionally stand up one StatefulSet (+ Service) per managed DNS
@@ -589,8 +608,19 @@ Getting client traffic to them is different for the two services, and each
 has its own section below: [Exposing DNS to clients](#exposing-dns-to-clients)
 and [Exposing DHCP to clients](#exposing-dhcp-to-clients).
 
-Pre-create the bootstrap PSK Secrets (or use `agentKey.value` inline for lab
-use only):
+The agent keys do not depend on `dnsAgents.enabled` / `dhcpAgents.enabled`
+(#4648): the api and worker always carry `DNS_AGENT_KEY` / `DHCP_AGENT_KEY`, so
+an appliance node can join a Helm control plane as a DNS or DHCP worker with no
+in-cluster agents. When you set neither `existingSecret` nor `value`, the chart
+generates a `<release>-agent-keys` Secret on first install, keeps it across
+upgrades and uninstalls (`helm.sh/resource-policy: keep`), and the in-cluster
+agents read the same Secret. Read the key to give an appliance with
+`kubectl get secret <release>-agent-keys -o jsonpath='{.data.DNS_AGENT_KEY}' | base64 -d`.
+A render with no cluster access (`helm template`, Argo CD / Flux) generates
+nothing, so pin the keys there with the settings below.
+
+To pin the keys, pre-create the bootstrap PSK Secrets (or use `agentKey.value`
+inline for lab use only):
 
 ```bash
 kubectl -n spatiumddi create secret generic spatium-dns-agent-key \
@@ -630,8 +660,8 @@ use the cluster's default StorageClass. Set it before the first install: claim
 templates are immutable, so Kubernetes refuses the change on a live
 StatefulSet, and a PVC that already exists keeps the class it was created with.
 On an existing install, `kubectl delete sts <name> -n <ns> --cascade=orphan`
-(pod and PVCs survive) and then upgrade or sync again; `helm upgrade` stops
-with that command when it detects the change. See the chart README,
+for each agent StatefulSet (pod and PVCs survive) and then upgrade or sync again; `helm upgrade` stops
+with one such command per StatefulSet when it detects the change. See the chart README,
 [Adopting `storageClass` on an existing install](https://github.com/spatiumnorth/spatiumddi/blob/main/charts/spatiumddi/README.md#adopting-storageclass-on-an-existing-install).
 
 Per-server entry fields (`name`, `role`, `group`, `storage.*`, `storageClass`,

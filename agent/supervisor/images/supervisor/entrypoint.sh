@@ -42,6 +42,26 @@ if [ -d /var/lib/spatiumddi-host/release-state ]; then
         -execdir chown -h 10001:10001 {} + 2>/dev/null || true
 fi
 
+# The storage-action request directory is written by whichever supervisor
+# is running: after a rollback that is the previous release's (uid 100), and
+# its start only re-owns its own state, not this directory. So it belongs to
+# the group both supervisors carry (spatium-host, 2770 -- the group
+# release-state itself uses), group-writable and setgid so names created in
+# it keep that group. No sticky bit: the supervisor removes the root-written
+# results, and with the bit it could not. Created here if missing and
+# corrected on every start. A symlink at the name is removed (rm does not
+# follow it) and chown / chmod run on "." from inside the directory after
+# checking it resolved to itself, so a swap after the check cannot redirect
+# them.
+if [ -d /var/lib/spatiumddi-host/release-state ]; then
+    _sd=/var/lib/spatiumddi-host/release-state/storage
+    [ -L "$_sd" ] && rm -f "$_sd"
+    mkdir -p "$_sd" 2>/dev/null || true
+    ( cd -P "$_sd" 2>/dev/null \
+        && [ "$(pwd -P)" = "$(cd -P /var/lib/spatiumddi-host/release-state && pwd -P)/storage" ] \
+        && chown 10001:2770 . && chmod 2770 . ) 2>/dev/null || true
+fi
+
 if [ -d /etc/nftables.d ]; then
     # Issue #239 — only the supervisor (spatium user) writes here.
     # 0750 keeps the group's read+traverse capability for operators

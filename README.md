@@ -481,7 +481,7 @@ register with the control plane. Two ways to provide it:
 **Pairing code (recommended).** Easy to type, even over an
 IPMI / serial console.
 
-1. On the control plane, open **Appliance → Pairing** and
+1. On the control plane, open **Appliance → Fleet → Pairing codes** and
    click **New pairing code**. Pick the agent kind (DNS /
    DHCP / DNS + DHCP for combined boxes), an optional server
    group, and an expiry (15 min default).

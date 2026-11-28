@@ -117,6 +117,7 @@ from app.services.mfa import (
 from app.services.mfa_enrol_stepup import EnrolStepup, resolve_enrol_stepup, verify_enrol_stepup
 from app.services.password_policy import (
     PasswordPolicy,
+    history_error,
     is_in_history,
     push_history,
 )
@@ -1091,10 +1092,7 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "reason": "password_history",
-                "errors": [
-                    f"Password matches one of the last {policy.history_count} "
-                    "passwords; choose a new one."
-                ],
+                "errors": [history_error(policy.history_count)],
             },
         )
 
@@ -1722,7 +1720,7 @@ async def _app_base_url(db: DB, request: Request) -> str:
         built_url=fallback,
         path=request.url.path,
         hint=(
-            "Settings > General > External URL is empty, so the OIDC redirect_uri / "
+            "Settings → Application → Branding & URL → External URL is empty, so the OIDC redirect_uri / "
             "SAML ACS is built from the incoming request. Behind a reverse proxy "
             "set it to the public https:// URL (docs/deployment/REVERSE_PROXY.md)."
         ),

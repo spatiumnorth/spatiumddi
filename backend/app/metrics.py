@@ -62,6 +62,21 @@ AGENT_BUNDLE_INLINE_FAILURES = Counter(
     ["family"],
 )
 
+# #4545 — DNS query log / DHCP activity log forwarding to syslog targets.
+# ``dropped`` is what the ``log_forward_dropping`` alert is about (its
+# persisted twin is ``audit_forward_target.log_stream_dropped_total``: this
+# registry is the api's, the alert is evaluated by the worker).
+LOG_STREAM_SENT = Counter(
+    "spatiumddi_log_stream_sent_total",
+    "Log-stream events delivered to a forward target",
+    ["stream", "target"],
+)
+LOG_STREAM_DROPPED = Counter(
+    "spatiumddi_log_stream_dropped_total",
+    "Log-stream events dropped because a forward target could not keep up",
+    ["stream", "target"],
+)
+
 # #1051 — the ``path_template`` value for a request no route claimed (a 404,
 # or a path the router never saw). ONE constant bucket, never the raw path:
 # the label set must stay bounded by the route table, not by what clients

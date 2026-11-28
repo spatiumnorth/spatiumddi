@@ -146,14 +146,19 @@ from app.services.agents.memory_status import (
 from app.services.agents.spool_status import SpoolStatus
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
-from app.services.api_token_scopes import read_only_post, token_outbound
+from app.services.api_token_scopes import read_only_post, token_outbound, token_write
 from app.services.appliance.group_names import (
     group_assigned_to_appliance,
     group_name_problem,
 )
 from app.services.appliance.tls import certificate_store_location
 from app.services.approvals.gate import gate_or_execute
-from app.services.dns import dnssec_signers, option_support, technitium_api_scope
+from app.services.dns import (
+    dnssec_policy_support,
+    dnssec_signers,
+    option_support,
+    technitium_api_scope,
+)
 from app.services.dns.agent_instance import duplicate_active as duplicate_agent_active
 from app.services.dns.bundle_dirty import mark_bundles_dirty
 from app.services.dns.cname_conflict import (
@@ -212,7 +217,11 @@ from app.services.dns.new_object_defaults import (
     default_zone_ttl,
     load_dns_defaults,
 )
-from app.services.dns.powerdns_alias import alias_resolver
+from app.services.dns.powerdns_alias import (
+    ALIAS_NO_FORWARDER_MESSAGE,
+    alias_resolver,
+    group_can_resolve_alias,
+)
 from app.services.dns.record_identity import describe_identical, find_identical_record
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
@@ -239,10 +248,13 @@ from app.services.dns.server_move import (
     elect_primary,
     ensure_group_catalog_compatible,
     ensure_group_classless_compatible,
+    ensure_group_dnssec_policy_compatible,
+    ensure_group_powerdns_compatible,
     ensure_group_single_driver,
     ensure_group_views_compatible,
     lock_server_row,
     move_server_to_group,
+    powerdns_zone_type_refusal,
     views_refusal,
     views_unsupported_message,
 )
@@ -414,6 +426,7 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/sign": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/unsign": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/dnssec/rollover": _Z,
+    "POST /groups/{group_id}/zones/{zone_id}/dnssec/ack-ds-change": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/move/preview": _Z,
     "POST /groups/{group_id}/zones/{zone_id}/move/commit": _Z,
     "GET /zone-templates": _Z,
@@ -443,7 +456,18 @@ _DNS_ROUTE_TYPES: dict[str, tuple[str, ...]] = {
     "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/preview": _R,
     "POST /groups/{group_id}/zones/{zone_id}/import/spreadsheet/commit": _R,
 }
-_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns")
+# The server-group routes are gated on ``dns_group`` but audit their changes as
+# ``dns_server_group``; a refusal is written under the audited type (#4718) so
+# the Audit Log's Resource filter lists it with the group's changes. Only the
+# routes whose own rows are ``dns_server_group`` are listed: the group's
+# servers, ACLs, views and keys are audited as their own types.
+_DNS_AUDIT_TYPES: dict[str, str] = {
+    "POST /groups": "dns_server_group",
+    "PUT /groups/{group_id}": "dns_server_group",
+    "DELETE /groups/{group_id}": "dns_server_group",
+    "POST /groups/{group_id}/group-tsig-key/rotate": "dns_server_group",
+}
+_DNS_GATE = require_route_types(_DNS_ROUTE_TYPES, "/dns", _DNS_AUDIT_TYPES)
 
 # The upload routes here check the login from the request headers before
 # the multipart body is read (app.api.pre_body_auth, #2780).
@@ -2850,6 +2874,8 @@ async def create_server(
         )
         await ensure_group_catalog_compatible(db, group, body.driver)
         await ensure_group_classless_compatible(db, group, body.driver)
+        await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
+        await ensure_group_dnssec_policy_compatible(db, group, body.driver)
         await ensure_group_views_compatible(db, group, body.driver)
     except ServerMoveError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -3000,6 +3026,8 @@ async def update_server(
             )
             await ensure_group_catalog_compatible(db, group, body.driver)
             await ensure_group_classless_compatible(db, group, body.driver)
+            await ensure_group_powerdns_compatible(db, group, body.driver)  # #4570
+            await ensure_group_dnssec_policy_compatible(db, group, body.driver)
             await ensure_group_views_compatible(db, group, body.driver)
         except ServerMoveError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
@@ -4087,7 +4115,10 @@ async def sync_group_with_servers(
                     result=result,
                 )
             )
-            servers_succeeded += 1
+            # A server whose every zone failed (PowerDNS: all unsupported)
+            # did not sync; don't report it as a success (#4604 B6).
+            if not (result.items and all(i.error for i in result.items)):
+                servers_succeeded += 1
             total_imported += result.total_imported
             total_pushed += result.total_pushed
             total_queued += result.total_queued
@@ -6303,6 +6334,25 @@ async def _assert_forward_zone_serviceable(
         )
 
 
+async def _refuse_powerdns_unsupported_zone_type(
+    db: DB, group_id: uuid.UUID, zone_type: str, current: DNSZone | None = None
+) -> None:
+    """422 a forward / stub zone on a group with a PowerDNS server (#4570).
+
+    PowerDNS Authoritative has no forward-zone type, so the agent logs and
+    drops the zone (clients get REFUSED), and it creates a ``stub`` as a
+    full ``Slave``. Refused on the transition only: a zone already stored
+    with that type (``current``) stays editable and re-saveable.
+    """
+    if zone_type not in {"forward", "stub"}:
+        return
+    if current is not None and current.zone_type == zone_type:
+        return
+    refusal = powerdns_zone_type_refusal(await _group_driver_names(db, group_id), zone_type)
+    if refusal is not None:
+        raise HTTPException(status_code=422, detail=refusal)
+
+
 async def _check_zone_forward_transport(
     group_id: uuid.UUID,
     changes: dict[str, Any],
@@ -6389,6 +6439,7 @@ async def create_zone(
         zone_fields["ttl"] = await default_zone_ttl(db, group_id)
     _refuse_superadmin_zone_fields(current_user, zone_fields, None)
     await _enforce_technitium_api_zone_scope(db, group_id, zone_fields, None)
+    await _refuse_powerdns_unsupported_zone_type(db, group_id, body.zone_type)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
     )
@@ -7248,6 +7299,9 @@ async def update_zone(
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     await _enforce_technitium_api_zone_scope(db, zone.group_id, changes, zone)
+    await _refuse_powerdns_unsupported_zone_type(
+        db, zone.group_id, changes.get("zone_type", zone.zone_type), zone
+    )
     changes.update(await _validated_zone_named_conf_fields(zone.group_id, changes, zone, db))
     effective_zone_type = changes.get("zone_type", zone.zone_type)
     await _assert_forward_zone_serviceable(
@@ -8313,6 +8367,10 @@ class ZoneDNSSECInfo(BaseModel):
     dnssec_policy_id: uuid.UUID | None = None
     dnssec_ds_records: list[str] = []
     dnssec_synced_at: datetime | None = None
+    # #4566 — when the DS set above replaced an earlier one (the server
+    # regenerated or rolled its keys), so it has to be published at the
+    # parent again. None for the first DS after signing.
+    dnssec_ds_changed_at: datetime | None = None
     keys: list[DNSSECKeyState] = []
     # #1762 — the zone is signed and its group has more than one DNS server,
     # each signing with its own keys; ``signing_servers`` is that count.
@@ -8323,6 +8381,8 @@ class ZoneDNSSECInfo(BaseModel):
     # ``dnssec_enabled`` this is a zone signed before the refusal.
     signing_unmanaged: bool = False
     dnssec_unmanaged_warning: bool = False
+    # #4623 — the zone holds a custom policy its PowerDNS group ignores.
+    unapplied_warning: str | None = None
 
 
 class ZoneTemplateParameter(BaseModel):
@@ -8420,10 +8480,12 @@ async def get_zone_dnssec_info(
     unmanaged = bool(await dnssec_signers.unmanaged_signing_group_ids(db, {zone.group_id}))
     return ZoneDNSSECInfo.model_validate(
         {
+            "dnssec_ds_changed_at": await dnssec_signers.ds_changed_at(db, zone),
             "dnssec_multi_signer": bool(zone.dnssec_enabled) and signers > 1,
             "signing_servers": signers,
             "signing_unmanaged": unmanaged,
             "dnssec_unmanaged_warning": bool(zone.dnssec_enabled) and unmanaged,
+            "unapplied_warning": await dnssec_policy_support.stored_policy_warning(db, zone),
             "zone_id": str(zone.id),
             "zone_name": zone.name,
             "dnssec_enabled": zone.dnssec_enabled,
@@ -8447,6 +8509,41 @@ async def get_zone_dnssec_info(
             ],
         }
     )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/dnssec/ack-ds-change",
+    response_model=ZoneDNSSECInfo,
+)
+@token_write("Records the operator's DS-published acknowledgement as an audit row")
+async def acknowledge_zone_dnssec_ds_change(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneDNSSECInfo:
+    """The operator published the zone's current DS set at the parent (#4566).
+
+    Clears the "DS records changed" warning on the DNSSEC card. SpatiumDDI
+    cannot see the parent zone, so this is the operator's word, recorded in the
+    audit log with the DS set it covers; a later DS change warns again.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=dnssec_signers.DS_ACK_AUDIT_ACTION,
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={"ds_records": [str(d) for d in zone.dnssec_ds_records or []]},
+            result="success",
+        )
+    )
+    await db.commit()
+    return await get_zone_dnssec_info(group_id, zone_id, db, current_user)
 
 
 class DNSSECSignRequest(BaseModel):
@@ -8693,6 +8790,9 @@ class ZoneMovePreviewResponse(BaseModel):
     #: refuses, not waivable by acknowledgement.
     technitium_acl_refusal: str | None = None
     classless_refusal: str | None = None
+    #: #4623 — a custom DNSSEC policy the PowerDNS target would ignore.
+    dnssec_policy_refusal: str | None = None
+    powerdns_refusal: str | None = None
     #: #4565 — a view the zone or its records would keep in a target group
     #: that cannot serve views; non-null means the commit refuses.
     views_refusal: str | None = None
@@ -8739,6 +8839,8 @@ class ZoneMovePreviewResponse(BaseModel):
             forward_transport_refusal=plan.forward_transport_refusal,
             technitium_acl_refusal=plan.technitium_acl_refusal,
             classless_refusal=plan.classless_refusal,
+            dnssec_policy_refusal=plan.dnssec_policy_refusal,
+            powerdns_refusal=plan.powerdns_refusal,
             views_refusal=plan.views_refusal,
             warnings=plan.warnings,
             required_acknowledgements=plan.required_acknowledgements,
@@ -12782,33 +12884,12 @@ async def _refuse_policy_on_powerdns(
 ) -> None:
     """422 a custom DNSSEC policy on a group that has a PowerDNS server (#4567).
 
-    The PowerDNS agent signs every zone with its own fixed settings (ECDSA
-    P-256, plain NSEC, no scheduled rollover) and never reads the policy, so a
-    stored custom policy would claim an algorithm / NSEC3 / lifetimes the zone
-    is not signed with. Only a *change* to a custom policy is refused: an
-    untouched save of a value already stored passes, and the built-in default
-    (which matches what PowerDNS does) is always accepted.
+    The rule lives in :mod:`app.services.dns.dnssec_policy_support`, shared
+    with the Copilot apply, the zone move and the server move (#4623).
     """
-    if policy_id is None or policy_id == zone.dnssec_policy_id:
-        return
-    pol = await db.get(DNSSECPolicy, policy_id)
-    if pol is None or pol.is_builtin:
-        return
-    res = await db.execute(
-        select(func.count())
-        .select_from(DNSServer)
-        .where(DNSServer.group_id == group_id, DNSServer.driver == "powerdns")
-    )
-    if res.scalar_one():
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "PowerDNS does not apply a custom DNSSEC policy: it signs zones with ECDSA "
-                "P-256 and plain NSEC and does no scheduled key rollover, so the policy "
-                f"{pol.name!r} would be stored but not honoured. Use the built-in default "
-                "policy, or put the zone in a BIND9 group."
-            ),
-        )
+    msg = await dnssec_policy_support.set_policy_refusal(db, group_id, zone, policy_id)
+    if msg:
+        raise HTTPException(status_code=422, detail=msg)
 
 
 async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) -> None:
@@ -12930,20 +13011,10 @@ async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID,
         # PowerDNS expands an ALIAS through the group's own plain-DNS
         # forwarders and nothing else (#1353); without them the record would
         # be stored and answer nothing.
-        opts = (
-            await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
-        ).scalar_one_or_none()
-        if not alias_resolver(
-            getattr(opts, "forwarders", None), getattr(opts, "forward_transport", None)
-        ):
+        if not await group_can_resolve_alias(db, group_id):
             raise HTTPException(
                 status_code=422,
-                detail=(
-                    "ALIAS records are resolved through the group's forwarders, and this "
-                    "group has none over plain DNS (Do53). Set forwarders under the "
-                    "group's server options first; SpatiumDDI no longer falls back to "
-                    "public resolvers."
-                ),
+                detail=ALIAS_NO_FORWARDER_MESSAGE,
             )
 
 

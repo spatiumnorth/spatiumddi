@@ -80,6 +80,7 @@ from app.services.ipam.subnet_boundary import (
 from app.services.ipam.subnet_carry import (
     merge_conflicts_and_warnings,
     merged_carried,
+    readable,
 )
 from app.services.ipam.subnet_dependents import (
     carry_for_merge,
@@ -294,7 +295,7 @@ def _check_metadata_compat(sources: list[Subnet]) -> list[MergeConflict]:
     ]
     for fname, label in fields_to_check:
         if not _all_eq(fname):
-            values = sorted({repr(getattr(s, fname)) for s in sources})
+            values = sorted({readable(getattr(s, fname)) for s in sources})
             conflicts.append(
                 MergeConflict(
                     type=f"metadata_mismatch:{fname}",

@@ -6,7 +6,7 @@ from it, so the bundle, the agent and the ETag see no new field. Every existing
 class gets NULL, which reads as "hand-written expression": nothing is rewritten.
 
 Revision ID: e5a1c8d27f43
-Revises: d8b3f6a1c274
+Revises: c4d8e1a7b9f2
 Create Date: 2026-11-21 10:00:00.000000
 """
 
@@ -15,7 +15,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "e5a1c8d27f43"
-down_revision = "d8b3f6a1c274"
+down_revision = "c4d8e1a7b9f2"
 branch_labels = None
 depends_on = None
 

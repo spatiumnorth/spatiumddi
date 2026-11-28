@@ -84,6 +84,7 @@ Access the UI at `http://your-host-or-ip:8077/` (or `http://localhost:8077/` if 
 | `DEBUG` | `false` | Enable FastAPI debug mode |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `15` | JWT access token lifetime |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh token lifetime |
+| `PDNS_PROXY_PROTOCOL_FROM` | unset | PowerDNS behind the dnsdist front only: the front's address or the compose network CIDR. Turns on PROXY protocol between the front and pdns so transfer / update ACLs and the query log see the real client. See [DNS drivers 2.7](../drivers/DNS_DRIVERS.md#27-dnsdist-front-for-powerdns-issue-146-phase-2) |
 
 ---
 
@@ -155,7 +156,7 @@ server {
 Then set `FRONTEND_TRUSTED_PROXY_CIDRS` in `.env` to the address the proxy
 connects from (a proxy on the Docker host itself usually arrives from the
 compose network's gateway, e.g. `172.18.0.1`; the frontend's access log shows
-it) and set **Settings > General > External URL** to the public `https://`
+it) and set **Settings → Application → Branding & URL → External URL** to the public `https://`
 URL. Without the first the frontend nginx overwrites the proxy's
 `X-Forwarded-Proto` and client address, so every user shares one login
 throttle bucket and SSO callbacks are built as `http://`.

@@ -119,6 +119,21 @@ spec:
                   name: spatiumddi-secrets
                   key: credential-key-since
                   optional: true
+            # #4648 — agent PSKs the control plane verifies registrations
+            # against (in-cluster agents AND appliance agent nodes). Optional;
+            # see secrets.yaml.example.
+            - name: DNS_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: dns-agent-key
+                  optional: true
+            - name: DHCP_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: dhcp-agent-key
+                  optional: true
             - name: DATABASE_URL
               value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-rw:5432/spatiumddi"
             # #1547 — Redis password from the Secret, interpolated

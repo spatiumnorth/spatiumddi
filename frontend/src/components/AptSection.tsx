@@ -620,10 +620,14 @@ export function AptSection({
           reboots. Applies even without managed APT sources. An empty
           allowed-origins list means nothing is auto-upgraded.
         </div>
-        <label className="block text-xs font-medium">
+        <label
+          htmlFor="apt-section-allowed-origins-one-per-line"
+          className="block text-xs font-medium"
+        >
           Allowed origins (one per line)
         </label>
         <textarea
+          id="apt-section-allowed-origins-one-per-line"
           className={cn(inputCls, "w-full font-mono text-xs")}
           rows={3}
           placeholder={"${distro_id}:${distro_codename}-security"}
@@ -634,12 +638,16 @@ export function AptSection({
             mark();
           }}
         />
-        <label className="block text-xs font-medium">
+        <label
+          htmlFor="apt-section-package-blocklist-never-auto-u"
+          className="block text-xs font-medium"
+        >
           Package blocklist — never auto-upgraded. One regular expression per
           line, matched from the start of the package name (not a glob:{" "}
           <code>linux-image-</code>, <code>^openssl$</code>)
         </label>
         <textarea
+          id="apt-section-package-blocklist-never-auto-u"
           className={cn(inputCls, "w-full font-mono text-xs")}
           rows={2}
           placeholder={"linux-image-\n^openssl$"}
