@@ -189,6 +189,7 @@ SECTIONS: tuple[Section, ...] = (
             "nat_mapping",
             "ip_mac_history",
             "subnet_plan",
+            "subnet_hold",
         ),
     ),
     Section(

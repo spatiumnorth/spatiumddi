@@ -1321,6 +1321,16 @@ def _ipam_endpoints() -> dict[str, object]:
         for name, obj in vars(mod).items():
             if callable(obj) and getattr(obj, "__module__", None) == mod.__name__:
                 found.setdefault(name, obj)
+    # Subnet holds (#4492) are mounted under /ipam/holds from their own package.
+    import inspect
+
+    # The package re-exports ``router`` (the APIRouter), which shadows the
+    # submodule as an attribute, so import it by name.
+    holds = importlib.import_module("app.api.v1.subnet_holds.router")
+
+    for name, obj in vars(holds).items():
+        if inspect.isfunction(obj) and obj.__module__ == holds.__name__:
+            found.setdefault(name, obj)
     return found
 
 

@@ -93,6 +93,7 @@ from app.models.dhcp import (
 from app.models.dns import DNSRecord
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.holds import hold_conflicts
 from app.services.ipam.subnet_boundary import (
     boundary_addresses,
     boundary_host_conflicts,
@@ -758,6 +759,10 @@ async def preview_subnet_resize(
                 exclude_block_ids=ancestor_block_ids,
             )
         )
+        conflicts.extend(
+            ResizeConflict(type="subnet_hold", detail=d)
+            for d in await hold_conflicts(db, subnet.space_id, canonical_new)
+        )
         conflicts.extend(await _parent_containment_conflicts_subnet(db, subnet, new_net))
         conflicts.extend(
             ResizeConflict(
@@ -1205,6 +1210,12 @@ async def commit_subnet_resize(
         raise ResizeError(
             "New CIDR overlaps another subnet in the same space: "
             + "; ".join(c.detail for c in overlap),
+            status_code=409,
+        )
+    held = await hold_conflicts(db, subnet.space_id, canonical_new)
+    if held:
+        raise ResizeError(
+            "New CIDR overlaps a held CIDR in the same space: " + "; ".join(held),
             status_code=409,
         )
     # Sibling/cousin BLOCK overlap — a subnet resize must not silently

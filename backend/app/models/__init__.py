@@ -149,6 +149,7 @@ from app.models.proxmox import ProxmoxNode
 from app.models.release_schema import ReleaseSchemaHead
 from app.models.saved_view import SavedView
 from app.models.settings import BrandingAsset, PlatformSettings
+from app.models.subnet_hold import SubnetHold  # noqa: F401
 from app.models.system_upgrade import SystemUpgradeRun
 from app.models.tailscale import TailscaleTenant
 from app.models.time_bound_grant import TimeBoundGrant

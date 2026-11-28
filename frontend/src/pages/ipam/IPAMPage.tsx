@@ -205,6 +205,7 @@ import {
   SubnetImportExportButton,
 } from "./ImportExportModals";
 import { ResizeBlockModal, ResizeSubnetModal } from "./ResizeModals";
+import { HoldsPanel } from "./HoldsPanel";
 import { MoveBlockModal } from "./MoveBlockModal";
 import {
   IPNetworkTab,
@@ -15101,6 +15102,7 @@ export function BlockDetailView({
           )}
         </div>
       </div>
+      <HoldsPanel block={block} />
       {showPlanAllocation && (
         <PlanAllocationModal
           block={block}

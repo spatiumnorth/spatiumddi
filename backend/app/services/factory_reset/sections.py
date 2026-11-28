@@ -116,6 +116,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         tables=(
             "ip_address",
             "subnet_plan",
+            "subnet_hold",
             "subnet",
             "ip_block",
             "ip_space",

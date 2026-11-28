@@ -68,6 +68,7 @@ from app.models.dhcp import (
 )
 from app.models.ipam import IPAddress, Subnet, SubnetDomain
 from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.ipam.holds import hold_conflicts
 from app.services.ipam.subnet_boundary import (
     boundary_addresses,
     boundary_host_conflicts,
@@ -261,6 +262,14 @@ async def preview_subnet_split(
         )
 
     children_nets = _children_of(parent, new_prefix_length)
+
+    # The children are carved out of the parent's CIDR, so a hold there means
+    # the parent was allocated over a held CIDR (#4492): refuse to mint more
+    # subnets on it.
+    conflicts.extend(
+        SplitConflict(type="subnet_hold", detail=d.replace("New CIDR", "Parent CIDR"))
+        for d in await hold_conflicts(db, subnet.space_id, str(parent))
+    )
 
     # Load all the rows on the parent we need to bucket.
     addr_rows = (

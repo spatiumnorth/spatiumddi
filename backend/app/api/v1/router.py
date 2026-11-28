@@ -88,6 +88,7 @@ from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
 from app.api.v1.sessions.router import router as sessions_router
 from app.api.v1.settings.router import router as settings_router
+from app.api.v1.subnet_holds import router as subnet_holds_router
 from app.api.v1.system import router as system_router
 from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
@@ -371,6 +372,7 @@ api_v1_router.include_router(groups_router, prefix="/groups", tags=["groups"])
 # resource-bound token is refused on it. Mounted before the IPAM router so no
 # parameterised IPAM path can shadow the literal one.
 api_v1_router.include_router(integration_space_audit_router, prefix="/ipam", tags=["ipam"])
+api_v1_router.include_router(subnet_holds_router, prefix="/ipam/holds", tags=["ipam"])
 include_token_scoped(
     api_v1_router,
     ipam_router,

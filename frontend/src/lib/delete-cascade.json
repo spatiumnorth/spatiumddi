@@ -23,6 +23,7 @@
     "multicast_membership": "multicast memberships",
     "ot_device": "OT devices",
     "ot_zone": "OT zones",
+    "subnet_hold": "subnet holds",
     "subnet_plan": "subnet plans",
     "vlan_mapping": "VLAN mappings"
   },
@@ -82,7 +83,12 @@
     "ip_space": {
       "root": "ip_space",
       "includes": ["ip_block"],
-      "tables": ["subnet_plan", "vlan_mapping", "av_reserved_range"],
+      "tables": [
+        "subnet_plan",
+        "vlan_mapping",
+        "av_reserved_range",
+        "subnet_hold"
+      ],
       "extra": []
     },
     "multicast_group": {
