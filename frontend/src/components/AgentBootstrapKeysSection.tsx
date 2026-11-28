@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { ReauthFields } from "@/components/ReauthFields";
+import { FormError } from "@/components/ui/form-error";
 import {
   NEEDS_SUPERADMIN,
   permissionGate,
@@ -118,10 +119,13 @@ export function AgentBootstrapKeysSection() {
             </p>
           )}
           {reveal.isError && (
-            <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
-              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <FormError className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+              <AlertCircle
+                aria-hidden="true"
+                className="mt-0.5 h-3.5 w-3.5 shrink-0"
+              />
               <span>{formatApiError(reveal.error)}</span>
-            </div>
+            </FormError>
           )}
           <button
             type="submit"
