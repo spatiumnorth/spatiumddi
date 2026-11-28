@@ -25,6 +25,7 @@ from app.models.auth import APIToken, Group
 from app.models.ipam import IPSpace
 from app.models.ownership import Customer
 from app.models.tenant import Tenant
+from app.services.api_token_scopes import token_write
 
 router = APIRouter()
 
@@ -160,6 +161,7 @@ async def list_tenants(_: SuperAdmin, db: DB) -> list[TenantResponse]:
 
 
 @router.post("", response_model=TenantResponse, status_code=status.HTTP_201_CREATED)
+@token_write("Creates a tenant row, which is a write to the tenancy configuration.")
 async def create_tenant(body: TenantCreate, user: SuperAdmin, db: DB) -> TenantResponse:
     await _check_customer(db, body.customer_id)
     if await _name_taken(db, body.name):
@@ -270,6 +272,7 @@ async def list_tenant_spaces(tenant_id: uuid.UUID, _: SuperAdmin, db: DB) -> lis
 
 
 @router.post("/{tenant_id}/spaces", response_model=TenantResponse)
+@token_write("Assigns IP spaces to a tenant, changing which tenant owns each space.")
 async def assign_spaces(
     tenant_id: uuid.UUID, body: TenantSpaceAssign, user: SuperAdmin, db: DB
 ) -> TenantResponse:
