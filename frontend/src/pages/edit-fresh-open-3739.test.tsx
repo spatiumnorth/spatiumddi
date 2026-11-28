@@ -119,6 +119,10 @@ const opts = (over: Partial<DNSServerOptions> = {}) =>
     tcp_clients: null,
     clients_per_query: null,
     max_clients_per_query: null,
+    recursive_clients: null,
+    serve_stale_enabled: false,
+    stale_answer_ttl: null,
+    max_stale_ttl: null,
     dnsdist_enabled: false,
     dnsdist_max_qps_per_client: null,
     dnsdist_action: "truncate",
@@ -140,6 +144,39 @@ const opts = (over: Partial<DNSServerOptions> = {}) =>
   }) as unknown as DNSServerOptions;
 
 describe("DNS group Options tab (#3739)", () => {
+  it("edits recursive-clients and serve-stale (#3567)", async () => {
+    const fresh = opts({ recursive_clients: 2000 });
+    const updateOptions = vi.fn(() => Promise.resolve(fresh));
+    answers.dnsApi = {
+      getOptions: () => Promise.resolve(fresh),
+      updateOptions,
+      listServers: () => Promise.resolve([]),
+    };
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    open(<OptionsTab groupId="g-1" />, client);
+    await waitFor(() => expect(screen.getByDisplayValue("2000")).toBeTruthy());
+    fireEvent.change(screen.getByDisplayValue("2000"), {
+      target: { value: "5000" },
+    });
+    const stale = screen
+      .getByText(/serve-stale/)
+      .closest("label")!
+      .querySelector("input")!;
+    fireEvent.click(stale);
+    fireEvent.change(screen.getByLabelText("stale-answer-ttl (seconds)"), {
+      target: { value: "30" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Save Changes/ }));
+    await waitFor(() => expect(updateOptions).toHaveBeenCalled());
+    expect(updateOptions).toHaveBeenCalledWith("g-1", {
+      recursive_clients: 5000,
+      serve_stale_enabled: true,
+      stale_answer_ttl: 30,
+    });
+  });
+
   it("fills from a fresh read, not the cache, and sends only the changed option", async () => {
     const stale = opts();
     const fresh = opts({

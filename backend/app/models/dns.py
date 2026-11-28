@@ -905,6 +905,15 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     tcp_clients: Mapped[int | None] = mapped_column(Integer, nullable=True)
     clients_per_query: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_clients_per_query: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Resolver limits (#3567). ``recursive-clients`` caps simultaneous recursive
+    # lookups (BIND's own default is 1000, low for a busy campus resolver); null
+    # renders nothing. Serve-stale answers from an expired cache entry when the
+    # upstream is unreachable: ``stale-answer-enable`` is gated by
+    # ``serve_stale_enabled`` and the two TTLs render only while it is on.
+    recursive_clients: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    serve_stale_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    stale_answer_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_stale_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # ── dnsdist front for PowerDNS (#146 Phase 2) ──────────────────────────
     # PowerDNS Authoritative has no RRL equivalent, so the project's answer is

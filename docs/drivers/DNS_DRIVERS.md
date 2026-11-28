@@ -149,6 +149,10 @@ The Options tab and `PUT /dns/groups/{id}/options` are driver-agnostic, and ever
 | `tcp_clients` | yes | no | no |
 | `clients_per_query` | yes | no | no |
 | `max_clients_per_query` | yes | no | no |
+| `recursive_clients` | yes | no | no |
+| `serve_stale_enabled` | yes | no | no |
+| `stale_answer_ttl` | yes | no | no |
+| `max_stale_ttl` | yes | no | no |
 | `dnsdist_enabled` | no | yes | no |
 | `dnsdist_max_qps_per_client` | no | yes | no |
 | `dnsdist_action` | no | yes | no |
@@ -408,7 +412,10 @@ the control-plane preview template `named.conf.j2`.
   [qps-scale]; [exempt-clients]; [log-only]; }` stanza. `log-only` is BIND's
   dry-run (count + log drops, drop nothing) for sizing the limit safely.
 - `minimal_responses`, `tcp_clients`, `clients_per_query`,
-  `max_clients_per_query` each render only when set.
+  `max_clients_per_query`, `recursive_clients` each render only when set.
+- `serve_stale_enabled` renders `stale-answer-enable yes;`; `stale_answer_ttl`
+  and `max_stale_ttl` (`stale-answer-ttl`, `max-stale-ttl`) render only while
+  it is on (#3567).
 - **Every field defaults to a no-op**, so adding the feature renders
   byte-identical config for groups that haven't opted in (the bundle etag
   shifts once on upgrade, causing a single graceful `rndc reconfig`).
@@ -1017,7 +1024,7 @@ The Options tab and `PUT /dns/groups/{id}/options` are driver-agnostic and the b
 | `dnssec_validation` | **applied**: `settings/set dnssecValidation` (boolean, default `true`). `no` sends `false`; `yes` and `auto` send `true`. A bundle without the key leaves the daemon alone. |
 | `allow_query` | **applied per zone**: `zones/options/set queryAccess` + `queryAccessNetworkACL` on Primary, Secondary, Stub and Forwarder zones (BIND's options-level `allow-query` covers a conditional-forward zone too). `any` (or empty) is `Allow`, `none` is `Deny`, a list of addresses / CIDRs (optionally `!`-negated, in order) is `UseSpecifiedNetworkACL`, with `any` inside a list becoming `0.0.0.0/0,::/0`. `Allow` and an empty ACL are sent too (Technitium reads an empty `queryAccessNetworkACL` as "clear"), so widening a list back to `any` un-restricts the zones. `localhost`, `localnets`, `key X` and ACL names have no equivalent: the API refuses them for a Technitium group, and a row stored earlier is reported once per apply as a partial apply and left as the daemon has it. It does not restrict recursion for names outside every zone; that is Technitium's own recursion setting. A Primary, Secondary or Stub zone's own `allow_query` replaces the group's for that zone, as a zone-level `allow-query` does in BIND (#2263); unset or empty inherits the group's, and a Forwarder zone always uses the group's. A zone list Technitium cannot express is refused by the API too (zone create, update and a move into the group), and one stored earlier leaves an existing zone as the daemon has it; a primary the agent has just created, which it holds at `Deny` until its records land, is released to the group's list in that case rather than to `Allow`. |
 | `blackhole` | **refused** (#2263): Technitium has no setting to drop a client's queries by address, so the API answers 422 for a non-empty list on a group with a Technitium server. |
-| `minimal_responses`, `tcp_clients`, `clients_per_query`, `max_clients_per_query` | **not supported**: Technitium has no setting for them. The API answers 422 to a change to a non-default value for a group holding a Technitium server (`services/dns/technitium_options.py`); re-posting the stored value, or the default, stays allowed because the form sends every field. The Options tab disables these controls with the reason, except one holding a stored value, which stays enabled so it can be cleared. |
+| `minimal_responses`, `tcp_clients`, `clients_per_query`, `max_clients_per_query`, `recursive_clients`, `serve_stale_enabled`, `stale_answer_ttl`, `max_stale_ttl` | **not supported**: Technitium has no setting for them. The API answers 422 to a change to a non-default value for a group holding a Technitium server (`services/dns/technitium_options.py`); re-posting the stored value, or the default, stays allowed because the form sends every field. The Options tab disables these controls with the reason, except one holding a stored value, which stays enabled so it can be cleared. |
 | `forward_policy` | **`only` is the one true value** (#1764). With forwarders set, Technitium resolves through them and never falls back to recursing from the root when they fail (BIND's `forward only`). `first` is the stored default for every group, so the API tolerates `first` over a stored `first`, accepts `only`, and answers 422 to a change *to* `first` once the group holds `only`. A group with forwarders and a stored `first` is listed in `technitium_warnings`. |
 | `forward_tls_verify` | **not supported** (#1764): Technitium always validates an encrypted upstream's certificate. The API refuses a change to `false` on a Technitium group; the default `true`, and a stored `false`, stay allowed. |
 

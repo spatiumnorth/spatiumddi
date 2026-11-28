@@ -116,6 +116,18 @@ options {
     {%- if options.max_clients_per_query is not none %}
     max-clients-per-query {{ options.max_clients_per_query }};
     {%- endif %}
+    {%- if options.recursive_clients is not none %}
+    recursive-clients {{ options.recursive_clients }};
+    {%- endif %}
+    {%- if options.serve_stale_enabled %}
+    stale-answer-enable yes;
+    {%- if options.stale_answer_ttl is not none %}
+    stale-answer-ttl {{ options.stale_answer_ttl }};
+    {%- endif %}
+    {%- if options.max_stale_ttl is not none %}
+    max-stale-ttl {{ options.max_stale_ttl }};
+    {%- endif %}
+    {%- endif %}
     {%- if options.rrl_enabled %}
     rate-limit {
         responses-per-second {{ options.rrl_responses_per_second }};
