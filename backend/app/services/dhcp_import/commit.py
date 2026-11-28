@@ -551,7 +551,9 @@ async def _commit_one_scope(
         # ``status="static_dhcp"`` pointing at rows Postgres has dropped (#618).
         # Delete the mirror rows (not just free them) so the IPs fold back into
         # free gaps in the subnet view.
-        await remove_ipam_for_scope_statics(db, existing.id, touched_subnets=touched_subnets)
+        await remove_ipam_for_scope_statics(
+            db, existing.id, touched_subnets=touched_subnets, user=current_user
+        )
         await db.delete(existing)
         await db.flush()
         overwrote = True

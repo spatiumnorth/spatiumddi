@@ -415,3 +415,34 @@ async def test_skip_conflicts_is_refused_on_a_cascade_batch(
     assert resp.status_code == 200, resp.text
     rows = await _rows_including_deleted(db_session, ids)
     assert all(r.deleted_at is None for r in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_serverless_group_deletes_like_the_singular_route_4368(
+    client: AsyncClient, db_session: AsyncSession, permanent: bool
+) -> None:
+    """#4368: a group with no server has nothing to retract, so the records
+    still go to the Trash (or are removed) instead of every one being skipped."""
+    headers = await _user(db_session, superadmin=permanent)
+    server, zone = await _agent_zone(db_session)
+    await db_session.delete(server)
+    await db_session.flush()
+    ids = await _records(db_session, zone, 3)
+    await db_session.commit()
+
+    resp = await client.post(
+        _url(zone, permanent=permanent),
+        headers=headers,
+        json={"record_ids": [str(i) for i in ids]},
+    )
+    assert resp.status_code == 200, resp.text
+    body: dict[str, Any] = resp.json()
+    assert body["deleted"] == 3 and body["skipped"] == [], body
+    rows = await _rows_including_deleted(db_session, ids)
+    if permanent:
+        assert rows == []
+        assert body["deletion_batch_id"] is None
+    else:
+        assert len(rows) == 3 and all(r.deleted_at is not None for r in rows)
+        assert {str(r.deletion_batch_id) for r in rows} == {body["deletion_batch_id"]}

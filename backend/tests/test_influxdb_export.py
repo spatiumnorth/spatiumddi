@@ -989,3 +989,83 @@ async def test_update_applies_only_the_keys_it_carries(
     # An explicit null name is refused, not applied.
     r = await client.put(f"{url}/{tid}", headers=h, json={"name": None})
     assert r.status_code == 422, r.text
+
+
+@pytest.mark.asyncio
+async def test_version_switch_drops_the_other_versions_secret(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """v1 password -> v2 token (and back) leaves no secret its form hides (#4889)."""
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+    v1 = {
+        **_v2_body(),
+        "version": "v1",
+        "database": "ddi",
+        "username": "u",
+        "password": "pw",
+        "token": None,
+        "enabled": False,
+    }
+    r = await client.post(url, headers=h, json=v1)
+    assert r.status_code == 201, r.text
+    tid = r.json()["id"]
+    assert r.json()["password_set"] is True
+
+    # Switch to v2 with a new URL and a token: the hidden password neither
+    # blocks the URL move nor stays stored.
+    r = await client.put(
+        f"{url}/{tid}",
+        headers=h,
+        json={"version": "v2", "token": "tok", "url": "http://other:8086"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["token_set"] is True
+    assert r.json()["password_set"] is False
+
+    # And back to v1: the token goes.
+    r = await client.put(
+        f"{url}/{tid}",
+        headers=h,
+        json={"version": "v1", "password": "pw2", "database": "ddi"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["password_set"] is True
+    assert r.json()["token_set"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_target_never_keeps_the_secret_its_version_does_not_use(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A create carrying both secrets, and a row stored before the fix, keep
+    only the one their version uses, so a URL move cannot carry the other (#4889)."""
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    url = "/api/v1/settings/influxdb-targets"
+
+    # A v2 create that also carries a password stores the token only.
+    r = await client.post(url, headers=h, json={**_v2_body(), "password": "pw", "enabled": False})
+    assert r.status_code == 201, r.text
+    assert r.json()["token_set"] is True
+    assert r.json()["password_set"] is False
+
+    # A v2 row that already holds a password (saved before this fix): moving
+    # its URL with the token re-entered drops the password with it.
+    tid = r.json()["id"]
+    row = await db_session.get(InfluxDBTarget, uuid.UUID(tid))
+    assert row is not None
+    row.password_encrypted = encrypt_str("old-pw")
+    await db_session.commit()
+    r = await client.put(
+        f"{url}/{tid}",
+        headers=h,
+        json={"url": "http://other:8086", "token": "tok2"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["password_set"] is False
+
+    # Switching that target to v1 afterwards finds no password to send.
+    r = await client.put(f"{url}/{tid}", headers=h, json={"version": "v1", "database": "ddi"})
+    assert r.status_code == 200, r.text
+    assert r.json()["password_set"] is False
+    assert r.json()["token_set"] is False

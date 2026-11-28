@@ -79,7 +79,8 @@ async def ensure_self_signed_cert() -> None:
         The row is read and the Secret written under the reconcile
         advisory lock (#4164), so a pod starting mid-roll cannot write a
         stale copy over a cert a sibling just regenerated; a pod that
-        loses the lock does nothing and the periodic loops converge.
+        loses the lock does nothing and the periodic loops converge (the cert
+        deploy loop retries this call while no active row exists, #4442).
 
     Path B — no active row, but the TLS Secret holds a usable cert
     covering every desired SAN (the fresh-appliance case: firstboot
@@ -130,7 +131,8 @@ async def ensure_self_signed_cert() -> None:
         # flipped to the old one and back within a tick, and every member
         # supervisor saw a certificate it had not pinned. A pod that loses
         # the lock changes nothing; the reconcile loops converge on the
-        # active row (``sync_active_cert_to_secret`` re-checks every tick).
+        # active row (``sync_active_cert_to_secret`` re-checks every tick),
+        # and the deploy loop re-runs this when no row exists yet (#4442).
         got = (
             await db.execute(
                 text("select pg_try_advisory_xact_lock(:k)"), {"k": _CERT_RECONCILE_LOCK_KEY}
@@ -213,6 +215,34 @@ async def ensure_self_signed_cert() -> None:
             return
 
         await _generate_activate_deploy(db, hostname, ips, extra_sans)
+
+
+async def retry_bootstrap_if_no_active_cert() -> bool:
+    """Re-run the startup bootstrap when it was deferred and no cert exists (#4442).
+
+    ``ensure_self_signed_cert`` runs once per api start and, losing the
+    reconcile lock to a sibling replica, does nothing; both reconcile loops
+    then answer ``no-active-cert`` because the startup bootstrap "owns the
+    first issue", so a fresh multi-replica install had no certificate until
+    the next api restart. The periodic cert loop calls this when its sync
+    finds no active row. Idempotent and lock-guarded like the startup call;
+    returns True when it ran the bootstrap.
+    """
+    if not settings.appliance_mode:
+        return False
+    async with AsyncSessionLocal() as db:
+        active = (
+            await db.execute(
+                select(ApplianceCertificate.id)
+                .where(ApplianceCertificate.is_active.is_(True))
+                .limit(1)
+            )
+        ).first()
+    if active is not None:
+        return False
+    logger.info("appliance_cert_bootstrap_retry", reason="no-active-cert")
+    await ensure_self_signed_cert()
+    return True
 
 
 async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> bool:

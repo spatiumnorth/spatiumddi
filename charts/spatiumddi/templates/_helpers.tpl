@@ -69,7 +69,9 @@ Control-plane image — pass `imageName` (e.g. "spatiumddi-api") via merge:
 */}}
 {{- define "spatiumddi.image" -}}
 {{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
-{{- printf "%s/%s/%s:%s" .Values.image.registry .Values.image.repository .imageName $tag -}}
+{{- /* #3913 — ``image.tagSuffix`` ("-ubi") selects the Red Hat UBI variant of
+       the same version; empty (the default) leaves every tag as it was. */ -}}
+{{- printf "%s/%s/%s:%s%s" .Values.image.registry .Values.image.repository .imageName $tag (.Values.image.tagSuffix | default "") -}}
 {{- end -}}
 
 {{/*
@@ -659,6 +661,19 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
       name: {{ include "spatiumddi.appSecretName" . }}
       key: metrics-token
       optional: true
+{{- /* #4659 — initial Appliance registration state on a fresh install only. */}}
+- name: INITIAL_SUPERVISOR_REGISTRATION
+  value: {{ ((.Values.supervisorRegistration).initiallyEnabled | default false) | quote }}
+
+# #4548 — bcrypt hash the very first `admin` user is created with, instead of
+# admin / admin (and without a forced password change). Optional: absent on
+# every install that did not choose one, which keeps the old default account.
+- name: INITIAL_ADMIN_PASSWORD_HASH
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "spatiumddi.appSecretName" . }}
+      key: initial-admin-password-hash
+      optional: true
 - name: DATABASE_URL
   value: "postgresql+asyncpg://{{ include "spatiumddi.postgresUser" . }}:$(POSTGRES_PASSWORD)@{{ include "spatiumddi.postgresHost" . }}:{{ include "spatiumddi.postgresPort" . }}/{{ include "spatiumddi.postgresDatabase" . }}"
 {{- if eq (include "spatiumddi.redisIsSentinel" .) "true" }}
@@ -715,29 +730,28 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
 - name: CELERY_RESULT_BACKEND
   value: "redis://{{ include "spatiumddi.redisHost" . }}:{{ include "spatiumddi.redisPort" . }}/2"
 {{- end }}
-{{- if .Values.dnsAgents.enabled }}
-{{/* DNS agent PSK — agents bootstrap-register against the api with
-     this key, so the api / worker pods need it to verify the
-     incoming registration handshake. The Secret is rendered by
-     templates/dns-agent.yaml under the same name + key. */}}
+{{/* #4648 — the agent PSKs are injected whether or not the chart runs
+     in-cluster agents: an appliance agent node joined to a Helm control
+     plane registers with the same keys. The Secret is resolved by
+     spatiumddi.dnsAgentKeySecret / dhcpAgentKeySecret (operator-supplied,
+     else chart-generated). `optional` only matters on a render that cannot
+     generate the Secret (helm template / GitOps diff with no key set). */}}
 - name: DNS_AGENT_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) }}
+      name: {{ include "spatiumddi.dnsAgentKeySecret" . }}
       key: DNS_AGENT_KEY
-{{- end }}
-{{- if .Values.dhcpAgents.enabled }}
+      optional: true
 {{/* DHCP agent PSK. Agent side env var is SPATIUM_AGENT_KEY, but the
      control plane reads DHCP_AGENT_KEY (see backend/app/api/v1/dhcp/
-     agents.py). The dhcp-agent Secret stores under SPATIUM_AGENT_KEY
-     so we name the env var differently while pointing at the same
-     value. */}}
+     agents.py). The Secret stores under SPATIUM_AGENT_KEY so we name
+     the env var differently while pointing at the same value. */}}
 - name: DHCP_AGENT_KEY
   valueFrom:
     secretKeyRef:
-      name: {{ .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) }}
+      name: {{ include "spatiumddi.dhcpAgentKeySecret" . }}
       key: SPATIUM_AGENT_KEY
-{{- end -}}
+      optional: true
 {{- end -}}
 
 {{/*
@@ -817,8 +831,19 @@ URL comes from commonEnv.
         # Revision lines only: a failure prints a multi-line explanation.
         CUR=$(printf '%s\n' "$OUT" | awk '$1 ~ /^[0-9a-f]+$/ {print $1}' | sort | tr '\n' ',')
         if [ -n "$CUR" ] && [ "$CUR" = "$HEADS" ]; then
-          echo "alembic at head ($CUR)"
-          break
+          # #4678 — a restore replays the archive's head before it migrates
+          # up, so head alone is not enough while one is running. Exit 3
+          # means it is; anything else (no module, no database, an error)
+          # passes, so this can only ever add waiting.
+          GATE=0
+          python -m app.core.restore_gate || GATE=$?
+          if [ "$GATE" -ne 3 ]; then
+            echo "alembic at head ($CUR)"
+            break
+          fi
+          echo "alembic at head ($CUR), but a backup restore is running; waiting"
+          sleep 3
+          continue
         fi
         # #1227 — a database a NEWER release migrated never reaches this
         # image's head, so this loop cannot end on its own. env.py names the
@@ -1117,7 +1142,9 @@ volumeClaimTemplates are immutable, so setting dnsAgents/dhcpAgents
 .storageClass (or servers[].storageClass) on an existing install can only be
 applied after the StatefulSet is deleted with --cascade=orphan.
 
-Takes (dict "root" $ "name" <statefulset name> "class" <class this render sets>).
+Takes (dict "root" $ "name" <statefulset name> "class" <class this render sets>
+"found" <dict with "names" and "details" lists to append to>); it never fails
+itself, spatiumddi.checkAgentClaimClasses reports everything at once.
 Fires only when this render SETS a class and the live object has a claim
 template whose class is absent or different. An install that never set a
 class renders no storageClassName and never reaches the comparison. `lookup`
@@ -1134,9 +1161,45 @@ render that changes nothing.
 {{- range $t := (dig "spec" "volumeClaimTemplates" (list) $live) -}}
 {{- $old := dig "spec" "storageClassName" "" $t -}}
 {{- if ne $old $.class -}}
-{{- fail (printf "StatefulSet %q has a %q claim template with storageClassName %s, and this render sets %q. Kubernetes forbids updating a StatefulSet's volumeClaimTemplates, so this upgrade would be refused. Delete the StatefulSet without deleting its pod or PVCs, then upgrade again:\n  kubectl delete sts %s -n %s --cascade=orphan\nExisting PVCs keep their old class; only new claims get %q. See the chart README, \"Adopting storageClass on an existing install\"." $.name (dig "metadata" "name" "?" $t) (ternary "unset" (quote $old) (eq $old "")) $.class $.name $.root.Release.Namespace $.class) -}}
+{{- $_ := set $.found "names" (append (index $.found "names") $.name) -}}
+{{- $_ := set $.found "details" (append (index $.found "details") (printf "StatefulSet %q has a %q claim template with storageClassName %s, and this render sets %q." $.name (dig "metadata" "name" "?" $t) (ternary "unset" (quote $old) (eq $old "")) $.class)) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Every agent StatefulSet (DNS and DHCP) whose claim class would change, in ONE
+refusal. Called once from dns-agent.yaml, outside its enabled gate, because a
+fail inside the per-server loops names only the first StatefulSet it meets and
+a three-agent install then needs three rounds of upgrade, refuse, delete,
+retry (#4682). Mirrors the object-name and class resolution of the two loops.
+*/}}
+{{- define "spatiumddi.checkAgentClaimClasses" -}}
+{{- $root := . -}}
+{{- $found := dict "names" (list) "details" (list) -}}
+{{- if .Values.dnsAgents.enabled -}}
+{{- range $server := .Values.dnsAgents.servers -}}
+{{- $flavor := $server.flavor | default "bind9" -}}
+{{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dns-%s-%s" $flavor $server.name) "prefix" $root.Values.dnsAgents.prefixWithFullname) -}}
+{{- $class := $server.storageClass | default $root.Values.dnsAgents.storageClass -}}
+{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $class "found" $found) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.dhcpAgents.enabled -}}
+{{- range $server := .Values.dhcpAgents.servers -}}
+{{- $flavor := $server.flavor | default "kea" -}}
+{{- $instance := include "spatiumddi.agentObjectName" (dict "root" $root "instance" (printf "dhcp-%s-%s" $flavor $server.name) "prefix" $root.Values.dhcpAgents.prefixWithFullname) -}}
+{{- $class := $server.storageClass | default $root.Values.dhcpAgents.storageClass -}}
+{{- include "spatiumddi.checkAgentClaimClass" (dict "root" $root "name" $instance "class" $class "found" $found) -}}
+{{- end -}}
+{{- end -}}
+{{- if index $found "names" -}}
+{{- $cmds := list -}}
+{{- range $n := index $found "names" -}}
+{{- $cmds = append $cmds (printf "  kubectl delete sts %s -n %s --cascade=orphan" $n $root.Release.Namespace) -}}
+{{- end -}}
+{{- fail (printf "%s\nKubernetes forbids updating a StatefulSet's volumeClaimTemplates, so this upgrade would be refused. Delete each of these StatefulSets without deleting its pods or PVCs, then upgrade again:\n%s\nExisting PVCs keep their old class; only new claims get the new one. See the chart README, \"Adopting storageClass on an existing install\"." (join "\n" (index $found "details")) (join "\n" ($cmds | uniq))) -}}
 {{- end -}}
 {{- end -}}
 
@@ -1281,4 +1344,34 @@ subjects:
     name: {{ . }}
     namespace: {{ $root.Release.Namespace }}
   {{- end }}
+{{- end -}}
+
+{{/*
+#4648 — name of the Secret carrying the DNS / DHCP agent PSK, shared by the
+api / worker env and the in-cluster agents. Precedence: agentKey.existingSecret;
+agentKey.value (the legacy chart-rendered <fullname>-{dns,dhcp}-agent-key
+Secret); an operator-precreated <fullname>-{dns,dhcp}-agent-key found by
+`lookup` (the pre-#4648 convention); else the chart-generated
+<fullname>-agent-keys (templates/agent-keys-secret.yaml).
+*/}}
+{{- define "spatiumddi.dnsAgentKeySecret" -}}
+{{- $legacy := printf "%s-dns-agent-key" (include "spatiumddi.fullname" .) -}}
+{{- if .Values.dnsAgents.agentKey.existingSecret -}}
+{{- .Values.dnsAgents.agentKey.existingSecret -}}
+{{- else if or .Values.dnsAgents.agentKey.value (lookup "v1" "Secret" .Release.Namespace $legacy) -}}
+{{- $legacy -}}
+{{- else -}}
+{{- printf "%s-agent-keys" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "spatiumddi.dhcpAgentKeySecret" -}}
+{{- $legacy := printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .) -}}
+{{- if .Values.dhcpAgents.agentKey.existingSecret -}}
+{{- .Values.dhcpAgents.agentKey.existingSecret -}}
+{{- else if or .Values.dhcpAgents.agentKey.value (lookup "v1" "Secret" .Release.Namespace $legacy) -}}
+{{- $legacy -}}
+{{- else -}}
+{{- printf "%s-agent-keys" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- end -}}

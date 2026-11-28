@@ -16,6 +16,7 @@ import {
   type SupportBundlePreview,
 } from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
+import { countNoun } from "@/lib/count-noun";
 
 /**
  * Support bundle (#875) — generate a scrubbed diagnostics archive for a
@@ -193,7 +194,7 @@ export function SupportBundleSection() {
 
           <div>
             <p className="mb-1 text-xs font-medium">
-              {preview.files.length} files ·{" "}
+              {countNoun(preview.files.length, "file")} ·{" "}
               {(preview.total_bytes / 1024).toFixed(0)} KB compressed
             </p>
             <div className="max-h-56 overflow-y-auto rounded border">

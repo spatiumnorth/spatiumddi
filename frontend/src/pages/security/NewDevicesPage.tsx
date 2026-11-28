@@ -221,7 +221,6 @@ export function NewDevicesPage() {
       invalidateAll();
       setShowBaseline(false);
     },
-    onError: (e) => setActionError(errMsg(e, "Baseline import failed")),
   });
 
   const moduleSummary = summaryQ.data;
@@ -586,8 +585,16 @@ export function NewDevicesPage() {
         }
         confirmLabel="Mark fleet as known"
         loading={baselineMut.isPending}
+        error={
+          baselineMut.error
+            ? errMsg(baselineMut.error, "Baseline import failed")
+            : null
+        }
         onConfirm={() => baselineMut.mutate()}
-        onClose={() => setShowBaseline(false)}
+        onClose={() => {
+          setShowBaseline(false);
+          baselineMut.reset();
+        }}
       />
     </div>
   );
@@ -813,8 +820,16 @@ function AllowlistModal({ onClose }: { onClose: () => void }) {
         tone="destructive"
         confirmLabel="Remove"
         loading={delMut.isPending}
+        error={
+          delMut.error
+            ? errMsg(delMut.error, "Failed to remove allowlist entry")
+            : null
+        }
         onConfirm={() => del && delMut.mutate(del.id)}
-        onClose={() => setDel(null)}
+        onClose={() => {
+          setDel(null);
+          delMut.reset();
+        }}
       />
     </Modal>
   );

@@ -10,9 +10,15 @@ import {
   type BGPCommunityKind,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { FreshEdit } from "@/components/FreshEdit";
+import { changedFields } from "@/hooks/useFreshRow";
 import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { FormError } from "@/components/ui/form-error";
+
+// The Value label names whichever control the kind draws: the standard
+// select or the free-text input. Only one is rendered at a time (#4786).
+const VALUE_ID = "communities-tab-value";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -101,12 +107,17 @@ function CommunityFormModal({
         outbound_action: outboundAction,
       };
       if (existing) {
-        return asnsApi.updateCommunity(existing.id, {
+        // Send only what changed from the row read when the dialog opened
+        // (#4379), so a field another client set since is not put back.
+        const full = {
           name,
           description,
           inbound_action: inboundAction,
           outbound_action: outboundAction,
-        });
+        };
+        const update = changedFields(existing, full);
+        if (Object.keys(update).length === 0) return Promise.resolve(existing);
+        return asnsApi.updateCommunity(existing.id, update);
       }
       return asnsApi.createCommunity(asnId, body);
     },
@@ -133,10 +144,17 @@ function CommunityFormModal({
         {!isEdit && (
           <>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <span
+                id="communities-tab-kind-label"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Kind
-              </label>
-              <div className="flex flex-col gap-1">
+              </span>
+              <div
+                role="radiogroup"
+                aria-labelledby="communities-tab-kind-label"
+                className="flex flex-col gap-1"
+              >
                 {(["standard", "regular", "large"] as BGPCommunityKind[]).map(
                   (k) => (
                     <label
@@ -163,11 +181,15 @@ function CommunityFormModal({
               </div>
             </div>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor={VALUE_ID}
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Value
               </label>
               {kind === "standard" ? (
                 <select
+                  id={VALUE_ID}
                   className={inputCls}
                   value={value}
                   onChange={(e) => setValue(e.target.value)}
@@ -181,6 +203,7 @@ function CommunityFormModal({
                 </select>
               ) : (
                 <input
+                  id={VALUE_ID}
                   className={cn(
                     inputCls,
                     valueError && value && "border-destructive",
@@ -199,10 +222,14 @@ function CommunityFormModal({
           </>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="communities-tab-name-operator-friendly-label"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name (operator-friendly label)
           </label>
           <input
+            id="communities-tab-name-operator-friendly-label"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -210,10 +237,14 @@ function CommunityFormModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="communities-tab-description"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <textarea
+            id="communities-tab-description"
             className={cn(inputCls, "min-h-[60px]")}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -222,10 +253,14 @@ function CommunityFormModal({
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="communities-tab-inbound-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Inbound action
             </label>
             <input
+              id="communities-tab-inbound-action"
               className={inputCls}
               value={inboundAction}
               onChange={(e) => setInboundAction(e.target.value)}
@@ -233,10 +268,14 @@ function CommunityFormModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="communities-tab-outbound-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Outbound action
             </label>
             <input
+              id="communities-tab-outbound-action"
               className={inputCls}
               value={outboundAction}
               onChange={(e) => setOutboundAction(e.target.value)}
@@ -323,8 +362,10 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           Operator-defined community values for this AS plus a copy of the
-          well-known catalog. The catalog rows are read-only — use the "Use on
-          this AS" button to attach one to this row with operator notes.
+          well-known catalog. The catalog rows are read-only
+          {!writeGate.disabled &&
+            ' — use the "Use on this AS" button to attach one to this row with operator notes'}
+          .
         </p>
         <button
           type="button"
@@ -399,6 +440,12 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
         )}
       </div>
 
+      <FormError className="text-sm">
+        {deleteMut.error
+          ? formatApiError(deleteMut.error, "Delete failed")
+          : null}
+      </FormError>
+
       {/* Per-ASN communities. */}
       {communities.length === 0 ? (
         <p className="rounded-lg border p-8 text-center text-sm text-muted-foreground">
@@ -464,6 +511,7 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
                           <button
                             type="button"
                             onClick={() => {
+                              deleteMut.reset();
                               if (
                                 confirm(
                                   `Delete community "${c.value}"? This cannot be undone.`,
@@ -490,10 +538,10 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
         </div>
       )}
 
-      {showAdd && (
+      {showAdd && !editing && (
         <CommunityFormModal
           asnId={asnId}
-          existing={editing}
+          existing={null}
           presetValue={presetValue}
           presetKind={presetKind}
           onClose={() => {
@@ -503,6 +551,28 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
             setPresetKind(undefined);
           }}
         />
+      )}
+      {showAdd && editing && (
+        <FreshEdit
+          row={editing}
+          queryKeys={[["asn-communities", asnId]]}
+          title="Edit BGP community"
+          onClose={() => {
+            setShowAdd(false);
+            setEditing(null);
+          }}
+        >
+          {(fresh) => (
+            <CommunityFormModal
+              asnId={asnId}
+              existing={fresh}
+              onClose={() => {
+                setShowAdd(false);
+                setEditing(null);
+              }}
+            />
+          )}
+        </FreshEdit>
       )}
     </div>
   );

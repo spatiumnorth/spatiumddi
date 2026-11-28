@@ -1,3 +1,4 @@
+import { pluralize } from "./count-noun";
 import type { DNSBlockList, DNSBlockListFeedSkipped } from "@/lib/api";
 
 /** Rules the last refresh could not enforce (#2123, #3531); 0 when the
@@ -28,7 +29,7 @@ export function feedSkippedTitle(l: DNSBlockList): string {
   if (!s) return "";
   const enforced =
     typeof l.entry_count === "number"
-      ? `${l.entry_count.toLocaleString("en-US")} entries enforced. `
+      ? `${l.entry_count.toLocaleString("en-US")} ${pluralize(l.entry_count, "entry", "entries")} enforced. `
       : "";
   if (!s.regex && !s.modifier && !s.badfilter && !s.malformed && s.invalid_name)
     return (

@@ -7,7 +7,9 @@ template definition.
 
 Apply policy:
     - ``force=True``: every template-bearing column overwrites the
-      target unconditionally.
+      target unconditionally, except ``tags`` and ``custom_fields``,
+      which are merged: the template's keys win and the target's other
+      keys stay (#4420).
     - ``force=False``: only empty/null target columns are filled
       from the template.
 
@@ -100,14 +102,25 @@ def _differs(current: Any, new: Any) -> bool:
     return bool(current != new)
 
 
+# Dict columns a forced stamp merges into rather than replaces: a key the
+# template does not hold was set by an operator and is not the template's to
+# erase (#4420).
+_MERGED_FIELDS: frozenset[str] = frozenset({"tags", "custom_fields"})
+
+
 def _stamp(target: Any, name: str, template_value: Any, *, force: bool) -> bool:
     """Stamp ``template_value`` onto ``target.{name}`` per apply policy.
+
+    Under ``force`` the ``tags`` and ``custom_fields`` dicts are merged: the
+    template's keys are set, every other key on the target is kept (#4420).
 
     Returns True only if the column's value changed: writing the template's
     own empty value over an empty column changes nothing, and listing it as
     written would name columns the apply never touched (#1634).
     """
     current = getattr(target, name, None)
+    if force and name in _MERGED_FIELDS and isinstance(current, dict):
+        template_value = {**current, **(template_value or {})}
     if force or _is_empty(current):
         setattr(target, name, template_value)
         return _differs(current, template_value)

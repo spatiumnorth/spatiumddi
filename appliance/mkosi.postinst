@@ -57,6 +57,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-snmp-reload.path \
             spatiumddi-apt-reload.path \
             spatiumddi-chrony-reload.path \
+            spatiumddi-chrony-status.timer \
             spatiumddi-lldp-reload.path \
             spatiumddi-syslog-reload.path \
             spatiumddi-ssh-reload.path \
@@ -327,6 +328,12 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-images"
 # #1215 — k3s.service's ExecStartPre=- that skips the first-boot TLS
 # manifest on an upgraded seed. The ``-`` would swallow a 203/EXEC silently.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-tls-manifest-skip"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etcd-peer-reset"
+# #4801 — k3s.service ExecStartPre=-: pins node-ip when there is no default route.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-k3s-node-ip"
+# ...and the NM dispatcher hook that keeps the service-CIDR route across DHCP
+# renewals / reconnects (NM refuses a dispatcher script that is not root 0755).
+chmod 0755 "$BUILDROOT/etc/NetworkManager/dispatcher.d/50-spatium-k3s-service-route"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
 # #999 Part C2 — keeps the mirror member's ESP in step with the primary's.
@@ -387,6 +394,8 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-image-unpack.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-chrony-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-status.timer"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-status.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-lldp-reload"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-lldp-reload.service"
@@ -536,9 +545,27 @@ install -d -m 0755 "$BUILDROOT/var/log/spatiumddi"
 # appended to the input chain on each `nft -f /etc/nftables.conf`.
 install -d -m 0755 "$BUILDROOT/etc/nftables.d"
 
+# #4801 — mask Debian's chrony-wait.service. It blocks until chrony has
+# synchronised and fails with "start operation timed out" 3 minutes after
+# EVERY boot on a host with no reachable time source (an isolated network, or
+# the installer's blank time source, #1002), which leaves ``systemctl
+# is-system-running`` at ``degraded`` for good. Nothing on the appliance orders
+# After= / Requires= on time-sync.target; the NTP sync state is reported by the
+# supervisor heartbeat (ntp_sync_state) and shown on the NTP page instead.
+ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/chrony-wait.service"
+
+# #4951 — mask Debian's chronyd-restricted.service. The package presets it
+# enabled and it Conflicts= with chrony.service, so it won the boot and the
+# appliance's own chrony.service (enabled above; the unit the chrony-reload
+# apply path reloads) never ran. Masking leaves chrony.service the daemon.
+ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/chronyd-restricted.service"
+
 # Persistent systemd journal. The mere existence of /var/log/journal
 # flips systemd-journald from volatile (in-memory) to persistent.
 # Mode 2755 + group systemd-journal is what systemd expects.
+# /var is its own partition on an installed appliance, which hides this
+# directory, so etc/systemd/journald.conf.d/50-spatium-persistent.conf also
+# sets Storage=persistent (#4801).
 install -d -m 2755 "$BUILDROOT/var/log/journal"
 chgrp systemd-journal "$BUILDROOT/var/log/journal" 2>/dev/null || true
 

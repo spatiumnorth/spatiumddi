@@ -37,6 +37,10 @@ vi.mock("@/lib/api", async () => {
         breaks: [],
       }),
       get: (id: string) => get(id),
+      facets: vi.fn().mockResolvedValue({
+        actions: ["appliance.self_bootstrap_minted", "dns.server.approve"],
+        resource_types: ["pairing_code", "platform_settings"],
+      }),
     },
   };
 });
@@ -105,4 +109,56 @@ describe("AuditPage details", () => {
     expect(title).not.toMatch(/at least/);
     expect(title).toMatch(/once its last full pass is more than 7 days old/);
   });
+
+  it("offers every result the backend writes and paints ok/accepted green (#4293)", async () => {
+    vi.mocked(auditApi.list).mockResolvedValue({
+      total: 3,
+      items: [
+        { ...entry, id: "r1", result: "ok" },
+        { ...entry, id: "r2", result: "accepted" },
+        { ...entry, id: "r3", result: "skipped" },
+      ],
+    } as never);
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AuditPage />
+      </QueryClientProvider>,
+    );
+    await screen.findAllByRole("button", { name: /show details/i });
+    const values = Array.from(container.querySelectorAll("option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    for (const r of ["ok", "failed", "accepted", "skipped", "error", "denied"])
+      expect(values).toContain(r);
+    const badge = (r: string) =>
+      Array.from(container.querySelectorAll("tbody span")).find(
+        (e) => e.textContent === r,
+      )!.className;
+    expect(badge("ok")).toContain("green");
+    expect(badge("accepted")).toContain("green");
+    expect(badge("skipped")).not.toContain("red");
+    expect(badge("skipped")).not.toContain("green");
+  });
+
+  it("offers the actions and resource types the log holds (#4482)", async () => {
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <AuditPage />
+      </QueryClientProvider>,
+    );
+    await screen.findAllByRole("button", { name: /show details/i });
+    await vi.waitFor(
+      () => {
+        const values = Array.from(container.querySelectorAll("option")).map(
+          (o) => (o as HTMLOptionElement).value,
+        );
+        expect(values).toContain("appliance.self_bootstrap_minted");
+        expect(values).toContain("dns.server.approve");
+        expect(values).toContain("pairing_code");
+        expect(values).toContain("platform_settings");
+        expect(values).toContain("create");
+      },
+      { timeout: 10000 },
+    );
+  }, 30000);
 });

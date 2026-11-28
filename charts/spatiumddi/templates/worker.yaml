@@ -124,6 +124,11 @@ spec:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
             {{- include "spatiumddi.sharedEnv" . | nindent 12 }}
             {{- include "spatiumddi.slotImageMirrorClientEnv" . | nindent 12 }}
+            # #4306 — prefork child recycling (read by app/celery_app.py).
+            - name: WORKER_MAX_TASKS_PER_CHILD
+              value: {{ .Values.worker.maxTasksPerChild | default 0 | int | quote }}
+            - name: WORKER_MAX_MEMORY_PER_CHILD_KIB
+              value: {{ .Values.worker.maxMemoryPerChildKiB | default 0 | int | quote }}
             # #989 item 3 — the node this replica runs on. SCHEDULED
             # backups run here, and a removable destination is
             # node-local: without this the worker cannot say which node

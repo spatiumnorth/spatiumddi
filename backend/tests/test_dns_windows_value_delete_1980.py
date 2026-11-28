@@ -110,7 +110,11 @@ async def _rfc2136_update(monkeypatch, change: RecordChange) -> Any:
 
     sent: list[Any] = []
     monkeypatch.setattr(windows, "resolve_server_address", lambda *a, **k: ["192.0.2.53"])
-    monkeypatch.setattr(dns.query, "tcp", lambda msg, *a, **k: sent.append(msg))
+    import dns.message
+
+    monkeypatch.setattr(
+        dns.query, "tcp", lambda msg, *a, **k: (sent.append(msg), dns.message.make_response(msg))[1]
+    )
     server = SimpleNamespace(id="s1", host="dc1.example.com", api_port=53)
     await windows.WindowsDNSDriver().apply_record_change(server, change)
     (msg,) = sent

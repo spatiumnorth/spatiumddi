@@ -32,8 +32,14 @@ the negative control — run against a render with the platform forced to
 Kubernetes it proves the check can see a pin at all, instead of passing because
 it parsed nothing.
 
+``--external-sccs DIR`` is for a render with ``openshift.scc.create=false``
+(admin-managed SCCs, #3913): the agents' SCCs are applied by a cluster admin
+from DIR (``charts/spatiumddi/files/openshift``), so the capability check treats
+each agent ServiceAccount as granted the SCCs in DIR for its component, and the
+render itself must contain no SCC, Role or RoleBinding of its own.
+
 Usage:
-    chart-openshift.py [--require-scc] [--expect-pins] file...
+    chart-openshift.py [--require-scc] [--expect-pins] [--external-sccs DIR] file...
 """
 
 from __future__ import annotations
@@ -56,6 +62,11 @@ def pod_spec(doc: dict) -> dict | None:
 def main(argv: list[str]) -> int:
     require_scc = "--require-scc" in argv
     expect_pins = "--expect-pins" in argv
+    ext_dir = None
+    if "--external-sccs" in argv:
+        i = argv.index("--external-sccs")
+        ext_dir = argv[i + 1]
+        argv = argv[:i] + argv[i + 2 :]
     files = [a for a in argv if not a.startswith("--")]
     if not files:
         print("usage: chart-openshift.py [--require-scc] [--expect-pins] file...")
@@ -186,8 +197,20 @@ def main(argv: list[str]) -> int:
                 failures.append(f"{path}: SCC {n} is privileged")
             if "ALL" not in (scc.get("requiredDropCapabilities") or []):
                 failures.append(f"{path}: SCC {n} does not require dropping ALL capabilities")
+        external: dict[str, set[str]] = {}  # SA -> capabilities an admin-applied SCC allows
+        if ext_dir:
+            if sccs or granted:
+                failures.append(f"{path}: --external-sccs render must contain no SCC / grant")
+            import glob
+
+            for f in glob.glob(f"{ext_dir}/*-scc.yaml"):
+                scc = yaml.safe_load(open(f))
+                comp = scc["metadata"]["labels"]["app.kubernetes.io/component"]
+                for sa in sas:
+                    if sa.endswith(f"-{comp}"):
+                        external.setdefault(sa, set()).update(scc.get("allowedCapabilities") or [])
         for name, caps in adds.items():
-            allowed: set[str] = set()
+            allowed: set[str] = set(external.get(sa_of[name], set()))
             for n in granted.get(sa_of[name], set()):
                 allowed.update((sccs.get(n) or {}).get("allowedCapabilities") or [])
             extra = caps - allowed

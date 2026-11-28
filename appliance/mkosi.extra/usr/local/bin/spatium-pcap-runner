@@ -66,7 +66,7 @@ os.execvp(sys.argv[2], sys.argv[2:])
 
 log() { logger -t spatium-pcap-runner "$*" 2>/dev/null || echo "spatium-pcap-runner: $*" >&2; }
 
-# PCAP_DIR belongs to the supervisor (uid 100, chowned by firstboot) and this
+# PCAP_DIR belongs to the supervisor (uid 10001, chowned by firstboot) and this
 # runs as root: by name, anything in it, the directory itself included, can
 # be swapped for a symlink at any moment. So the runner works from inside it:
 # ``cd -P`` resolves it once, the check refuses a PCAP_DIR that resolved

@@ -155,17 +155,35 @@ def _refuse_blocked(value: str) -> None:
         raise NmapArgError(_BLOCKED_TARGET_MESSAGE)
 
 
-def _refuse_resolved_blocked(host: str) -> None:
-    """Refuse a hostname any of whose addresses is in a blocked range. A name
-    that does not resolve is left for nmap to report."""
+async def resolve_target(target: str) -> str:
+    """Resolve a hostname target once, refuse a blocked answer, and return the
+    address to scan.
+
+    A literal address or a CIDR passes through unchanged. For a name, every
+    address of the one lookup is checked against the blocked ranges and the
+    first is returned, so the address that was checked is the address nmap
+    scans: handing nmap the name would make it resolve a second time, and the
+    two answers can differ. Runs on the loop's resolver, not a blocking call.
+    """
+    target = target.strip()
     try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except (OSError, UnicodeError):
-        return
-    for info in infos:
-        addr = info[4][0]
-        if isinstance(addr, str):
-            _refuse_blocked(addr.split("%", 1)[0])
+        ipaddress.ip_address(target)
+        return target
+    except ValueError:
+        pass
+    if "/" in target or not _HOSTNAME_RE.match(target):
+        return target
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(target, None, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as exc:
+        raise NmapArgError(f"target {target!r} does not resolve") from exc
+    addrs = [str(i[4][0]).split("%", 1)[0] for i in infos if isinstance(i[4][0], str)]
+    if not addrs:
+        raise NmapArgError(f"target {target!r} does not resolve")
+    for addr in addrs:
+        _refuse_blocked(addr)
+    return addrs[0]
 
 
 def _validate_target(target: str) -> str:
@@ -173,10 +191,10 @@ def _validate_target(target: str) -> str:
 
     Hostname mode is a deliberate extension over the original IP-only
     contract — operators routinely want to scan ``router1.lan``
-    without first looking up its IP. nmap performs DNS resolution
-    itself, so we just need to validate the syntax tightly enough
-    that the argv builder can pass the value through to nmap without
-    risk of injection. The hostname regex rejects shell metachars,
+    without first looking up its IP. The name is resolved once, by
+    :func:`resolve_target`, and nmap is handed that address; here we
+    only validate the syntax tightly enough that the value is safe
+    to pass on. The hostname regex rejects shell metachars,
     spaces, slashes, and anything else that isn't a valid DNS label
     character.
 
@@ -222,7 +240,6 @@ def _validate_target(target: str) -> str:
                 "use a single address, a CIDR, or a hostname"
             )
         _refuse_blocked(target)
-        _refuse_resolved_blocked(target)
         return target
     raise NmapArgError(
         f"target must be a valid IPv4/IPv6 address, CIDR, or hostname (got {target!r})"
@@ -743,8 +760,9 @@ async def run_scan(scan_id: uuid.UUID) -> None:
             xml_path = xml_tmp.name
 
             try:
+                scan_target = await resolve_target(str(scan.target_ip))
                 argv = build_argv(
-                    str(scan.target_ip),
+                    scan_target,
                     scan.preset,
                     scan.port_spec,
                     scan.extra_args,
@@ -1022,6 +1040,7 @@ __all__ = [
     "PRESETS",
     "NmapArgError",
     "build_argv",
+    "resolve_target",
     "parse_nmap_xml",
     "run_scan",
     "stream_scan_lines",

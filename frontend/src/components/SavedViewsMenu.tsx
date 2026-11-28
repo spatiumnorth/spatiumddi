@@ -244,12 +244,12 @@ export function SavedViewsMenu<P extends Record<string, unknown>>({
         message={
           <>
             <p>{`Delete the saved view "${toDelete?.name ?? ""}"?`}</p>
-            {remove.isError && (
-              <p role="alert" className="mt-2 text-destructive">
-                {formatApiError(remove.error, "Couldn't delete the view.")}
-              </p>
-            )}
           </>
+        }
+        error={
+          remove.error
+            ? formatApiError(remove.error, "Couldn't delete the view.")
+            : null
         }
         confirmLabel="Delete"
         tone="destructive"

@@ -77,13 +77,14 @@ export function useFreshRow<T>(
  * same; "" is not null, so a cleared text field is sent). An empty result
  * means the Save has nothing to send.
  */
-export function changedFields<A extends Record<string, unknown>>(
-  before: Record<string, unknown>,
+export function changedFields<A extends object>(
+  before: object,
   after: A,
 ): Partial<A> {
+  const prev = before as Record<string, unknown>;
   const out: Partial<A> = {};
   for (const k of Object.keys(after) as (keyof A & string)[]) {
-    if (JSON.stringify(before[k] ?? null) !== JSON.stringify(after[k] ?? null))
+    if (JSON.stringify(prev[k] ?? null) !== JSON.stringify(after[k] ?? null))
       out[k] = after[k];
   }
   return out;

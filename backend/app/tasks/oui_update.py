@@ -13,6 +13,13 @@ untouched, which keeps each row's ``updated_at`` meaningful (it
 tracks actual vendor re-assignments, not cron ticks). Failures roll
 back to the previous snapshot so lookups never serve partial data.
 
+A failed fetch is recorded as an ``oui-update`` audit row with
+``result="failure"`` (the reason in ``new_value``), raises
+:class:`OUIUpdateError` so the task is FAILURE rather than a SUCCESS carrying
+an error, and backs the beat-driven retries off to once a day so an offline
+install logs one warning a day, not one an hour (#4800). The Settings card
+reads that row.
+
 Return payload on success: ``{"status": "ran", "total", "added",
 "updated", "removed", "unchanged", "forced"}`` — consumed by the
 polling endpoint that drives the Settings-page refresh modal.
@@ -51,6 +58,47 @@ _OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv"
 # the IEEE CSV currently has ~35k rows and bulk inserting the lot in one go
 # works on Postgres but risks a statement-parameter cap on smaller setups.
 _CHUNK_SIZE = 1000
+# After a failed fetch the hourly beat tick leaves the source alone this long.
+# A manual "Refresh now" ignores it.
+FAILURE_BACKOFF = timedelta(hours=24)
+_AUDIT_ACTION = "oui-update"
+
+
+class OUIUpdateError(RuntimeError):
+    """The refresh could not complete; the previous snapshot is untouched."""
+
+
+async def _record_failure(db: Any, reason: str, detail: str) -> None:
+    db.add(
+        AuditLog(
+            user_display_name="<system>",
+            auth_source="system",
+            action=_AUDIT_ACTION,
+            resource_type="platform",
+            resource_id=str(_SINGLETON_ID),
+            resource_display="oui-database",
+            result="failure",
+            new_value={"reason": reason, "detail": detail[:500]},
+        )
+    )
+    await db.commit()
+
+
+async def last_failure(db: Any, since: datetime | None) -> AuditLog | None:
+    """The newest failed refresh newer than the last success, else None."""
+    row = (
+        await db.execute(
+            select(AuditLog)
+            .where(AuditLog.action == _AUDIT_ACTION)
+            .order_by(AuditLog.timestamp.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if row is None or row.result != "failure":
+        return None
+    if since is not None and row.timestamp <= since:
+        return None
+    return row
 
 
 def _parse_oui_csv(text: str) -> list[dict[str, str]]:
@@ -94,6 +142,9 @@ async def _run_update(force: bool = False) -> dict[str, Any]:
                 skip = interval_skip(now, ps.oui_last_updated_at, interval)
                 if skip is not None:
                     return skip
+                failed = await last_failure(db, ps.oui_last_updated_at)
+                if failed is not None and now - failed.timestamp < FAILURE_BACKOFF:
+                    return {"status": "skipped", "reason": "fetch_failure_backoff"}
 
             logger.info("oui_update_fetching", url=_OUI_SOURCE_URL, force=force)
             try:
@@ -113,12 +164,14 @@ async def _run_update(force: bool = False) -> dict[str, Any]:
                     csv_text = resp.text
             except Exception as exc:  # noqa: BLE001
                 logger.warning("oui_update_fetch_failed", error=str(exc))
-                return {"status": "error", "reason": "fetch_failed", "detail": str(exc)}
+                await _record_failure(db, "fetch_failed", str(exc))
+                raise OUIUpdateError(f"fetch_failed: {exc}") from exc
 
             entries = _parse_oui_csv(csv_text)
             if not entries:
                 logger.warning("oui_update_empty_csv", url=_OUI_SOURCE_URL)
-                return {"status": "error", "reason": "empty_csv"}
+                await _record_failure(db, "empty_csv", "the downloaded file had no OUI rows")
+                raise OUIUpdateError("empty_csv")
 
             # Incremental diff: load the existing snapshot and categorise
             # each prefix into add / update / remove / unchanged. A typical
@@ -193,6 +246,8 @@ def auto_update_oui_database(self: object) -> dict[str, Any]:  # type: ignore[ty
     ``oui_lookup_enabled`` and ``oui_update_interval_hours``."""
     try:
         return asyncio.run(_run_update(force=False))
+    except OUIUpdateError:
+        raise  # already logged + audited where it happened
     except Exception as exc:  # noqa: BLE001
         logger.exception("oui_update_failed", error=str(exc))
         raise
@@ -204,6 +259,8 @@ def update_oui_database_now(self: object) -> dict[str, Any]:  # type: ignore[typ
     still requires the feature to be enabled."""
     try:
         return asyncio.run(_run_update(force=True))
+    except OUIUpdateError:
+        raise  # already logged + audited where it happened
     except Exception as exc:  # noqa: BLE001
         logger.exception("oui_update_failed", error=str(exc))
         raise

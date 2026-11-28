@@ -6,12 +6,15 @@ import { cn } from "@/lib/utils";
  * ``onChange`` (mirroring the native ``<input>`` API) so callers can
  * either await an async mutation or commit to local form state. */
 export function Toggle({
+  id,
   checked,
   onChange,
   disabled,
   label,
   title,
 }: {
+  /** Lets a ``<label htmlFor>`` name the switch (#4380). */
+  id?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
@@ -23,6 +26,7 @@ export function Toggle({
 }) {
   return (
     <button
+      id={id}
       role="switch"
       aria-checked={checked}
       aria-label={label}

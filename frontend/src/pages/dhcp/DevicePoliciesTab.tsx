@@ -605,7 +605,9 @@ function PreviewModal({
       {isFetching ? (
         <div className="text-sm text-muted-foreground">Compiling&hellip;</div>
       ) : isError ? (
-        <div className="text-sm text-destructive">{errMsg(error)}</div>
+        <div role="alert" className="text-sm text-destructive">
+          {errMsg(error)}
+        </div>
       ) : data ? (
         <PreviewBody data={data} />
       ) : null}

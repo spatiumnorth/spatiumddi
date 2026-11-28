@@ -1,7 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, ArrowRight, CheckCircle2, Loader2 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
-import { dnsApi, formatApiError, type DelegationRecord } from "@/lib/api";
+import {
+  dnsApi,
+  formatApiError,
+  type DelegationPreviewResponse,
+  type DelegationRecord,
+} from "@/lib/api";
 import { FormError } from "@/components/ui/form-error";
 
 /**
@@ -25,13 +30,35 @@ export function DelegationModal({
 }) {
   const qc = useQueryClient();
 
-  const { data, isLoading, error, refetch } = useQuery({
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ["dns-delegation-preview", groupId, zoneId],
     queryFn: () => dnsApi.getDelegationPreview(groupId, zoneId),
+    // Re-read on open: the zone page read this for its menu, and the child's
+    // apex NS may have changed since (#4310).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
   const applyMut = useMutation({
-    mutationFn: () => dnsApi.applyDelegation(groupId, zoneId),
+    // Apply makes the server recompute from the child's apex NS as stored
+    // then. Read the preview once more first: if what would be created is not
+    // what the dialog listed, show the new list and let the operator decide
+    // instead of writing records they were not shown (#4310).
+    mutationFn: async () => {
+      const shown = data;
+      const fresh = await dnsApi.getDelegationPreview(groupId, zoneId);
+      const toCreate = (d?: DelegationPreviewResponse) =>
+        d?.has_parent
+          ? JSON.stringify([d.ns_records_to_create, d.glue_records_to_create])
+          : "";
+      if (toCreate(fresh) !== toCreate(shown)) {
+        qc.setQueryData(["dns-delegation-preview", groupId, zoneId], fresh);
+        throw new Error(
+          "The zone's NS records changed since this list was shown. The list has been updated: review it and apply again.",
+        );
+      }
+      return dnsApi.applyDelegation(groupId, zoneId);
+    },
     onSuccess: () => {
       // The parent zone's record list changed — invalidate any cached view.
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -59,7 +86,11 @@ export function DelegationModal({
           </FormError>
         )}
 
-        {data && data.has_parent === false && (
+        {data && data.has_parent === false && data.reason && (
+          <p className="text-xs text-muted-foreground">{data.reason}</p>
+        )}
+
+        {data && data.has_parent === false && !data.reason && (
           <p className="text-xs text-muted-foreground">
             No parent zone for <code className="font-mono">{childDisplay}</code>{" "}
             exists in this server group, so there is nothing to delegate. Create
@@ -78,6 +109,11 @@ export function DelegationModal({
                 <span>{childDisplay}</span>
                 <ArrowRight className="h-3 w-3 text-muted-foreground" />
                 <span>{data.parent_zone_name.replace(/\.$/, "")}</span>
+                {data.parent_view_name && (
+                  <span className="text-muted-foreground">
+                    (view {data.parent_view_name})
+                  </span>
+                )}
               </div>
               <p className="mt-1 text-[11px] text-muted-foreground">
                 These records will be created in the parent zone so recursive
@@ -86,6 +122,16 @@ export function DelegationModal({
                 NS-chasing. The records mirror this zone's apex NS records.
               </p>
             </div>
+
+            {(data.cname_conflicts ?? []).length > 0 && (
+              <FormError className="text-xs text-destructive">
+                <ul className="list-disc space-y-0.5 pl-4">
+                  {(data.cname_conflicts ?? []).map((c, i) => (
+                    <li key={i}>{c}</li>
+                  ))}
+                </ul>
+              </FormError>
+            )}
 
             {data.warnings.length > 0 && (
               <div className="rounded border border-amber-300 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
@@ -160,7 +206,9 @@ export function DelegationModal({
               onClick={() => applyMut.mutate()}
               disabled={
                 applyMut.isPending ||
+                isFetching ||
                 data.child_apex_ns_count === 0 ||
+                (data.cname_conflicts ?? []).length > 0 ||
                 (data.ns_records_to_create.length === 0 &&
                   data.glue_records_to_create.length === 0)
               }

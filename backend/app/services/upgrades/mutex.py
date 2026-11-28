@@ -216,6 +216,7 @@ def acquire(
     holder: str | None = None,
     namespace: str | None = None,
     lease_duration_seconds: int = LEASE_DURATION_S,
+    retry_budget_s: float = 0.0,
 ) -> tuple[bool, str | None]:
     """Acquire the upgrade lease as ``holder`` (default: this pod's hostname;
     the orchestrator passes its ``drive_identity()``).
@@ -229,9 +230,14 @@ def acquire(
 
     ``lease_duration_seconds`` overrides the default for callers that run long
     enough that 60 s would expire mid-step (the orchestrator passes ~600 s).
+
+    ``retry_budget_s`` > 0 (#4512) tries the first Lease read again for that
+    long when the kubeapi refuses it or answers 5xx (a k3s restart), instead of
+    reporting the Lease held by ``<unreachable>`` on one bad answer. It sleeps,
+    so call it from a worker thread.
     """
     me = holder or _identity()
-    state, version = _read(namespace=namespace)
+    state, version = _read(namespace=namespace, retry_budget_s=retry_budget_s)
     if not state.held and state.holder is None:
         ok, err = k8s.create_lease(
             LEASE_NAME,

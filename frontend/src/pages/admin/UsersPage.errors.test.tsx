@@ -107,6 +107,10 @@ describe("user dialogs, a refused email", () => {
   it("Edit User says it in words", async () => {
     open();
     fireEvent.click(await screen.findByTitle("Edit"));
+    // The dialog reads the row first, and sends only what was changed.
+    fireEvent.change(await screen.findByDisplayValue(/@/), {
+      target: { value: "not-an-email" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(expectWordsNotJson);
   });

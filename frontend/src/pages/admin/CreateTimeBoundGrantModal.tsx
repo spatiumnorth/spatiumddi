@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Field } from "@/components/ui/field";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -23,23 +24,6 @@ const inputCls =
 // grant the role editor can make can also be made temporary (#1631).
 const ACTIONS = GRANT_ACTIONS;
 const RESOURCE_TYPES: readonly string[] = GRANT_RESOURCE_TYPES;
-
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">
-        {label}
-      </label>
-      {children}
-    </div>
-  );
-}
 
 // Default the expiry picker to "now + 24h" in the local-tz format a
 // datetime-local input expects (YYYY-MM-DDTHH:mm).
