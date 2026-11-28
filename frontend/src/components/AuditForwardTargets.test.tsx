@@ -305,3 +305,65 @@ describe("Test result wording (#4237)", () => {
     expect(screen.getByText("delivered to collector")).toBeTruthy();
   });
 });
+
+describe("a Test result is announced (#4966)", () => {
+  it("announces a failed Test and keeps it past the old timeout", async () => {
+    api.test.mockRejectedValue({
+      response: { status: 502, data: { detail: "delivery failed: refused" } },
+    });
+    api.list.mockResolvedValue([TARGET]);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <AuditForwardTargets isSuperadmin />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("https://collector.example.test/…");
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await act(async () => {
+        fireEvent.click(
+          screen.getByTitle("Send a synthetic event to this target"),
+        );
+      });
+      const alert = await screen.findByRole("alert");
+      expect(alert.textContent).toContain("delivery failed");
+      await act(async () => {
+        vi.advanceTimersByTime(60_000);
+      });
+      expect(screen.getByRole("alert").textContent).toContain(
+        "delivery failed",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not announce a successful Test", async () => {
+    api.test.mockResolvedValue({
+      status: "ok",
+      target: "collector.example.test",
+    });
+    api.list.mockResolvedValue([TARGET]);
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <AuditForwardTargets isSuperadmin />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("https://collector.example.test/…");
+    await act(async () => {
+      fireEvent.click(
+        screen.getByTitle("Send a synthetic event to this target"),
+      );
+    });
+    await screen.findByText(/delivered to/);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
