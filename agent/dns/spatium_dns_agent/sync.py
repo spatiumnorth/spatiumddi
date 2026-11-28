@@ -1374,7 +1374,6 @@ class SyncLoop:
                     zone=op.get("zone_name"),
                 )
                 _note_reached(reached, op)
-                touched.add(_zone_key(op.get("zone_name")))
                 # A driver that can serve a zone at a serial of its own
                 # (PowerDNS never goes backwards from the one it serves,
                 # #1968; BIND9 numbers an update itself when the op's serial
@@ -1409,13 +1408,16 @@ class SyncLoop:
         # A zone the structural apply left partly refused (#2060) is not
         # reported converged by an op that landed beside the refusal either.
         unconverged = self._unconverged_zone_keys()
-        self._report_reached_serials(
-            {
-                zone: serial
-                for zone, serial in reached.items()
-                if zone not in failed_zones and zone.lower() not in unconverged
-            }
-        )
+        reportable = {
+            zone: serial
+            for zone, serial in reached.items()
+            if zone not in failed_zones and zone.lower() not in unconverged
+        }
+        # #5025 — only a zone whose serial this pass reported is left out of
+        # the next sweep: one the op could not read back (or a failed or
+        # unconverged one) is still the sweep's to read.
+        touched.update(reportable)
+        self._report_reached_serials(reportable)
 
         # #882 — we got here with nothing quarantined and nothing to
         # re-render, so whatever the control plane is serving is what we are

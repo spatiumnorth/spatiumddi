@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import dns.query
 import dns.rdata
@@ -33,7 +33,7 @@ from spatium_dns_agent import sync as sync_mod
 from spatium_dns_agent.cache import ensure_layout, load_config
 from spatium_dns_agent.config_apply import ApplyStatus
 from spatium_dns_agent.drivers import bind9 as bind9_mod
-from spatium_dns_agent.drivers.base import DriverBase
+from spatium_dns_agent.drivers.base import SERIAL_UNREAD, DriverBase
 from spatium_dns_agent.drivers.bind9 import Bind9Driver
 from spatium_dns_agent.fetch import get_config
 from spatium_dns_agent.sync import SyncLoop
@@ -51,7 +51,7 @@ class _Resp:
         self._chunks = chunks
         self.consumed = 0
 
-    def __enter__(self) -> _Resp:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> bool:
@@ -224,7 +224,7 @@ class _ControlPlane:
         self.replies: list[Any] = []
         self.polls: list[dict[str, str]] = []
 
-    def __enter__(self) -> _ControlPlane:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> bool:
@@ -430,12 +430,7 @@ def _driver(tmp_path: Path) -> Bind9Driver:
 
 
 def _adds(update: Any) -> list[str]:
-    return [
-        rd.to_text()
-        for rrset in update.update
-        if rrset.deleting is None
-        for rd in rrset
-    ]
+    return [rd.to_text() for rrset in update.update if rrset.deleting is None for rd in rrset]
 
 
 def test_ops_of_one_zone_are_one_update_and_order_is_kept(tmp_path: Path, wire: list[Any]) -> None:
@@ -492,13 +487,17 @@ def test_a_run_never_crosses_an_op_it_cannot_batch(tmp_path: Path) -> None:
 def test_an_op_that_can_change_the_apex_is_applied_on_its_own(tmp_path: Path) -> None:
     drv = _driver(tmp_path)
     drv._apex_blob = (  # type: ignore[attr-defined]
-        b"\na.test\t" + json.dumps({"name": "a.test.", "ns": [], "primary_ns": "ns1.a.test."}).encode()
+        b"\na.test\t"
+        + json.dumps({"name": "a.test.", "ns": [], "primary_ns": "ns1.a.test."}).encode()
         + b"\n"
     )
     ns = _rrset_op("n", "a.test.", "@", "ns2.a.test.")
     ns["record"]["type"] = "NS"
     glue = _rrset_op("g", "a.test.", "ns1", "10.0.0.53")
-    plain = [_rrset_op("1", "a.test.", "h1", "10.0.0.1"), _rrset_op("2", "a.test.", "h2", "10.0.0.2")]
+    plain = [
+        _rrset_op("1", "a.test.", "h1", "10.0.0.1"),
+        _rrset_op("2", "a.test.", "h2", "10.0.0.2"),
+    ]
     plan = drv.plan_op_batches([plain[0], ns, glue, plain[1]])
     assert [[o["op_id"] for o in b] for b in plan] == [["1"], ["n"], ["g"], ["2"]]
 
@@ -636,7 +635,7 @@ def test_the_sweep_waits_while_ops_drain_and_skips_the_zones_they_touched(
     loop = SyncLoop(_Cfg(tmp_path), ["tok"], driver, _Heartbeat())
     cp = _ControlPlane()
     loop._client = lambda **kw: cp  # type: ignore[method-assign]
-    cp.replies = [_Reply(200, _bundle("e1", [_op("o1", "a.test.")], remaining=5000))]
+    cp.replies = [_Reply(200, _bundle("e1", [_op("o1", "a.test.", target=6)], remaining=5000))]
     loop._poll_once()
     assert loop._draining
 
@@ -659,6 +658,24 @@ def test_the_sweep_waits_while_ops_drain_and_skips_the_zones_they_touched(
     clock[0] += 61
     loop._report_served_serials()
     assert driver.sweeps == [{"a.test"}, set()]
+
+
+def test_a_zone_whose_serial_the_op_could_not_read_stays_in_the_sweep(tmp_path: Path) -> None:
+    class _Unread(_SweepDriver):
+        def reached_serial(self, zone_name: str) -> object:
+            return SERIAL_UNREAD
+
+    ensure_layout(tmp_path)
+    driver = _Unread(tmp_path)
+    loop = SyncLoop(_Cfg(tmp_path), ["tok"], driver, _Heartbeat())
+    cp = _ControlPlane()
+    loop._client = lambda **kw: cp  # type: ignore[method-assign]
+    cp.replies = [_Reply(200, _bundle("e1", [_op("o1", "a.test.", target=6)])), _Reply(304)]
+    loop._poll_once()
+    loop._poll_once()  # the queue is empty: the sweep is no longer deferred
+    loop._report_served_serials()
+    # Nothing was reported for a.test, so the sweep still reads it.
+    assert driver.sweeps == [set()]
 
 
 def test_bind9_leaves_the_excluded_zones_out_of_the_sweep(tmp_path: Path) -> None:

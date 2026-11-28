@@ -12,6 +12,10 @@ BIND9 driver's ``apply_record_op`` paths against
   Python server, so absolute numbers are not named's; compare before / after,
   not this to production.
 
+``--real-named`` starts a real ``named`` (on PATH, e.g. in the dns-bind9 image)
+with one primary zone per ``--zones`` instead of the stand-in, and checks every
+record the ops created answers.
+
 It needs to bind port 53 (run it as root in a container)::
 
     docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \\
@@ -90,13 +94,15 @@ def make_ops(n: int, zones: int) -> list[dict]:
 # ── stand-in control plane ───────────────────────────────────────────────
 
 
-def serve_control_plane(port: int, body: bytes, ops: list[dict], page: int, mode: str, state) -> None:
+def serve_control_plane(
+    port: int, body: bytes, ops: list[dict], page: int, mode: str, state
+) -> None:
     sent = {"n": 0, "bytes": 0}
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def log_message(self, *a):  # noqa: ANN002
+        def log_message(self, *a):
             pass
 
         def do_POST(self):  # zone-state / heartbeat reports
@@ -119,9 +125,13 @@ def serve_control_plane(port: int, body: bytes, ops: list[dict], page: int, mode
             sent["n"] = n + len(chunk)
             remaining = len(ops) - sent["n"]
             head = (
-                b'{"etag":"' + ETAG.encode() + b'","pending_record_ops":'
+                b'{"etag":"'
+                + ETAG.encode()
+                + b'","pending_record_ops":'
                 + json.dumps(chunk, separators=(",", ":")).encode()
-                + b',"pending_ops_remaining":' + str(remaining).encode() + b","
+                + b',"pending_ops_remaining":'
+                + str(remaining).encode()
+                + b","
             )
             held = self.headers.get("If-None-Match") == ETAG
             if mode == "ops-only" and held and self.headers.get("X-Spatium-Ops-Only") == "1":
@@ -183,7 +193,8 @@ def serve_named(serials_per_zone: dict) -> None:
                     zone = q.question[0].name.to_text()
                     r.flags |= dns.flags.AA
                     soa = dns.rdata.from_text(
-                        "IN", "SOA",
+                        "IN",
+                        "SOA",
                         f"ns1.{zone} h.{zone} {serials.get(zone, 1)} 3600 600 86400 300",
                     )
                     r.answer.append(dns.rrset.from_rdata(q.question[0].name, 300, soa))
@@ -196,6 +207,66 @@ def serve_named(serials_per_zone: dict) -> None:
         request_queue_size = 256
 
     S(("127.0.0.1", 53), H).serve_forever()
+
+
+def start_real_named(state_dir: Path, zones: int):
+    """Write a minimal named.conf with ``zones`` primary zones that take TSIG-signed
+    updates, start named on 127.0.0.1:53 and wait until it answers."""
+    import subprocess
+
+    root = state_dir / "named"
+    (root / "zones").mkdir(parents=True)
+    conf = [
+        f'options {{ directory "{root}"; listen-on port 53 {{ 127.0.0.1; }}; listen-on-v6 {{ none; }};',
+        f'  recursion no; pid-file "{root}/named.pid"; session-keyfile "{root}/session.key"; }};',
+        KEY.strip(),
+    ]
+    for z in range(zones):
+        name = zone_name(z)
+        (root / "zones" / f"{name}zone").write_text(
+            f"$TTL 300\n@ IN SOA ns1.{name} h.{name} 1 3600 600 86400 300\n"
+            f"@ IN NS ns1.{name}\nns1 IN A 192.0.2.1\n"
+        )
+        conf.append(
+            f'zone "{name.rstrip(".")}" {{ type primary; file "zones/{name}zone"; '
+            "allow-update { key bench; }; };"
+        )
+    (root / "named.conf").write_text("\n".join(conf) + "\n")
+    with open(root / "named.log", "wb") as log_fh:
+        proc = subprocess.Popen(
+            ["named", "-g", "-c", str(root / "named.conf")],
+            stdout=subprocess.DEVNULL,
+            stderr=log_fh,
+        )
+    import dns.message
+    import dns.query
+
+    q = dns.message.make_query(zone_name(0), "SOA")
+    for _ in range(120):
+        try:
+            if dns.query.tcp(q, "127.0.0.1", timeout=1).answer:
+                return proc
+        except Exception:  # noqa: BLE001 - not up yet
+            time.sleep(0.5)
+    raise SystemExit("named did not come up; see " + str(root / "named.log"))
+
+
+def verify_served(ops: list[dict]) -> bool:
+    """Ask the real named for every record the ops created."""
+    import dns.message
+    import dns.query
+
+    bad = 0
+    with_conn = 0
+    for op in ops:
+        name = f"{op['record']['name']}.{op['zone_name']}"
+        r = dns.query.tcp(dns.message.make_query(name, "A"), "127.0.0.1", timeout=5)
+        got = {rd.to_text() for rrs in r.answer for rd in rrs}
+        with_conn += 1
+        if op["record"]["value"] not in got:
+            bad += 1
+    print(f"served check: {with_conn - bad}/{with_conn} names answer", file=sys.stderr)
+    return bad == 0
 
 
 # ── the agent ────────────────────────────────────────────────────────────
@@ -219,6 +290,11 @@ def main() -> int:
     ap.add_argument("--page", type=int, default=5_000)
     ap.add_argument("--mode", choices=["full", "ops-only"], default="full")
     ap.add_argument("--port", type=int, default=18765)
+    ap.add_argument(
+        "--real-named",
+        action="store_true",
+        help="apply the ops to a real named (must be on PATH, run as root) instead of the stand-in",
+    )
     args = ap.parse_args()
 
     from spatium_dns_agent.cache import ensure_layout, save_config
@@ -230,18 +306,26 @@ def main() -> int:
     ensure_layout(state_dir)
     bundle = make_bundle(args.records, args.zones)
     body = json.dumps(bundle, separators=(",", ":")).encode()
-    print(f"bundle: {len(body) / 1e6:.1f} MB, {args.zones} zones, {args.records} records", file=sys.stderr)
+    print(
+        f"bundle: {len(body) / 1e6:.1f} MB, {args.zones} zones, {args.records} records",
+        file=sys.stderr,
+    )
     (state_dir / "tsig").mkdir(exist_ok=True)
     (state_dir / "tsig" / "ddns.key").write_text(KEY)
     ops = make_ops(args.ops, args.zones)
 
     done = mp.Value("i", 0)
     cp = mp.Process(
-        target=serve_control_plane, args=(args.port, body, ops, args.page, args.mode, done), daemon=True
+        target=serve_control_plane,
+        args=(args.port, body, ops, args.page, args.mode, done),
+        daemon=True,
     )
-    dns_srv = mp.Process(target=serve_named, args=({},), daemon=True)
     cp.start()
-    dns_srv.start()
+    if args.real_named:
+        dns_srv = start_real_named(state_dir, args.zones)
+    else:
+        dns_srv = mp.Process(target=serve_named, args=({},), daemon=True)
+        dns_srv.start()
     time.sleep(1.0)
 
     cfg = AgentConfig(
@@ -258,11 +342,17 @@ def main() -> int:
     driver = Bind9Driver(state_dir=state_dir)
     # The sweep reads every primary zone the last render wrote (#2835).
     driver._rendered_has_views = False
+
     def apex(z: int) -> str:
         name = zone_name(z)
         state = {
-            "name": name, "primary_ns": f"ns1.{name}", "admin_email": f"h.{name}", "ttl": 3600,
-            "ns": [f"ns1.{name}"], "addressed": [], "signed": False,
+            "name": name,
+            "primary_ns": f"ns1.{name}",
+            "admin_email": f"h.{name}",
+            "ttl": 3600,
+            "ns": [f"ns1.{name}"],
+            "addressed": [],
+            "signed": False,
         }
         return f"{name.rstrip('.')}\t{json.dumps(state, separators=(',', ':'))}"
 
@@ -295,9 +385,14 @@ def main() -> int:
         f"ops/s={args.ops / dt:.1f}",
         file=sys.stderr,
     )
+    served_ok = True
+    if args.real_named:
+        served_ok = verify_served(ops)
     cp.terminate()
     dns_srv.terminate()
-    return 0 if ok == args.ops else 1
+    if args.real_named:
+        dns_srv.wait()
+    return 0 if ok == args.ops and served_ok else 1
 
 
 if __name__ == "__main__":
