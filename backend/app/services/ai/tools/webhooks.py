@@ -130,6 +130,7 @@ async def get_webhook_event_types(
         _RESOURCE_NAMESPACE,
         _SPECIAL_EVENT_MAP,
         _VERB_MAP,
+        ALERT_EVENT_TYPES,
     )
 
     types: set[str] = set()
@@ -137,6 +138,7 @@ async def get_webhook_event_types(
         for verb in _VERB_MAP.values():
             types.add(f"{namespace}.{verb}")
     types.update(_SPECIAL_EVENT_MAP.values())
+    types.update(ALERT_EVENT_TYPES)  # #2145 — same catalog as GET /webhooks/event-types
     return {"event_types": sorted(types)}
 
 
