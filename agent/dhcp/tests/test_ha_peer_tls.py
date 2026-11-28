@@ -223,7 +223,7 @@ def _heartbeat(agent_cfg: AgentConfig, monkeypatch, refuse_field: str | None):
 def test_heartbeat_advertises_the_ha_peer_tls_capability(agent_cfg, monkeypatch):
     hb, sent = _heartbeat(agent_cfg, monkeypatch, refuse_field=None)
     hb.send_once()
-    assert sent[-1]["capabilities"] == ["ha_peer_tls"]
+    assert sent[-1]["capabilities"] == ["ha_peer_tls", "ha_v6"]
 
 
 def test_heartbeat_drops_the_field_for_a_control_plane_that_refuses_it(
@@ -259,9 +259,9 @@ def test_heartbeat_offers_the_field_again_once_the_control_plane_is_upgraded(
     # …and then offer it again, which the upgraded control plane accepts.
     now[0] += heartbeat_mod.CAPABILITIES_RETRY_SECONDS
     hb.send_once()
-    assert sent[-1]["capabilities"] == ["ha_peer_tls"]
+    assert sent[-1]["capabilities"] == ["ha_peer_tls", "ha_v6"]
     hb.send_once()
-    assert sent[-1]["capabilities"] == ["ha_peer_tls"]
+    assert sent[-1]["capabilities"] == ["ha_peer_tls", "ha_v6"]
 
 
 def test_a_url_without_a_port_keeps_its_port_under_https():

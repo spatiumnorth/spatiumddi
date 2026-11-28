@@ -281,6 +281,23 @@ def _dhcp_ha_rule(
     return port, v4, v6
 
 
+def _dhcp_ha_ports(role_assignment: dict[str, Any], ha_port: int) -> str:
+    """#1258 — the ``tcp dport`` operand for the Kea HA rule.
+
+    ``dhcp_ha_port`` alone, or ``{ port, v6_port }`` when the control plane
+    also set ``dhcp_ha_v6_port`` (kea-dhcp6's own listener, opened to the same
+    peers). An unusable v6 value is ignored, leaving the v4-only operand.
+    Keep byte-identical across the three renderers.
+    """
+    try:
+        v6_port = int(role_assignment.get("dhcp_ha_v6_port"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return str(ha_port)
+    if not 1 <= v6_port <= 65535 or v6_port == ha_port:
+        return str(ha_port)
+    return "{ " + ", ".join(str(p) for p in sorted((ha_port, v6_port))) + " }"
+
+
 def render_drop_in(
     role_assignment: dict[str, Any] | None,
     cluster_peer_cidrs: list[Any] | None = None,
@@ -451,9 +468,16 @@ def render_drop_in(
             lines.append("")
             lines.append("# ── Per-role service ports ─────────────────────────────")
         _emit_family_rule(
-            lines, ha_v4, ha_v6, f"tcp dport {ha_port} accept", "role:dhcp-ha"
+            lines,
+            ha_v4,
+            ha_v6,
+            f"tcp dport {_dhcp_ha_ports(role_assignment, ha_port)} accept",
+            "role:dhcp-ha",
         )
-        tcp_ports.add(ha_port)
+        # #1258 — the operand may also carry kea-dhcp6's listener.
+        tcp_ports.update(
+            int(p) for p in _dhcp_ha_ports(role_assignment, ha_port).strip("{} ").split(",")
+        )
     tcp_ports.update(role_tcp)
     udp_ports.update(role_udp)
 

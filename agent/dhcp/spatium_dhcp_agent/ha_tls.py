@@ -20,8 +20,11 @@ from typing import Any
 # Advertised on register + heartbeat; the control plane renders the
 # credential only when every Kea peer in the group sends it.
 CAPABILITY = "ha_peer_tls"
+# #1258 — advertised by an agent that renders the HA hook into Dhcp6 as well.
+# The control plane ships the v6 peer URLs only once every Kea member sends it.
+CAPABILITY_HA_V6 = "ha_v6"
 # Everything this agent advertises on register + heartbeat.
-AGENT_CAPABILITIES: tuple[str, ...] = (CAPABILITY,)
+AGENT_CAPABILITIES: tuple[str, ...] = (CAPABILITY, CAPABILITY_HA_V6)
 
 CA_FILE = "ca.pem"
 CERT_FILE = "cert.pem"

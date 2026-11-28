@@ -1061,8 +1061,15 @@ def _https(url: str) -> str:
     return urlunparse(("https", netloc, p.path or "/", p.params, p.query, p.fragment))
 
 
-def _ha_hook(failover: dict[str, Any], ha_tls_dir: str = DEFAULT_HA_TLS_DIR) -> dict[str, Any]:
+def _ha_hook(
+    failover: dict[str, Any], ha_tls_dir: str = DEFAULT_HA_TLS_DIR, *, v6: bool = False
+) -> dict[str, Any]:
     """Render the ``libdhcp_ha.so`` hook entry from a failover payload.
+
+    ``v6=True`` renders the Dhcp6 daemon's entry (#1258): the same relationship
+    with each peer's ``url_v6`` instead of ``url``. Kea runs one HTTP listener
+    per daemon, so kea-dhcp6 cannot share the port kea-dhcp4's hook holds; the
+    control plane derives the v6 URL (v4 port + 1) and ships it per peer.
 
     Shape mirrors Kea's HA hook reference (ARM §14.3): the hook takes
     a ``parameters`` dict that in turn contains a ``high-availability``
@@ -1083,7 +1090,7 @@ def _ha_hook(failover: dict[str, Any], ha_tls_dir: str = DEFAULT_HA_TLS_DIR) -> 
     use_tls = credential_from_failover(failover) is not None
     peers = []
     for p in failover["peers"]:
-        url = _resolve_peer_url(p["url"])
+        url = _resolve_peer_url(p["url_v6"] if v6 else p["url"])
         peers.append(
             {
                 "name": p["name"],
@@ -1640,6 +1647,22 @@ def render(
     # #637 — see the Dhcp4 block. Optional, so set conditionally.
     if _global_max_age is not None:
         dhcp6["cache-max-age"] = int(_global_max_age)
+
+    # #1258 — DHCPv6 HA. kea-dhcp6 is its own process with its own HA state
+    # machine and HTTP listener, so it gets its own hook entry on the v6 peer
+    # URLs. Rendered only when this pair actually serves v6 scopes (an idle
+    # Dhcp6 would otherwise bind a listener for nothing) and only when the
+    # control plane sent a v6 URL for EVERY peer, which it does once every
+    # member's agent supports it — a partner that never binds the port would
+    # leave this daemon waiting on it. lease_cmds above is load-bearing here
+    # too: Kea rejects the HA hook without it.
+    if (
+        v6_scopes
+        and isinstance(failover, dict)
+        and failover.get("peers")
+        and all(p.get("url_v6") for p in failover["peers"])
+    ):
+        dhcp6["hooks-libraries"].append(_ha_hook(failover, ha_tls_dir, v6=True))
 
     # Global option-data + client classes only apply when v6 scopes are
     # being served — the idle skeleton stays bare so it can't reject on

@@ -51,11 +51,11 @@ class ListDHCPServersArgs(BaseModel):
         "includes name, group, driver, operational status, HA state, and "
         "whether two agent processes are polling as it at once "
         "(``duplicate_agent``, a cloned VM or copied agent state dir). "
-        "Kea HA covers DHCPv4 only: ha_state is the DHCPv4 daemon's state, "
-        "and DHCPv6 scopes on an HA group are served by each member "
-        "independently, with no lease coordination. ``memory`` is the agent's "
-        "reported container used / peak / limit and Kea / agent RSS in bytes "
-        "(null when the agent has not reported it)."
+        "ha_state is the DHCPv4 daemon's HA state and ha_state_v6 the DHCPv6 "
+        "daemon's (null while the group runs no DHCPv6 HA, in which case its "
+        "DHCPv6 scopes are served by each member independently). ``memory`` is "
+        "the agent's reported container used / peak / limit and Kea / agent RSS "
+        "in bytes (null when the agent has not reported it)."
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",
@@ -86,6 +86,7 @@ async def list_dhcp_servers(
             "driver": s.driver,
             "status": s.status,
             "ha_state": s.ha_state,
+            "ha_state_v6": s.ha_state_v6,
             # #3143 — a second live agent process polls as this server and is
             # being refused (the one the row's alert and chip read).
             "duplicate_agent": duplicate_agent_active(s),

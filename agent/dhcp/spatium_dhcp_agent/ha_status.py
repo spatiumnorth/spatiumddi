@@ -5,7 +5,9 @@ emits the HA hook config and the local Kea daemon loads it. This
 module then periodically asks Kea for its HA state via the control
 socket and POSTs that state to
 ``/api/v1/dhcp/agents/ha-status`` so the UI can render a live
-"HA: normal" / "HA: partner-down" pill.
+"HA: normal" / "HA: partner-down" pill. The DHCPv4 and DHCPv6 daemons each
+run their own HA hook, so both control sockets are polled and the two states
+are reported separately (#1258).
 
 When the server is standalone (no failover block in the last bundle),
 the poller is a no-op. We key that off a shared flag set by the
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import random
 import threading
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -93,11 +96,13 @@ class HAStatusPoller:
             timeout=10.0,
         )
 
-    def _poll_kea(self) -> tuple[str | None, dict[str, Any] | None]:
+    def _poll_kea(self, socket: Path | None = None) -> tuple[str | None, dict[str, Any] | None]:
         # ``status-get`` rather than ``ha-status-get``: Kea 2.6 folded
         # HA state into the generic status response (see _extract_state).
+        # ``socket`` defaults to the DHCPv4 daemon's; the DHCPv6 daemon is a
+        # separate process with its own socket and its own HA state (#1258).
         try:
-            resp = send_command(self.cfg.kea_control_socket, "status-get")
+            resp = send_command(socket or self.cfg.kea_control_socket, "status-get")
         except KeaCtrlError as e:
             # Kea returns an error when the HA hook isn't loaded. That's
             # the common case for standalone servers — log at debug so
@@ -112,12 +117,24 @@ class HAStatusPoller:
             return None, None
         return _extract_state(resp), resp.get("arguments")
 
-    def _report(self, state: str, raw: dict[str, Any] | None) -> None:
+    def _report(
+        self,
+        state: str,
+        raw: dict[str, Any] | None,
+        state_v6: str | None = None,
+        raw_v6: dict[str, Any] | None = None,
+    ) -> None:
+        body: dict[str, Any] = {"state": state, "raw": raw or {}}
+        # The v6 keys are sent only when kea-dhcp6 reported one, so a control
+        # plane that predates DHCPv6 HA sees exactly the payload it always did.
+        if state_v6 is not None:
+            body["state_v6"] = state_v6
+            body["raw_v6"] = raw_v6 or {}
         try:
             with self._client() as c:
                 resp = c.post(
                     "/api/v1/dhcp/agents/ha-status",
-                    json={"state": state, "raw": raw or {}},
+                    json=body,
                     headers={"Authorization": f"Bearer {self.token_ref[0]}"},
                 )
             if resp.status_code not in (200, 204):
@@ -130,7 +147,11 @@ class HAStatusPoller:
             if self._enabled:
                 state, raw = self._poll_kea()
                 if state is not None:
-                    self._report(state, raw)
+                    # kea-dhcp6 answers ``status-get`` with no HA section (or
+                    # not at all) while its hook is not loaded, which reads as
+                    # None here: no v6 HA, not an error.
+                    state_v6, raw_v6 = self._poll_kea(self.cfg.kea_control_socket_v6)
+                    self._report(state, raw, state_v6, raw_v6)
             # 15s base cadence + small jitter so N paired peers don't
             # hit the control plane in lockstep. HA state changes
             # propagate as fast as heartbeats detect them (Kea's own
