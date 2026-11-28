@@ -1,0 +1,49 @@
+[Unit]
+Description=SpatiumDDI installer wizard on the serial console (%I)
+Documentation=https://github.com/spatiumnorth/spatiumddi/issues/4549
+# The serial twin of spatium-install.service (tty1), for IPMI Serial-over-LAN,
+# headless servers and serial-only VMs. Same gate: only on installer media.
+ConditionKernelCommandLine=spatium-mode=install
+ConditionPathExists=/dev/%I
+# The kernel creates /dev/ttyS0..3 whether or not a UART is behind them
+# (console=ttyS0 is on every cmdline), and opening a missing one fails EIO.
+# That is "no serial port here", not a failure: ExecCondition= exiting 1..254
+# skips the unit without marking it failed (the #994 rule for the console
+# dashboard's instance, same reason).
+ExecCondition=/bin/sh -c ': > /dev/%I'
+# Not before the tty1 unit and the live bootstrap, so the answer-file lookup
+# (which the wizard here waits on, not repeats) starts on tty1 first.
+After=getty@tty1.service systemd-user-sessions.service plymouth-quit.service
+After=systemd-networkd.service spatium-live-bootstrap.service
+# No Conflicts= (see spatium-install.service for why a load-time conflict
+# leaks onto the installed system); the stop below is the belt and braces.
+
+[Service]
+Type=idle
+ExecStartPre=-/usr/bin/systemctl stop serial-getty@%I.service
+ExecStart=/bin/bash -x /usr/local/bin/spatium-install
+# Tells the wizard it is the secondary console: it waits for tty1's verdict on
+# an answer file and only runs when there is none, and it keeps its xtrace in
+# its own file so two wizards never write one trace through separate offsets.
+Environment=SPATIUM_INSTALL_CONSOLE=serial
+Environment=SPATIUM_INSTALL_TRACE_LOG=/var/log/spatium-install-trace-%I.log
+# A serial terminal is whatever the operator's software says it is, and the
+# kernel does not know its size (the wizard sizes its dialogs for 80x24 then).
+# vt220 has no colour and draws boxes with the ACS set, which any serial
+# terminal emulator renders; the 'linux' terminfo entry assumes a VT.
+Environment=TERM=vt220
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+KillMode=process
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+# Never auto-restart: see spatium-install.service.
+Restart=no
+
+# No [Install]: enabled per instance by an explicit symlink in mkosi.postinst
+# (spatium-console@ttyS0's shape), since a template's [Install] cannot name
+# which port to start.
