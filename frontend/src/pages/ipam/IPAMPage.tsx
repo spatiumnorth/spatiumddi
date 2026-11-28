@@ -1266,6 +1266,7 @@ function DnsSettingsSection({
   parentBlockId,
   fallbackSpaceId,
   hideInheritToggle,
+  subnetId,
 }: {
   inherit: boolean;
   groupIds: string[];
@@ -1278,6 +1279,9 @@ function DnsSettingsSection({
   parentBlockId?: string | null;
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
+  /** Set when editing an existing subnet: a writer of it who cannot read
+   *  zones type-wide is offered the zones it may write there (#5006). */
+  subnetId?: string | null;
 }) {
   const dnsGroupSelectId = useId();
   const primaryZoneSelectId = useId();
@@ -1291,6 +1295,11 @@ function DnsSettingsSection({
   const { can, unanswered } = usePermissions();
   const canReadGroups = can("read", "dns_group");
   const canReadZones = can("read", "dns_zone");
+  // A subnet-scoped writer cannot read the group's zone list (#4854); the
+  // subnet's writable-zones read serves it, so the zone query runs for it too
+  // (#5006). The server still decides which zones come back.
+  const subnetWriter = !!subnetId && can("write", "subnet", subnetId);
+  const canListZones = canReadZones || subnetWriter;
   const { data: allGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
@@ -1332,14 +1341,17 @@ function DnsSettingsSection({
 
   const zoneQueries = useQueries({
     queries: (activeGroupIds as string[]).map((gId: string) => ({
-      queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryKey: ["dns-zones", gId, subnetWriter ? subnetId : null],
+      queryFn: () =>
+        subnetWriter
+          ? dnsApi.listZones(gId, undefined, subnetId!)
+          : dnsApi.listZones(gId),
       staleTime: 0,
       refetchOnMount: "always" as const,
       // Needs its own gate, unlike the dashboard's: these ids come from
       // the inherited block/space settings, not from the dns-groups query
       // that the module gate empties.
-      enabled: dnsOn && canReadZones,
+      enabled: dnsOn && canListZones,
     })),
   });
   const allAvailableZones: DNSZone[] = zoneQueries.flatMap(
@@ -1455,42 +1467,47 @@ function DnsSettingsSection({
         </div>
 
         {/* A stored zone the user may not read: said, not dropped. */}
-        {!canReadZones && displayZoneId && (
-          <div>
-            <label
-              htmlFor={primaryZoneSelectId}
-              className="mb-1 block text-xs text-muted-foreground"
-            >
-              Primary Zone
-            </label>
-            <select
-              id={primaryZoneSelectId}
-              value="linked"
-              disabled
+        {!canReadZones &&
+          displayZoneId &&
+          !availableZones.some((z) => z.id === displayZoneId) && (
+            <div>
+              <label
+                htmlFor={primaryZoneSelectId}
+                className="mb-1 block text-xs text-muted-foreground"
+              >
+                Primary Zone
+              </label>
+              <select
+                id={primaryZoneSelectId}
+                value="linked"
+                disabled
+                title={
+                  unanswered ??
+                  "Your role cannot read DNS zones, so this cannot be changed here."
+                }
+                className={`${inputCls} w-full`}
+              >
+                <option value="linked">
+                  {unanswered ?? "Linked (not visible to your role)"}
+                </option>
+              </select>
+            </div>
+          )}
+        {!canReadZones &&
+          availableZones.length === 0 &&
+          !inherit &&
+          displayAdditionalIds.length > 0 && (
+            <p
+              className="text-xs text-muted-foreground"
               title={
                 unanswered ??
-                "Your role cannot read DNS zones, so this cannot be changed here."
+                "Your role cannot read DNS zones, so these cannot be changed here."
               }
-              className={`${inputCls} w-full`}
             >
-              <option value="linked">
-                {unanswered ?? "Linked (not visible to your role)"}
-              </option>
-            </select>
-          </div>
-        )}
-        {!canReadZones && !inherit && displayAdditionalIds.length > 0 && (
-          <p
-            className="text-xs text-muted-foreground"
-            title={
-              unanswered ??
-              "Your role cannot read DNS zones, so these cannot be changed here."
-            }
-          >
-            Additional Zones: {displayAdditionalIds.length} linked (
-            {unanswered ?? "not visible to your role"})
-          </p>
-        )}
+              Additional Zones: {displayAdditionalIds.length} linked (
+              {unanswered ?? "not visible to your role"})
+            </p>
+          )}
 
         {/* Primary Zone */}
         {availableZones.length > 0 && (
@@ -9389,6 +9406,7 @@ function EditSubnetModalForm({
             onZoneIdChange={setDnsZoneId}
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
             parentBlockId={subnet.block_id}
+            subnetId={subnet.id}
           />
           <div className="border-t pt-4">
             <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
