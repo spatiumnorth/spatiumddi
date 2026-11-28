@@ -16,6 +16,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.dashboards import integrations as integrations_dashboard
 from app.core.security import create_access_token, hash_password
 from app.main import _BUILTIN_ROLES
 from app.models.asn import ASN
@@ -216,7 +217,7 @@ async def test_integrations_summary_only_shows_readable_integrations(
     resp = await client.get("/api/v1/dashboards/integrations/summary", headers=viewer)
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert len(body["panels"]) == 12  # + vsphere (#4740)
+    assert len(body["panels"]) == len(integrations_dashboard._PANELS)
     assert "docker-reconcile-target" in [e["target_display"] for e in body["recent_errors"]]
 
 
