@@ -16,7 +16,7 @@ from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import case, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -103,47 +103,72 @@ def _entry_rows(list_id: uuid.UUID) -> Any:
     )
 
 
+#: Rows fetched per round trip by ``_collect_lists``'s single cursor.
+_COLLECT_BATCH = 10_000
+
+
 async def _collect_lists(
     db: AsyncSession, lists: list[DNSBlockList]
 ) -> tuple[list[EffectiveEntry], set[str], list[uuid.UUID]]:
-    entries: list[EffectiveEntry] = []
-    list_ids: list[uuid.UUID] = []
+    enabled = _enabled(lists)
+    list_ids = [bl.id for bl in enabled]
 
     # Column rows, not ORM entities (#1109, the #948 pattern): a Family
     # filter profile is ~596k entries, and hydrating each into a tracked
     # DNSBlockListEntry on every bundle build is the cost #948 removed for
-    # records. Still one query per list, in the caller's list order, because
-    # that order decides which list wins a duplicate owner name (#878); within
-    # a list the rows come in ``domain`` order so the bundle, and its ETag, are
-    # stable between builds instead of following the heap order. ``domain`` is
-    # unique per list, so the order is total, and it is served by the
-    # ``(list_id, domain)`` unique index rather than a sort of every row (``id``
-    # is a random UUID, so ordering by it bought nothing an index could serve).
-    for bl in lists:
-        if not bl.enabled:
-            continue
-        list_ids.append(bl.id)
-
-        entry_result = await db.execute(_entry_rows(bl.id))
-        block_mode, sinkhole_ip, list_id, list_name = (
-            bl.block_mode,
-            bl.sinkhole_ip,
-            bl.id,
-            bl.name,
-        )
-        entries.extend(
-            EffectiveEntry(
-                domain=domain.lower(),
-                action=entry_type,
-                block_mode=block_mode,
-                sinkhole_ip=sinkhole_ip,
-                target=target,
-                is_wildcard=is_wildcard,
-                list_id=list_id,
-                list_name=list_name,
+    # records. ONE query across every enabled list (``list_id IN (...)``)
+    # rather than one per list (a server-side cursor, so the driver never buffers
+    # more than a batch of rows), so the statement count does not follow the
+    # number of lists. The rows come back in ``(list_id, domain)`` order, which
+    # the ``(list_id, domain)`` unique index serves without a sort; they are
+    # bucketed per list and emitted in the CALLER's list order, because that
+    # order decides which list wins a duplicate owner name (#878). Within a
+    # list the ``domain`` order keeps the bundle, and its ETag, stable between
+    # builds instead of following the heap order; ``domain`` is unique per
+    # list, so the order is total.
+    #
+    # Each row carries its list's POSITION in the caller's order (a small int
+    # the database computes) rather than its ``list_id``: a UUID object per
+    # row is ~200k allocations on a Family-filter-sized profile.
+    by_list: list[list[EffectiveEntry]] = [[] for _ in enabled]
+    if enabled:
+        position = case(
+            {bl.id: i for i, bl in enumerate(enabled)}, value=DNSBlockListEntry.list_id
+        ).label("position")
+        result = await db.stream(
+            select(
+                position,
+                DNSBlockListEntry.domain,
+                DNSBlockListEntry.entry_type,
+                DNSBlockListEntry.target,
+                DNSBlockListEntry.is_wildcard,
             )
-            for domain, entry_type, target, is_wildcard in entry_result.tuples()
+            .where(DNSBlockListEntry.list_id.in_(list_ids))
+            .order_by(DNSBlockListEntry.list_id, DNSBlockListEntry.domain)
+            .execution_options(yield_per=_COLLECT_BATCH)
         )
+        try:
+            async for rows in result.partitions():
+                for pos, domain, entry_type, target, is_wildcard in rows:
+                    bl = enabled[pos]
+                    by_list[pos].append(
+                        EffectiveEntry(
+                            domain=domain.lower(),
+                            action=entry_type,
+                            block_mode=bl.block_mode,
+                            sinkhole_ip=bl.sinkhole_ip,
+                            target=target,
+                            is_wildcard=is_wildcard,
+                            list_id=bl.id,
+                            list_name=bl.name,
+                        )
+                    )
+        finally:
+            await result.close()
+
+    entries: list[EffectiveEntry] = []
+    for bucket in by_list:
+        entries.extend(bucket)
 
     exceptions = await exception_domains(db, lists)
     return entries, exceptions, list_ids
@@ -374,18 +399,23 @@ async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[
     enabled = _enabled(lists)
     out: set[str] = set()
     feed: dict[uuid.UUID, set[str]] = {}
-    for bl in enabled:
-        rows = await db.execute(
-            select(DNSBlockListException.domain, DNSBlockListException.source).where(
-                DNSBlockListException.list_id == bl.id
-            )
-        )
-        for domain, source in rows.tuples():
-            name = domain.lower().rstrip(".")
-            if source == "feed":
-                feed.setdefault(bl.id, set()).add(name)
-            else:
-                out.add(domain.lower())
+    if not enabled:
+        return out
+    # One query across every enabled list; only the feed rules need to know
+    # which list they came from.
+    rows = await db.execute(
+        select(
+            DNSBlockListException.list_id,
+            DNSBlockListException.domain,
+            DNSBlockListException.source,
+        ).where(DNSBlockListException.list_id.in_([bl.id for bl in enabled]))
+    )
+    for list_id, domain, source in rows.tuples():
+        name = domain.lower().rstrip(".")
+        if source == "feed":
+            feed.setdefault(list_id, set()).add(name)
+        else:
+            out.add(domain.lower())
     if feed:
         out |= await _pooled_feed_exceptions(db, enabled, feed)
     return out
