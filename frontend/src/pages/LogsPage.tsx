@@ -50,6 +50,10 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { DNSThreatTab } from "./logs/DNSThreatTab";
+import {
+  analyticsFilterParams,
+  describeAnalyticsFilters,
+} from "./logs/analyticsFilters";
 
 /**
  * Logs page — central log viewer.
@@ -1226,6 +1230,11 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [clientIp, setClientIp] = useState<string>("");
   const [view, setView] = useState<string>("");
   const [rcode, setRcode] = useState<string>("");
+  // Off = the strip covers the whole window, as it always did (#4072).
+  const [followFilters, setFollowFilters] = useSessionState<boolean>(
+    "logs-dns-analytics-follow-filters",
+    false,
+  );
 
   const scope = selection ? selectionToScope(selection) : {};
 
@@ -1264,14 +1273,30 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     retry: false,
   });
 
-  // Analytics rollups — keyed off (server_id, since) only so per-keystroke
-  // filter changes (qtype / client_ip / q) don't refetch the entire summary.
+  // Analytics rollups. With "follow filters" off the key is (scope, since)
+  // only, so filter changes don't refetch the whole summary; with it on the
+  // filters join the key, and the free-text ones are debounced because each
+  // change re-runs five aggregations (#4072).
+  const debouncedQ = useDebouncedValue(q);
+  const analyticsFilters = analyticsFilterParams(followFilters, {
+    q: debouncedQ,
+    qtype,
+    client_ip: debouncedClientIp,
+    view,
+    rcode,
+  });
   const analyticsQuery = useQuery({
-    queryKey: ["logs-dns-queries-analytics", selection, sinceIso],
+    queryKey: [
+      "logs-dns-queries-analytics",
+      selection,
+      sinceIso,
+      analyticsFilters,
+    ],
     queryFn: () =>
       logsApi.dnsQueryAnalytics({
         ...scope,
         since: sinceIso,
+        ...analyticsFilters,
         limit: 10,
       }),
     enabled,
@@ -1396,6 +1421,9 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
       <DNSQueryAnalyticsStrip
         analytics={analyticsQuery.data ?? null}
         loading={analyticsQuery.isFetching}
+        followFilters={followFilters}
+        onToggleFollow={setFollowFilters}
+        filterLabel={describeAnalyticsFilters(analyticsFilters)}
         onPickQname={(name) => setQ(name)}
         onPickClient={(ip) => setClientIp(ip)}
         onPickQtype={(t) => setQtype(t)}
@@ -1457,9 +1485,12 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   );
 }
 
-function DNSQueryAnalyticsStrip({
+export function DNSQueryAnalyticsStrip({
   analytics,
   loading,
+  followFilters,
+  onToggleFollow,
+  filterLabel,
   onPickQname,
   onPickClient,
   onPickQtype,
@@ -1468,6 +1499,9 @@ function DNSQueryAnalyticsStrip({
 }: {
   analytics: import("@/lib/api").DNSQueryAnalyticsResponse | null;
   loading: boolean;
+  followFilters: boolean;
+  onToggleFollow: (on: boolean) => void;
+  filterLabel: string;
   onPickQname: (name: string) => void;
   onPickClient: (ip: string) => void;
   onPickQtype: (t: string) => void;
@@ -1500,8 +1534,16 @@ function DNSQueryAnalyticsStrip({
         <span className="text-muted-foreground/70">
           {loading
             ? "computing…"
-            : `${total.toLocaleString()} ${total === 1 ? "query" : "queries"} in window`}
+            : `${filterLabel ? `${filterLabel} · ` : ""}${total.toLocaleString()} ${total === 1 ? "query" : "queries"}${filterLabel ? "" : " in window"}`}
         </span>
+        <label className="ml-auto flex cursor-pointer items-center gap-1.5 font-normal normal-case tracking-normal">
+          <input
+            type="checkbox"
+            checked={followFilters}
+            onChange={(e) => onToggleFollow(e.target.checked)}
+          />
+          Analytics follow filters
+        </label>
       </div>
       <div className={cn("grid grid-cols-1 gap-3", cols)}>
         <AnalyticsCard
