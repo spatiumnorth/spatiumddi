@@ -17,6 +17,10 @@ on:
       - '.github/workflows/build-appliance-builder.yml'
   workflow_dispatch:
 
+# Read-only by default (#1334); the one job that pushes raises its own.
+permissions:
+  contents: read
+
 jobs:
   build-and-publish:
     # Forks inherit this workflow (#830); never push the builder image
@@ -28,25 +32,25 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Required now that this builds two architectures on an amd64
       # runner: without a registered binfmt handler for aarch64, BuildKit
       # cannot execute the arm64 leg's RUN layers at all. Every other
       # multi-arch build in this repo pairs these two the same way.
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build (PR) / Build + push (main)
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: appliance/builder
           push: ${{ github.event_name != 'pull_request' }}

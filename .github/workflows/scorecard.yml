@@ -1,0 +1,45 @@
+# OpenSSF Scorecard (#1334). Scores the repo against the Scorecard checks,
+# publishes the result (so the README badge resolves) and uploads the SARIF to
+# the code scanning tab next to the CodeQL alerts.
+#
+# publish_results: true requires: no top-level write permissions or env, and
+# only approved actions in the job. Every action here is pinned to a commit.
+name: Scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '23 4 * * 1'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    # Forks inherit this workflow; only the canonical repo publishes.
+    if: github.repository_owner == 'spatiumnorth'
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: results.sarif

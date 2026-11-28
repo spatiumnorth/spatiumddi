@@ -13,6 +13,7 @@
 <p align="center">
   <a href="https://github.com/spatiumnorth/spatiumddi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spatiumnorth/spatiumddi/ci.yml?branch=main&label=CI" alt="CI"/></a>
   <a href="https://github.com/spatiumnorth/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/spatiumnorth/spatiumddi"><img src="https://api.scorecard.dev/projects/github.com/spatiumnorth/spatiumddi/badge" alt="OpenSSF Scorecard"/></a>
   <a href="https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
   <img src="https://img.shields.io/badge/status-release%20candidate-blue" alt="Status"/>

@@ -86,7 +86,7 @@ jobs:
       # #1020 — "all", or the space-separated test files this PR can affect.
       tests: ${{ steps.select.outputs.tests }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The diff is taken against the PR's merge base, so both sides of
           # the history have to be present.
@@ -278,9 +278,9 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
           cache: pip
@@ -351,6 +351,12 @@ jobs:
       - name: Workflow shell-status linter
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_workflow_shell.py
+
+      # #1334 — every third-party `uses:` is pinned to a commit, so a moved tag
+      # cannot change what CI runs. stdlib-only; runs from repo root.
+      - name: Action pin linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_action_pins.py
 
       # #1088 — a published image whose Dockerfile never upgrades the base
       # image's own packages can only be fixed by upstream rebuilding that
@@ -480,9 +486,9 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
           cache: pip
@@ -581,7 +587,7 @@ jobs:
       # subset must never become the file the shards are balanced with.
       - name: Upload measured durations
         if: needs.changes.outputs.tests == 'all'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-durations-shard-${{ matrix.shard }}
           path: backend/.test_durations
@@ -592,7 +598,7 @@ jobs:
       # pytest-cov has already combined the xdist workers' data into one file.
       - name: Upload coverage contexts
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-shard-${{ matrix.shard }}
           path: backend/.coverage
@@ -682,7 +688,7 @@ jobs:
       # tag cut well after the merge.
       - name: Upload backend-suite marker
         if: steps.verdict.outputs.marker != ''
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: backend-${{ steps.verdict.outputs.marker }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/backend-marker/backend-suite.txt
@@ -693,10 +699,10 @@ jobs:
       # a partial union would drop the missing tests from the file and they
       # would be split as "unknown → average" from then on. The job is
       # ``if: always()``, hence the explicit gate on each step.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.backend-test-shard.result == 'success'
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: needs.backend-test-shard.result == 'success' && needs.changes.outputs.tests == 'all'
         with:
           pattern: test-durations-shard-*
@@ -718,7 +724,7 @@ jobs:
       # cadence; the per-shard pieces above only need to outlive this job.
       - name: Upload merged durations
         if: needs.backend-test-shard.result == 'success' && needs.changes.outputs.tests == 'all'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-durations
           path: ${{ runner.temp }}/merged/.test_durations
@@ -730,7 +736,7 @@ jobs:
       # never a merge-group run, #2431):
       # those are always the whole suite, and a map built from a narrowed run
       # would attribute too little and shrink the next selection further.
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.backend-test-shard.result == 'success'
         with:
           pattern: coverage-shard-*
@@ -753,7 +759,7 @@ jobs:
       # long, and the selector falls back to the full suite without one.
       - name: Upload test-impact map
         if: github.event_name != 'pull_request' && github.event_name != 'merge_group' && needs.backend-test-shard.result == 'success'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-impact-map
           path: ${{ runner.temp }}/impact/test-impact-map.json
@@ -769,9 +775,9 @@ jobs:
     name: Docs — Diagram Geometry
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -797,9 +803,9 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           # #1022 — both frontend jobs install from the same lockfile; without
@@ -843,9 +849,9 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           # #1022 — both frontend jobs install from the same lockfile; without
@@ -886,9 +892,9 @@ jobs:
       run:
         working-directory: agent/${{ matrix.agent }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           # #1037 — the agent IMAGES ship Python 3.14 (alpine 3.24). Testing
           # on 3.12 while shipping 3.14 is the skew that lets a 3.14-only
@@ -930,9 +936,9 @@ jobs:
     name: Appliance — Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -961,17 +967,17 @@ jobs:
     name: Charts — Lint & Template
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Helm
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.3.1
 
       - name: Install kubeconform
         run: .github/scripts/install-kubeconform.sh
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -982,7 +988,7 @@ jobs:
         # kubeconform caches fetched schemas only in memory, per invocation;
         # persisting its disk cache means a steady-state PR fetches nothing
         # from raw.githubusercontent.com — the job's only flake source.
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/kubeconform-schemas
           key: kubeconform-schemas-v0.8.0-k8s-1.36.0-${{ hashFiles('.github/scripts/charts-render-check.sh') }}
@@ -997,7 +1003,7 @@ jobs:
 
       - name: Upload rendered manifests
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rendered-charts
           path: ${{ runner.temp }}/charts
@@ -1028,9 +1034,9 @@ jobs:
     name: Perf — Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 

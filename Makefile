@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream docs-drift workflow-shell-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream docs-drift workflow-shell-check action-pins-check image-upgrade-check changelog changelog-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -85,6 +85,7 @@ help:
 	@echo "  make docs-drift         Weekly docs-vs-code drift check (not part of make ci)"
 	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
 	@echo "  make workflow-shell-check  Refuse \$$? captured after a bare command under set -e"
+	@echo "  make action-pins-check     Refuse a third-party action referenced by tag, not commit"
 	@echo "  make image-upgrade-check   Refuse a shipped image that never upgrades its packages"
 	@echo "  make changelog-check    Validate the changelog.d/ fragments (part of make ci)"
 	@echo "  make changelog          Release prep: fold changelog.d/ into CHANGELOG.md, delete them"
@@ -403,7 +404,7 @@ lint-untyped-routes-baseline: $(UNTYPED_LIST)
 
 FORCE:
 
-ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check image-upgrade-check changelog-check
+ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check action-pins-check image-upgrade-check changelog-check
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."
 
@@ -477,6 +478,12 @@ docs-drift:
 workflow-shell-check:
 	@echo "→ Workflow shell-status linter (matches .github/workflows/ci.yml)"
 	@python3 scripts/lint_workflow_shell.py
+
+# Action pin guard (#1334): every third-party `uses:` is a commit sha, so a moved
+# tag cannot change what CI runs. Same check CI's Backend Lint job runs.
+action-pins-check:
+	@echo "→ Action pin linter (matches .github/workflows/ci.yml)"
+	@python3 scripts/lint_action_pins.py
 
 # Changelog fragments (merge queue). A PR adds one file under changelog.d/
 # instead of editing CHANGELOG.md, so no two PRs conflict on the same

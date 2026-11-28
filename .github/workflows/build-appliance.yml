@@ -82,6 +82,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
 
+# Top-level token ceiling (#1334): read-only, plus packages: read for the ghcr
+# pulls. A called workflow can never exceed what the caller's job grants.
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   # #170 Phase A4 — the ISO is **fully baked**: every image the appliance
   # can run is pulled from ghcr.io at ``image_tag``, saved as a zstd
@@ -106,7 +112,7 @@ jobs:
       iso_name: ${{ steps.wrap.outputs.iso_name }}
       slot_name: ${{ steps.slot.outputs.slot_name }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
@@ -136,7 +142,7 @@ jobs:
           fi
           echo "building ${REF}, on: ${on//$'\n'/ }"
       - name: Log in to GHCR
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -183,7 +189,7 @@ jobs:
         # host: baltocdn.com" — Azure runner network policy).
         # bake-chart.sh shells out to ``helm package`` so helm must be
         # on PATH before the chart-bake step.
-        uses: azure/setup-helm@v5
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v4.3.1
       - name: Fetch k3s binary + airgap tarball
@@ -379,7 +385,7 @@ jobs:
           ls -lh appliance/build/spatiumddi-appliance-slot-*
           echo "slot_name=spatiumddi-appliance-slot-${TAG}-${ARCH}.raw.xz" >> "$GITHUB_OUTPUT"
       - name: Upload appliance artifacts (ISO + slot image)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # #1026 — per-architecture, or the second leg's upload
           # replaces the first's under one shared name.
