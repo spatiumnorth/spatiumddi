@@ -11,33 +11,23 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/spatiumnorth/spatiumddi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spatiumnorth/spatiumddi/ci.yml?branch=main&label=CI" alt="CI"/></a>
-  <a href="https://github.com/spatiumnorth/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
-  <a href="https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
-  <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
-  <img src="https://img.shields.io/badge/status-stable-brightgreen" alt="Status"/>
-</p>
-
-<p align="center">
   <a href="https://github.com/spatiumnorth/spatiumddi/releases/latest"><img src="https://img.shields.io/github/v/release/spatiumnorth/spatiumddi?label=release" alt="Latest release"/></a>
-  <a href="https://github.com/spatiumnorth/spatiumddi/commits/main"><img src="https://img.shields.io/github/last-commit/spatiumnorth/spatiumddi" alt="Last commit"/></a>
-  <img src="https://img.shields.io/maintenance/yes/2026" alt="Maintained"/>
+  <a href="https://github.com/spatiumnorth/spatiumddi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spatiumnorth/spatiumddi/ci.yml?branch=main&label=CI" alt="CI"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"/></a>
+  <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
+  <a href="docs/PRIVACY.md"><img src="https://img.shields.io/badge/telemetry-none-2ea44f" alt="Telemetry: none"/></a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.12+-green" alt="Python"/>
-  <img src="https://img.shields.io/badge/react-18+-61DAFB" alt="React"/>
-  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000" alt="Code style: black"/></a>
-  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-FCC21B" alt="Lint: ruff"/></a>
-  <a href="https://mypy-lang.org/"><img src="https://img.shields.io/badge/type%20checked-mypy-blue" alt="Type checked: mypy"/></a>
+  <a href="https://catalog.redhat.com/en/software/container-stacks/detail/6af49e43879a2dda6c257559"><img src="https://img.shields.io/badge/Red%20Hat%20OpenShift-Partner%20Validated-EE0000?logo=redhatopenshift&logoColor=white" alt="Red Hat OpenShift: Partner Validated"/></a>
+  <a href="docs/deployment/KUBERNETES.md"><img src="https://img.shields.io/badge/Kubernetes-Helm%20chart-326CE5?logo=kubernetes&logoColor=white" alt="Kubernetes: Helm chart"/></a>
+  <a href="docs/deployment/DOCKER.md"><img src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white" alt="Docker Compose"/></a>
+  <a href="docs/deployment/APPLIANCE.md"><img src="https://img.shields.io/badge/appliance-amd64%20%7C%20arm64-6e40c9?logo=linux&logoColor=white" alt="Appliance: amd64 and arm64"/></a>
 </p>
 
 <p align="center">
   <a href="https://discord.com/invite/ANJAnvg2Dd"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Discord"/></a>
-  <a href="https://github.com/spatiumnorth/spatiumddi/stargazers"><img src="https://img.shields.io/github/stars/spatiumnorth/spatiumddi?style=social" alt="Stars"/></a>
-  <a href="https://github.com/spatiumnorth/spatiumddi/discussions"><img src="https://img.shields.io/github/discussions/spatiumnorth/spatiumddi" alt="Discussions"/></a>
-  <a href="https://github.com/spatiumnorth/spatiumddi/graphs/contributors"><img src="https://img.shields.io/github/contributors/spatiumnorth/spatiumddi" alt="Contributors"/></a>
-  <a href="https://github.com/spatiumnorth/spatiumddi/issues"><img src="https://img.shields.io/github/issues/spatiumnorth/spatiumddi" alt="Issues"/></a>
+  <a href="https://github.com/spatiumnorth/spatiumddi/stargazers"><img src="https://img.shields.io/github/stars/spatiumnorth/spatiumddi?style=social" alt="GitHub stars"/></a>
 </p>
 
 ---
