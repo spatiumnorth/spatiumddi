@@ -82,6 +82,7 @@ import { FeaturesPage } from "@/pages/admin/FeaturesPage";
 import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
 import { IPAMTemplatesPage } from "@/pages/admin/IPAMTemplatesPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
+import { ServiceAccountsPage } from "@/pages/admin/ServiceAccountsPage";
 import { SessionsPage } from "@/pages/admin/SessionsPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { DNSBLPage } from "@/pages/admin/DNSBLPage";
@@ -279,6 +280,10 @@ export default function App() {
         <Route path="admin/ipam/templates" element={<IPAMTemplatesPage />} />
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
+        <Route
+          path="admin/service-accounts"
+          element={<ServiceAccountsPage />}
+        />
         <Route path="admin/sessions" element={<SessionsPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
         <Route path="admin/dns-blocklists" element={<DNSBLPage />} />

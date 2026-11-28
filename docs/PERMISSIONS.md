@@ -146,6 +146,15 @@ superadmins so a disabled bootstrap admin can still reach diagnostic
 surfaces during incident triage. The wildcard-permission path still
 requires `is_active=True` because `user_has_permission` short-circuits
 on inactive.
+
+Second carve-out: a **service account** (#2144, `auth_source = "service"`)
+is never an effective superadmin, whatever its groups' roles carry. It passes
+the `require_permission` gates its roles grant and no superadmin-only route,
+so an external system's token can never administer principals — itself
+included. Any change that would put it in a group granting `*` / `*` (its
+own groups, a group's members or roles, a role's permissions, a time-bound
+grant) is refused outright. See
+[AUTH.md → Service accounts](features/AUTH.md#service-accounts-issue-2144).
 3. **Match algorithm** for a given check (`action`, `resource_type`, `resource_id`):
    - Walk every role in every group the user is a member of.
    - A permission entry matches when:

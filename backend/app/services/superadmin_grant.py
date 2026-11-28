@@ -36,7 +36,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.auth import Role, User, group_role, user_group
+from app.models.auth import SERVICE_ACCOUNT_AUTH_SOURCE, Role, User, group_role, user_group
 from app.models.time_bound_grant import TimeBoundGrant
 
 
@@ -99,8 +99,18 @@ async def load_model(db: AsyncSession) -> SuperadminModel:
         model.group_roles[group_id].add(role_id)
     for role_id, permissions in await db.execute(select(Role.id, Role.permissions)):
         model.role_wildcard[role_id] = permissions_grant_superadmin(permissions)
+    # A service account (#2144) never counts as an active superadmin: it
+    # cannot sign in or pass a step-up, so it cannot administer the install,
+    # and ``is_effective_superadmin`` answers False for it whatever its roles.
     model.active = set(
-        (await db.execute(select(User.id).where(User.is_active.is_(True)))).scalars()
+        (
+            await db.execute(
+                select(User.id).where(
+                    User.is_active.is_(True),
+                    User.auth_source != SERVICE_ACCOUNT_AUTH_SOURCE,
+                )
+            )
+        ).scalars()
     )
     model.granted_groups = set(
         (

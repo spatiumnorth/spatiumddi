@@ -70,6 +70,17 @@ async def list_audit_log(
     resource_display: str | None = Query(default=None),
     result: str | None = Query(default=None),
     source_ip: str | None = Query(default=None),
+    auth_source: str | None = Query(
+        default=None,
+        description=(
+            "Exact match on how the actor authenticated: ``local``, a provider "
+            "name, ``system``, or ``service`` for every change a service account "
+            "made (#2144)."
+        ),
+    ),
+    user_id: uuid.UUID | None = Query(
+        default=None, description="Exact match on the acting account's id (#2144)."
+    ),
     include_details: bool = Query(
         default=False,
         description="Also return old_value / new_value / changed_fields / error_detail per row.",
@@ -89,6 +100,10 @@ async def list_audit_log(
         q = q.where(AuditLog.result == result)
     if source_ip:
         q = q.where(AuditLog.source_ip.ilike(f"%{source_ip}%"))
+    if auth_source:
+        q = q.where(AuditLog.auth_source == auth_source)
+    if user_id is not None:
+        q = q.where(AuditLog.user_id == user_id)
 
     count_q = select(func.count()).select_from(q.subquery())
     total = (await db.execute(count_q)).scalar_one()

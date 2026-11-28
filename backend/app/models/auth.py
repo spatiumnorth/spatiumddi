@@ -24,6 +24,18 @@ from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 if TYPE_CHECKING:
     from app.models.time_bound_grant import TimeBoundGrant
 
+# ``User.auth_source`` of a service account (#2144): a non-interactive
+# principal for an external system (Home Assistant, Ansible, a monitoring
+# poller). It has no password, never signs in, and authenticates only with the
+# API tokens a superadmin mints for it; it holds groups (and so roles) like any
+# other account. Keeping it a ``User`` row, rather than a table of its own,
+# means every permission check, token-binding rule and audit ``user_id`` works
+# unchanged. Being neither ``local`` nor a provider type is what keeps it out
+# of every place that means "a person": the local password login, lockout,
+# the password policy and forced change, and provider sign-in (a provider
+# subject never matches it, so its name is a ``username_collision``).
+SERVICE_ACCOUNT_AUTH_SOURCE = "service"
+
 # Many-to-many: users ↔ groups
 user_group = Table(
     "user_group",
@@ -90,7 +102,8 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     hashed_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    # Auth source: local | ldap | oidc | saml | radius | tacacs
+    # Auth source: local | ldap | oidc | saml | radius | tacacs | service
+    # (``service`` = a service account, #2144; see SERVICE_ACCOUNT_AUTH_SOURCE)
     auth_source: Mapped[str] = mapped_column(String(20), nullable=False, default="local")
     external_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True
@@ -117,6 +130,12 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     force_password_change: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    @property
+    def is_service_account(self) -> bool:
+        """A non-interactive service account (#2144): no password, no sign-in,
+        API tokens only."""
+        return self.auth_source == SERVICE_ACCOUNT_AUTH_SOURCE
 
     @property
     def password_change_required(self) -> bool:
@@ -297,8 +316,11 @@ class APIToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=True, index=True
     )
-    created_by_user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("user.id", ondelete="RESTRICT"), nullable=False
+    # Who minted it. A superadmin mints a service account's tokens (#2144),
+    # so this can differ from ``user_id``; deleting that superadmin keeps the
+    # token and clears this (the audit log still names them).
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
 
     # Optional restriction: list of allowed API path prefixes
