@@ -7,9 +7,10 @@ interval is stored in *seconds* (minimum 10) so operators can tune
 near-real-time IPAM population from Windows DHCP without restarting
 beat.
 
-Each run iterates every ``DHCPServer`` whose driver is registered as
-agentless (``windows_dhcp``, ``fortigate``) and calls
-``pull_leases_from_server`` to:
+Each run reads every ``DHCPServer`` whose driver is registered as
+agentless (``windows_dhcp``, ``fortigate``) concurrently (bounded, with a
+per-server deadline, #5008) so unreachable hosts cost one connect bound
+between them, then calls ``pull_leases_from_server`` for each in turn to:
 
   1. Poll the server for active leases (driver-specific — WinRM +
      ``Get-DhcpServerv4Lease`` for windows_dhcp).
@@ -36,7 +37,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
@@ -55,13 +56,22 @@ logger = structlog.get_logger(__name__)
 
 _SINGLETON_ID = 1
 
+# #5008 — the wire reads of every due server run together, at most this many
+# at a time, so a few unreachable hosts cost one connect bound, not one each.
+_READ_CONCURRENCY = 4
+# Per-server ceiling on all of a server's reads (scopes, failover, leases): a
+# host that stalls costs the pass this long and is recorded as failed.
+_READ_TIMEOUT_S = 120.0
+
 
 async def _run_pull() -> dict[str, Any]:
     # Deferred import — keeps celery-worker startup light and avoids pulling
     # in the API router graph just to register the task.
     from app.services.dhcp.pull_leases import (  # noqa: PLC0415
+        _release_pass,
         claim_scan,
         pull_leases_from_server,
+        read_wire_bounded,
         release_scan,
     )
     from app.services.ipam.utilization import (  # noqa: PLC0415
@@ -73,6 +83,7 @@ async def _run_pull() -> dict[str, Any]:
     )
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     scan_token: str | None = None
+    claim_tokens: dict[Any, str | None] = {}  # per-server pass claims (#5008)
 
     try:
         async with session_factory() as db:
@@ -132,7 +143,6 @@ async def _run_pull() -> dict[str, Any]:
 
             servers = list((await db.execute(select(DHCPServer))).scalars().all())
 
-            servers_scanned = 0
             servers_busy = 0
             total_server_leases = 0
             total_imported = 0
@@ -160,16 +170,43 @@ async def _run_pull() -> dict[str, Any]:
             wake_group_ids: set[str] = set()  # #428 — DNS groups to wake post-commit
             touched_subnet_ids: set[Any] = set()  # #3345 — recounted before commit
 
-            for server in servers:
-                if not is_agentless(server.driver):
-                    continue
+            agentless_servers = [srv for srv in servers if is_agentless(srv.driver)]
+            servers_scanned = len(agentless_servers)
 
-                servers_scanned += 1
+            # #5008 — read every due server's wire at once (bounded), then
+            # write the results one server at a time below, so the
+            # transactions, the recount and the DDNS wake stay serial. The
+            # clock is the database's, taken before any read (#620).
+            snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
+            await db.commit()  # #4776 — no transaction open across the reads
+            sem = asyncio.Semaphore(_READ_CONCURRENCY)
+            reads = await asyncio.gather(
+                *(
+                    read_wire_bounded(srv, snapshot_at, sem, claim_tokens, _READ_TIMEOUT_S)
+                    for srv in agentless_servers
+                ),
+                return_exceptions=True,
+            )
+
+            for server, wire_read in zip(agentless_servers, reads, strict=True):
+                if wire_read is None:
+                    # #2262 — a manual Sync (or a still-running pass) holds
+                    # this server; it is doing the work, so skip it quietly.
+                    servers_busy += 1
+                    continue
                 try:
+                    if isinstance(wire_read, BaseException):
+                        raise wire_read
                     # #3345 — recounted once, after the last server's pull.
-                    # #4776 — commits before the driver reads, none run in a txn.
+                    # #4776 — the reads above ran with no transaction open.
                     result = await pull_leases_from_server(
-                        db, server, apply=True, recount=False, release_txn_for_wire=True
+                        db,
+                        server,
+                        apply=True,
+                        recount=False,
+                        release_txn_for_wire=True,
+                        prefetched=wire_read,
+                        claim_token=claim_tokens.get(server.id),
                     )
                 except Exception as exc:  # noqa: BLE001 — don't let one server poison the run
                     errors.append(f"{server.name}: {exc}")
@@ -183,12 +220,13 @@ async def _run_pull() -> dict[str, Any]:
                     # it; a later successful pull clears it.
                     server.last_sync_error = (str(exc) or type(exc).__name__)[:2000]
                     server.last_sync_error_at = now
+                    await db.commit()
                     continue
 
                 if result.busy:
-                    # #2262 — a manual Sync (or a still-running pass) holds
-                    # this server; it is doing the work, so skip it quietly.
+                    # The server was deleted or re-pointed while its reads ran.
                     servers_busy += 1
+                    await db.commit()
                     continue
 
                 total_server_leases += result.server_leases
@@ -211,6 +249,9 @@ async def _run_pull() -> dict[str, Any]:
                 touched_subnet_ids.update(result.touched_subnet_ids)
                 errors.extend(f"{server.name}: {e}" for e in result.errors)
                 warnings.extend(f"{server.name}: {w}" for w in result.warnings)
+                # Each server's writes commit before the next one's, as the
+                # reads-then-write pull always did (#4776).
+                await db.commit()
 
             # (``dhcp_pull_leases_last_run_at`` was claimed at the start, #2262.)
 
@@ -315,6 +356,10 @@ async def _run_pull() -> dict[str, Any]:
                 "errors": len(errors),
             }
     finally:
+        # Idempotent: a server's claim is normally released by its pull; this
+        # covers one whose pull never started (or blew up before releasing).
+        for sid, token in claim_tokens.items():
+            await _release_pass(sid, token)
         await release_scan(scan_token)
         await engine.dispose()
 

@@ -218,13 +218,18 @@ async def test_concurrent_beat_ticks_run_one_pass(
 
     calls = 0
 
-    async def _slow_pull(_db, _server, *, apply=True, recount=True, release_txn_for_wire=False):  # type: ignore[no-untyped-def]
+    async def _slow_pull(_db, _server, **_kw):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
         await asyncio.sleep(0.5)
         return pl.PullLeasesResult()
 
     monkeypatch.setattr(pl, "pull_leases_from_server", _slow_pull)
+
+    async def _no_wire(server, snapshot_at, *a, **k):  # type: ignore[no-untyped-def]
+        return pl.WireRead(snapshot_at=snapshot_at, read_driver=server.driver)
+
+    monkeypatch.setattr(pl, "read_wire", _no_wire)
 
     results = await asyncio.wait_for(asyncio.gather(task._run_pull(), task._run_pull()), _TIMEOUT)
 

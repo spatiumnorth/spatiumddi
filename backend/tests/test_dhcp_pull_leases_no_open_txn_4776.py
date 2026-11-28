@@ -331,6 +331,7 @@ async def test_scan_claim_released_after_an_exception(
     import app.services.dhcp.pull_leases as mod
 
     monkeypatch.setattr(mod, "pull_leases_from_server", _explode)
+    monkeypatch.setattr(pl, "get_driver", lambda _n: _Drv([]))
     res = await task._run_pull()  # per-server failures are recorded, not raised
     assert res["status"] == "ran" and _FakeRedis.store == {}
 
