@@ -1331,7 +1331,7 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
     zones_res = await db.execute(
         select(DNSZone)
         .where(DNSZone.group_id == server.group_id)
-        .order_by(DNSZone.name, DNSZone.id)
+        .order_by(DNSZone.name, DNSZone.view_id, DNSZone.id)
     )
     zones = zones_res.scalars().all()
 

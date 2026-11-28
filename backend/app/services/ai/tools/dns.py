@@ -141,7 +141,7 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
     zone_ids = token_zone_ids(user)
     if zone_ids is not None:
         stmt = stmt.where(DNSZone.id.in_(zone_ids))
-    stmt = stmt.order_by(DNSZone.name.asc())
+    stmt = stmt.order_by(DNSZone.name.asc(), DNSZone.view_id.asc(), DNSZone.id.asc())
 
     wanted = args.name_scope  # already normalised + validated
     stmt = stmt.limit(_ZONE_SCOPE_SCAN_CAP if wanted else args.limit)
