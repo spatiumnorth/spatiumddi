@@ -216,3 +216,39 @@ async def test_reconcile_noop_when_covered(
 
     result = await reconcile_cluster_cert_sans()
     assert result["status"] == "covered", result
+
+
+@pytest.mark.asyncio
+async def test_reconcile_adds_the_appliance_fqdn_san(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4550 — a domain given at install puts ``hostname.domain`` in the SANs.
+
+    An existing self-signed cert that covers only the short name is regenerated;
+    with no domain configured the same cert is left alone."""
+    monkeypatch.setattr(bootstrap.settings, "appliance_mode", True)
+    monkeypatch.setattr(bootstrap.settings, "appliance_hostname", "ddi1")
+    monkeypatch.setattr(bootstrap.settings, "appliance_host_ips", "192.168.0.199")
+    monkeypatch.setattr(bootstrap.settings, "appliance_extra_cert_sans", "")
+    monkeypatch.setattr(bootstrap.settings, "appliance_fqdn", "ddi1.corp.example.com.")
+
+    await _seed_active_cert(db_session, CERT_SOURCE_SELF_SIGNED, ["ddi1", "192.168.0.199"])
+    await _seed_appliance(db_session, "ddi1", "192.168.0.199", CLUSTER_ROLE_PRIMARY)
+    await db_session.commit()
+
+    result = await reconcile_cluster_cert_sans()
+    assert result["status"] == "regenerated", result
+    active = (
+        await db_session.execute(
+            select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
+        )
+    ).scalar_one()
+    assert "ddi1.corp.example.com" in set(active.sans_json or [])
+
+
+def test_with_fqdn_is_a_noop_without_a_domain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bootstrap.settings, "appliance_fqdn", "")
+    assert bootstrap._with_fqdn(["10.0.0.1"]) == ["10.0.0.1"]
+    monkeypatch.setattr(bootstrap.settings, "appliance_fqdn", "a.b.example")
+    assert bootstrap._with_fqdn(["a.b.example"]) == ["a.b.example"]
+    assert bootstrap._with_fqdn(["10.0.0.1"]) == ["10.0.0.1", "a.b.example"]

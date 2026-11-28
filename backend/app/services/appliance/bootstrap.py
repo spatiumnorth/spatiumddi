@@ -119,7 +119,7 @@ async def ensure_self_signed_cert() -> None:
     ips = _parse_host_ips(settings.appliance_host_ips)
     # #272 Phase 6 — extra SANs the cert must also cover (the
     # control-plane VIP etc), threaded in from the chart on promote.
-    extra_sans = _parse_extra_sans(settings.appliance_extra_cert_sans)
+    extra_sans = _with_fqdn(_parse_extra_sans(settings.appliance_extra_cert_sans))
     desired_sans = _desired_sans(hostname, ips, extra_sans)
 
     async with AsyncSessionLocal() as db:
@@ -605,7 +605,7 @@ async def reconcile_cluster_cert_sans() -> dict[str, object]:
         # Stable seed identity, same inputs ensure_self_signed_cert uses.
         hostname = settings.appliance_hostname or "spatiumddi-appliance"
         ips = _parse_host_ips(settings.appliance_host_ips)
-        extra_sans = _parse_extra_sans(settings.appliance_extra_cert_sans)
+        extra_sans = _with_fqdn(_parse_extra_sans(settings.appliance_extra_cert_sans))
 
         # Union in every settled control-plane member: node IP as an IP
         # SAN, hostname as a DNS SAN.
@@ -715,6 +715,19 @@ def _parse_extra_sans(env: str) -> list[str]:
         if s not in out:
             out.append(s)
     return out
+
+
+def _with_fqdn(extra_sans: list[str]) -> list[str]:
+    """Add the appliance's FQDN (``APPLIANCE_FQDN``, #4550) to the extra SANs.
+
+    The hostname is the certificate's CN and first SAN; the FQDN is the name
+    an operator types into a browser, so the cert must cover it too. A
+    no-op when no domain was configured, so existing installs keep the SAN
+    list they have and are not regenerated."""
+    fqdn = (settings.appliance_fqdn or "").strip().rstrip(".")
+    if fqdn and fqdn not in extra_sans:
+        return [*extra_sans, fqdn]
+    return extra_sans
 
 
 def _desired_sans(hostname: str, ips: list[str], extra_sans: list[str]) -> list[str]:
