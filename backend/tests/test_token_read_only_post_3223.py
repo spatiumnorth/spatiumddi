@@ -29,6 +29,7 @@ EXPECTED_READ_ONLY_POSTS: frozenset[str] = frozenset(
         "/api/v1/appliance/acme/preview",
         "/api/v1/appliance/firewall/preview",
         "/api/v1/av/allocation-preview",
+        "/api/v1/dhcp/client-classes/compile-match",
         "/api/v1/dhcp/import/isc/preview",
         "/api/v1/dhcp/import/kea/preview",
         "/api/v1/dicom/aes/import/preview",

@@ -775,6 +775,7 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
     def capabilities(self) -> dict[str, Any]:
         return {
             "name": "fortigate",
+            "relay_agent_match": False,
             "read_only": False,
             "bundle_config_push": False,
             "lease_monitoring": True,

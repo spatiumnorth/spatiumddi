@@ -441,6 +441,34 @@ class ExclusionResult:
     error: str | None = None
 
 
+# ── Relay-agent (option 82) match, backend-neutral (#54) ────────────────────
+
+
+@dataclass(frozen=True)
+class RelayMatchCondition:
+    """One test on a DHCPv4 relay agent information (option 82) sub-option.
+
+    ``value`` is the decoded bytes (never text), so no driver ever sees an
+    operator-typed character. ``op`` is one of ``exists`` / ``not_exists`` /
+    ``equals`` / ``not_equals`` / ``starts_with`` / ``ends_with`` / ``slice``;
+    ``offset`` is set only for ``slice``. The service layer validates all of
+    it; a driver compiles it and does not re-check ranges.
+    """
+
+    sub_option: int
+    op: str
+    value: bytes | None = None
+    offset: int | None = None
+
+
+@dataclass(frozen=True)
+class RelayMatchSpec:
+    """An option-82 client-class match: ``combine`` (``all`` | ``any``) of conditions."""
+
+    combine: str
+    conditions: tuple[RelayMatchCondition, ...]
+
+
 # ── Driver abstract base ────────────────────────────────────────────────────
 
 
@@ -462,6 +490,18 @@ class DHCPDriver(ABC):
     @abstractmethod
     def render_config(self, bundle: ConfigBundle) -> str:
         """Render the daemon's top-level config (JSON for Kea, text for ISC)."""
+
+    def compile_relay_match(self, spec: RelayMatchSpec) -> str:
+        """The backend's client-class test for an option-82 ``spec`` (#54).
+
+        Only drivers that render client classes implement it; the default
+        refuses so a caller cannot get an empty (match-everything) test.
+        """
+        raise NotImplementedError(f"{self.name} cannot render option 82 matches")
+
+    def relay_match_support(self, spec: RelayMatchSpec) -> tuple[bool, str]:
+        """Can this backend carry ``spec``? ``(supported, reason)`` (#54)."""
+        return (False, f"{self.name} does not support option 82 matching")
 
     @abstractmethod
     async def apply_config(self, server: Any, bundle: ConfigBundle) -> None:
@@ -593,6 +633,8 @@ __all__ = [
     "PhoneClassDef",
     "PoolDef",
     "RAConfigDef",
+    "RelayMatchCondition",
+    "RelayMatchSpec",
     "RemoveReservationItem",
     "ReservationItem",
     "ReservationResult",

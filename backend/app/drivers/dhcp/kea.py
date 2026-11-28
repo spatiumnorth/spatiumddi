@@ -27,11 +27,61 @@ from app.drivers.dhcp.base import (
     PhoneClassDef,
     PoolDef,
     PXEClassDef,
+    RelayMatchCondition,
+    RelayMatchSpec,
     ScopeDef,
     StaticAssignmentDef,
 )
 
 logger = structlog.get_logger(__name__)
+
+
+def _relay_term(c: RelayMatchCondition) -> str:
+    """One Kea boolean term for an option-82 condition (#54).
+
+    Every operand is an integer formatted with ``%d`` or the uppercase hex of
+    ``bytes``, so the term is built from ``[a-z0-9A-F[]().,=- ]`` only: no
+    quote, backslash or control character can come from an operator value.
+    Kea's string literals have no escape for ``'`` (measured on 3.0.3), which
+    is why a quoted literal is never used. A missing sub-option reads as an
+    empty string in Kea, so ``not_equals`` also requires the sub-option to be
+    present rather than matching every non-relayed client.
+    """
+    n = int(c.sub_option)
+    sub = f"relay4[{n}]"
+    if c.op == "exists":
+        return f"{sub}.exists"
+    if c.op == "not_exists":
+        return f"not {sub}.exists"
+    if c.value is None or not c.value:
+        raise ValueError(f"option 82 condition {c.op!r} needs a value")
+    lit = "0x" + c.value.hex().upper()
+    length = len(c.value)
+    if c.op == "equals":
+        return f"{sub}.hex == {lit}"
+    if c.op == "not_equals":
+        return f"({sub}.exists and not ({sub}.hex == {lit}))"
+    if c.op == "starts_with":
+        return f"substring({sub}.hex, 0, {length}) == {lit}"
+    if c.op == "ends_with":
+        return f"substring({sub}.hex, -{length}, all) == {lit}"
+    if c.op == "slice":
+        if c.offset is None:
+            raise ValueError("option 82 'slice' needs an offset")
+        return f"substring({sub}.hex, {int(c.offset)}, {length}) == {lit}"
+    raise ValueError(f"unknown option 82 operator {c.op!r}")
+
+
+def compile_relay_match_expression(spec: RelayMatchSpec) -> str:
+    """The Kea ``test`` for ``spec``: parenthesised terms joined by and / or."""
+    if not spec.conditions:
+        raise ValueError("an option 82 match needs at least one condition")
+    joiner = {"all": " and ", "any": " or "}.get(spec.combine)
+    if joiner is None:
+        raise ValueError(f"unknown combine {spec.combine!r}")
+    # The operator's order, not sorted: it is theirs and stable, so the ETag is.
+    return joiner.join(f"({_relay_term(c)})" for c in spec.conditions)
+
 
 # #1283 — Kea's multi-threading ``packet-queue-size``. The agent renders it
 # (``spatium_dhcp_agent.render_kea.KEA_PACKET_QUEUE_SIZE``, where the reasons
@@ -734,6 +784,12 @@ class KeaDriver(DHCPDriver):
                     errors.append(f"pool in {s.subnet_cidr} missing start/end")
         return (not errors), errors
 
+    def compile_relay_match(self, spec: RelayMatchSpec) -> str:
+        return compile_relay_match_expression(spec)
+
+    def relay_match_support(self, spec: RelayMatchSpec) -> tuple[bool, str]:
+        return (True, "")
+
     def capabilities(self) -> dict[str, Any]:
         return {
             "name": "kea",
@@ -741,6 +797,7 @@ class KeaDriver(DHCPDriver):
             "options": sorted(_KEA_OPTION_NAMES.keys()),
             "features": {
                 "client_classes": True,
+                "relay_agent_match": True,
                 "reservations": True,
                 "ddns": True,
                 "ha": True,

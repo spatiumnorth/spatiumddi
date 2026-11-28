@@ -1,0 +1,404 @@
+[
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "exists"
+    }
+   ]
+  },
+  "expression": "(relay4[1].exists)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 9,
+     "op": "not_exists"
+    }
+   ]
+  },
+  "expression": "(not relay4[9].exists)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 255,
+     "op": "exists"
+    }
+   ]
+  },
+  "expression": "(relay4[255].exists)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "encoding": "hex",
+     "value": "0A0B"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x0A0B)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "encoding": "hex",
+     "value": "00"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x00)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "encoding": "hex",
+     "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "eth0/1:100"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x657468302F313A313030)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 2,
+     "op": "equals",
+     "value": "\u00e9"
+    }
+   ]
+  },
+  "expression": "(relay4[2].hex == 0xC3A9)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 2,
+     "op": "not_equals",
+     "encoding": "hex",
+     "value": "AABBCC010203"
+    }
+   ]
+  },
+  "expression": "((relay4[2].exists and not (relay4[2].hex == 0xAABBCC010203)))"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "not_equals",
+     "value": "Gi1/0/7"
+    }
+   ]
+  },
+  "expression": "((relay4[1].exists and not (relay4[1].hex == 0x4769312F302F37)))"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 2,
+     "op": "starts_with",
+     "encoding": "hex",
+     "value": "AABBCC"
+    }
+   ]
+  },
+  "expression": "(substring(relay4[2].hex, 0, 3) == 0xAABBCC)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "starts_with",
+     "value": "eth0/"
+    }
+   ]
+  },
+  "expression": "(substring(relay4[1].hex, 0, 5) == 0x657468302F)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "ends_with",
+     "encoding": "hex",
+     "value": "0A0B0C"
+    }
+   ]
+  },
+  "expression": "(substring(relay4[1].hex, -3, all) == 0x0A0B0C)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "ends_with",
+     "value": ":100"
+    }
+   ]
+  },
+  "expression": "(substring(relay4[1].hex, -4, all) == 0x3A313030)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "ends_with",
+     "encoding": "hex",
+     "value": "FF"
+    }
+   ]
+  },
+  "expression": "(substring(relay4[1].hex, -1, all) == 0xFF)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "slice",
+     "encoding": "hex",
+     "value": "0064",
+     "offset": 2
+    }
+   ]
+  },
+  "expression": "(substring(relay4[1].hex, 2, 2) == 0x0064)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 6,
+     "op": "slice",
+     "encoding": "hex",
+     "value": "AB",
+     "offset": 0
+    }
+   ]
+  },
+  "expression": "(substring(relay4[6].hex, 0, 1) == 0xAB)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "slice",
+     "encoding": "hex",
+     "value": "AB",
+     "offset": 254
+    }
+   ]
+  },
+  "expression": "(substring(relay4[1].hex, 254, 1) == 0xAB)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "' or 1 --"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x27206F722031202D2D)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "\\"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x5C)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "\""
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x22)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "line1\nline2"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x6C696E65310A6C696E6532)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "encoding": "hex",
+     "value": "61:00:62"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x610062)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "\ud83d\ude00"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0xF09F9880)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "') or (relay4[1].exists"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x2729206F72202872656C6179345B315D2E657869737473)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "all",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "starts_with",
+     "value": "eth0/"
+    },
+    {
+     "sub_option": 2,
+     "op": "exists"
+    }
+   ]
+  },
+  "expression": "(substring(relay4[1].hex, 0, 5) == 0x657468302F) and (relay4[2].exists)"
+ },
+ {
+  "spec": {
+   "kind": "relay_agent",
+   "combine": "any",
+   "conditions": [
+    {
+     "sub_option": 1,
+     "op": "equals",
+     "value": "a"
+    },
+    {
+     "sub_option": 2,
+     "op": "equals",
+     "value": "b"
+    },
+    {
+     "sub_option": 6,
+     "op": "not_exists"
+    }
+   ]
+  },
+  "expression": "(relay4[1].hex == 0x61) or (relay4[2].hex == 0x62) or (not relay4[6].exists)"
+ }
+]

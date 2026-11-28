@@ -191,6 +191,9 @@ OPEN_DNS_DHCP_WRITES: frozenset[tuple[str, str]] = frozenset(
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/import/spreadsheet/preview"),
         ("POST", f"{_DNS}/groups/{{group_id}}/zones/{{zone_id}}/sync-with-server"),
         ("POST", f"{_DNS}/tools/propagation-check"),
+        # Read-only: compiles an option-82 match spec to its Kea test and stores
+        # nothing (#54), so it takes read on dhcp_client_class like a preview.
+        ("POST", f"{_DHCP}/client-classes/compile-match"),
     }
 )
 

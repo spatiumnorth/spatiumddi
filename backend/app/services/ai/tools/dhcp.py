@@ -500,9 +500,12 @@ class ListDHCPClientClassesArgs(BaseModel):
         "List DHCP client classes — group-scoped expressions used "
         "for conditional option delivery. Each row carries id, "
         "group_id, name, match_expression (the Kea expression), "
-        "description, and the option overrides JSON. Use for 'what "
-        "client classes are defined for corp?' or 'show me the "
-        "match expression for the IoT class'."
+        "match_spec (the structured option 82 / relay agent match the "
+        "expression was compiled from, or null for a hand-written "
+        "expression), description, and the option overrides JSON. Use "
+        "for 'what client classes are defined for corp?', 'show me the "
+        "match expression for the IoT class' or 'which classes match on "
+        "option 82?'."
     ),
     args_model=ListDHCPClientClassesArgs,
     category="dhcp",
@@ -524,12 +527,45 @@ async def list_dhcp_client_classes(
             "group_id": str(c.group_id),
             "name": c.name,
             "match_expression": c.match_expression,
+            "match_spec": c.match_spec,
             "description": c.description,
             "address_family": c.address_family,
             "options": c.options,
         }
         for c in rows
     ]
+
+
+class CountDHCPClientClassesArgs(BaseModel):
+    group_id: str | None = Field(default=None, description="Filter by DHCP server group UUID.")
+    option82_only: bool = Field(
+        default=False,
+        description="Count only classes built from the structured option 82 match (match_spec).",
+    )
+
+
+@register_tool(
+    name="count_dhcp_client_classes",
+    permission=("read", "dhcp_client_class"),
+    description=(
+        "Count DHCP client classes, optionally for one server group and "
+        "optionally only those built from the structured option 82 (relay "
+        "agent information) match. Use for 'how many option 82 classes "
+        "does corp have?'."
+    ),
+    args_model=CountDHCPClientClassesArgs,
+    category="dhcp",
+    module="core.dhcp",
+)
+async def count_dhcp_client_classes(
+    db: AsyncSession, user: User, args: CountDHCPClientClassesArgs
+) -> dict[str, Any]:
+    stmt = select(func.count(DHCPClientClass.id))
+    if args.group_id:
+        stmt = stmt.where(DHCPClientClass.group_id == args.group_id)
+    if args.option82_only:
+        stmt = stmt.where(DHCPClientClass.match_spec.is_not(None))
+    return {"count": int((await db.execute(stmt)).scalar_one())}
 
 
 # ── list_dhcp_option_templates ────────────────────────────────────────

@@ -15,8 +15,10 @@ from app.api.v1.dhcp._audit import write_audit
 from app.api.v1.dhcp.scopes import validate_dhcp_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.core.update_nulls import changed_keys, snapshot
+from app.core.update_nulls import changed_keys, resolve_update_changes, snapshot
+from app.drivers.dhcp.registry import get_driver
 from app.models.dhcp import DHCPClientClass, DHCPPool, DHCPScope, DHCPServerGroup
+from app.services.api_token_scopes import read_only_post
 from app.services.dhcp.class_refs import (
     classes_testing_membership,
     describe_pools,
@@ -24,7 +26,9 @@ from app.services.dhcp.class_refs import (
     reserved_name_reason,
     trash_hint,
 )
+from app.services.dhcp.option_spelling import group_drivers
 from app.services.dhcp.option_validation import normalize_options, validate_class_test
+from app.services.dhcp.relay_match import RelayMatchSpecModel, spec_warnings
 
 # Which Kea daemons the class renders into (#1229). ``dual`` sends each option
 # to whichever family it is valid in (#1295).
@@ -38,6 +42,9 @@ router = APIRouter(
 class ClientClassCreate(BaseModel):
     name: str
     match_expression: str = ""
+    # Structured option-82 match (#54). When set, ``match_expression`` is the
+    # compiled test: omit it, or send exactly what ``compile-match`` returned.
+    match_spec: RelayMatchSpecModel | None = None
     description: str = ""
     address_family: ClassFamily = "ipv4"
     options: dict[str, Any] = {}
@@ -46,9 +53,26 @@ class ClientClassCreate(BaseModel):
 class ClientClassUpdate(BaseModel):
     name: str | None = None
     match_expression: str | None = None
+    # Explicit ``null`` converts a builder class to a hand-written one (#54).
+    match_spec: RelayMatchSpecModel | None = None
     description: str | None = None
     address_family: ClassFamily | None = None
     options: dict[str, Any] | None = None
+
+
+class CompileMatchRequest(BaseModel):
+    match_spec: RelayMatchSpecModel
+
+
+class CompileMatchWindows(BaseModel):
+    supported: bool
+    reason: str
+
+
+class CompileMatchResponse(BaseModel):
+    expression: str
+    warnings: list[str]
+    windows: CompileMatchWindows
 
 
 class ClientClassResponse(BaseModel):
@@ -56,6 +80,7 @@ class ClientClassResponse(BaseModel):
     group_id: uuid.UUID
     name: str
     match_expression: str
+    match_spec: dict[str, Any] | None = None
     description: str
     address_family: ClassFamily
     options: dict[str, Any]
@@ -86,6 +111,39 @@ def _check_test(expression: str, family: str) -> None:
         validate_class_test(expression, family)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def _compile_spec(db: DB, group_id: uuid.UUID, family: str, spec: RelayMatchSpecModel) -> str:
+    """The Kea test for ``spec``, after the refusals that make it renderable (#54)."""
+    if family != "ipv4":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "an option 82 match is DHCPv4 only (relay4); set the class's address "
+                "family to ipv4 or write the expression by hand"
+            ),
+        )
+    drivers = await group_drivers(db, group_id)
+    if drivers and "kea" not in drivers:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "option 82 matching is rendered by Kea only; this group's servers are "
+                f"{', '.join(sorted(drivers))}. Manage option 82 policies on the server itself."
+            ),
+        )
+    return get_driver("kea").compile_relay_match(spec.to_def())
+
+
+def _refuse_conflicting_expression(sent: str | None, compiled: str) -> None:
+    if sent and sent != compiled:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "this class is built from match_spec, which compiles to its match_expression; "
+                "send one or the other. To write the expression by hand, send match_spec: null."
+            ),
+        )
 
 
 def class_families(family: str) -> set[str]:
@@ -153,10 +211,50 @@ async def refuse_if_name_referenced(
     )
 
 
+@router.post("/client-classes/compile-match", response_model=CompileMatchResponse)
+@read_only_post
+async def compile_match(body: CompileMatchRequest) -> CompileMatchResponse:
+    """Compile an option-82 ``match_spec`` to the Kea test, writing nothing (#54).
+
+    The UI previews with this so the compiler lives in one place. ``windows``
+    says whether Windows DHCP could express the same match; it is not
+    rendered there in this release.
+    """
+    spec = body.match_spec.to_def()
+    ok, reason = get_driver("windows_dhcp").relay_match_support(spec)
+    return CompileMatchResponse(
+        expression=get_driver("kea").compile_relay_match(spec),
+        warnings=spec_warnings(body.match_spec),
+        windows=CompileMatchWindows(supported=ok, reason=reason),
+    )
+
+
 @router.get("/server-groups/{group_id}/client-classes", response_model=list[ClientClassResponse])
 async def list_classes(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPClientClass]:
     res = await db.execute(select(DHCPClientClass).where(DHCPClientClass.group_id == group_id))
     return list(res.scalars().all())
+
+
+async def validate_new_class(db: DB, group_id: uuid.UUID, body: ClientClassCreate) -> None:
+    """Every refusal of a create, no write. Fills in the compiled test and the
+    normalised options on ``body``. Shared with the copilot's
+    ``create_dhcp_client_class`` operation so the two cannot drift."""
+    _check_name(body.name)
+    existing = await db.execute(
+        select(DHCPClientClass).where(
+            DHCPClientClass.group_id == group_id, DHCPClientClass.name == body.name
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="A client class with that name exists")
+    if body.match_spec is not None:
+        compiled = await _compile_spec(db, group_id, body.address_family, body.match_spec)
+        _refuse_conflicting_expression(body.match_expression, compiled)
+        body.match_expression = compiled
+    _check_test(body.match_expression, body.address_family)
+    body.options = normalize_options(body.options)
+    # A client class is rendered by Kea / FortiGate only: the Kea raw-code rule (#1296).
+    await validate_dhcp_options(db, body.options, group_id=None, address_family=body.address_family)
 
 
 @router.post(
@@ -170,19 +268,11 @@ async def create_class(
     grp = await db.get(DHCPServerGroup, group_id)
     if grp is None:
         raise HTTPException(status_code=404, detail="DHCP server group not found")
-    _check_name(body.name)
-    existing = await db.execute(
-        select(DHCPClientClass).where(
-            DHCPClientClass.group_id == group_id, DHCPClientClass.name == body.name
-        )
+    await validate_new_class(db, group_id, body)
+    spec = body.match_spec.stored() if body.match_spec is not None else None
+    cc = DHCPClientClass(
+        group_id=group_id, **body.model_dump(exclude={"match_spec"}), match_spec=spec
     )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A client class with that name exists")
-    _check_test(body.match_expression, body.address_family)
-    body.options = normalize_options(body.options)
-    # A client class is rendered by Kea / FortiGate only: the Kea raw-code rule (#1296).
-    await validate_dhcp_options(db, body.options, group_id=None, address_family=body.address_family)
-    cc = DHCPClientClass(group_id=group_id, **body.model_dump())
     db.add(cc)
     await db.flush()
     write_audit(
@@ -192,7 +282,7 @@ async def create_class(
         resource_type="dhcp_client_class",
         resource_id=str(cc.id),
         resource_display=cc.name,
-        new_value=body.model_dump(mode="json"),
+        new_value={**body.model_dump(mode="json", exclude={"match_spec"}), "match_spec": spec},
     )
     collect_wake(dhcp_group_channel(group_id))
     await db.commit()
@@ -207,7 +297,9 @@ async def update_class(
     cc = await db.get(DHCPClientClass, class_id)
     if cc is None:
         raise HTTPException(status_code=404, detail="Client class not found")
-    changes = body.model_dump(exclude_none=True)
+    # ``match_spec`` is resolved below: an explicit null is meaningful for it only.
+    changes = resolve_update_changes(body, exclude={"match_spec"})
+    spec_sent = "match_spec" in body.model_fields_set
     family = changes.get("address_family", cc.address_family)
     family_changed = family != cc.address_family
     new_name = changes.get("name")
@@ -227,6 +319,30 @@ async def update_class(
         )
     if family_changed:
         await _refuse_orphaned_pools(db, cc, family)
+    if spec_sent and body.match_spec is not None:
+        compiled = await _compile_spec(db, cc.group_id, family, body.match_spec)
+        _refuse_conflicting_expression(changes.get("match_expression"), compiled)
+        changes["match_expression"] = compiled
+        changes["match_spec"] = body.match_spec.stored()
+    elif spec_sent:
+        changes["match_spec"] = None  # converts to a hand-written class
+    elif cc.match_spec is not None:
+        if "match_expression" in changes and changes["match_expression"] != cc.match_expression:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "this class is built from match_spec; send a new match_spec, or "
+                    "match_spec: null to convert it to a hand-written expression"
+                ),
+            )
+        if family != "ipv4":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "this class is built from an option 82 match_spec, which is DHCPv4 "
+                    "only; send match_spec: null to write the expression by hand first"
+                ),
+            )
     if family_changed or "match_expression" in changes:
         _check_test(changes.get("match_expression", cc.match_expression), family)
     if "options" in changes or family_changed:
@@ -255,7 +371,10 @@ async def update_class(
         resource_id=str(cc.id),
         resource_display=cc.name,
         changed_fields=changed_keys(before, changes),
-        new_value=body.model_dump(mode="json", exclude_none=True),
+        new_value={
+            **body.model_dump(mode="json", exclude_none=True, exclude={"match_spec"}),
+            **{k: changes[k] for k in ("match_spec", "match_expression") if k in changes},
+        },
     )
     collect_wake(dhcp_group_channel(cc.group_id))
     await db.commit()
