@@ -91,6 +91,31 @@ export function plainTintedBoxes(source: string, rel = ""): string[] {
   return out;
 }
 
+// An amber warning box that blocks the commit is a refusal too (#4986): Bulk
+// allocate's conflicts box stops "Abort if any conflict", yet is amber, so no
+// scan above reads it. A box is blocking when its body is conditional on a
+// `blockedBy*` flag; an amber note without one is informational and exempt.
+const AMBER_OPENING =
+  /<(?<tag>div|p|section|aside)\b(?<attrs>[^<>]*?\bclassName="(?<cls>[^"]*)"[^<>]*)>/g;
+
+export function plainAmberBlockingBoxes(source: string): string[] {
+  if (!source.includes("Modal") && !source.includes("fixed inset")) return [];
+  const out: string[] = [];
+  for (const m of source.matchAll(AMBER_OPENING)) {
+    const { attrs, cls } = m.groups as { attrs: string; cls: string };
+    if (!/\bborder-amber-\d+/.test(cls) || !/\bbg-amber-\d+/.test(cls))
+      continue;
+    if (/role=/.test(attrs)) continue;
+    const rest = source.slice(m.index + m[0].length);
+    // Up to the box's own end: the next amber box or the function's close.
+    const end = rest.search(/\n\}\n|border-amber-\d+/);
+    const inner = end < 0 ? rest : rest.slice(0, end);
+    if (!/\bblockedBy\w*\s*&&/.test(inner)) continue;
+    out.push(`line ${source.slice(0, m.index).split("\n").length}`);
+  }
+  return out;
+}
+
 // Boxes that are stored or passive state, shown on page load rather than in
 // response to something the operator just did. A role="alert" there would be
 // announced on every load (FleetTab and ClusterUpgradeTab render many rows), so
@@ -135,6 +160,7 @@ for (const f of files(SRC)) {
     ...plainRefusalBoxes(text, true),
     ...plainErrorComponents(text),
     ...plainTintedBoxes(text, rel),
+    ...plainAmberBlockingBoxes(text),
   ];
   const skip = STANDING_STATE[rel]?.names ?? [];
   const hits = all.filter((h) => !skip.includes(h));
@@ -193,6 +219,21 @@ describe("dialog refusals are announced (#3821)", () => {
     expect(
       plainTintedBoxes(box.replace("<div ", '<div role="alert" ')),
     ).toEqual([]);
+  });
+
+  it("detects an amber box that blocks the commit, not an amber note (#4986)", () => {
+    const box = `function XModal(){ return <Modal>{n > 0 && (<div className="rounded border border-amber-300 bg-amber-50 p-3"><ul/>{blockedByAbort && <p>Mode is abort</p>}</div>)}</Modal>; }`;
+    expect(plainAmberBlockingBoxes(box)).toEqual(["line 1"]);
+    expect(
+      plainAmberBlockingBoxes(
+        box.replace(
+          "<div ",
+          '<div role={blockedByAbort ? "alert" : undefined} ',
+        ),
+      ),
+    ).toEqual([]);
+    const note = `function XModal(){ return <Modal><div className="rounded border border-amber-300 bg-amber-50 p-3">{w}</div></Modal>; }`;
+    expect(plainAmberBlockingBoxes(note)).toEqual([]);
   });
 
   it("no error or refusal box is drawn without a role", () => {

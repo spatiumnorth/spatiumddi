@@ -747,7 +747,10 @@ function PreviewResults({
       </div>
 
       {totalConflicts > 0 && (
-        <div className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200">
+        <div
+          role={blockedByAbort ? "alert" : undefined}
+          className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-900/20 dark:text-amber-200"
+        >
           <div className="mb-1 flex items-center gap-2 font-medium">
             <AlertTriangle className="h-4 w-4" />
             {totalConflicts} conflict{totalConflicts === 1 ? "" : "s"}
