@@ -369,10 +369,14 @@ function PickGroupZoneModal({
           Pools belong to a zone — that&apos;s where the rendered records land.
         </p>
         <div className="space-y-2">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="dnspools-server-group"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Server group
           </label>
           <select
+            id="dnspools-server-group"
             value={groupId}
             onChange={(e) => {
               setGroupId(e.target.value);
@@ -389,10 +393,14 @@ function PickGroupZoneModal({
           </select>
         </div>
         <div className="space-y-2">
-          <label className="block text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="dnspools-zone"
+            className="block text-xs font-medium text-muted-foreground"
+          >
             Zone
           </label>
           <select
+            id="dnspools-zone"
             value={zoneId}
             onChange={(e) => setZoneId(e.target.value)}
             disabled={!groupId}

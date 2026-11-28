@@ -59,7 +59,7 @@ API_TEMPLATE = REPO / "charts" / "spatiumddi" / "templates" / "api.yaml"
 CHART_VALUES = REPO / "charts" / "spatiumddi" / "values.yaml"
 
 HOST_GID = 2770
-SUPERVISOR_UID = 100
+SUPERVISOR_UID = 10001
 API_UID = 1000
 
 needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
@@ -331,8 +331,8 @@ def test_guard_rejects_a_symlinked_trigger(tmp_path: Path, trig_dir: Path) -> No
 
 @needs_bash
 def test_guard_distrusts_owner_in_a_world_writable_directory(tmp_path: Path) -> None:
-    # On the legacy 1777 directory an owner uid proves nothing: host uid 100
-    # is some system daemon, not the supervisor.
+    # On the legacy 1777 directory an owner uid proves nothing: a host uid
+    # below 1000 is some system daemon, not the supervisor.
     legacy = tmp_path / "release-state"
     legacy.mkdir()
     legacy.chmod(0o1777)
@@ -392,7 +392,7 @@ def test_guard_with_no_arguments_refuses(tmp_path: Path) -> None:
 
 def test_supervisor_ids_are_pinned_and_it_carries_the_host_gid() -> None:
     text = _read(SUPERVISOR_DOCKERFILE)
-    assert "addgroup -S -g 101 spatium" in text
+    assert "addgroup -S -g 10001 spatium" in text
     assert f"adduser -S -u {SUPERVISOR_UID} -G spatium spatium" in text
     assert f"addgroup -S -g {HOST_GID} spatium-host" in text
     assert "addgroup spatium spatium-host" in text
@@ -446,3 +446,85 @@ def test_supervisor_reads_env_as_root_before_dropping_privileges() -> None:
     # it while still root, then su-execs.
     text = _read(SUPERVISOR_ENTRYPOINT)
     assert text.index('done < "$HOST_ENV"') < text.index("exec su-exec spatium")
+
+
+def test_supervisor_ids_are_outside_the_host_system_range() -> None:
+    """The supervisor's state lives on the host's STATE partition, so its ids
+    must not be ones a host system account owns.
+    Dockerfile, firstboot's pcap dir and the trigger guard must all agree."""
+    assert SUPERVISOR_UID >= 1000 and SUPERVISOR_UID != API_UID
+    docker = _read(SUPERVISOR_DOCKERFILE)
+    gid = re.search(r"addgroup -S -g (\d+) spatium \\?$", docker, re.M)
+    uid = re.search(r"adduser -S -u (\d+) -G spatium spatium", docker)
+    assert gid and uid
+    assert int(gid.group(1)) >= 1000 and int(uid.group(1)) >= 1000
+    assert int(uid.group(1)) == SUPERVISOR_UID
+    first = _read(FIRSTBOOT)
+    assert f"chown {uid.group(1)}:{gid.group(1)} . " in first
+    # Existing installs: stale 100:101 files in release-state are re-owned,
+    # and the entrypoint re-owns the state dir on every start.
+    for text in (first, _read(SUPERVISOR_ENTRYPOINT)):
+        assert "-maxdepth 2" in text
+        flat = re.sub(r"\\\n\s*", "", text)
+        assert "-user 100 -group 101 -execdir chown -h 10001:10001" in flat
+    assert "chown -R spatium:spatium /var/lib/spatium-supervisor" in _read(
+        SUPERVISOR_ENTRYPOINT
+    )
+
+
+def test_entrypoint_reowns_old_release_state_names_as_root_before_dropping_privileges() -> None:
+    """A pod still on the old image can write uid-100 names after firstboot
+    has run; the new supervisor must re-own them (including the storage/
+    request directory it created) before its first write."""
+    text = _read(SUPERVISOR_ENTRYPOINT)
+    code = re.sub(r"(?m)^\s*#.*$", "", text)
+    flat = re.sub(r"\\\n\s*", "", code)
+    m = re.search(r"find -P /var/lib/spatiumddi-host/release-state .*", flat)
+    assert m, "entrypoint does not re-own release-state"
+    assert "-type d" in m.group(0) and "-xdev" in m.group(0)
+    assert "-execdir chown -h 10001:10001" in m.group(0)
+    assert code.index(m.group(0)[:40]) < code.index("exec su-exec spatium")
+
+
+def _storage_block(root: Path) -> str:
+    """The entrypoint's storage/ request-directory block, pointed at ``root``."""
+    text = _read(SUPERVISOR_ENTRYPOINT)
+    start = text.index("# The storage-action request directory")
+    block = text[start : text.index("\nfi\n", text.index("_sd=", start)) + 4]
+    return block.replace("/var/lib/spatiumddi-host/release-state", str(root))
+
+
+@needs_bash
+@pytest.mark.parametrize("planted", ["missing", "old_755", "symlink"])
+def test_entrypoint_makes_storage_request_dir_writable_by_both_supervisors(
+    tmp_path: Path, planted: str
+) -> None:
+    """After a rollback the previous supervisor (another uid, same host group)
+    must still be able to queue a storage request: the directory is group
+    writable and setgid, and corrected on every start."""
+    root = tmp_path / "release-state"
+    root.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    victim.chmod(0o755)
+    sd = root / "storage"
+    if planted == "old_755":
+        sd.mkdir()
+        sd.chmod(0o755)
+    elif planted == "symlink":
+        sd.symlink_to(victim)
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    # Unprivileged run: record the chown instead of performing it.
+    (stubs / "chown").write_text(f'#!/bin/sh\necho "$@" >> {tmp_path}/chown.log\n')
+    (stubs / "chown").chmod(0o755)
+    script = tmp_path / "blk.sh"
+    script.write_text("set -eu\n" + _storage_block(root))
+    env = {**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"}
+    subprocess.run(["sh", str(script)], check=True, env=env)
+    assert sd.is_dir() and not sd.is_symlink()
+    mode = stat.S_IMODE(sd.stat().st_mode)
+    assert mode == 0o2770, oct(mode)
+    assert (tmp_path / "chown.log").read_text().split() == [f"{SUPERVISOR_UID}:{HOST_GID}", "."]
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+    assert not (tmp_path / "chown.log").read_text().count(str(victim))

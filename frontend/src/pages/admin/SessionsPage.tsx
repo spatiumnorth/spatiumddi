@@ -1,3 +1,4 @@
+import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { LogOut, Monitor, RefreshCcw } from "lucide-react";
@@ -234,7 +235,10 @@ export function SessionsPage() {
                     <td className="px-4 py-3 text-right">
                       {!s.revoked && !expired && (
                         <button
-                          onClick={() => revoke.mutate(s.id)}
+                          onClick={() => {
+                            armRemovalFocus();
+                            revoke.mutate(s.id);
+                          }}
                           disabled={revoke.isPending}
                           className="inline-flex items-center gap-1 rounded p-1 text-amber-600 hover:text-amber-700 disabled:opacity-50 dark:text-amber-400"
                           title="Revoke (force-logout this session)"

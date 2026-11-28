@@ -32,7 +32,7 @@ whose server is gone, which the keys would refuse, is detached rather than
 deleted, the same as a server delete does; detached rows are kept.
 
 Revision ID: a8d2f6c04b71
-Revises: d8b3f6a1c274
+Revises: c4d8e1a7b9f2
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "a8d2f6c04b71"
-down_revision: str | None = "d8b3f6a1c274"
+down_revision: str | None = "c4d8e1a7b9f2"
 branch_labels: str | None = None
 depends_on: str | None = None
 

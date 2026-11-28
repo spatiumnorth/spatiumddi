@@ -158,6 +158,8 @@ export function TagFilterChips({
             onClick={(e) => {
               e.stopPropagation();
               removeAt(idx);
+              // The chip, and the button focus was on, go with it (#4862).
+              inputRef.current?.focus();
             }}
             className="rounded-full hover:bg-primary/20"
             title={`Remove "${chip}"`}

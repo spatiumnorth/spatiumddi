@@ -1663,6 +1663,16 @@ async def _assemble(db: AsyncSession, server: DNSServer, *, stream: bool) -> _As
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
         "query_log_enabled": (bool(getattr(opts, "query_log_enabled", False)) if opts else False),
+        # #4594 — channel severity and print-* flags. The BIND9 agent reads
+        # them (``_query_log_channel_settings``); absent, every group rendered
+        # the historical defaults whatever the operator saved.
+        "query_log_severity": (getattr(opts, "query_log_severity", "info") if opts else "info"),
+        "query_log_print_category": (
+            bool(getattr(opts, "query_log_print_category", True)) if opts else True
+        ),
+        "query_log_print_severity": (
+            bool(getattr(opts, "query_log_print_severity", True)) if opts else True
+        ),
         # Response logging (#914) — same reasoning: it changes the rendered
         # named.conf, so it belongs in the fingerprint or a UI toggle would
         # not shift the etag and the agent would never re-render.

@@ -35,7 +35,7 @@ class FindLLDPSettingsArgs(BaseModel):
 
 @register_tool(
     name="find_lldp_settings",
-    permission="authenticated",
+    permission=("read", "settings"),
     description=(
         "Return the appliance LLDP configuration — master toggle, transmit "
         "interval + hold (and the advertised TTL = interval × hold), which "

@@ -178,12 +178,13 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal:9.9@sha256:baafce2d34783a28b4a4
 # python3.12: the agent. libpcap: scapy's BPF socket (optional fingerprint
 # sniffer). libcap: setcap. util-linux: setpriv (the agent's ambient NET_RAW
 # launch, and the su-exec shim below). openssl-libs / libstdc++ come with Kea's
-# link set; ``shadow-utils`` is deliberately absent, the user is written by hand.
+# link set (libatomic: Kea's arm64 build links it, #4638; absent from ubi-minimal and
+# harmless on amd64); ``shadow-utils`` is deliberately absent, the user is written by hand.
 ARG RPM_SNAPSHOT=dev
 RUN echo "rpm snapshot ${RPM_SNAPSHOT}" >/dev/null \
  && microdnf upgrade -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
  && microdnf install -y --setopt=install_weak_deps=0 --setopt=tsflags=nodocs \
-      python3.12 libpcap libcap util-linux ca-certificates tzdata openssl-libs libstdc++ \
+      python3.12 libpcap libcap util-linux ca-certificates tzdata openssl-libs libstdc++ libatomic \
  && microdnf clean all \
  && rm -rf /var/cache/yum /var/cache/dnf /var/lib/dnf/history* \
  && alternatives --set python3 /usr/bin/python3.12 2>/dev/null || ln -sf /usr/bin/python3.12 /usr/local/bin/python3

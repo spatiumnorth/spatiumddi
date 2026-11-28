@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
@@ -283,8 +284,8 @@ export function RouteDetailModal({
             <Info className="mt-0.5 h-4 w-4 flex-shrink-0" />
             <div>
               <span className="font-semibold">Anycast / multi-homed:</span> this
-              prefix is learned from {summary.peer_count} routers, all
-              originated by {originLabels.join(", ")}.
+              prefix is learned from {countNoun(summary.peer_count, "router")},
+              all originated by {originLabels.join(", ")}.
             </div>
           </div>
         ) : (
@@ -536,7 +537,7 @@ export function RouteDetailModal({
             <AskAIButton
               context={[
                 `BGP prefix ${d.prefix}`,
-                `${summary.path_count} paths from ${summary.peer_count} routers`,
+                `${countNoun(summary.path_count, "path")} from ${countNoun(summary.peer_count, "router")}`,
                 `origin ASN${summary.distinct_origin_asns.length === 1 ? "" : "s"}: ${originLabels.join(", ")}`,
                 summary.multi_origin
                   ? "multiple distinct origin ASNs (possible hijack/leak)"

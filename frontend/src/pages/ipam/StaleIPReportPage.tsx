@@ -10,6 +10,7 @@ import {
   type StaleIPDeprecateResponse,
   type StaleIPEntry,
 } from "@/lib/api";
+import { ListEmpty } from "@/components/ui/list-read-error";
 import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { SeenDot } from "@/pages/ipam/SeenDot";
@@ -166,7 +167,7 @@ export function StaleIPReportPage() {
           </HeaderButton>
           <HeaderButton
             variant="destructive"
-            disabled={total === 0 || deprecate.isPending}
+            disabled={report.isError || total === 0 || deprecate.isPending}
             onClick={() => setPending({ kind: "all", count: total })}
             {...deprecateGate}
           >
@@ -307,7 +308,9 @@ export function StaleIPReportPage() {
                   colSpan={6}
                   className="px-3 py-8 text-center text-muted-foreground"
                 >
-                  No stale IPs in this window. Address space looks healthy. ✨
+                  <ListEmpty error={report.error} what="stale IPs">
+                    No stale IPs in this window. Address space looks healthy. ✨
+                  </ListEmpty>
                 </td>
               </tr>
             ) : (
