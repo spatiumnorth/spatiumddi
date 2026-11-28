@@ -51,6 +51,7 @@ AUDITED_TOKEN_BINDING_TOOLS = frozenset(
         "list_ip_blocks",
         "list_subnets",
         "find_subnets_decommissioning",
+        "find_subnet_forecasts",
         "get_subnet_summary",
         "find_subnet_reconciliation",
         "get_subnet_utilization_trend",

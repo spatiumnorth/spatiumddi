@@ -673,6 +673,18 @@ export const SUBNET_ROLE_LABELS: Record<SubnetRole, string> = {
   guest: "Guest",
 };
 
+// Capacity forecast (#43): only subnets with a projectable trend are returned.
+export interface SubnetCapacityForecast {
+  subnet_id: string;
+  network: string;
+  name: string;
+  utilization_percent: number;
+  slope_percent_per_day: number;
+  sample_count: number;
+  days_to_full: number;
+  forecast_full_date: string;
+}
+
 export interface SubnetUtilizationPoint {
   sampled_at: string;
   allocated_ips: number;
@@ -1740,6 +1752,11 @@ export const ipamApi = {
       .get<
         SubnetUtilizationPoint[]
       >(`/ipam/subnets/${id}/utilization-history`, { params: { days } })
+      .then((r) => r.data),
+  // Projected full date per subnet, soonest first (#43).
+  getCapacityForecasts: () =>
+    api
+      .get<SubnetCapacityForecast[]>("/ipam/subnets/capacity-forecast")
       .then((r) => r.data),
   // IP discovery reconciliation report (issue #23).
   getReconciliation: (id: string, staleMinutes?: number) =>

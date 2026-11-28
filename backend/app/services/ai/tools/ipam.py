@@ -393,6 +393,72 @@ async def find_subnets_decommissioning(
     ]
 
 
+# ── find_subnet_forecasts ─────────────────────────────────────────────
+
+
+class FindSubnetForecastsArgs(BaseModel):
+    within_days: int = Field(
+        default=365,
+        ge=0,
+        le=3650,
+        description="Only subnets projected to be full within this many days (default 365).",
+    )
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="find_subnet_forecasts",
+    honours_token_binding=True,
+    permission=("read", "subnet"),
+    description=(
+        "Capacity forecast (issue #43): subnets whose utilisation trend over "
+        "the last 30 days projects them to reach 100% within N days "
+        "(default 365), soonest first. Use when the operator asks 'what is "
+        "about to run out of addresses?' or 'when will X be full?'. Each row "
+        "carries ``days_to_full``, ``forecast_full_date`` and the growth "
+        "rate in percentage points per day. Subnets with a flat or falling "
+        "trend, or under 14 daily snapshots of history, are not listed."
+    ),
+    args_model=FindSubnetForecastsArgs,
+    category="ipam",
+    writes=False,
+    default_enabled=True,
+    module=None,
+)
+async def find_subnet_forecasts(
+    db: AsyncSession, user: User, args: FindSubnetForecastsArgs
+) -> list[dict[str, Any]]:
+    from app.services.ipam.capacity_forecast import compute_capacity_forecasts
+
+    scoped = token_subnet_ids(user)
+    if scoped is not None and not scoped:
+        return []
+    rows = await compute_capacity_forecasts(
+        db, subnet_ids=list(scoped) if scoped is not None else None
+    )
+    out = []
+    for f in rows:
+        if f.days_to_full > args.within_days:
+            continue
+        if not token_allows_subnet(user, f.subnet_id):
+            continue
+        out.append(
+            {
+                "id": str(f.subnet_id),
+                "network": f.network,
+                "name": f.name,
+                "utilization_percent": f.utilization_percent,
+                "growth_percent_per_day": f.slope_percent_per_day,
+                "days_to_full": f.days_to_full,
+                "forecast_full_date": f.forecast_full_date.isoformat(),
+                "sample_count": f.sample_count,
+            }
+        )
+        if len(out) >= args.limit:
+            break
+    return out
+
+
 # ── get_subnet_summary ────────────────────────────────────────────────
 
 
