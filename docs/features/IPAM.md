@@ -1257,6 +1257,46 @@ Pair it with `GET /api/v1/dhcp/lease-history?mac=<mac>` (see
 [`DHCP.md`](DHCP.md)) for the DHCP side of the same question — that one is
 fleet-wide and needs no module.
 
+## 12c. Device presence by MAC (#2147)
+
+"Are these devices on the network right now?" for a presence consumer (Home
+Assistant `device_tracker`, an automation, a script) that polls a fixed set of
+MACs, in one call:
+
+```
+POST /api/v1/presence
+{"macs": ["AA-BB-CC-DD-EE-01", "aabb.ccdd.ee02"], "window_seconds": 600}
+```
+
+`macs` takes 1 to 500 entries in any common form (colon, hyphen, dotted, bare
+hex); duplicates collapse. A malformed entry is a `422` naming every bad entry,
+and more than 500 is a `422`. `window_seconds` defaults to 600 (30 to 86400).
+The response has one row per distinct MAC, in the order first given:
+`mac` (canonical), `present`, `randomized`, `ip`, `hostname`, `last_seen_at`,
+`source`, `lease_expires_at`, `leases[]` (every active lease with its scope and
+subnet) and `freshness_s`.
+
+- **A lease alone is not presence.** `present` needs an active, unexpired lease
+  **and** the freshest activity signal within `window_seconds`. Signals, freshest
+  wins: the lease's own last report (`dhcp`), an address's discovery stamp
+  (`arp` / `ping` / `snmp`) and `ip_mac_history` sightings. A MAC with no lease is
+  not present, whatever else saw it.
+- **Randomized MACs** (locally-administered bit set) carry `randomized: true`:
+  the identity may rotate per network.
+- **Polled DHCP.** Leases from a Windows DHCP server arrive by polling, so their
+  state can lag; `freshness_s` is then the lease-pull interval, and null for
+  agent-reported leases.
+- **Permissions.** Needs `read` on `subnet`; a caller whose grant is scoped to
+  particular subnets is admitted and only ever sees leases and activity in
+  subnets they may read. A MAC seen only elsewhere reads exactly like an
+  unknown MAC. A read-scoped API token may call it (it is a read, the POST only
+  carries the list).
+- **Trash.** Leases and addresses under a trashed scope, subnet or space are
+  never reported as present; restoring brings them back.
+
+The Operator Copilot has the same lookup as `find_device_presence`
+(default-enabled: it exposes nothing `find_dhcp_leases` does not).
+
 ## 13. Network Device Management (SNMP Polling)
 
 SpatiumDDI can manage a registry of **network devices** (routers, switches, access points) that are polled via SNMP to gather:

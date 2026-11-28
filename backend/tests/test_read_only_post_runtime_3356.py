@@ -551,6 +551,9 @@ CASES: dict[str, Callable[[Seed], Req]] = {
             },
         },
     ),
+    "/api/v1/presence": lambda s: _json(
+        "/api/v1/presence", {"macs": ["00:11:22:33:44:55"], "window_seconds": 300}
+    ),
     "/api/v1/tools/mac-vendor": lambda s: _json(
         "/api/v1/tools/mac-vendor", {"macs": ["00:11:22:33:44:55"]}
     ),

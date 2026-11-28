@@ -79,6 +79,7 @@ from app.api.v1.ownership import (
 )
 from app.api.v1.panos import router as panos_router
 from app.api.v1.pcap import router as pcap_router
+from app.api.v1.presence import router as presence_router
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.reports import router as reports_router
 from app.api.v1.requests import router as requests_router
@@ -451,6 +452,7 @@ api_v1_router.include_router(
     new_devices_router,
     dependencies=[Depends(require_module("security.new_device_watch")), Depends(wake_publishing)],
 )
+api_v1_router.include_router(presence_router)
 api_v1_router.include_router(
     block_sync_router,
     dependencies=[Depends(require_module("security.block_sync"))],
