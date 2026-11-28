@@ -1,3 +1,0 @@
-### Fixed
-
-- IPAM: Next available no longer tells an address-set delegate that no address is free while its set has free hosts (an IPv6 /64 under the default random policy, or a set past a subnet's first 65,536 hosts): the pick draws and walks inside the caller's own ranges. Resize with "Move gateway", and Merge, keep an old Gateway row the operator gave tags, a MAC, an owner or custom fields, by the rule Edit Subnet uses; only a bare auto-created row is replaced. Plan allocation pre-fills /64, not a size longer than /64, on an IPv6 block, and its words now say first-fit, which is what it does (#4279, #4280, #4281).

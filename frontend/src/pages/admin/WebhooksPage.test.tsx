@@ -218,4 +218,21 @@ describe("Webhooks header (#4373)", () => {
     expect(p).toMatch(/unsigned when it has none/);
     expect(p).not.toMatch(/receives one\s+HMAC-signed POST/);
   });
+
+  it("does not say the audit-forward webhook ships every audit row (#4890)", async () => {
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <WebhooksPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    const p = (await screen.findByText(/Typed-event subscriptions/))
+      .textContent as string;
+    expect(p).not.toMatch(/ships every audit row/);
+    expect(p).toMatch(/minimum severity and resource type filters/);
+  });
 });

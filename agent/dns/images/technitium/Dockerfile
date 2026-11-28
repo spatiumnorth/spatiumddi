@@ -113,8 +113,12 @@ RUN echo "apt snapshot ${APT_SNAPSHOT}" >/dev/null \
     # image adds can still bind :53 — this container runs nothing else, so
     # scoping the capability to `dotnet` system-wide is acceptable here.
  && setcap cap_net_bind_service=+ep "$(readlink -f "$(command -v dotnet)")" \
- && groupadd -g 102 spatium \
- && useradd -u 101 -g spatium -M -s /usr/sbin/nologin spatium \
+    # 10003:10003, outside the host's system-account range: on the appliance
+    # /var/lib/spatium-dns-agent and /etc/dns are hostPaths on the host (101/102
+    # were host system accounts' ids). Existing state is re-owned by the
+    # entrypoint's ``chown -R`` on the first start after an upgrade.
+ && groupadd -g 10003 spatium \
+ && useradd -u 10003 -g spatium -M -s /usr/sbin/nologin spatium \
  && mkdir -p /var/lib/spatium-dns-agent /etc/dns /var/log/technitium \
  && chown -R spatium:spatium /var/lib/spatium-dns-agent /etc/dns /var/log/technitium
 

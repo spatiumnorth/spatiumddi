@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
@@ -275,7 +276,8 @@ function TreemapTooltip({
       <div className="font-mono">{c.network}</div>
       {c.subName && <div className="text-muted-foreground">{c.subName}</div>}
       <div className="text-muted-foreground">
-        {c.kind} · {c.addrs.toLocaleString()} addrs
+        {c.kind} · {c.addrs.toLocaleString()}{" "}
+        {pluralize(Number(c.addrs), "addr")}
         {c.kind !== "free" && typeof c.utilization === "number" && (
           <> · {Math.round(c.utilization)}% used</>
         )}

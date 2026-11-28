@@ -8,6 +8,7 @@ a short history, and shows both beside the blocklist memory estimate.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -105,6 +106,13 @@ async def test_heartbeat_stores_the_report_and_a_sample(
     srv = await (_dns if kind == "dns" else _dhcp)(db_session)
     model = DNSMetricSample if kind == "dns" else DHCPMetricSample
     sid = srv.id
+
+    # The two heartbeats below must land in the same one-minute bucket. Near
+    # the top of a minute they can straddle it and write two samples, so start
+    # clear of the edge.
+    second = datetime.now(UTC).second
+    if second >= 50:
+        await asyncio.sleep(61 - second)
 
     r = await _post(client, kind, srv, "heartbeat", {"memory": BLOCK})
     assert r.status_code == 200, r.text

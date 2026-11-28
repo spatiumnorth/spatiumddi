@@ -59,7 +59,7 @@ namespace on supervisor-managed appliances — a directly-attached server
 typically wants `network_mode: host` **and** `dhcp_socket_mode: direct`.
 
 **Behind the MetalLB DHCP relay VIP, a group must be `relay` (#2899).**
-The relay VIP (`dhcp_relay_vip`, Fleet → Network → MetalLB → Advanced) is a
+The relay VIP (`dhcp_relay_vip`, Appliance → Network & Host → MetalLB → Advanced) is a
 LoadBalancer Service over every Kea pod in the appliance cluster, with
 `externalTrafficPolicy: Cluster`. kube-proxy on the node announcing the VIP
 keeps about one relay flow in N on that node's own Kea. In `direct` mode
@@ -886,6 +886,8 @@ DHCPMACBlock
 
 **What a MAC block can and cannot catch on DHCPv6.** A DHCPv6 packet has no hardware address field (Kea has no `pkt6.mac`), so the Dhcp6 `DROP` class derives the MAC from what the client sends: the link-layer address inside an Ethernet DUID-LL (type 3) or DUID-LLT (type 1) client-id, and the client link-layer address option (79, RFC 6939) that a first-hop relay may add (checked on both the innermost relay, which is the first hop, and the outermost, so a chain of relays is covered). It does **not** catch a client using DUID-EN or DUID-UUID, a DUID it randomised (many OSes generate a stable but non-MAC-derived DUID), a client that changes DUID, or a relayed packet whose relay adds no option 79. Treat the v6 block as a partial control: for a hard guarantee also block the device at the switch or router. Windows DHCP's deny filter is IPv4-only and does not apply to DHCPv6 scopes.
 
+**Windows DHCP deny list is authoritative once SpatiumDDI manages it.** The sync diffs the server's whole `Get-DhcpServerv4Filter -List Deny` list against the group's active blocks and removes every entry that is not desired, including entries an operator added by hand on the server. A server that has never been pushed a block (`dhcp_server.mac_blocks_pushed` false, with no active block in its group) is skipped entirely since #4759, so its hand-added deny entries are left alone until the first block applies to it. From then on the list is reconciled to exactly the desired set, and removing the last block clears it once. Servers that existed before the upgrade start with the flag set, so their first sync after upgrading still reconciles (and, with no blocks, clears) the list once. Manage deny entries for a SpatiumDDI-managed Windows server through MAC Blocks, not on the server.
+
 Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Windows doesn't support per-scope deny at all. A single "this device is bad, nowhere gets to serve it" rule is the usage pattern — per-scope precision is deferred until a concrete need surfaces.
 
 **MAC input shapes** — the API accepts the common operator formats (`aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff`, or bare `aabbccddeeff`, any case) and canonicalizes to colon-separated lowercase server-side. Agents see canonical form only.
@@ -1048,10 +1050,33 @@ only past a number of packets).
 Two things do not help with *sustained* overload, and it is worth knowing why
 before reaching for them:
 
-* **A bigger socket receive buffer** removes the drops and replaces them with
+* **A big socket receive buffer** removes the drops and replaces them with
   latency. Measured under #952: with 8 MiB of buffer the drops vanish and a
   DORA takes **34 s instead of 1.5 s**, because Kea then works through a
-  backlog answering requests whole retransmit rounds late.
+  backlog answering requests whole retransmit rounds late. A *modest* buffer
+  is a different case, and the one the appliance ships (#4544): Kea never
+  sets `SO_RCVBUF`, so its socket takes `net.core.rmem_default` (212,992
+  bytes stock, a few hundred milliseconds of DHCP arrivals), and a
+  receive-thread stall of that length drops a burst that the packet queue
+  behind it had room for. The appliance sets `net.core.rmem_default` and
+  `rmem_max` to **1 MiB** (`/etc/sysctl.d/60-spatium-net.conf`), which rides
+  out a 1 to 2 second stall and keeps the worst-case added wait under the
+  client's 4 second first retransmit. Do not go higher without measuring.
+  The setting is host-wide, so BIND and other UDP sockets get the same
+  default.
+
+  **Docker Compose and plain Kubernetes** cannot set it from the container:
+  `net.core.*` is not a namespaced sysctl. Set it on the host that runs Kea,
+  then restart the Kea container (only sockets opened afterwards see it):
+
+  ```
+  echo 'net.core.rmem_default = 1048576
+  net.core.rmem_max = 1048576' | sudo tee /etc/sysctl.d/60-spatium-net.conf
+  sudo sysctl --system
+  ```
+
+  Read it back with `ss -uanm 'sport = :67'`: `rb` is the buffer size and `d`
+  is the drop count.
 * **A bigger `packet-queue-size`** does not raise throughput. At 12,000
   relayed pkt/s offered, 64 → 2048 (32x) changed neither throughput nor
   socket drops. That queue sits *behind* the receive thread, and no queue
@@ -1867,6 +1892,13 @@ Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`]
 | `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
 | `dhcp_pull_leases_last_run_at` | — | Claimed when a pass **starts** (#2262), so a pass slower than the beat tick is not started again while it runs; visible in Settings. |
 
+Two further beat tasks open a session per agentless server and are gated the same way (#4759), both on a 60 s beat tick:
+
+| Setting | Default | Description |
+|---|---|---|
+| `dhcp_health_interval_seconds` | 60 | How often agentless servers (Windows DHCP, FortiGate) get a health probe, 60 to 3600 s. Agent-based servers (Kea) are not governed by it: their status follows the agent heartbeat and is evaluated every minute. |
+| `dhcp_mac_blocks_sync_interval_seconds` | 60 | How often each agentless server's MAC deny list is reconciled, 60 to 3600 s. A server with no active block in its group and none pushed before is skipped with no WinRM round trip; removing the last block still syncs once to clear the filter list. Saving a block in the UI pushes immediately regardless of the interval. |
+
 > **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 
 Per poll:
@@ -2382,7 +2414,7 @@ SpatiumDDI ships DHCPv6 via Kea, but Kea does not emit ICMPv6 Router
 Advertisements. This feature lets the DHCP agent run **radvd** from
 config rendered by the control plane, and passively watches the segment
 for **rogue RAs**. Both live behind the `ipv6.router_advertisements` feature module, which
-ships **disabled** (Settings → Features): it is the one DHCP-adjacent surface
+ships **disabled** (Features & Integrations): it is the one DHCP-adjacent surface
 that ends in something transmitted onto the wire, and a v4-only install has no
 use for it ([#1069](https://github.com/spatiumnorth/spatiumddi/issues/1069)).
 

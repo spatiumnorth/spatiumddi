@@ -188,7 +188,10 @@ function MfaPanel() {
               </p>
             )}
             {reauthFailed && (
-              <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              <p
+                role="alert"
+                className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+              >
                 Re-authentication did not complete, so nothing was changed. Try
                 again.
               </p>
@@ -402,8 +405,11 @@ function EnrollModal({
             </label>
           </li>
           <li>
-            <p>Enter the 6-digit code from your authenticator to confirm:</p>
+            <label htmlFor="account-totp-confirm-code" className="block">
+              Enter the 6-digit code from your authenticator to confirm:
+            </label>
             <input
+              id="account-totp-confirm-code"
               autoFocus
               type="text"
               inputMode="numeric"
@@ -485,11 +491,15 @@ function PasswordCodePrompt({
               enter their password; SSO accounts can leave it blank.
             </p>
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="account-current-password"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Current password{" "}
                 <span className="font-normal">(local accounts)</span>
               </label>
               <input
+                id="account-current-password"
                 type="password"
                 autoComplete="current-password"
                 value={password}
@@ -498,10 +508,14 @@ function PasswordCodePrompt({
               />
             </div>
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="account-authenticator-code"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Authenticator code
               </label>
               <input
+                id="account-authenticator-code"
                 type="text"
                 inputMode="numeric"
                 pattern="[0-9]*"
@@ -677,12 +691,16 @@ function EnrolPasswordModal({
           if (password) onSubmit(password);
         }}
       >
-        <p className="text-xs text-muted-foreground">
+        <label
+          htmlFor="account-2fa-setup-password"
+          className="block text-xs text-muted-foreground"
+        >
           {providerName
             ? `Enter your ${providerName} password to set up two-factor authentication. It is checked with ${providerName}, not stored here.`
             : "Enter your current password to set up two-factor authentication."}
-        </p>
+        </label>
         <input
+          id="account-2fa-setup-password"
           type="password"
           autoComplete="current-password"
           autoFocus

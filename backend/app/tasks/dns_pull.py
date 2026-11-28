@@ -45,13 +45,66 @@ logger = structlog.get_logger(__name__)
 _SINGLETON_ID = 1
 
 
+def _primary_signature(primary: DNSServer) -> tuple[Any, ...]:
+    """What a transfer from ``primary`` depends on; a change while the transfer
+    ran voids its result."""
+    return (primary.id, primary.driver, primary.host, primary.port, primary.group_id)
+
+
+async def _sync_one_zone(
+    session_factory: Any, zone_id: Any, *, deps: Any
+) -> tuple[Any, DNSServer | None] | None:
+    """Pull one zone with no session open, then apply it in a fresh one (#4808).
+
+    The pull (AXFR, WinRM, the Technitium / cloud API) used to run on the
+    sweep's one shared session, whose selects had opened a transaction before
+    every wire call: a server that answered slowly held a pooled connection
+    ``idle in transaction``. Now a read-only session resolves the primary and
+    key and commits, the transfer runs with none open, and a fresh session
+    re-reads the zone and primary and applies the result, dropping it when
+    either was deleted, disabled or re-pointed meanwhile. The push phase
+    commits what the pull wrote (and the serial) just before its provider
+    call, so that call holds no transaction either.
+
+    Returns ``(SyncResult, primary)``, or ``None`` when the zone is skipped.
+    """
+    sync_zone_with_server, prepare_wire_read, fetch_wire, resolve_primary_server = deps
+    async with session_factory() as db:
+        zone = await db.get(DNSZone, zone_id)
+        if zone is None:
+            return None
+        wire = await prepare_wire_read(db, zone)
+        signature = _primary_signature(wire.primary)
+        zone_group = zone.group_id
+        await db.commit()  # end the read transaction before the transfer
+
+    await fetch_wire(wire)
+
+    async with session_factory() as db:
+        zone = await db.get(DNSZone, zone_id)
+        if zone is None or zone.group_id != zone_group:
+            return None
+        primary = await resolve_primary_server(db, zone)
+        if primary is None or not primary.is_enabled or _primary_signature(primary) != signature:
+            return None
+        wire.primary = primary  # bound to this session for the apply
+        result = await sync_zone_with_server(db, zone, apply=True, wire=wire, before_send=db.commit)
+        await db.commit()
+        return result, primary
+
+
 async def _run_sync() -> dict[str, Any]:
     # Deferred imports — keep celery-worker startup light and avoid pulling
     # in the FastAPI router graph.
     from app.services.dns.pull_from_server import (  # noqa: PLC0415
+        fetch_wire,
         non_authoritative_reason,
+        prepare_wire_read,
         sync_zone_with_server,
     )
+    from app.services.dns.record_ops import resolve_primary_server  # noqa: PLC0415
+
+    deps = (sync_zone_with_server, prepare_wire_read, fetch_wire, resolve_primary_server)
 
     engine = create_async_engine(
         settings.database_url, future=True, connect_args=task_connect_args()
@@ -59,6 +112,8 @@ async def _run_sync() -> dict[str, Any]:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
+        # Plan under one short session: gate, interval, and which zones have a
+        # primary whose driver can be pulled from. Nothing here touches the wire.
         async with session_factory() as db:
             # #1068 — the DHCP/DNS subsystem can be switched off wholesale;
             # do no work (and open no driver connections) when it is.
@@ -76,14 +131,7 @@ async def _run_sync() -> dict[str, Any]:
 
             zones = list((await db.execute(select(DNSZone))).scalars().all())
 
-            zones_scanned = 0
-            zones_touched = 0
-            total_imported = 0
-            total_pushed = 0
-            total_push_errors = 0
-            total_server_records = 0
-            errors: list[str] = []
-
+            planned: list[tuple[Any, str, DNSServer]] = []
             for zone in zones:
                 # #3758 — forward / stub zones aren't held authoritatively.
                 if non_authoritative_reason(zone) is not None:
@@ -113,29 +161,46 @@ async def _run_sync() -> dict[str, Any]:
                 driver = get_driver(primary.driver)
                 if not hasattr(driver, "pull_zone_records"):
                     continue
+                planned.append((zone.id, zone.name, primary))
+            await db.commit()
 
-                zones_scanned += 1
-                try:
-                    result = await sync_zone_with_server(db, zone, apply=True)
-                except Exception as exc:  # noqa: BLE001 — don't let one zone poison the run
-                    errors.append(f"{zone.name}: {exc}")
-                    logger.warning(
-                        "dns_sync_zone_failed",
-                        zone=zone.name,
-                        server=str(primary.id),
-                        driver=primary.driver,
-                        error=str(exc),
-                    )
-                    continue
+        zones_scanned = 0
+        zones_touched = 0
+        total_imported = 0
+        total_pushed = 0
+        total_push_errors = 0
+        total_server_records = 0
+        errors: list[str] = []
 
-                total_server_records += result.pull.server_records
-                total_imported += result.pull.imported
-                total_pushed += result.push.pushed
-                total_push_errors += len(result.push.push_errors)
-                if result.pull.imported or result.push.pushed:
-                    zones_touched += 1
+        for zone_id, zone_name, planned_primary in planned:
+            zones_scanned += 1
+            try:
+                outcome = await _sync_one_zone(session_factory, zone_id, deps=deps)
+            except Exception as exc:  # noqa: BLE001 — don't let one zone poison the run
+                errors.append(f"{zone_name}: {exc}")
+                logger.warning(
+                    "dns_sync_zone_failed",
+                    zone=zone_name,
+                    server=str(planned_primary.id),
+                    driver=planned_primary.driver,
+                    error=str(exc),
+                )
+                continue
+            if outcome is None:
+                continue  # deleted, disabled or re-pointed while it was read
+            result, _primary = outcome
 
-            ps.dns_pull_from_server_last_run_at = now
+            total_server_records += result.pull.server_records
+            total_imported += result.pull.imported
+            total_pushed += result.push.pushed
+            total_push_errors += len(result.push.push_errors)
+            if result.pull.imported or result.push.pushed:
+                zones_touched += 1
+
+        async with session_factory() as db:
+            ps = await db.get(PlatformSettings, _SINGLETON_ID)
+            if ps is not None:
+                ps.dns_pull_from_server_last_run_at = now
 
             if total_imported or total_pushed or total_push_errors or errors:
                 db.add(
@@ -160,26 +225,26 @@ async def _run_sync() -> dict[str, Any]:
                 )
             await db.commit()
 
-            logger.info(
-                "dns_server_sync_completed",
-                imported=total_imported,
-                pushed=total_pushed,
-                push_errors=total_push_errors,
-                zones_touched=zones_touched,
-                zones_scanned=zones_scanned,
-                server_records=total_server_records,
-                error_count=len(errors),
-            )
-            return {
-                "status": "ran",
-                "imported": total_imported,
-                "pushed": total_pushed,
-                "push_errors": total_push_errors,
-                "zones_touched": zones_touched,
-                "zones_scanned": zones_scanned,
-                "server_records": total_server_records,
-                "errors": len(errors),
-            }
+        logger.info(
+            "dns_server_sync_completed",
+            imported=total_imported,
+            pushed=total_pushed,
+            push_errors=total_push_errors,
+            zones_touched=zones_touched,
+            zones_scanned=zones_scanned,
+            server_records=total_server_records,
+            error_count=len(errors),
+        )
+        return {
+            "status": "ran",
+            "imported": total_imported,
+            "pushed": total_pushed,
+            "push_errors": total_push_errors,
+            "zones_touched": zones_touched,
+            "zones_scanned": zones_scanned,
+            "server_records": total_server_records,
+            "errors": len(errors),
+        }
     finally:
         await engine.dispose()
 

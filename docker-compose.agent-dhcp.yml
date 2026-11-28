@@ -16,6 +16,8 @@ name: spatiumddi-agent-dhcp
 #   # Set the two required env vars (or put them in an .env next to
 #   # this file — compose auto-loads .env).
 #   export SPATIUM_API_URL=https://spatium.example.com
+#   # Use the frontend URL (e.g. http://host:8077) or your reverse proxy,
+#   # never :8000: the Compose API listens on 127.0.0.1 only.
 #   export SPATIUM_AGENT_KEY=$(openssl rand -hex 32)
 #
 #   # Register the key on the control plane first (Settings → Agent
