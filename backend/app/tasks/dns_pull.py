@@ -45,6 +45,12 @@ logger = structlog.get_logger(__name__)
 _SINGLETON_ID = 1
 
 
+# Audit-row bound on the refused-record detail (#5011): a server refusing a
+# whole zone must not bloat the row; the rest is counted, not listed.
+_AUDIT_DETAIL_CAP = 20
+_AUDIT_DETAIL_LEN = 300
+
+
 def _primary_signature(primary: DNSServer) -> tuple[Any, ...]:
     """What a transfer from ``primary`` depends on; a change while the transfer
     ran voids its result."""
@@ -171,6 +177,8 @@ async def _run_sync() -> dict[str, Any]:
         total_push_errors = 0
         total_server_records = 0
         errors: list[str] = []
+        push_error_details: list[str] = []
+        push_error_detail_count = 0
 
         for zone_id, zone_name, planned_primary in planned:
             zones_scanned += 1
@@ -194,6 +202,13 @@ async def _run_sync() -> dict[str, Any]:
             total_imported += result.pull.imported
             total_pushed += result.push.pushed
             total_push_errors += len(result.push.push_errors)
+            # #5011 — name what the server refused, not just how many.
+            for err in result.push.push_errors:
+                push_error_detail_count += 1
+                if len(push_error_details) < _AUDIT_DETAIL_CAP:
+                    push_error_details.append(
+                        f"{zone_name} @ {planned_primary.name}: {err}"[:_AUDIT_DETAIL_LEN]
+                    )
             if result.pull.imported or result.push.pushed:
                 zones_touched += 1
 
@@ -220,6 +235,12 @@ async def _run_sync() -> dict[str, Any]:
                             "zones_scanned": zones_scanned,
                             "server_records": total_server_records,
                             "errors": errors[:20],
+                            # Zone, server, record, type and the server's own
+                            # error, capped; the remainder is counted.
+                            "push_error_details": push_error_details,
+                            "push_error_details_more": (
+                                push_error_detail_count - len(push_error_details)
+                            ),
                         },
                     )
                 )
