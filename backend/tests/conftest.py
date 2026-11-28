@@ -282,11 +282,18 @@ def _no_bundle_render_enqueue() -> Iterator[None]:
     from app.config import settings as _settings
 
     before = _settings.dns_agent_bundle_enqueue_renders
+    before_dhcp = _settings.dhcp_agent_bundle_enqueue_renders
+    before_grace = _settings.dhcp_agent_bundle_inline_grace_seconds
     _settings.dns_agent_bundle_enqueue_renders = False
+    _settings.dhcp_agent_bundle_enqueue_renders = False
+    # No worker in the suite: a DHCP poll builds inline at once, as before.
+    _settings.dhcp_agent_bundle_inline_grace_seconds = 0
     try:
         yield
     finally:
+        _settings.dhcp_agent_bundle_inline_grace_seconds = before_grace
         _settings.dns_agent_bundle_enqueue_renders = before
+        _settings.dhcp_agent_bundle_enqueue_renders = before_dhcp
 
 
 @pytest.fixture(autouse=True)

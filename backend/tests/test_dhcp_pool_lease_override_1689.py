@@ -12,12 +12,12 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.dhcp import agents
 from app.api.v1.dhcp.pools import PoolCreate
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPServerGroup
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.services.dhcp import agent_bundle
 
 
 async def _setup(db: AsyncSession) -> tuple[dict[str, str], DHCPScope]:
@@ -97,17 +97,17 @@ async def test_pool_update_refuses_value_but_allows_clearing(
 
 def test_every_accepted_pool_field_reaches_the_agent_or_is_refused() -> None:
     """The guard #1689 asked for: this is the third pool field (after #430 and
-    #858) that the API accepted and the agent pool dict never carried. Every
+    #858) that the API accepted and the agent pool dict (services/dhcp/agent_bundle.py) never carried. Every
     field ``PoolCreate`` accepts must be a key of that dict, be refused, or be
     listed here with the reason it is not rendered."""
-    tree = ast.parse(Path(agents.__file__).read_text())
+    tree = ast.parse(Path(agent_bundle.__file__).read_text())
     pool_dicts = [
         {k.value for k in node.keys if isinstance(k, ast.Constant)}
         for node in ast.walk(tree)
         if isinstance(node, ast.Dict)
         and any(isinstance(k, ast.Constant) and k.value == "pd_prefix" for k in node.keys)
     ]
-    assert len(pool_dicts) == 1, "expected exactly one agent pool dict in agents.py"
+    assert len(pool_dicts) == 1, "expected exactly one agent pool dict in agent_bundle.py"
     sent = pool_dicts[0]
 
     refused = {"lease_time_override"}  # 422 on a non-null value (#1689)

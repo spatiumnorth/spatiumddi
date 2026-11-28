@@ -257,6 +257,19 @@ class Settings(BaseSettings):
     # in ``dns_agent_bundle``; this many versions per server are kept (the
     # agent's own N-1 rule, #882), older ones are pruned on store.
     dns_agent_bundle_keep_versions: int = 2
+    # #1111 — DHCP agent bundles are rendered by the worker and stored in
+    # ``dhcp_agent_bundle``. After a commit that dirtied them the render
+    # request is published to the worker (the sweep is the backstop). Off only
+    # for test suites that have no broker.
+    dhcp_agent_bundle_enqueue_renders: bool = True
+    # The worker re-renders every agent server's bundle at least this often
+    # (a render that changes nothing stores nothing): E911 freshness,
+    # observed fingerprints and MAC-block expiry change the bundle without a
+    # write the dirty marking can attribute, so this bounds their latency.
+    dhcp_agent_bundle_refresh_seconds: int = 15
+    # A poll that finds no current stored bundle holds this long for the
+    # worker's render before building one inline, as it always did.
+    dhcp_agent_bundle_inline_grace_seconds: int = 5
     # After a commit that dirtied a bundle, publish the render request to the
     # worker (the 30 s render-missing sweep is the backstop either way). Off
     # only for test suites that have no broker.

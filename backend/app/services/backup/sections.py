@@ -288,6 +288,9 @@ SECTIONS: tuple[Section, ...] = (
         ),
         tables=(
             "dhcp_server_group",
+            # #1111 — the per-server stored config bundle; cascades from
+            # dhcp_server, so it restores and truncates with it.
+            "dhcp_agent_bundle",
             "dhcp_server",
             # #1110 — observed Windows failover relationships + per-server
             # scope presence. Re-read by the next topology poll, but they

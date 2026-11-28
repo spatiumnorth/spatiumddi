@@ -35,6 +35,7 @@ SESSION_LISTENER_MODULES: tuple[str, ...] = (
     "app.services.audit_forward",
     "app.services.event_publisher",
     "app.services.dns.bundle_dirty",
+    "app.services.dhcp.agent_bundle",
 )
 
 
