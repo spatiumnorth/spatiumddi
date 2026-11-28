@@ -41,6 +41,7 @@ import structlog
 
 from .config import AgentConfig
 from .push import CPPoster, disabled_spool, late_bound
+from .scapy_sniff import load_layers, sniff_interfaces
 from .spool import Shipper, Spool
 
 log = structlog.get_logger(__name__)
@@ -248,9 +249,10 @@ class MacSightingShipper:
     ) -> None:
         self.cfg = cfg
         self.token_ref = token_ref
-        # Default interface "any" matches scapy's wildcard binding —
-        # works for host-networked containers. Operators on bridge
-        # networks should set DHCP_MAC_SIGHTING_IFACE explicitly.
+        # Default interface "any" listens on every non-loopback interface (see
+        # scapy_sniff.sniff_interfaces), so it works on host networking too.
+        # Operators on bridge networks should set DHCP_MAC_SIGHTING_IFACE
+        # explicitly.
         self.iface = iface or os.environ.get("DHCP_MAC_SIGHTING_IFACE") or "any"
         self._stop = threading.Event()
         self._state = _ShipperState()
@@ -306,12 +308,14 @@ class MacSightingShipper:
     def _start_sniffer(self) -> bool:
         try:
             from scapy.sendrecv import AsyncSniffer  # type: ignore[import-not-found]
+
+            load_layers()
         except ImportError as exc:
             log.warning("mac_sighting_scapy_missing", error=str(exc))
             return False
         try:
             self._sniffer = AsyncSniffer(
-                iface=None if self.iface == "any" else self.iface,
+                iface=sniff_interfaces(self.iface),
                 # ARP frames carry the sender MAC+IP; ICMPv6 (which
                 # includes ND NS/NA) carries the IPv6 pairing.
                 filter="arp or icmp6",
