@@ -32,7 +32,7 @@ class _FakeEngine:
 
 
 def _use_test_db(monkeypatch: pytest.MonkeyPatch, module: Any) -> None:
-    monkeypatch.setattr(module, "create_async_engine", lambda *a, **k: _FakeEngine())
+    monkeypatch.setattr(module, "task_engine", lambda *a, **k: _FakeEngine())
     monkeypatch.setattr(module, "async_sessionmaker", lambda *a, **k: _TestSessionLocal)
 
 

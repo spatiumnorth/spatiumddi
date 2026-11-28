@@ -38,7 +38,6 @@ holiday" is visible history, never a silent no-op.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -79,6 +78,7 @@ from app.services.wol_scheduler.verify import (
     auto_stagger_ms,
     verify_run_targets,
 )
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 if TYPE_CHECKING:
@@ -970,7 +970,7 @@ def verify_wol_run(run_id: str, attempt: int = 1) -> dict[str, Any]:
     ``include=[...]`` list — so no include change is needed (#218 gotcha
     satisfied).
     """
-    return asyncio.run(_verify_run(run_id, attempt))
+    return run_task(_verify_run(run_id, attempt))
 
 
 async def _sweep() -> dict[str, int]:
@@ -1110,7 +1110,7 @@ async def _sweep() -> dict[str, int]:
 @celery_app.task(name="app.tasks.wol_scheduler.sweep_wol_schedules")
 @module_gated("tools.wake_scheduler")
 def sweep_wol_schedules() -> dict[str, int]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     if (
         result.get("fired")
         or result.get("gated")

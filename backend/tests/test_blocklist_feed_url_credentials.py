@@ -135,7 +135,7 @@ def _wire_task(monkeypatch: pytest.MonkeyPatch, db: AsyncSession, kind: str) -> 
     monkeypatch.setattr(
         safe_fetch, "GuardedTransport", lambda **kw: httpx.MockTransport(_handler(kind))
     )
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _factory_cm():  # type: ignore[no-untyped-def]

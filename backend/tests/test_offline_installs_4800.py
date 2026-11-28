@@ -52,7 +52,7 @@ def _wire_oui(
             raise httpx.ConnectError("Temporary failure in name resolution")
 
     monkeypatch.setattr(oui_update.httpx, "AsyncClient", _Client)
-    monkeypatch.setattr(oui_update, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(oui_update, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _factory_cm():  # type: ignore[no-untyped-def]

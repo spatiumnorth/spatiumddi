@@ -31,7 +31,7 @@ def _wire(monkeypatch: pytest.MonkeyPatch, db_session: AsyncSession, response) -
     monkeypatch.setattr(
         safe_fetch, "GuardedTransport", lambda **kw: httpx.MockTransport(lambda r: response)
     )
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _cm():  # type: ignore[no-untyped-def]

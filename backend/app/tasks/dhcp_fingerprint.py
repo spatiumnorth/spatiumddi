@@ -12,7 +12,6 @@ synchronous round-trip.
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Any
 
@@ -22,6 +21,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.services.feature_modules import is_module_enabled
 from app.services.profiling.passive import run_lookup_and_stamp
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -48,7 +48,7 @@ def lookup_fingerprint_task(
     """
     logger.info("dhcp_fingerprint_task_started", mac=mac_address)
     try:
-        asyncio.run(_run(mac_address, server_id))
+        run_task(_run(mac_address, server_id))
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "dhcp_fingerprint_task_error",

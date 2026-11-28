@@ -23,7 +23,6 @@ healthy install it finds nothing and writes nothing (not even an audit row).
 
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any
 
@@ -36,6 +35,7 @@ from app.models.audit import AuditLog
 from app.services.dhcp.lease_cleanup import sweep_orphaned_lease_mirrors
 from app.services.dhcp.static_ipam import sweep_orphaned_static_mirrors
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -108,7 +108,7 @@ async def _sweep() -> int:
 )
 @module_gated("core.dhcp")
 def sweep_orphaned_mirrors(self: Any) -> dict[str, int]:  # noqa: ARG001
-    freed = asyncio.run(_sweep())
+    freed = run_task(_sweep())
     if freed:
         # Warning, not info: a healthy install frees nothing, so a hit means a
         # reservation-destroying path skipped its mirror release and wants

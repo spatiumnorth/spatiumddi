@@ -26,7 +26,6 @@ its own freshness signal.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -36,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.multicast import MulticastMembership
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -70,7 +70,7 @@ async def _sweep() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.prune_multicast_memberships.prune_stale_igmp_memberships")
 def prune_stale_igmp_memberships() -> dict[str, int]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     if result["removed"]:
         logger.info(
             "prune_stale_igmp_memberships",

@@ -13,22 +13,20 @@ Idempotent (NN#9): re-running converges to the same device state.
 
 from __future__ import annotations
 
-import asyncio
 import uuid as _uuid
 from typing import Any
 
 import structlog
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.models.meraki import MerakiOrg
 from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.feature_modules import is_module_enabled
 from app.services.integration_sync_failure import record_sync_crash
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -45,9 +43,7 @@ async def _run_sweep() -> dict[str, Any]:
         reconcile_unifi,
     )
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -187,7 +183,7 @@ async def _run_sweep() -> dict[str, Any]:
                 "messages": messages[:20],
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 async def _run_one(target_kind: str, target_id: str) -> dict[str, Any]:
@@ -198,9 +194,7 @@ async def _run_one(target_kind: str, target_id: str) -> dict[str, Any]:
         reconcile_unifi,
     )
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -244,7 +238,7 @@ async def _run_one(target_kind: str, target_id: str) -> dict[str, Any]:
                 "errors": summary.errors,
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 async def _run_lift(target_kind: str, target_id: str) -> dict[str, Any]:
@@ -253,9 +247,7 @@ async def _run_lift(target_kind: str, target_id: str) -> dict[str, Any]:
     leaving its blocks stuck on the device is the bug we're fixing)."""
     from app.services.block_sync.reconcile import lift_all_for_target  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -281,25 +273,25 @@ async def _run_lift(target_kind: str, target_id: str) -> dict[str, Any]:
                 "removed": summary.removed,
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.block_sync.sweep_block_sync", bind=True)
 @module_gated("security.block_sync")
 def sweep_block_sync(self: Any) -> dict[str, Any]:  # noqa: ARG001
-    return asyncio.run(_run_sweep())
+    return run_task(_run_sweep())
 
 
 @celery_app.task(name="app.tasks.block_sync.lift_target_now", bind=True)
 def lift_target_now(self: Any, target_kind: str, target_id: str) -> dict[str, Any]:  # noqa: ARG001
-    return asyncio.run(_run_lift(target_kind, target_id))
+    return run_task(_run_lift(target_kind, target_id))
 
 
 @celery_app.task(name="app.tasks.block_sync.reconcile_target_now", bind=True)
 def reconcile_target_now(
     self: Any, target_kind: str, target_id: str
 ) -> dict[str, Any]:  # noqa: ARG001
-    return asyncio.run(_run_one(target_kind, target_id))
+    return run_task(_run_one(target_kind, target_id))
 
 
 __all__ = ["lift_target_now", "reconcile_target_now", "sweep_block_sync"]

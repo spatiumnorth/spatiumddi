@@ -15,7 +15,6 @@ minutes of history vs five hours doesn't move the operational needle.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -27,6 +26,7 @@ from app.db import task_session
 from app.models.dhcp import DHCPLeaseHistory
 from app.models.settings import PlatformSettings
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -57,7 +57,7 @@ async def _prune() -> int:
 @celery_app.task(name="app.tasks.dhcp_lease_history_prune.prune_lease_history")
 @module_gated("core.dhcp")
 def prune_lease_history() -> dict[str, int]:
-    removed = asyncio.run(_prune())
+    removed = run_task(_prune())
     logger.info("dhcp_lease_history_prune_complete", rows_removed=removed)
     return {"rows_removed": removed}
 

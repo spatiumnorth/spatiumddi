@@ -21,7 +21,6 @@ expected shape.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -37,6 +36,7 @@ from app.services.backup.drill import (
     reap_orphaned_scratch_dbs,
     run_drill_for_target,
 )
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -100,7 +100,7 @@ async def _sweep() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.backup_drill.sweep_restore_drills")
 def sweep_restore_drills() -> dict[str, int]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     if any(result.values()):
         logger.info("restore_drill_sweep_tick", **result)
     return result

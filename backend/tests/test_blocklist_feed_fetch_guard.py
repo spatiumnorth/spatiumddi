@@ -302,7 +302,7 @@ def _wire_task(
 ) -> None:
     if rec is not None:
         monkeypatch.setattr(safe_fetch, "GuardedTransport", lambda **kw: rec.transport())
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _factory_cm():  # type: ignore[no-untyped-def]

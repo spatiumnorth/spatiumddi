@@ -23,7 +23,6 @@ batch — so one wedged row can't strand the queue.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -33,6 +32,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.change_request import ChangeRequest
 from app.services.approvals.service import get_change_request, mark_expired
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -90,6 +90,6 @@ async def _sweep() -> dict[str, int]:
 @celery_app.task(name="app.tasks.change_request_expiry.sweep_expired_change_requests")
 def sweep_expired_change_requests() -> dict[str, int]:
     """Celery entry point. Idempotent — safe to retry."""
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("change_request_expiry_sweep_complete", **result)
     return result

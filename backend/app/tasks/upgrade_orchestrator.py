@@ -31,7 +31,6 @@ drive releases its Lease, leaves the row ``running`` and is retried.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import signal
 import time
@@ -54,6 +53,7 @@ from app.services.upgrades.orchestrator import (
     hop_heartbeat_key,
     touch_hop_heartbeat,
 )
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -334,7 +334,7 @@ def drive_upgrade_run(  # type: ignore[type-arg]
         )
         return {"run_id": run_id, "state": "passed_on"}
     try:
-        return asyncio.run(_async_drive(run_id, avoid_version=avoid_version))
+        return run_task(_async_drive(run_id, avoid_version=avoid_version))
     except DriveDatabaseUnavailable as exc:
         retries = int(getattr(self.request, "retries", 0) or 0)
         if retries >= len(_DB_RETRY_COUNTDOWNS_S):
@@ -398,7 +398,7 @@ def release_lingering_shared_tag_hold() -> dict[str, str] | None:
     installed version (the operator finished, or took back, the roll node
     by node). Without it the control plane would stay on the old tag until
     a rolling run succeeded."""
-    return asyncio.run(_async_release_lingering_hold())
+    return run_task(_async_release_lingering_hold())
 
 
 # A `running` rolling run whose Lease is free is re-driven only after it has
@@ -568,7 +568,7 @@ def resume_orphaned_runs() -> list[str]:
 
     if k8s.get_config() is None:
         return []
-    runs = asyncio.run(_running_runs())
+    runs = run_task(_running_runs())
     if not runs:
         return []
     try:

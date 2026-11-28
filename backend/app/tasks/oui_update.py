@@ -31,7 +31,6 @@ forced run against an already-synced CSV returns zero added / updated
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
 from datetime import UTC, datetime, timedelta
@@ -40,14 +39,13 @@ from typing import Any
 import httpx
 import structlog
 from sqlalchemy import delete, func, insert, select, update
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks._interval_gate import interval_skip
 
 logger = structlog.get_logger(__name__)
@@ -125,9 +123,7 @@ def _parse_oui_csv(text: str) -> list[dict[str, str]]:
 
 
 async def _run_update(force: bool = False) -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     try:
@@ -237,7 +233,7 @@ async def _run_update(force: bool = False) -> dict[str, Any]:
             logger.info("oui_update_completed", **summary)
             return {"status": "ran", **summary}
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.oui_update.auto_update_oui_database", bind=True)
@@ -245,7 +241,7 @@ def auto_update_oui_database(self: object) -> dict[str, Any]:  # type: ignore[ty
     """Celery beat entrypoint. Fires hourly; the task itself gates on
     ``oui_lookup_enabled`` and ``oui_update_interval_hours``."""
     try:
-        return asyncio.run(_run_update(force=False))
+        return run_task(_run_update(force=False))
     except OUIUpdateError:
         raise  # already logged + audited where it happened
     except Exception as exc:  # noqa: BLE001
@@ -258,7 +254,7 @@ def update_oui_database_now(self: object) -> dict[str, Any]:  # type: ignore[typ
     """Manual kick from the Settings UI — ignores the interval gate but
     still requires the feature to be enabled."""
     try:
-        return asyncio.run(_run_update(force=True))
+        return run_task(_run_update(force=True))
     except OUIUpdateError:
         raise  # already logged + audited where it happened
     except Exception as exc:  # noqa: BLE001

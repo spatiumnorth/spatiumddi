@@ -14,7 +14,6 @@ and recorded as ``check_error``, never raised).
 
 from __future__ import annotations
 
-import asyncio
 import socket
 from datetime import UTC, datetime
 
@@ -23,6 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
 from app.db import task_session
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -40,7 +40,7 @@ logger = structlog.get_logger(__name__)
 @module_gated("security.dnsbl")
 def sweep_dnsbl(self) -> dict[str, object]:
     """Daily DNSBL reputation sweep across every public-facing candidate IP."""
-    return asyncio.run(_sweep_async())
+    return run_task(_sweep_async())
 
 
 async def _sweep_async() -> dict[str, object]:

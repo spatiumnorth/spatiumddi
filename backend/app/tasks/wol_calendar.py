@@ -21,7 +21,6 @@ set-reconcile of the current horizon's events.
 
 from __future__ import annotations
 
-import asyncio
 import socket
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -30,14 +29,13 @@ from typing import Any
 import httpx
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.models.wol_schedule import WolCalendar
 from app.services.feature_modules import get_enabled_modules
 from app.services.wol_scheduler.calendar_sync import sync_calendar
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -54,9 +52,7 @@ def _due(calendar: WolCalendar, now: datetime) -> bool:
 
 
 async def _sweep() -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -93,13 +89,11 @@ async def _sweep() -> dict[str, Any]:
                 "errors": errors,
             }
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 async def _sync_one(calendar_id: str) -> dict[str, Any]:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -108,13 +102,13 @@ async def _sync_one(calendar_id: str) -> dict[str, Any]:
                 return {"status": "not_found"}
             return await sync_calendar(db, calendar)
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.wol_calendar.sweep_wol_calendars", bind=True)
 @module_gated("tools.wake_scheduler")
 def sweep_wol_calendars(self: object) -> dict[str, Any]:  # noqa: ARG001
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     if result.get("synced") or result.get("errors"):
         logger.info("wol_calendar_sweep_tick", **result)
     return result
@@ -136,7 +130,7 @@ def sync_wol_calendar(self: object, calendar_id: str) -> dict[str, Any]:  # noqa
     persisting the per-row error state, so ``autoretry_for`` backs off; a parse
     failure is swallowed (no retry).
     """
-    return asyncio.run(_sync_one(calendar_id))
+    return run_task(_sync_one(calendar_id))
 
 
 __all__ = ["sweep_wol_calendars", "sync_wol_calendar"]

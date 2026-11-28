@@ -283,15 +283,16 @@ async def test_task_sessions_ping_their_connection_on_checkout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app import db as db_module
+    from app import task_runtime
 
     seen: dict[str, Any] = {}
-    real = db_module.create_async_engine
+    real = task_runtime.create_async_engine
 
     def _spy(*a: Any, **kw: Any) -> Any:
         seen.update(kw)
         return real(*a, **kw)
 
-    monkeypatch.setattr(db_module, "create_async_engine", _spy)
+    monkeypatch.setattr(task_runtime, "create_async_engine", _spy)
     async with db_module.task_session():
         pass
     assert seen.get("pool_pre_ping") is True

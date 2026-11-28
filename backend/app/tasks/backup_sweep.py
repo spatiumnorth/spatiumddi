@@ -21,7 +21,6 @@ ignored entirely (manual-only).
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -36,6 +35,7 @@ from app.services.backup.runner import (
     reap_stale_backup_run,
     run_backup_for_target,
 )
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -113,7 +113,7 @@ async def _sweep() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.backup_sweep.sweep_backup_targets")
 def sweep_backup_targets() -> dict[str, int]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     if result["fired"] or result["skipped_in_progress"] or result["reaped_stale"]:
         logger.info("backup_sweep_tick", **result)
     return result

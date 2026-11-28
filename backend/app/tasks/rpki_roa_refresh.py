@@ -39,7 +39,6 @@ Idempotent: re-running before any AS is due is a no-op.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -51,6 +50,7 @@ from app.db import task_session
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.task_runtime import run_task
 from app.tasks.module_gate import module_gated
 
 logger = structlog.get_logger(__name__)
@@ -453,7 +453,7 @@ def refresh_due_roas(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
     pace; ``PlatformSettings.rpki_roa_refresh_interval_hours`` controls
     the cadence operator-side without restarting beat."""
     try:
-        return asyncio.run(_run_refresh())
+        return run_task(_run_refresh())
     except Exception as exc:  # noqa: BLE001
         logger.exception("rpki_roa_refresh_failed", error=str(exc))
         raise

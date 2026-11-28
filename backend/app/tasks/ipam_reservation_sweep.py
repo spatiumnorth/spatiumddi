@@ -20,7 +20,6 @@ previously-reserved IP went back into the free pool.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -32,6 +31,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPAddress
 from app.models.settings import PlatformSettings
 from app.services.ipam.utilization import recount_subnets_and_blocks
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -98,6 +98,6 @@ async def _sweep() -> dict[str, int]:
 @celery_app.task(name="app.tasks.ipam_reservation_sweep.sweep_expired_reservations")
 def sweep_expired_reservations() -> dict[str, int]:
     """Celery entry point. Idempotent — safe to retry."""
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("ipam_reservation_sweep_complete", **result)
     return result

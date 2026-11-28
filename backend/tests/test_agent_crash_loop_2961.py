@@ -573,10 +573,10 @@ async def test_the_health_sweeps_no_longer_leave_a_stale_ok(
     db_session.add(dns)
     await db_session.commit()
 
-    monkeypatch.setattr(dhcp_health, "create_async_engine", lambda *a, **kw: _Eng())
+    monkeypatch.setattr(dhcp_health, "task_engine", lambda *a, **kw: _Eng())
     monkeypatch.setattr(dhcp_health, "async_sessionmaker", lambda *a, **kw: _cm)
     await dhcp_health._check_health(kea.id)
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _Eng())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _Eng())
     monkeypatch.setattr(dns_tasks, "async_sessionmaker", lambda *a, **kw: _cm)
     await dns_tasks._dns_agent_stale_sweep_async()
 

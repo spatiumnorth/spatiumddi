@@ -7,18 +7,19 @@ from unittest.mock import patch
 import pytest
 
 from app import db as app_db
+from app import task_runtime
 from app.config import settings
 
 
 async def _captured_kwargs(**session_kwargs):
     seen = {}
-    real = app_db.create_async_engine
+    real = task_runtime.create_async_engine
 
     def spy(*a, **kw):
         seen.update(kw)
         return real(*a, **kw)
 
-    with patch.object(app_db, "create_async_engine", spy):
+    with patch.object(task_runtime, "create_async_engine", spy):
         async with app_db.task_session(**session_kwargs):
             pass
     return seen
@@ -126,7 +127,9 @@ def test_every_app_db_engine_in_tasks_and_services_is_bounded():
         if not ok:
             unbounded.append(f"{rel}:{lineno}")
     # Guard against the scan silently matching nothing.
-    assert seen > 30, seen
+    # (The tasks moved onto ``app.task_runtime``'s engine in #4515, which
+    # ``test_task_engine_has_default_bounds`` pins; what is left is the services.)
+    assert seen > 3, seen
     assert not unbounded, f"engines without connect_args=task_connect_args(): {unbounded}"
 
 
@@ -153,7 +156,7 @@ def test_exempt_engines_still_exist():
         ),
         (
             "app.tasks.snmp_poll",
-            "task_connect_args(command_timeout=settings.task_db_long_command_timeout)",
+            "task_engine(settings.task_db_long_command_timeout)",
         ),
     ],
 )
@@ -173,13 +176,13 @@ async def test_agent_bundle_render_session_gets_long_bound(monkeypatch, db_sessi
     from app.tasks import agent_bundles
 
     seen = {}
-    real = app_db.create_async_engine
+    real = task_runtime.create_async_engine
 
     def spy(*a, **kw):
         seen.update(kw)
         return real(*a, **kw)
 
-    monkeypatch.setattr(app_db, "create_async_engine", spy)
+    monkeypatch.setattr(task_runtime, "create_async_engine", spy)
     result = await agent_bundles._render_once(uuid.uuid4())
     assert result == {"status": "gone"}
     assert seen["connect_args"]["command_timeout"] == settings.task_db_long_command_timeout

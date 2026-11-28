@@ -13,18 +13,16 @@ this module owns the platform-settings gate, the resolver list, the
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks._interval_gate import interval_skip
 
 logger = structlog.get_logger(__name__)
@@ -35,9 +33,7 @@ _SINGLETON_ID = 1
 async def _run_sweep(force: bool = False) -> dict[str, Any]:
     from app.services.ipam.reverse_dns import populate_reverse_dns  # noqa: PLC0415
 
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -79,7 +75,7 @@ async def _run_sweep(force: bool = False) -> dict[str, Any]:
             logger.info("reverse_dns_sweep_completed", forced=force, **counts)
             return {"status": "ran", **counts}
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(name="app.tasks.reverse_dns.sweep_reverse_dns", bind=True)
@@ -87,7 +83,7 @@ def sweep_reverse_dns(self: object, force: bool = False) -> dict[str, Any]:  # t
     """Beat entrypoint (fires every 60 s) + on-demand entrypoint
     (``force=True`` bypasses the enabled-gate and the interval)."""
     try:
-        return asyncio.run(_run_sweep(force=force))
+        return run_task(_run_sweep(force=force))
     except Exception as exc:  # noqa: BLE001
         logger.exception("reverse_dns_sweep_failed", error=str(exc))
         raise

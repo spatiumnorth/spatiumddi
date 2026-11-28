@@ -15,7 +15,6 @@ regardless of when the sweep runs.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import structlog
@@ -25,6 +24,7 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.time_bound_grant import TimeBoundGrant
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -77,6 +77,6 @@ async def _sweep() -> dict[str, int]:
 @celery_app.task(name="app.tasks.time_bound_grant_sweep.sweep_expired_grants")
 def sweep_expired_grants() -> dict[str, int]:
     """Celery entry point. Idempotent — safe to retry."""
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("time_bound_grant_sweep_complete", **result)
     return result

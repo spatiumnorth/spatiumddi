@@ -48,7 +48,7 @@ class _FakeEngine:
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, module: Any, ps: Any) -> None:
-    monkeypatch.setattr(module, "create_async_engine", lambda *a, **k: _FakeEngine())
+    monkeypatch.setattr(module, "task_engine", lambda *a, **k: _FakeEngine())
     monkeypatch.setattr(module, "async_sessionmaker", lambda *a, **k: lambda: _FakeSession(ps))
 
     async def _enabled(*_a: Any, **_k: Any) -> bool:

@@ -66,7 +66,7 @@ class _FakeEngine:
 
 def _install_task_sessions(monkeypatch: pytest.MonkeyPatch) -> list[AsyncSession]:
     sessions: list[AsyncSession] = []
-    monkeypatch.setattr(task, "create_async_engine", lambda *a, **k: _FakeEngine())
+    monkeypatch.setattr(task, "task_engine", lambda *a, **k: _FakeEngine())
 
     def factory(*a: Any, **k: Any) -> Any:
         def make() -> Any:

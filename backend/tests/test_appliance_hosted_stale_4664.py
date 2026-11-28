@@ -67,9 +67,9 @@ async def test_appliance_hosted_rows_flip_unreachable_when_agent_silent(
     async def _cm():  # type: ignore[no-untyped-def]
         yield db_session
 
-    monkeypatch.setattr(dhcp_health, "create_async_engine", lambda *a, **kw: _Eng())
+    monkeypatch.setattr(dhcp_health, "task_engine", lambda *a, **kw: _Eng())
     monkeypatch.setattr(dhcp_health, "async_sessionmaker", lambda *a, **kw: _cm)
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _Eng())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _Eng())
     monkeypatch.setattr(dns_tasks, "async_sessionmaker", lambda *a, **kw: _cm)
     await dhcp_health._check_health(kea.id)
     await dns_tasks._dns_agent_stale_sweep_async()

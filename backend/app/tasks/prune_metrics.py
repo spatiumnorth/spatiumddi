@@ -12,7 +12,6 @@ the default queue.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -24,6 +23,7 @@ from app.config import settings
 from app.db import task_session
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.settings import PlatformSettings
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -60,6 +60,6 @@ async def _sweep() -> dict[str, int]:
 
 @celery_app.task(name="app.tasks.prune_metrics.prune_metric_samples")
 def prune_metric_samples() -> dict[str, int]:
-    result = asyncio.run(_sweep())
+    result = run_task(_sweep())
     logger.info("metric_samples_pruned", **result)
     return result

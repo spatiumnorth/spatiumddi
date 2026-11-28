@@ -14,7 +14,6 @@ automatically.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -33,6 +32,7 @@ from app.services.audit_chain import (
     checkpoint_still_valid,
     verify_chain,
 )
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -284,4 +284,4 @@ async def _async_verify_and_alert() -> dict:
 def verify_audit_chain(self: object) -> dict:  # type: ignore[type-arg]
     """Celery entry point. Runs nightly via beat; idempotent on its
     own — re-runs are cheap and self-resolving when the break clears."""
-    return asyncio.run(_async_verify_and_alert())
+    return run_task(_async_verify_and_alert())

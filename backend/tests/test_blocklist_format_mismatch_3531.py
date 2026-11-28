@@ -142,7 +142,7 @@ async def test_refresh_refuses_wrong_format_and_keeps_entries(
         "GuardedTransport",
         lambda **kw: httpx.MockTransport(lambda r: httpx.Response(200, text=ADBLOCK)),
     )
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _cm():  # type: ignore[no-untyped-def]
@@ -190,7 +190,7 @@ async def test_first_refresh_of_a_wrong_format_list_says_why(
         "GuardedTransport",
         lambda **kw: httpx.MockTransport(lambda r: httpx.Response(200, text=hosts)),
     )
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _cm():  # type: ignore[no-untyped-def]
@@ -245,7 +245,7 @@ async def test_refresh_of_adblock_list_refuses_hosts_or_domains_and_keeps_entrie
         "GuardedTransport",
         lambda **kw: httpx.MockTransport(lambda r: httpx.Response(200, text=content)),
     )
-    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+    monkeypatch.setattr(dns_tasks, "task_engine", lambda *a, **kw: _NullEngine())
 
     @contextlib.asynccontextmanager
     async def _cm():  # type: ignore[no-untyped-def]

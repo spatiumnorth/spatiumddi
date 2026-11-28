@@ -19,7 +19,6 @@ orchestrator so, and it then ends the order instead of re-raising (#1686).
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -32,6 +31,7 @@ from app.celery_app import celery_app
 from app.core.task_lock import single_flight
 from app.db import task_session
 from app.services.acme_client.orchestrator import run_order
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -66,7 +66,7 @@ def run_acme_order(self: Any, order_id: str) -> str:  # type: ignore[type-arg]
     # orchestrator, which then ends the order on a network error rather
     # than leave it ``processing`` for a retry that never comes (#1686).
     final_attempt = self.max_retries is not None and self.request.retries >= self.max_retries
-    return asyncio.run(_run(order_id, final_attempt=final_attempt))
+    return run_task(_run(order_id, final_attempt=final_attempt))
 
 
 async def _run(order_id: str, *, final_attempt: bool = False) -> str:
@@ -104,7 +104,7 @@ def renew_due_certificates(self: object) -> str:  # type: ignore[type-arg]
     and alerted on instead of minting an order that can never succeed.
     Gated on ``acme_enabled`` + ``acme_auto_renew``.
     """
-    return asyncio.run(_renew())
+    return run_task(_renew())
 
 
 async def _renew() -> str:
@@ -383,7 +383,7 @@ def sweep_stale_acme_txt_records(self: object) -> str:  # type: ignore[type-arg]
     left behind). Runs ``services.acme.sweep_stale_txt_records``, which
     had no caller before this task existed.
     """
-    return asyncio.run(_sweep_stale_txt())
+    return run_task(_sweep_stale_txt())
 
 
 async def _sweep_stale_txt() -> str:

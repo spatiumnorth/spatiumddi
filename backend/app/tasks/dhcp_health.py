@@ -28,16 +28,15 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.celery_app import celery_app
-from app.config import settings
-from app.db import task_connect_args
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
 from app.models.settings import PlatformSettings
 from app.services.agents.daemon_state import forget_stale_ok
 from app.services.feature_modules import is_module_enabled
+from app.task_runtime import release_task_engine, run_task, task_engine
 from app.tasks._interval_gate import interval_skip
 from app.tasks.module_gate import module_gated
 
@@ -65,9 +64,7 @@ async def _probe_agentless(server: DHCPServer) -> tuple[bool, str | None]:
 
 
 async def _check_health(server_id: uuid.UUID) -> None:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -158,7 +155,7 @@ async def _check_health(server_id: uuid.UUID) -> None:
                 host=fresh.host,
             )
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
 
 
 @celery_app.task(
@@ -170,7 +167,7 @@ async def _check_health(server_id: uuid.UUID) -> None:
 def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ignore[type-arg]
     """Idempotent single-server health check."""
     try:
-        asyncio.run(_check_health(uuid.UUID(server_id)))
+        run_task(_check_health(uuid.UUID(server_id)))
     except Exception as exc:  # noqa: BLE001
         logger.warning("dhcp_health_check_error", server_id=server_id, error=str(exc))
         raise self.retry(exc=exc, countdown=30) from exc  # type: ignore[attr-defined]
@@ -198,13 +195,11 @@ async def _check_many(server_ids: list[uuid.UUID]) -> None:
 )
 def check_agentless_dhcp_servers_health(server_ids: list[str]) -> None:
     """Idempotent batch health check for agentless servers (#4829)."""
-    asyncio.run(_check_many([uuid.UUID(s) for s in server_ids]))
+    run_task(_check_many([uuid.UUID(s) for s in server_ids]))
 
 
 async def _enqueue_all() -> None:
-    engine = create_async_engine(
-        settings.database_url, future=True, connect_args=task_connect_args()
-    )
+    engine = task_engine()
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as db:
@@ -231,7 +226,7 @@ async def _enqueue_all() -> None:
                         ps.dhcp_health_last_run_at = now
                         await db.commit()
     finally:
-        await engine.dispose()
+        await release_task_engine(engine)
     for sid in ids:
         check_dhcp_server_health.delay(sid)
     # #4829 — one task for every due agentless server, probed concurrently.
@@ -248,4 +243,4 @@ def check_all_dhcp_servers_health(self: object) -> None:  # type: ignore[type-ar
     servers are enqueued on every tick; agentless servers only once
     ``PlatformSettings.dhcp_health_interval_seconds`` has elapsed (#4759).
     """
-    asyncio.run(_enqueue_all())
+    run_task(_enqueue_all())

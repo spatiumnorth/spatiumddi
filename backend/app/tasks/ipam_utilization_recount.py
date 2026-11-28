@@ -34,7 +34,6 @@ hourly.
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 from typing import Any
 
@@ -52,6 +51,7 @@ from app.services.ipam.utilization import (
     block_subnet_contribution_sql,
     block_utilization_percent,
 )
+from app.task_runtime import run_task
 
 logger = structlog.get_logger(__name__)
 
@@ -245,7 +245,7 @@ def recount_ipam_utilization() -> dict[str, int]:
     """Celery beat entrypoint — fires hourly. Idempotent: corrects cached
     subnet/block utilization counters that drifted from the live row counts,
     writing (and auditing) only what changed."""
-    result = asyncio.run(_run_recount())
+    result = run_task(_run_recount())
     logger.info(
         "ipam_utilization_recount_completed",
         subnets_corrected=result["subnets_corrected"],
