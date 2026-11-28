@@ -15,7 +15,7 @@ afterEach(cleanup);
 
 const group = { id: "g1", name: "cloud" } as unknown as DNSServerGroup;
 
-function show(queued: boolean) {
+function show(queued: boolean, pushErrors: string[] = []) {
   const result = {
     servers_attempted: 1,
     servers_succeeded: 1,
@@ -51,7 +51,7 @@ function show(queued: boolean) {
               imported: 0,
               pushed: 250,
               server_records: 0,
-              push_errors: [],
+              push_errors: pushErrors,
               queued_for_agent: queued,
               error: null,
             },
@@ -60,7 +60,7 @@ function show(queued: boolean) {
       },
     ],
   };
-  render(
+  return render(
     <QueryClientProvider client={new QueryClient()}>
       <MemoryRouter>
         <SyncWithServersResultModal
@@ -87,5 +87,13 @@ describe("Sync with servers modal queued push (#3817)", () => {
     show(false);
     expect(screen.queryByText("Queued for delivery")).toBeNull();
     expect(screen.getByText("ok")).toBeTruthy();
+  });
+
+  it("announces records a server refused inside a synced zone (#4942)", () => {
+    show(false, ["A www: REFUSED"]);
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("A www: REFUSED");
+    expect(alert.textContent).toContain("big.example.com");
+    expect(document.querySelector("details")?.hasAttribute("open")).toBe(true);
   });
 });

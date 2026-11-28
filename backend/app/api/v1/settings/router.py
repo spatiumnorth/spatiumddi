@@ -61,6 +61,7 @@ from app.models.settings import (
 )
 from app.services import audit_forward as audit_forward_svc
 from app.services import feature_modules as fm_svc
+from app.services import log_stream_forward
 from app.services.api_token_scopes import token_write
 from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import (
@@ -165,6 +166,8 @@ class SettingsResponse(BaseModel):
     dhcp_pull_leases_enabled: bool
     dhcp_pull_leases_interval_seconds: int
     dhcp_pull_leases_last_run_at: datetime | None
+    dhcp_health_interval_seconds: int
+    dhcp_mac_blocks_sync_interval_seconds: int
     audit_forward_syslog_enabled: bool
     audit_forward_syslog_host: str
     audit_forward_syslog_port: int
@@ -1060,6 +1063,8 @@ SETTINGS_DELEGATE_WRITABLE: frozenset[str] = frozenset(
         "dns_pull_from_server_interval_minutes",
         "dhcp_pull_leases_enabled",
         "dhcp_pull_leases_interval_seconds",
+        "dhcp_health_interval_seconds",
+        "dhcp_mac_blocks_sync_interval_seconds",
         "dhcp_default_lease_time",
         "dhcp_default_domain_name",
         "dhcp_default_domain_search",
@@ -1121,6 +1126,8 @@ class SettingsUpdate(BaseModel):
     dns_pull_from_server_interval_minutes: int | None = None
     dhcp_pull_leases_enabled: bool | None = None
     dhcp_pull_leases_interval_seconds: int | None = None
+    dhcp_health_interval_seconds: int | None = None
+    dhcp_mac_blocks_sync_interval_seconds: int | None = None
     audit_forward_syslog_enabled: bool | None = None
     audit_forward_syslog_host: str | None = None
     audit_forward_syslog_port: int | None = None
@@ -1827,6 +1834,15 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Must be >= 10 (Celery beat ticks every 10 seconds)")
         return v
 
+    @field_validator("dhcp_health_interval_seconds", "dhcp_mac_blocks_sync_interval_seconds")
+    @classmethod
+    def validate_dhcp_agentless_seconds(cls, v: int | None) -> int | None:
+        # Beat ticks every 60 s -- a shorter interval can't be honoured.
+        # Cap at 1 h: slower and a dead server would go unnoticed all day.
+        if v is not None and not (60 <= v <= 3600):
+            raise ValueError("Must be between 60 and 3600 seconds")
+        return v
+
     @field_validator("domain_whois_interval_hours")
     @classmethod
     def validate_domain_whois_interval(cls, v: int | None) -> int | None:
@@ -2144,6 +2160,41 @@ def _is_section_audited(field: str) -> bool:
     return field in _SECTION_AUDITED_FIELDS or field.startswith(_SECTION_AUDITED_PREFIXES)
 
 
+class SettingsPublicResponse(BaseModel):
+    """What ``GET /settings`` returns to a caller without ``read`` on
+    ``settings``: only the fields the console shell and the ordinary
+    (non-Settings) pages read. An explicit allow-list, so a field added to
+    ``SettingsResponse`` stays admin-only until it is listed here too."""
+
+    app_title: str
+    session_timeout_minutes: int
+    auto_logout_minutes: int
+    utilization_warn_threshold: int
+    utilization_critical_threshold: int
+    utilization_max_prefix_ipv4: int
+    utilization_max_prefix_ipv6: int
+    subnet_tree_default_expanded_depth: int
+    dns_default_ttl: int
+    dns_default_zone_type: str
+    dns_recursive_by_default: bool
+    dhcp_default_dns_servers: list[str]
+    dhcp_default_domain_name: str
+    dhcp_default_domain_search: list[str]
+    dhcp_default_ntp_servers: list[str]
+    dhcp_default_lease_time: int
+    integration_kubernetes_enabled: bool
+    integration_docker_enabled: bool
+    integration_proxmox_enabled: bool
+    integration_tailscale_enabled: bool
+    integration_unifi_enabled: bool
+    integration_cloud_enabled: bool
+    integration_opnsense_enabled: bool
+    integration_netbird_enabled: bool
+    integration_panos_enabled: bool
+    integration_fortinet_enabled: bool
+    integration_meraki_enabled: bool
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -2201,9 +2252,25 @@ async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResp
     )
 
 
-@router.get("", response_model=SettingsResponse)
-async def get_settings(current_user: CurrentUser, db: DB) -> SettingsResponse:
-    return await _settings_response(db, await _get_or_create(db))
+def _may_read_settings(user: Any) -> bool:
+    return user_has_permission(user, "read", "settings") or user_has_permission(
+        user, "write", "settings"
+    )
+
+
+@router.get("", response_model=SettingsResponse | SettingsPublicResponse)
+async def get_settings(
+    current_user: CurrentUser, db: DB
+) -> SettingsResponse | SettingsPublicResponse:
+    """The full settings for a caller holding ``read`` (or ``write``, which
+    the Settings page needs to edit) on ``settings``; every other signed-in
+    caller gets the reduced ``SettingsPublicResponse``."""
+    full = await _settings_response(db, await _get_or_create(db))
+    if _may_read_settings(current_user):
+        return full
+    return SettingsPublicResponse.model_validate(
+        full.model_dump(include=set(SettingsPublicResponse.model_fields))
+    )
 
 
 @router.get("/defaults")
@@ -3065,7 +3132,10 @@ async def update_settings(
 # ── Dedicated resolver endpoints (issue #158) ───────────────────────────────────
 
 
-@router.get("/resolver", response_model=ResolverSettingsResponse)
+@router.get(
+    "/resolver",
+    response_model=ResolverSettingsResponse,
+)
 async def get_resolver_settings(current_user: CurrentUser, db: DB) -> ResolverSettingsResponse:
     """Scoped read of just the appliance DNS-resolver config (issue #158).
 
@@ -3074,6 +3144,11 @@ async def get_resolver_settings(current_user: CurrentUser, db: DB) -> ResolverSe
     ``SettingsResponse`` too); this endpoint exists per the spec so the form
     can fetch just its own state.
     """
+    if not _may_read_settings(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'read' on 'settings'",
+        )
     settings = await _get_or_create(db)
     return ResolverSettingsResponse.model_validate(settings)
 
@@ -3222,6 +3297,9 @@ class OUIStatusResponse(BaseModel):
     interval_hours: int
     last_updated_at: datetime | None
     vendor_count: int
+    # #4800 — the newest failed refresh since the last success, else null.
+    last_error: str | None = None
+    last_error_at: datetime | None = None
 
 
 class OUIRefreshResponse(BaseModel):
@@ -3252,11 +3330,17 @@ class OUITaskStatusResponse(BaseModel):
 async def get_oui_status(current_user: CurrentUser, db: DB) -> OUIStatusResponse:
     ps = await _get_or_create(db)
     count = (await db.execute(select(func.count(OUIVendor.prefix)))).scalar_one()
+    from app.tasks.oui_update import last_failure  # noqa: PLC0415
+
+    failed = await last_failure(db, ps.oui_last_updated_at)
+    nv = (failed.new_value or {}) if failed is not None else {}
     return OUIStatusResponse(
         enabled=ps.oui_lookup_enabled,
         interval_hours=ps.oui_update_interval_hours,
         last_updated_at=ps.oui_last_updated_at,
         vendor_count=int(count),
+        last_error=(nv.get("detail") or nv.get("reason")) if failed is not None else None,
+        last_error_at=failed.timestamp if failed is not None else None,
     )
 
 
@@ -3595,6 +3679,18 @@ class AuditTargetBody(BaseModel):
     # filter
     min_severity: str | None = None
     resource_types: list[str] | None = None
+    # log streams (#4545). Syslog targets only; both off unless asked for.
+    stream_dns_query_log: bool = False
+    stream_dhcp_activity_log: bool = False
+    log_stream_filters: dict[str, list[str]] | None = None
+    dns_query_sample_percent: int = Field(default=100, ge=1, le=100)
+
+    @field_validator("log_stream_filters")
+    @classmethod
+    def _valid_log_stream_filters(
+        cls, v: dict[str, list[str]] | None
+    ) -> dict[str, list[str]] | None:
+        return log_stream_forward.normalize_filters(v)
 
     @field_validator("kind")
     @classmethod
@@ -3659,6 +3755,11 @@ class AuditTargetBody(BaseModel):
             smtp_from_address=self.smtp_from_address,
             smtp_to_addresses=self.smtp_to_addresses,
         )
+        _check_log_streams(
+            self.kind,
+            self.format,
+            self.stream_dns_query_log or self.stream_dhcp_activity_log,
+        )
         if self.kind == "webhook":
             # ``url`` is write-only (#1502): ``None`` keeps the stored URL,
             # so only an explicit blank is refused here. A webhook with no
@@ -3666,6 +3767,21 @@ class AuditTargetBody(BaseModel):
             if self.url is not None and not self.url.strip():
                 raise ValueError("url is required for a webhook target")
         return self
+
+
+def _check_log_streams(kind: str, fmt: str, any_stream: bool) -> None:
+    """A log stream needs a syslog target in a format that carries it (#4545)."""
+    if not any_stream:
+        return
+    if kind != "syslog":
+        raise ValueError(
+            "the DNS query log and DHCP activity log can only be forwarded to a syslog target"
+        )
+    if fmt not in log_stream_forward.STREAM_FORMATS:
+        raise ValueError(
+            f"log streams need one of {list(log_stream_forward.STREAM_FORMATS)} "
+            f"as the format, not {fmt!r}"
+        )
 
 
 def _check_kind_config(
@@ -3748,6 +3864,12 @@ class AuditTargetResponse(BaseModel):
     smtp_reply_to: str
     min_severity: str | None
     resource_types: list[str] | None
+    stream_dns_query_log: bool
+    stream_dhcp_activity_log: bool
+    log_stream_filters: dict[str, list[str]] | None
+    dns_query_sample_percent: int
+    log_stream_dropped_total: int
+    log_stream_last_drop_at: datetime | None
     created_at: datetime
     modified_at: datetime
 
@@ -3778,6 +3900,12 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
         smtp_reply_to=t.smtp_reply_to or "",
         min_severity=t.min_severity,
         resource_types=t.resource_types,
+        stream_dns_query_log=bool(t.stream_dns_query_log),
+        stream_dhcp_activity_log=bool(t.stream_dhcp_activity_log),
+        log_stream_filters=t.log_stream_filters,
+        dns_query_sample_percent=int(t.dns_query_sample_percent or 100),
+        log_stream_dropped_total=int(t.log_stream_dropped_total or 0),
+        log_stream_last_drop_at=t.log_stream_last_drop_at,
         created_at=t.created_at,
         modified_at=t.modified_at,
     )
@@ -3803,9 +3931,19 @@ _AUDIT_PLAIN_FIELDS = (
     "smtp_reply_to",
     "min_severity",
     "resource_types",
+    "stream_dns_query_log",
+    "stream_dhcp_activity_log",
+    "log_stream_filters",
+    "dns_query_sample_percent",
 )
 # Columns that are NULL-able; an explicit null on an update clears them.
-_AUDIT_NULLABLE_FIELDS = {"ca_cert_pem", "smtp_to_addresses", "min_severity", "resource_types"}
+_AUDIT_NULLABLE_FIELDS = {
+    "ca_cert_pem",
+    "smtp_to_addresses",
+    "min_severity",
+    "resource_types",
+    "log_stream_filters",
+}
 
 
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
@@ -3860,6 +3998,14 @@ def _check_merged_target(t: AuditForwardTarget, body: AuditTargetUpdate) -> None
             smtp_port=int(merged("smtp_port") or 0),
             smtp_from_address=merged("smtp_from_address") or "",
             smtp_to_addresses=list(to_addrs) if to_addrs else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        _check_log_streams(
+            kind,
+            merged("format"),
+            bool(merged("stream_dns_query_log") or merged("stream_dhcp_activity_log")),
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -3957,6 +4103,10 @@ def _forward_snapshot(t: AuditForwardTarget) -> dict:
         "smtp_reply_to": t.smtp_reply_to,
         "min_severity": t.min_severity,
         "resource_types": t.resource_types,
+        "stream_dns_query_log": t.stream_dns_query_log,
+        "stream_dhcp_activity_log": t.stream_dhcp_activity_log,
+        "log_stream_filters": t.log_stream_filters,
+        "dns_query_sample_percent": t.dns_query_sample_percent,
     }
 
 
@@ -4007,6 +4157,7 @@ async def create_audit_target(
     try:
         await db.commit()
         targets_cache.invalidate()
+        log_stream_forward.invalidate()
     except Exception as exc:  # noqa: BLE001 — name collisions land here
         await db.rollback()
         raise HTTPException(
@@ -4036,6 +4187,7 @@ async def update_audit_target(
     try:
         await db.commit()
         targets_cache.invalidate()
+        log_stream_forward.invalidate()
     except Exception as exc:  # noqa: BLE001
         await db.rollback()
         raise HTTPException(
@@ -4054,6 +4206,7 @@ async def delete_audit_target(target_id: uuid.UUID, current_user: SuperAdmin, db
     await db.delete(row)
     await db.commit()
     targets_cache.invalidate()
+    log_stream_forward.invalidate()
 
 
 @router.post("/audit-forward-targets/{target_id}/test")
@@ -4327,6 +4480,11 @@ _INFLUX_PLAIN_FIELDS = (
 )
 
 
+def _influx_secret_name(version: str) -> str:
+    """The credential a version authenticates with: v1 a password, v2/v3 a token."""
+    return "password" if version == "v1" else "token"
+
+
 def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]:
     """Apply ``body`` to ``t``; return which secrets were set or cleared.
 
@@ -4340,6 +4498,10 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]
     from app.core.crypto import encrypt_str
 
     sent = body.model_fields_set if isinstance(body, InfluxDBTargetUpdate) else None
+    stored_before = {
+        "password": t.password_encrypted is not None,
+        "token": t.token_encrypted is not None,
+    }
     for field in _INFLUX_PLAIN_FIELDS:
         if sent is not None and field not in sent:
             continue
@@ -4362,6 +4524,18 @@ def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> list[str]
     elif body.clear_token and t.token_encrypted:
         t.token_encrypted = None
         secret_changes.append("token_cleared")
+    # A target never keeps the secret its version does not use (#4889): its
+    # form neither shows nor clears it, and the URL-change check only asks for
+    # the one in use. Dropped on every create and update, so a version switch,
+    # a create that carried both, and a row saved before this fix all end up
+    # holding one secret at most.
+    unused = "token" if _influx_secret_name(t.version) == "password" else "password"
+    if f"{unused}_set" in secret_changes:
+        secret_changes.remove(f"{unused}_set")
+    if getattr(t, f"{unused}_encrypted") is not None:
+        setattr(t, f"{unused}_encrypted", None)
+        if stored_before[unused] and f"{unused}_cleared" not in secret_changes:
+            secret_changes.append(f"{unused}_cleared")
     return secret_changes
 
 
@@ -4489,11 +4663,22 @@ async def update_influxdb_target(
         sent_fields["password"] = ""
     if body.clear_token:
         sent_fields["token"] = ""
+    # A switch between v1 and v2/v3 drops the other version's secret (#4889),
+    # so only the secret the target ends up using has to be re-entered.
+    new_version = sent_fields.get("version") or row.version
+    kept = _influx_secret_name(new_version)
     require_secret_with_destination_change(
         row,
         sent_fields,
         destination=("url",),
-        secrets={"password": row.password_encrypted, "token": row.token_encrypted},
+        secrets={
+            name: stored
+            for name, stored in (
+                ("password", row.password_encrypted),
+                ("token", row.token_encrypted),
+            )
+            if name == kept
+        },
         # A blank never clears here (only the flag does), so it keeps the stored
         # value and is not a re-entry.
         blank_keeps=[

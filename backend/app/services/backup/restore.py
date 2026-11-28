@@ -50,7 +50,6 @@ import asyncio
 import os
 import secrets
 import tempfile
-import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +58,8 @@ from typing import Any
 import asyncpg
 import structlog
 
+from app.core.restore_gate import RESTORE_LOCK_HOLDERS_SQL, RESTORE_LOCK_KEY
+from app.services.backup import appliance_identity
 from app.services.backup.archive import (
     BackupArchiveError,
     _pg_env_from_url,
@@ -148,6 +149,14 @@ class RestoreOutcome:
     # Backup targets whose ``in_progress`` claim came back inside the
     # archive and was settled (#2097). Empty when none.
     reconciled_backup_targets: list[dict[str, Any]] = field(default_factory=list)
+    # Sessions the restore ended (sessions): the archive's copy of the table
+    # replaces the live one, every row in it is set to revoked, and this counts
+    # the ones that were live (not revoked, not expired) at that moment.
+    # ``None`` when the restore did not reach the table, ``-1`` when ending
+    # them failed (a warning says so).
+    sessions_ended: int | None = None
+    # Appliance rows of this install kept across the restore (#4677).
+    adopted_appliances: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -1027,26 +1036,71 @@ async def _collect_post_restore_warnings(db_url: str) -> list[str]:
     ]
 
 
-#: Session-level Postgres advisory lock serialising restores (#1571).
-#: Neither restore endpoint took any lock, so two concurrent restores
-#: interleaved their schema clear and replay — each replaying over
-#: the other's half-cleared schema. Fixed key (this is a whole-install
-#: operation, there is only ever one restore at a time), derived from
-#: a label rather than hand-picked so it cannot collide with the
-#: crc32-based per-resource keys elsewhere by accident.
-_RESTORE_LOCK_KEY = zlib.crc32(b"spatiumddi:backup-restore") - 2**31
+#: Session-level Postgres advisory lock serialising restores (#1571). The key
+#: lives in ``app.core.restore_gate``, which the chart's ``wait-for-migrate``
+#: init container also reads (#4678).
+_RESTORE_LOCK_KEY = RESTORE_LOCK_KEY
 
 #: The backend holding the restore lock, if any: the running restore's own
 #: lock connection, which ``_terminate_other_db_connections`` must not end
 #: (#1648). ``pg_locks`` shows a bigint key as its high half in ``classid``
 #: and its low half in ``objid``, with ``objsubid`` 1. ``pid IS NOT NULL``
 #: keeps a prepared transaction's lock from turning ``NOT IN`` into NULL.
-_RESTORE_LOCK_HOLDERS_SQL = (
-    "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted "
-    "AND pid IS NOT NULL AND objsubid = 1 "
-    f"AND ((classid::bigint << 32) | objid::bigint) = {_RESTORE_LOCK_KEY} "
-    "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
-)
+_RESTORE_LOCK_HOLDERS_SQL = RESTORE_LOCK_HOLDERS_SQL
+
+
+_LIVE_SESSIONS_SQL = "SELECT count(*) FROM user_session WHERE NOT revoked AND expires_at > now()"
+
+
+async def _end_restored_sessions(db_url: str) -> int:
+    """Revoke every ``user_session`` row the replay brought back.
+
+    The archive's copy of the table replaces the live one, so a session that
+    was revoked after the archive was taken comes back live, and so does every
+    session that was live when the archive was made. A restore ends every
+    session, as its notice says. Access tokens are accepted only while the
+    row their ``jti`` names is live, and a refresh cookie only while the row
+    its hash names is live and not rotated, so revoking the rows covers both;
+    nothing else caches either decision (the idle timeout cache holds a
+    setting, not a session). Rotation markers are cleared too, so no row can
+    stand for a successor inside the rotation grace window.
+
+    Every row is revoked and cleared, but the number returned counts only the
+    sessions that were live at that moment: not already revoked and not past
+    ``expires_at``. The archive's table also holds rows nobody could use. Runs
+    on its own connection, like the
+    other post-replay steps, because the app's pool was disposed. It runs
+    immediately after the replay, so an older archive's table may lack the
+    rotation columns; those rows are revoked without them.
+    """
+    from sqlalchemy import text  # noqa: PLC0415
+    from sqlalchemy.exc import ProgrammingError  # noqa: PLC0415
+    from sqlalchemy.ext.asyncio import create_async_engine  # noqa: PLC0415
+    from sqlalchemy.pool import NullPool  # noqa: PLC0415
+
+    from app.db import task_connect_args  # noqa: PLC0415
+
+    engine = create_async_engine(db_url, poolclass=NullPool, connect_args=task_connect_args())
+    try:
+        try:
+            async with engine.begin() as conn:
+                live = await conn.scalar(text(_LIVE_SESSIONS_SQL))
+                await conn.execute(
+                    text(
+                        "UPDATE user_session SET revoked = true, "
+                        "rotated_at = NULL, rotated_to_id = NULL"
+                    )
+                )
+                return int(live or 0)
+        except ProgrammingError:
+            # An archive older than the rotation columns, before the migration
+            # has added them: there are no markers to clear, only rows to end.
+            async with engine.begin() as conn:
+                live = await conn.scalar(text(_LIVE_SESSIONS_SQL))
+                await conn.execute(text("UPDATE user_session SET revoked = true"))
+                return int(live or 0)
+    finally:
+        await engine.dispose()
 
 
 async def restore_lock_held(db) -> bool:
@@ -1317,6 +1371,16 @@ async def _apply_backup_restore_inner(
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
     cascade_widened: list[str] = []
+    # The appliance registry is replaced by a full restore, and by a selective
+    # one whose TRUNCATE ... CASCADE reaches it. Capture the live rows first
+    # so the running supervisor stays known to the restored database (#4677).
+    identity_snapshot = None
+    identity_snapshot_error: str | None = None
+    try:
+        identity_snapshot = await appliance_identity.snapshot(db_url)
+    except Exception as exc:  # noqa: BLE001 — never block a restore on the capture
+        logger.error("backup_restore_identity_snapshot_failed", error=str(exc))
+        identity_snapshot_error = str(exc)
 
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
         if selective:
@@ -1377,6 +1441,25 @@ async def _apply_backup_restore_inner(
             # Streamed from the bytes already in memory: staging them on
             # disk only to read them back cost a full write of the dump.
             await _run_psql(db_bytes, db_url)
+
+    # A restore ends every session, as its notice says (sessions). Right after
+    # the replay commits, before the migration, the fold and the rewrap: a
+    # restored row is accepted from that commit until it is revoked, and those
+    # steps can take minutes. Only when the replay reached ``user_session``: a
+    # selective restore of other sections leaves the live table alone.
+    sessions_ended: int | None = None
+    sessions_warning: str | None = None
+    if restored_tables is None or "user_session" in restored_tables:
+        try:
+            sessions_ended = await _end_restored_sessions(db_url)
+        except Exception as exc:  # noqa: BLE001 — the data is in; say so loudly
+            logger.error("backup_restore_end_sessions_failed", error=str(exc))
+            sessions_ended = -1
+            sessions_warning = (
+                "Could not end the sessions restored from the archive "
+                f"({exc}). Sign-ins from before the restore may still be accepted; "
+                "end them from Administration, Sessions."
+            )
 
     # Phase 6: alembic upgrade-on-restore. The destination DB is now
     # at the source's schema head; if local code expects a newer
@@ -1477,6 +1560,26 @@ async def _apply_backup_restore_inner(
             rewrap_outcome.aborted = True
             rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
+    # Phase 7b (#4677): put this install's own appliance identity back.
+    adoption = appliance_identity.AdoptionOutcome()
+    if identity_snapshot_error is not None:
+        adoption.warnings.append(
+            "This install's appliance identity could not be read before the restore "
+            f"({identity_snapshot_error}), so it was not kept. The appliance will be refused "
+            "by the control plane until it is paired again."
+        )
+    if identity_snapshot is not None and (
+        restored_tables is None or "appliance" in restored_tables
+    ):
+        try:
+            adoption = await appliance_identity.adopt(db_url, identity_snapshot)
+        except Exception as exc:  # noqa: BLE001 — the data is in
+            logger.error("backup_restore_identity_adopt_failed", error=str(exc))
+            adoption.warnings.append(
+                f"This install's appliance identity could not be kept ({exc}). The appliance "
+                "will be refused by the control plane until it is paired again."
+            )
+
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
     # DNSSEC-enabled zones and surface a registrar-republish
     # advisory. Failure here is non-fatal — the data is in.
@@ -1525,11 +1628,15 @@ async def _apply_backup_restore_inner(
                 f"archive ({exc}); they free themselves after 2 hours."
             )
 
+    if sessions_warning:
+        post_warnings.append(sessions_warning)
+
     # The override is the first thing an operator should read back.
     if schema_override_warning:
         post_warnings.insert(0, schema_override_warning)
     if fold_warning:
         post_warnings.append(fold_warning)
+    post_warnings.extend(adoption.warnings)
 
     # Say plainly that the restore reached past the ticked sections.
     # An operator who picked "DNS" and finds their IPAM rows reverted
@@ -1594,4 +1701,6 @@ async def _apply_backup_restore_inner(
         rewrap=rewrap_outcome,
         warnings=post_warnings,
         reconciled_backup_targets=reconciled,
+        sessions_ended=sessions_ended,
+        adopted_appliances=adoption.adopted,
     )

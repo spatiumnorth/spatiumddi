@@ -92,14 +92,18 @@ RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
  && setcap cap_net_bind_service=+ep /usr/sbin/pdns_server \
     # uid/gid PINNED (#50). The dnsdist front container reads the DoT/DoH
     # listener key this image writes at mode 0600 through a shared volume,
-    # so the two must agree on the uid. Both landed on 101:102 by accident
-    # of package ordering; pinning makes a future package that creates a
+    # so the two must agree on the uid. They used to land on 101:102 by
+    # accident of package ordering; pinning makes a future package that creates a
     # system user fail the BUILD loudly instead of silently shifting the
     # uid and breaking TLS at runtime (dnsdist --check-config never opens
     # the PEM, so the failure would only surface as a fatal daemon start).
-    # Also matches the on-disk ownership of existing state volumes.
- && addgroup -S -g 102 spatium \
- && adduser -S -u 101 -G spatium spatium \
+    # 10002:10002, outside the host's system-account range: on the appliance
+    # the state and data dirs are hostPaths on the host, where 101/102 belong
+    # to host system accounts. Existing state (owned 101:102) is re-owned by
+    # the entrypoint's ``chown -R`` on the first start after an upgrade.
+    # dnsdist pins the same ids; powerdns.py documents the dependency.
+ && addgroup -S -g 10002 spatium \
+ && adduser -S -u 10002 -G spatium spatium \
  && mkdir -p /var/lib/spatium-dns-agent /var/lib/powerdns /var/run/pdns \
  && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/lib/powerdns /var/run/pdns \
  && { \

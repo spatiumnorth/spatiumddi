@@ -776,7 +776,8 @@ async def _module_enabled(db: DB) -> bool:
     stmt = select(PlatformSettings).where(PlatformSettings.id == 1)
     row = (await db.execute(stmt)).scalar_one_or_none()
     if row is None:
-        return False
+        # No row yet: what the row will be created with (#4659).
+        return bool(settings.initial_supervisor_registration)
     return bool(row.supervisor_registration_enabled)
 
 
@@ -1889,6 +1890,12 @@ class SupervisorHeartbeatRequest(BaseModel):
         ]
         | None
     ) = None
+    # #4800 — the host's last ``apt-get update`` is stale or never succeeded.
+    # A separate optional field, NOT a new ``apt_state`` value: a control
+    # plane that predates it ignores an unknown field but would answer 422 to
+    # an unknown Literal, and supervisors and the control plane upgrade at
+    # different times. None = not collected / not stale-capable.
+    apt_update_stale: bool | None = None
     # Issue #347 — LLDP neighbours the local lldpd discovered. ``None`` = not
     # collected (leave the stored set alone); a list (possibly empty) is the
     # authoritative current set the handler upserts + absence-deletes against.
@@ -1908,6 +1915,11 @@ class SupervisorHeartbeatRequest(BaseModel):
     # None on the first heartbeat / before any role assignment.
     role_switch_state: Literal["idle", "ready", "failed"] | None = None
     role_switch_reason: str | None = None
+    # #4646 — roles assigned to this node that the supervisor held back
+    # because the control plane has no agent key for them. ``[]`` = none;
+    # None / omitted = an older supervisor didn't report, so the stored
+    # value is left untouched.
+    roles_awaiting_key: list[str] | None = Field(default=None, max_length=32)
     # #170 Wave E — service-container watchdog. Free-form dict keyed
     # by compose service name (``dns-bind9`` / ``dns-powerdns`` /
     # ``dns-technitium`` / ``dhcp-kea``); each value carries ``{role, status, since,
@@ -2549,6 +2561,35 @@ async def supervisor_heartbeat(
     response.headers[SIGNATURE_VERSIONS_HEADER] = SIGNATURE_VERSION
     try:
         return await _supervisor_heartbeat(body, request, db)
+    except HTTPException as exc:
+        # #4677 — a restore replays the appliance registry and only then puts
+        # the running appliance back, under the install-wide restore lock. A
+        # heartbeat landing between the two finds no row for its credential;
+        # answering that 403 is a revocation strike, and two in a row tear the
+        # node's roles down. While the lock is held the refusal is not a
+        # verdict on the row: 503 + Retry-After, which the supervisor retries
+        # without a strike (only a marked 403 counts).
+        if exc.status_code == status.HTTP_403_FORBIDDEN and REVOCATION_HEADER in (
+            exc.headers or {}
+        ):
+            from app.services.backup.restore import restore_lock_held  # noqa: PLC0415
+
+            try:
+                restoring = await restore_lock_held(db)
+            except Exception as lock_exc:  # noqa: BLE001 — the refusal below stands
+                logger.warning("supervisor_heartbeat_restore_check_failed", error=str(lock_exc))
+                restoring = False
+            if restoring:
+                logger.info(
+                    "supervisor_heartbeat_deferred_restore",
+                    appliance_id=str(body.appliance_id),
+                )
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "A restore is in progress. Retry.",
+                    headers={"Retry-After": "1"},
+                ) from exc
+        raise
     except Exception as exc:
         # #2845 — a CNPG switchover drops the connection under whichever
         # statement is in flight: most often the re-read after the long-poll
@@ -2814,7 +2855,10 @@ async def _supervisor_heartbeat(
         row.resolver_status = body.resolver_status
     # Issue #155 — applied APT host-config state (per-host). None = not
     # collected (leave the column alone); a value persists.
-    if body.apt_state is not None:
+    if body.apt_update_stale:
+        # #4800 — sources unreachable beats the config-apply state.
+        row.apt_state = "update-stale"
+    elif body.apt_state is not None:
         row.apt_state = body.apt_state
     # Issue #347 — ingest the supervisor's local LLDP neighbours (upsert +
     # absence-delete). None = not collected (leave the set alone).
@@ -2839,6 +2883,8 @@ async def _supervisor_heartbeat(
             row.role_switch_reason = body.role_switch_reason
         else:
             row.role_switch_reason = None
+    if body.roles_awaiting_key is not None:
+        row.roles_awaiting_key = sorted({r[:64] for r in body.roles_awaiting_key})
     if body.role_health is not None:
         # #170 Wave E — supervisor's per-service watchdog verdict.
         # Overwrite verbatim every tick: empty dict clears stale
@@ -4097,6 +4143,8 @@ class ApplianceRow(BaseModel):
     # compose-lifecycle apply.
     role_switch_state: str | None
     role_switch_reason: str | None
+    # #4646 — roles held back for a missing agent key.
+    roles_awaiting_key: list[str]
     # #170 Wave E — service-container watchdog. Per-service health
     # the supervisor reports every 5 min via heartbeat. Keys are
     # compose service names (``dns-bind9`` / ``dns-powerdns`` /
@@ -4330,6 +4378,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         firewall_state=dict(row.firewall_state or {}),
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
+        roles_awaiting_key=list(row.roles_awaiting_key or []),
         role_health=dict(row.role_health or {}),
         host_config_health=dict(row.host_config_health or {}),
         host_migration_health=dict(row.host_migration_health or {}),
@@ -5191,7 +5240,7 @@ async def update_appliance_roles(
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     "Cannot assign the 'dhcp' role: the DHCP module (core.dhcp) is "
-                    "disabled. Enable it under Administration > Features & "
+                    "disabled. Enable it under Features & "
                     "Integrations, or remove the role.",
                 )
         # #2135 — the same refusal for a DNS role while ``core.dns`` is off.
@@ -5211,7 +5260,7 @@ async def update_appliance_roles(
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     f"Cannot assign the {new_dns_roles[0]!r} role: the DNS module "
-                    "(core.dns) is disabled. Enable it under Administration > "
+                    "(core.dns) is disabled. Enable it under "
                     "Features & Integrations, or remove the role.",
                 )
         # Capability gate. Each requested role must be backed by the
@@ -5324,6 +5373,19 @@ async def update_appliance_roles(
                         status.HTTP_422_UNPROCESSABLE_ENTITY,
                         f"DNS server group {target.name!r}: {key_problem}",
                     )
+    # #4681 — an engine change to PowerDNS keeps the group, so none of the
+    # server-add / move refusals ran; a forward or stub zone in it would be
+    # accepted and never answer. Refused here, not at agent registration: a
+    # running node must not be stranded.
+    if row.assigned_dns_group_id is not None and "dns-powerdns" in (row.assigned_roles or []):
+        if "dns-powerdns" not in prev_dns_roles or row.assigned_dns_group_id != prev_dns_group_id:
+            from app.models.dns import DNSServerGroup
+            from app.services.dns.server_move import group_powerdns_refusal
+
+            pdns_group = await db.get(DNSServerGroup, row.assigned_dns_group_id)
+            if pdns_group is not None:
+                if pdns_problem := await group_powerdns_refusal(db, pdns_group):
+                    raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, pdns_problem)
     if signer_check is not None:
         from app.services.dns.dnssec_signers import second_signer_refusal
 
@@ -7819,8 +7881,10 @@ async def schedule_appliance_set_default_slot(
     * **Commit a trial boot** — operator booted the trial slot via
       ``/set-next-boot``, validated it, calls this against the
       currently-running slot to make it durable. (``firstboot.service``
-      also does this automatically when ``/health/live`` passes; this
-      endpoint exists for the explicit operator-action case.)
+      also does this automatically once k3s is Ready, the slot's images
+      are in containerd and the control chart has applied (the api runs
+      the slot's image, #4707); this endpoint exists for the explicit
+      operator-action case.)
     * **Durable revert** — operator wants to go back to the previous
       slot for good (not just one boot). Calls this against the
       previous slot."""
@@ -7985,6 +8049,13 @@ async def _cert_principal(request: Request, db: AsyncSession, *, body_streamed: 
     try:
         principal = await authenticate_cert(request, db, body_streamed=body_streamed)
     except CertAuthFailed as exc:
+        # #4677 — a restore replaying the registry leaves a moment with no row
+        # for this certificate. Not a verdict on it: 503, and the supervisor
+        # backs off without a strike. A replay (401) stays a refusal.
+        if exc.status_code == status.HTTP_403_FORBIDDEN:
+            from app.core.restore_gate import defer_if_restoring  # noqa: PLC0415
+
+            await defer_if_restoring(db, "the request")
         logger.warning("appliance.k8s_proxy.cert_auth_failed", reason=exc.reason)
         raise HTTPException(exc.status_code, "Invalid appliance client cert.") from exc
     if principal is None:

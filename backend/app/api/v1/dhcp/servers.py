@@ -1336,6 +1336,7 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
         try:
             driver = get_driver(s.driver)
             mac_added, mac_removed = await driver.sync_mac_blocks(s, desired=desired)
+            s.mac_blocks_pushed = bool(desired)
         except Exception as exc:  # noqa: BLE001 — don't fail the lease sync
             result.errors.append(f"sync_mac_blocks failed: {exc}")
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListReadError } from "@/components/ui/list-read-error";
 import { pollUnlessRefused } from "@/lib/refusal";
@@ -351,7 +352,10 @@ function HistoryTab({ onSelect }: { onSelect: (s: NmapScanRead) => void }) {
           <div className="flex gap-2">
             <button
               type="button"
-              onClick={() => setSelected(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setSelected(new Set());
+              }}
               className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
             >
               Clear

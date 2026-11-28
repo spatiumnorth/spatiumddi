@@ -126,11 +126,24 @@ def _resource_id_from_args(args: BaseModel) -> str | None:
     data = args.model_dump(mode="json")
     # Prefer the operation's own target id over a secondary (e.g. delete_zone
     # carries both group_id and zone_id — zone_id is the real target).
-    for key in ("zone_id", "scope_id", "subnet_id", "block_id", "space_id", "group_id"):
+    for key in ("zone_id", "scope_id", "subnet_id", "block_id", "space_id", "group_id", "row_id"):
         val = data.get(key)
         if val is not None:
             return str(val)
     return None
+
+
+def _refuse_inline_non_superadmin(user: User, operation: Operation, args: BaseModel) -> None:
+    """The route-time 403 for a superadmin step the caller is about to run inline (#4790).
+
+    The apply refuses a non-superadmin with an ``OperationPermissionError`` (so a
+    queued request stays pending), but an inline caller has no spine to translate
+    that, and it would surface as a 500. Refuse here with the route's own 403.
+    """
+    if operation.superadmin_when is not None and operation.superadmin_when(args):
+        from app.api.deps import ensure_superadmin  # noqa: PLC0415
+
+        ensure_superadmin(user)
 
 
 async def gate_or_execute(
@@ -144,12 +157,18 @@ async def gate_or_execute(
 ) -> ChangeRequestPending | None:
     """Decide whether ``operation`` must be queued for second-person approval.
 
+    ``count`` is the number of rows the operation touches. Every covered op
+    is a single-target delete, so it defaults to 1 (#4909): a policy with
+    ``min_count`` 1 gates every such delete, while a higher threshold needs a
+    bulk op that passes a real count.
+
     Returns ``None`` to tell the caller to execute inline (today's behaviour);
     a :class:`ChangeRequestPending` to tell the caller to return 202.
     """
     # 1. Module off → never gate, never query policies. This is the path
     #    every existing install takes (default-off) → zero behaviour change.
     if not await is_module_enabled(db, MODULE_ID):
+        _refuse_inline_non_superadmin(user, operation, args)
         return None
 
     # 2. Derive the policy lookup keys directly from the operation's
@@ -163,8 +182,9 @@ async def gate_or_execute(
     action, resource_type = operation.required_permission
 
     # 3. Strongest enabled matching policy, or None.
-    policy = await match_policy(db, resource_type, action, count)
+    policy = await match_policy(db, resource_type, action, 1 if count is None else count)
     if policy is None:
+        _refuse_inline_non_superadmin(user, operation, args)
         return None
 
     # 4. Superadmin bypass — only when the policy explicitly allows it.

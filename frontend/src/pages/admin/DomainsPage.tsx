@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { ListEmpty } from "@/components/ui/list-read-error";
 import { useMemo, useState } from "react";
@@ -84,7 +85,11 @@ function ExpiryBadge({ expiresAt }: { expiresAt: string | null }) {
           "rounded px-2 py-0.5 text-[11px] font-medium tabular-nums",
           cls,
         )}
-        title={`Expires in ${days} days`}
+        title={
+          days < 0
+            ? `Expired ${countNoun(Math.abs(days), "day")} ago`
+            : `Expires in ${countNoun(days, "day")}`
+        }
       >
         {label}
       </span>
@@ -205,10 +210,14 @@ function DomainEditorModal({
     >
       <div className="space-y-4">
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-apex-domain"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Apex domain
           </label>
           <input
+            id="domains-apex-domain"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -220,10 +229,14 @@ function DomainEditorModal({
           </p>
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-expected-nameservers"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Expected nameservers
           </label>
           <textarea
+            id="domains-expected-nameservers"
             className={cn(inputCls, "min-h-[90px] font-mono text-xs")}
             value={expectedNs}
             onChange={(e) => setExpectedNs(e.target.value)}
@@ -266,20 +279,28 @@ function DomainEditorModal({
           )}
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-tags-json-object"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Tags (JSON object)
           </label>
           <textarea
+            id="domains-tags-json-object"
             className={cn(inputCls, "min-h-[60px] font-mono text-xs")}
             value={tagsRaw}
             onChange={(e) => setTagsRaw(e.target.value)}
           />
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="domains-custom-fields-json-object"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Custom fields (JSON object)
           </label>
           <textarea
+            id="domains-custom-fields-json-object"
             className={cn(inputCls, "min-h-[60px] font-mono text-xs")}
             value={cfRaw}
             onChange={(e) => setCfRaw(e.target.value)}

@@ -13,6 +13,7 @@ command-line cap and hard-failing an entire chunk (#426).
 from __future__ import annotations
 
 import base64
+import socket
 import unicodedata
 from typing import Any
 
@@ -34,6 +35,14 @@ MAX_ENCODED_COMMAND = 7800
 # output-receive indefinitely and ties up a worker thread forever (#426).
 _OPERATION_TIMEOUT_SEC = 120
 _READ_TIMEOUT_SEC = 150
+
+
+# #4775 — the connect bound for the health probe and the MAC-block sync. pywinrm
+# has one timeout (``read_timeout_sec``) that also bounds the TCP connect, so a
+# host that answers nothing holds a call for the OS connect timeout (~127 s)
+# before it fails. ``run_ps(connect_timeout_sec=...)`` checks the port with this
+# short bound first.
+PROBE_CONNECT_TIMEOUT_SEC = 10.0
 
 
 class WinRMCommandTooLong(RuntimeError):
@@ -186,6 +195,7 @@ def run_ps(
     script: str,
     *,
     op_label: str = "winrm",
+    connect_timeout_sec: float | None = None,
 ) -> str:
     """Run a PowerShell script on a Windows host over WinRM.
 
@@ -193,6 +203,11 @@ def run_ps(
     Raises :class:`WinRMCommandTooLong` if the encoded command would
     overflow the CMD.EXE budget (split the batch and retry), or
     ``RuntimeError`` on a non-zero exit / WinRM transport error.
+
+    ``connect_timeout_sec`` (#4775) first opens a TCP connection to the WinRM
+    port with that bound and raises ``RuntimeError`` if it fails, so a host that
+    answers nothing fails in seconds instead of after pywinrm's ~135 s. Leave it
+    unset for long-running operations: it never shortens the read timeout.
     """
     # Guard the size BEFORE building a session so an oversized batch is a
     # clear, catchable error rather than a truncated-command failure.
@@ -220,6 +235,15 @@ def run_ps(
     endpoint = f"{scheme}://{host}:{port}/wsman"
 
     _warn_insecure_transport(host, transport, use_tls, verify_tls)
+
+    if connect_timeout_sec is not None:
+        try:
+            socket.create_connection((host, port), timeout=connect_timeout_sec).close()
+        except OSError as exc:
+            raise RuntimeError(
+                f"{op_label}: cannot connect to {host}:{port} within "
+                f"{connect_timeout_sec:g}s: {exc}"
+            ) from exc
 
     session = winrm.Session(
         endpoint,

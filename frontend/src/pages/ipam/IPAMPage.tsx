@@ -1,5 +1,14 @@
+import { countNoun, pluralize } from "@/lib/count-noun";
+import { handOffFocusOnRemove } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  useCallback,
+  useId,
+} from "react";
 import { FormError } from "@/components/ui/form-error";
 import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import { CreateScopeModal } from "@/pages/dhcp/CreateScopeModal";
@@ -130,7 +139,7 @@ import {
 } from "@/lib/dnsNames";
 import {
   GATEWAY_FORWARD_SKIPPED_LABEL,
-  GATEWAY_FORWARD_SKIPPED_NOTE,
+  gatewayForwardSkippedNote,
   classifyIpDnsState,
   isDefaultGatewayHostnameInput,
   staleReasonText,
@@ -139,6 +148,7 @@ import {
 import { CustomFieldMultiSelect } from "@/components/CustomFieldMultiSelect";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { cn, selectedRowClass, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { withoutEmptyValues } from "@/lib/withoutEmptyValues";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -927,7 +937,13 @@ function CustomFieldsSection({
                           ? "— Select —"
                           : "— None —"}
                     </option>
-                    {def.options.map((opt) => (
+                    {/* A stored value the admin later removed from the options
+                        gets a choice of its own, else the browser shows the
+                        empty choice or the first option (#4840). */}
+                    {withStoredValue(
+                      def.options,
+                      val === "" ? null : String(val),
+                    ).map((opt) => (
                       <option key={opt} value={opt}>
                         {opt}
                       </option>
@@ -1263,6 +1279,8 @@ function DnsSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  const dnsGroupSelectId = useId();
+  const primaryZoneSelectId = useId();
   // #1068 — mirror of the DHCP gate below; DNS can be switched off too.
   const { enabled: dnsFeature, ready: dnsFeatureReady } = useFeatureModules();
   const dnsOn = dnsFeatureReady && dnsFeature("core.dns");
@@ -1382,10 +1400,16 @@ function DnsSettingsSection({
             picker visually. The API still stores a list for backwards
             compatibility; we round-trip through a single-element array. */}
         <div>
-          <p className="text-xs text-muted-foreground mb-1">DNS Server Group</p>
+          <label
+            htmlFor={dnsGroupSelectId}
+            className="mb-1 block text-xs text-muted-foreground"
+          >
+            DNS Server Group
+          </label>
           {!canReadGroups ? (
             // Disabled, so the form keeps the stored group (never a clear).
             <select
+              id={dnsGroupSelectId}
               value={displayGroupIds[0] ? "linked" : ""}
               disabled
               title={
@@ -1407,6 +1431,7 @@ function DnsSettingsSection({
             </p>
           ) : (
             <select
+              id={dnsGroupSelectId}
               value={displayGroupIds[0] ?? ""}
               onChange={(e) => {
                 if (inherit) return;
@@ -1432,8 +1457,14 @@ function DnsSettingsSection({
         {/* A stored zone the user may not read: said, not dropped. */}
         {!canReadZones && displayZoneId && (
           <div>
-            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <label
+              htmlFor={primaryZoneSelectId}
+              className="mb-1 block text-xs text-muted-foreground"
+            >
+              Primary Zone
+            </label>
             <select
+              id={primaryZoneSelectId}
               value="linked"
               disabled
               title={
@@ -1464,8 +1495,14 @@ function DnsSettingsSection({
         {/* Primary Zone */}
         {availableZones.length > 0 && (
           <div>
-            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <label
+              htmlFor={primaryZoneSelectId}
+              className="mb-1 block text-xs text-muted-foreground"
+            >
+              Primary Zone
+            </label>
             <select
+              id={primaryZoneSelectId}
               value={displayZoneId ?? ""}
               onChange={(e) =>
                 !inherit && onZoneIdChange(e.target.value || null)
@@ -1549,6 +1586,7 @@ function DhcpSettingsSection({
   fallbackSpaceId?: string | null;
   hideInheritToggle?: boolean;
 }) {
+  const dhcpGroupSelectId = useId();
   // #1068 — DHCP can be switched off wholesale; these reads 404 then.
   // ``ready`` matters: ``enabled`` answers true while the module set is
   // still loading, so without it each of these fires once on a hard
@@ -1631,12 +1669,16 @@ function DhcpSettingsSection({
 
       <fieldset disabled={inherit} className="space-y-2 disabled:opacity-50">
         <div>
-          <p className="text-xs text-muted-foreground mb-1">
+          <label
+            htmlFor={dhcpGroupSelectId}
+            className="mb-1 block text-xs text-muted-foreground"
+          >
             DHCP Server Group
-          </p>
+          </label>
           {!canReadGroups ? (
             // Disabled, so the form keeps the stored group (never a clear).
             <select
+              id={dhcpGroupSelectId}
               value={displayGroupId ? "linked" : ""}
               disabled
               title={
@@ -1658,6 +1700,7 @@ function DhcpSettingsSection({
             </p>
           ) : (
             <select
+              id={dhcpGroupSelectId}
               value={displayGroupId ?? ""}
               onChange={(e) =>
                 !inherit && onServerGroupIdChange(e.target.value || null)
@@ -2079,11 +2122,15 @@ function ClassificationSection({
           </span>
         </label>
         <div className="space-y-1 pt-1">
-          <label className="flex items-center gap-2 text-xs">
+          <label
+            htmlFor="ipampage-field"
+            className="flex items-center gap-2 text-xs"
+          >
             <span className="font-medium">Decommission date</span>
           </label>
           <div className="flex items-center gap-2">
             <input
+              id="ipampage-field"
               type="date"
               value={decomDate}
               onChange={(e) => onDecomDateChange(e.target.value)}
@@ -2985,18 +3032,25 @@ export function CreateSubnetModal({
     staleTime: 0,
     refetchOnMount: "always",
   });
-  // What the Custom Fields section shows, defaults included, is what the
-  // request sends (#1303).
-  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
   // Values the new subnet inherits from its block chain count towards a
   // Required field (#2478).
   const { data: parentFields } = useQuery({
     queryKey: ["block-effective-fields", blockId],
     queryFn: () => ipamApi.effectiveBlockFields(blockId),
     enabled: !!blockId,
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const cfInherited = parentFields?.custom_fields ?? {};
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303); a value the block chain gives wins over the
+  // default and is left to inherit (#4556).
+  const shownCustomFields = withCustomFieldDefaults(
+    cfDefs,
+    customFields,
+    cfInherited,
+  );
 
   // Available subnets query (only active when in size mode and block + prefix are set)
   const { data: availableNets = [], isFetching: searchingNets } = useQuery({
@@ -3863,7 +3917,7 @@ export function AddAddressModal({
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, subnetId),
       // Re-read on open as well: the subnet's primary zone may be one created
       // since the cached list was taken, and the pick must not settle on
       // another zone before the list holds it (#4028, as #3078).
@@ -3902,9 +3956,9 @@ export function AddAddressModal({
   );
   // The pick is not final while zones are still on their way or the subnet's
   // DNS is being re-read over a cached copy: Allocate waits (#3080).
-  const zonesPending =
-    dnsOn &&
-    ((effectiveFetching && effectiveDns !== undefined) || !zonesSettled);
+  // The first read counts too: until it lands there are no zones to pick and
+  // no primary, and "needs a DNS zone" would be a guess (#4860).
+  const zonesPending = dnsOn && (effectiveFetching || !zonesSettled);
   useEffect(() => {
     if (dnsZoneTouched || availableZones.length === 0) return;
     const target =
@@ -4426,7 +4480,7 @@ export function AddAddressModal({
                 <span className="font-mono">{hostname || "<hostname>"}</span>; A
                 records point to the IP. Withdrawn while the IP is an orphan and
                 back when it is restored; deleted when the IP is purged.
-                {!publishZoneId && (
+                {!publishZoneId && !zonesPending && (
                   <span className="ml-1 text-amber-600">
                     Requires a DNS zone on this subnet.
                   </span>
@@ -5329,7 +5383,9 @@ export function SubnetDetail({
     queryKey: ["dns-zones", "subnet-detail", subnet.id, subnetDnsGroupIds],
     queryFn: async () => {
       const lists = await Promise.all(
-        subnetDnsGroupIds.map((gid) => dnsApi.listZones(gid)),
+        subnetDnsGroupIds.map((gid) =>
+          dnsApi.listZones(gid, undefined, subnet.id),
+        ),
       );
       return lists.flat();
     },
@@ -6147,7 +6203,10 @@ export function SubnetDetail({
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
       {actionError && (
-        <div className="flex items-start justify-between gap-3 border-b border-destructive/40 bg-destructive/5 px-6 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="flex items-start justify-between gap-3 border-b border-destructive/40 bg-destructive/5 px-6 py-2 text-xs text-destructive"
+        >
           <span>{actionError}</span>
           <button
             type="button"
@@ -6374,7 +6433,7 @@ export function SubnetDetail({
               <span className="text-xs text-muted-foreground">VLAN</span>
               <span
                 className="text-xs font-medium"
-                title="Legacy tag — assign a Router/VLAN from the Edit modal to manage"
+                title={`Legacy tag${canEditSubnet ? " — assign a Router/VLAN from the Edit modal to manage" : ""}`}
               >
                 {subnet.vlan_id}
               </span>
@@ -6593,7 +6652,10 @@ export function SubnetDetail({
                 Bulk delete
               </button>
               <button
-                onClick={() => setSelectedIpIds(new Set())}
+                onClick={(e) => {
+                  handOffFocusOnRemove(e.currentTarget);
+                  setSelectedIpIds(new Set());
+                }}
                 className="rounded-md p-1 text-muted-foreground hover:text-foreground"
                 title="Clear selection"
               >
@@ -6612,7 +6674,7 @@ export function SubnetDetail({
 
       {activeSubnetTab === "aliases" && dnsOn && (
         <div className="flex-1 overflow-auto">
-          <AliasesSubnetPanel subnetId={subnet.id} />
+          <AliasesSubnetPanel subnetId={subnet.id} canAdd={canAllocate} />
         </div>
       )}
 
@@ -6698,7 +6760,10 @@ export function SubnetDetail({
                 </label>
               </div>
               {inlineEditError && (
-                <div className="mb-2 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+                <div
+                  role="alert"
+                  className="mb-2 flex items-start gap-2 rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
+                >
                   <span className="flex-1">{inlineEditError}</span>
                   <button
                     type="button"
@@ -7262,7 +7327,7 @@ export function SubnetDetail({
                                   {(addr.alias_count ?? 0) > 0 && (
                                     <span
                                       className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
-                                      title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
+                                      title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"}${canEdit ? " — edit IP to view" : ""}`}
                                     >
                                       +{addr.alias_count}{" "}
                                       {addr.alias_count === 1
@@ -7447,7 +7512,7 @@ export function SubnetDetail({
                                   ) : dnsState === "out-of-sync" ? (
                                     <span
                                       className="inline-flex items-center gap-1 text-xs text-amber-600"
-                                      title="DNS records are missing or differ — open Sync DNS to reconcile"
+                                      title={`DNS records are missing or differ${canDnsSync ? " — open Sync DNS to reconcile" : ""}`}
                                     >
                                       <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
                                       out of sync
@@ -7455,7 +7520,9 @@ export function SubnetDetail({
                                   ) : dnsState === "forward-skipped" ? (
                                     <span
                                       className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-                                      title={GATEWAY_FORWARD_SKIPPED_NOTE}
+                                      title={gatewayForwardSkippedNote(
+                                        permitsWrite,
+                                      )}
                                     >
                                       <span className="inline-block h-1.5 w-1.5 rounded-full bg-muted-foreground/50" />
                                       {GATEWAY_FORWARD_SKIPPED_LABEL}
@@ -8221,7 +8288,7 @@ export function DnsSyncModal({
                     </div>
                   )}
                   {result.errors.length > 0 && (
-                    <div className="mt-1 text-destructive">
+                    <div role="alert" className="mt-1 text-destructive">
                       {result.errors.length} error
                       {result.errors.length === 1 ? "" : "s"}:{" "}
                       {result.errors.join("; ")}
@@ -8841,7 +8908,9 @@ function EditSubnetModalForm({
   const { data: effectiveFields } = useQuery({
     queryKey: ["effective-fields", subnet.id],
     queryFn: () => ipamApi.effectiveFields(subnet.id),
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const { data: allSpaces = [] } = useQuery({
     queryKey: ["spaces"],
@@ -8899,7 +8968,7 @@ function EditSubnetModalForm({
         vlan_ref_id: vlanRefId,
         vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status,
-        custom_fields: customFields,
+        custom_fields: withoutEmptyValues(customFields),
         tags: tagRowsToRecord(tagRows),
         dns_inherit_settings: dnsInherit,
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
@@ -9672,7 +9741,10 @@ function DhcpSyncSummaryBody({
                   emphasis={s.result.ipam_revoked > 0}
                 />
                 {s.result.errors.length > 0 && (
-                  <div className="col-span-2 mt-1 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive">
+                  <div
+                    role="alert"
+                    className="col-span-2 mt-1 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive"
+                  >
                     {s.result.errors.length} error(s):
                     <ul className="ml-3 list-disc">
                       {s.result.errors.slice(0, 3).map((e, i) => (
@@ -9686,7 +9758,10 @@ function DhcpSyncSummaryBody({
               </dl>
             )}
             {s.status === "error" && (
-              <p className="mt-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive">
+              <p
+                role="alert"
+                className="mt-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive"
+              >
                 {s.error}
               </p>
             )}
@@ -10019,7 +10094,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, address.subnet_id),
       staleTime: 60_000,
       enabled: dnsOn,
     })),
@@ -10055,7 +10130,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
     dnsOn &&
     subnetZonesSettled &&
     !availableZones.some((z: DNSZone) => z.id === storedZoneId);
-  const { data: lookupGroups = [] } = useQuery({
+  const { data: lookupGroups = [], isLoading: lookupGroupsLoading } = useQuery({
     queryKey: ["dns-groups"],
     queryFn: dnsApi.listGroups,
     enabled: storedZoneMissing,
@@ -10069,11 +10144,25 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
       enabled: storedZoneMissing,
     })),
   });
-  const storedExtraZone: DNSZone | undefined = storedZoneMissing
+  const lookedUpZone: DNSZone | undefined = storedZoneMissing
     ? lookupQueries
         .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
         .find((z: DNSZone) => z.id === storedZoneId)
     : undefined;
+  // #4893 — a role that may write one zone but not read the group's zones
+  // cannot find the stored zone in those lists, and the picker used to fall
+  // back to the writable zone, naming a zone the record is not in. The
+  // row carries only the zone id, so keep the record's own zone as the
+  // current value and call it "not visible to your role" instead of guessing.
+  const lookupSettled =
+    !lookupGroupsLoading &&
+    lookupQueries.every((q: { isLoading: boolean }) => !q.isLoading);
+  const storedZoneHidden = storedZoneMissing && !lookedUpZone;
+  const storedExtraZone: DNSZone | undefined =
+    lookedUpZone ??
+    (storedZoneMissing && lookupSettled
+      ? ({ id: storedZoneId, name: "" } as DNSZone)
+      : undefined);
   const pickerZones: DNSZone[] = storedExtraZone
     ? [...availableZones, storedExtraZone]
     : availableZones;
@@ -10095,7 +10184,7 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
 
   const selectedZone = pickerZones.find((z: DNSZone) => z.id === dnsZoneId);
   const fqdnPreview =
-    hostname && selectedZone
+    hostname && selectedZone && selectedZone.name
       ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
       : null;
 
@@ -10326,7 +10415,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
             {pickerZones.length === 1 ? (
               <p className="text-xs text-muted-foreground py-1">
                 <Globe2 className="inline h-3 w-3 mr-1" />
-                {pickerZones[0].name.replace(/\.$/, "")}
+                {pickerZones[0].name
+                  ? pickerZones[0].name.replace(/\.$/, "")
+                  : "Zone not visible to your role"}
                 {fqdnPreview && (
                   <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
                     → {fqdnPreview}
@@ -10351,7 +10442,9 @@ function EditAddressModalForm({ address, onClose }: EditAddressModalProps) {
                   />
                   {storedExtraZone && (
                     <option value={storedExtraZone.id}>
-                      {`${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
+                      {storedZoneHidden
+                        ? "Current zone — not visible to your role"
+                        : `${storedExtraZone.name.replace(/\.$/, "")} (current — not among this subnet's zones)`}
                     </option>
                   )}
                 </select>
@@ -10871,14 +10964,18 @@ function NatSubnetPanel({ subnetId }: { subnetId: string }) {
   );
 }
 
-function NatMappingsForIpModal({
+export function NatMappingsForIpModal({
   ip,
   onClose,
 }: {
   ip: IPAddress;
   onClose: () => void;
 }) {
-  const { data = [], isLoading } = useQuery({
+  const {
+    data = [],
+    isLoading,
+    error,
+  } = useQuery({
     queryKey: ["nat-by-ip", ip.id],
     queryFn: () => natApi.byIp(ip.id),
   });
@@ -10887,6 +10984,11 @@ function NatMappingsForIpModal({
       <div className="space-y-3">
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : error ? (
+          // A refused read is not an empty list (#4853).
+          <p className="text-sm">
+            <ListReadError error={error} what="this IP's NAT mappings" />
+          </p>
         ) : (
           <NatRowsTable
             rows={data}
@@ -10907,7 +11009,15 @@ function NatMappingsForIpModal({
   );
 }
 
-export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
+export function AliasesSubnetPanel({
+  subnetId,
+  canAdd = false,
+}: {
+  subnetId: string;
+  // Aliases are added from an address's edit / allocate modal: only a user
+  // Allocate IP is offered to is told so (#4588).
+  canAdd?: boolean;
+}) {
   const qc = useQueryClient();
   const perms = usePermissions();
   const { data: aliases = [], isLoading } = useQuery({
@@ -10945,9 +11055,11 @@ export function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
         <p className="text-sm text-muted-foreground">
           No aliases in this subnet.
         </p>
-        <p className="mt-1 text-xs text-muted-foreground/70">
-          Add aliases from the IP address edit or allocate modal.
-        </p>
+        {canAdd && (
+          <p className="mt-1 text-xs text-muted-foreground/70">
+            Add aliases from the IP address edit or allocate modal.
+          </p>
+        )}
       </div>
     );
   }
@@ -11563,7 +11675,7 @@ export function BulkEditAddressesModal({
   const zoneQueries = useQueries({
     queries: zoneGroupIds.map((gId: string) => ({
       queryKey: ["dns-zones", gId],
-      queryFn: () => dnsApi.listZones(gId),
+      queryFn: () => dnsApi.listZones(gId, undefined, subnetId),
       staleTime: 60_000,
       enabled: dnsOn,
     })),
@@ -11728,7 +11840,10 @@ export function BulkEditAddressesModal({
     editReservedUntil;
 
   return (
-    <Modal title={`Bulk edit ${ipIds.length} IP addresses`} onClose={onClose}>
+    <Modal
+      title={`Bulk edit ${countNoun(ipIds.length, "IP address", "IP addresses")}`}
+      onClose={onClose}
+    >
       <div className="space-y-3">
         <p className="text-xs text-muted-foreground">
           Only fields you tick will be touched. Tags and custom fields are
@@ -11921,7 +12036,8 @@ export function BulkEditAddressesModal({
                 {replaceAllTags ? (
                   <>
                     Selected IPs currently have {existingTagKeys.size} distinct
-                    tag keys — any key not listed below will be removed.
+                    tag {pluralize(existingTagKeys.size, "key")} — any key not
+                    listed below will be removed.
                   </>
                 ) : (
                   <>
@@ -12041,7 +12157,10 @@ export function BulkDeleteAddressesModal({
   });
 
   return (
-    <Modal title={`Delete ${ipIds.length} IP addresses`} onClose={onClose}>
+    <Modal
+      title={`Delete ${countNoun(ipIds.length, "IP address", "IP addresses")}`}
+      onClose={onClose}
+    >
       <div className="space-y-3">
         <p className="text-sm">
           {permanent ? (
@@ -13354,18 +13473,25 @@ export function CreateBlockModal({
     staleTime: 0,
     refetchOnMount: "always",
   });
-  // What the Custom Fields section shows, defaults included, is what the
-  // request sends (#1303).
-  const shownCustomFields = withCustomFieldDefaults(cfDefs, customFields);
   // Values inherited from the parent block chain count towards a Required
   // field (#2478).
   const { data: parentFields } = useQuery({
     queryKey: ["block-effective-fields", parentBlockId],
     queryFn: () => ipamApi.effectiveBlockFields(parentBlockId),
     enabled: !!parentBlockId,
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const cfInherited = parentFields?.custom_fields ?? {};
+  // What the Custom Fields section shows, defaults included, is what the
+  // request sends (#1303); a value the block chain gives wins over the
+  // default and is left to inherit (#4556).
+  const shownCustomFields = withCustomFieldDefaults(
+    cfDefs,
+    customFields,
+    cfInherited,
+  );
 
   // Re-read on open, and hold the picker until it answers: applying a
   // template copies its DHCP group and tags into the form, and another client
@@ -13752,7 +13878,9 @@ function EditBlockModalForm({
   const { data: effectiveFields } = useQuery({
     queryKey: ["block-effective-fields", block.id],
     queryFn: () => ipamApi.effectiveBlockFields(block.id),
-    staleTime: 30_000,
+    // Re-read on open: a save elsewhere changes inherited values (#4581).
+    staleTime: 0,
+    refetchOnMount: "always",
   });
   const { data: allSpaces = [] } = useQuery({
     queryKey: ["spaces"],
@@ -13798,7 +13926,7 @@ function EditBlockModalForm({
         // ``""`` when cleared, as for a subnet (#3370).
         name,
         description,
-        custom_fields: customFields,
+        custom_fields: withoutEmptyValues(customFields),
         tags: tagRowsToRecord(tagRows),
         dns_inherit_settings: dnsInherit,
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
@@ -14632,7 +14760,7 @@ export function BlockDetailView({
         .join("\n");
       setBlockBulkDeleteNotice(queuedNote);
       setBlockBulkDeleteError(
-        `${failures.length} of ${total} items could not be deleted:\n${detail}`,
+        `${failures.length} of ${countNoun(total, "item")} could not be deleted:\n${detail}`,
       );
     },
   });
@@ -14776,7 +14904,12 @@ export function BlockDetailView({
                 >
                   Delete ({selectedCount})
                 </HeaderButton>
-                <HeaderButton onClick={() => setSelected(new Set())}>
+                <HeaderButton
+                  onClick={(e) => {
+                    handOffFocusOnRemove(e.currentTarget);
+                    setSelected(new Set());
+                  }}
+                >
                   Clear
                 </HeaderButton>
               </>
@@ -15184,7 +15317,10 @@ export function BlockDetailView({
           {roleFilters.size > 0 && (
             <button
               type="button"
-              onClick={() => setRoleFilters(new Set())}
+              onClick={(e) => {
+                handOffFocusOnRemove(e.currentTarget);
+                setRoleFilters(new Set());
+              }}
               className="text-[11px] text-muted-foreground hover:text-foreground"
             >
               clear
@@ -15563,7 +15699,7 @@ export function BlockDetailView({
                             ) : (
                               <span
                                 className="inline-block h-3.5 w-3.5"
-                                title="Block has child blocks or subnets — delete those first"
+                                title={`Block has child blocks or subnets${selectionDeleteGateFor(perms, true, true).disabled ? "" : " — delete those first"}`}
                               />
                             )}
                           </td>
@@ -15684,7 +15820,7 @@ export function BlockDetailView({
                             ) : s.vlan_id != null ? (
                               <span
                                 className="text-muted-foreground/70"
-                                title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                                title={`Legacy tag${canWriteSubnets ? " — assign a Router/VLAN from the Edit modal" : ""}`}
                               >
                                 {s.vlan_id}
                               </span>
@@ -16149,7 +16285,7 @@ export function SpaceTableView({
         .join("\n");
       setSpaceBulkDeleteNotice(queuedNote);
       setSpaceBulkDeleteError(
-        `${failures.length} of ${total} items could not be deleted:\n${detail}`,
+        `${failures.length} of ${countNoun(total, "item")} could not be deleted:\n${detail}`,
       );
     },
   });
@@ -16621,7 +16757,7 @@ export function SpaceTableView({
                           ) : (
                             <span
                               className="inline-block h-3.5 w-3.5"
-                              title="Block has child blocks or subnets — delete those first"
+                              title={`Block has child blocks or subnets${selectionDeleteGateFor(perms, true, true).disabled ? "" : " — delete those first"}`}
                             />
                           )}
                         </td>
@@ -16728,7 +16864,7 @@ export function SpaceTableView({
                           ) : s.vlan_id != null ? (
                             <span
                               className="text-muted-foreground/70"
-                              title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                              title={`Legacy tag${canWriteSubnets ? " — assign a Router/VLAN from the Edit modal" : ""}`}
                             >
                               {s.vlan_id}
                             </span>
@@ -17529,7 +17665,10 @@ export function SpaceSection({
       )}
 
       {dndError && (
-        <div className="mx-2 mt-2 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+        <div
+          role="alert"
+          className="mx-2 mt-2 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive"
+        >
           <span className="flex-1">{dndError}</span>
           <button
             aria-label="Dismiss"
@@ -17795,7 +17934,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
       setSelected(new Set(res.ids));
       if (res.capped)
         setSelectAllError(
-          `Selection capped at ${res.ids.length.toLocaleString()} of ${res.total.toLocaleString()} matches (server limit). Narrow the search to act on the rest.`,
+          `Selection capped at ${res.ids.length.toLocaleString()} of ${res.total.toLocaleString()} ${pluralize(res.total, "match", "matches")} (server limit). Narrow the search to act on the rest.`,
         );
     } catch (e) {
       setSelectAllError(formatApiError(e, "Failed to gather matching IPs."));
@@ -17846,12 +17985,16 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
             className="flex flex-wrap items-end gap-2"
           >
             <div className="min-w-[12rem] flex-1">
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipampage-search"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Search (IP · hostname · MAC · description)
               </label>
               <div className="relative">
                 <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60" />
                 <input
+                  id="ipampage-search"
                   autoFocus
                   value={qDraft}
                   onChange={(e) => setQDraft(e.target.value)}
@@ -17861,10 +18004,14 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
               </div>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor="ipampage-status"
+                className="mb-1 block text-xs font-medium text-muted-foreground"
+              >
                 Status
               </label>
               <select
+                id="ipampage-status"
                 value={statusDraft}
                 onChange={(e) => setStatusDraft(e.target.value)}
                 className="rounded-md border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-ring"
@@ -17926,7 +18073,7 @@ function GlobalIpSearchModal({ onClose }: { onClose: () => void }) {
                   >
                     {selectingAll
                       ? "Selecting…"
-                      : `Select all ${total.toLocaleString()} matches`}
+                      : `Select all ${total.toLocaleString()} ${pluralize(total, "match", "matches")}`}
                   </button>
                 )}
                 {selected.size > 0 && (
@@ -18473,7 +18620,14 @@ export function IPAMPage() {
             {treeFilter && (
               <button
                 type="button"
-                onClick={() => setTreeFilter("")}
+                onClick={(e) => {
+                  const box = e.currentTarget.parentElement;
+                  handOffFocusOnRemove(
+                    e.currentTarget,
+                    () => box?.querySelector("input") ?? null,
+                  );
+                  setTreeFilter("");
+                }}
                 aria-label="Clear tree filter"
                 title="Clear filter"
                 className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/60 hover:text-foreground"
