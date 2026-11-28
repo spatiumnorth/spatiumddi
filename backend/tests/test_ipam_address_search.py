@@ -132,6 +132,58 @@ async def test_list_addresses_backward_compatible_no_params(
 
 
 @pytest.mark.asyncio
+async def test_list_addresses_no_limit_is_capped_and_says_so(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1256: a call with no limit gets at most the cap, and is told it was cut."""
+    from app.api.v1.ipam import router as ipam_router
+
+    monkeypatch.setattr(ipam_router, "_ADDRESS_LIST_CAP", 3)
+    _, token = await _user(db_session, superadmin=True)
+    subnet = await _subnet(db_session)
+    for i in range(1, 6):
+        await _ip(db_session, subnet, f"10.0.5.{i}")
+
+    res = await client.get(f"/api/v1/ipam/subnets/{subnet.id}/addresses", headers=_auth(token))
+    assert res.status_code == 200
+    assert [r["address"] for r in res.json()] == ["10.0.5.1", "10.0.5.2", "10.0.5.3"]
+    assert res.headers["X-Total-Count"] == "5"
+    assert res.headers["X-Result-Truncated"] == "true"
+    assert "5 rows" in res.headers["Warning"]
+
+    # An explicit window is the caller's own choice: not flagged truncated.
+    res2 = await client.get(
+        f"/api/v1/ipam/subnets/{subnet.id}/addresses?limit=2&offset=3", headers=_auth(token)
+    )
+    assert [r["address"] for r in res2.json()] == ["10.0.5.4", "10.0.5.5"]
+    assert "X-Result-Truncated" not in res2.headers
+
+
+@pytest.mark.asyncio
+async def test_list_addresses_under_cap_is_not_flagged(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _user(db_session, superadmin=True)
+    subnet = await _subnet(db_session)
+    await _ip(db_session, subnet, "10.0.5.1")
+    res = await client.get(f"/api/v1/ipam/subnets/{subnet.id}/addresses", headers=_auth(token))
+    assert "X-Result-Truncated" not in res.headers
+    assert res.headers["X-Total-Count"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_list_addresses_limit_above_cap_is_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _user(db_session, superadmin=True)
+    subnet = await _subnet(db_session)
+    res = await client.get(
+        f"/api/v1/ipam/subnets/{subnet.id}/addresses?limit=10001", headers=_auth(token)
+    )
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_list_addresses_q_filter(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _user(db_session, superadmin=True)
     subnet = await _subnet(db_session)
