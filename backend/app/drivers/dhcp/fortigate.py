@@ -455,7 +455,7 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
         # atomic table replace, so shifting ids on a delete scrambles the
         # table (see ``_CHILD_TABLE_KEYS``).
         reserved: list[dict[str, Any]] = []
-        for i, st in enumerate(scope.statics, start=1):
+        for i, st in enumerate([x for x in scope.statics if x.mac_address is not None], start=1):
             reserved.append(
                 {
                     "id": i,

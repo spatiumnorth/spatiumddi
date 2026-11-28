@@ -382,10 +382,9 @@ def _render_reservation(s: StaticAssignmentDef, *, address_family: str = "ipv4")
         else:
             r = {"hw-address": s.mac_address, "ip-addresses": [s.ip_address]}
     else:
-        r = {
-            "hw-address": s.mac_address,
-            "ip-address": s.ip_address,
-        }
+        r = {"ip-address": s.ip_address}
+        if s.mac_address:
+            r = {"hw-address": s.mac_address, **r}
     if s.hostname:
         r["hostname"] = s.hostname
     if s.client_id and address_family != "ipv6":

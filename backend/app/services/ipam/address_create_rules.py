@@ -33,12 +33,32 @@ def assert_subnet_takes_addresses(subnet: Subnet) -> None:
         )
 
 
-def assert_static_dhcp_has_mac(addr_status: str | None, mac_address: str | None) -> None:
-    """``static_dhcp`` needs a MAC to reserve (422)."""
-    if addr_status == "static_dhcp" and not mac_address:
+def assert_static_dhcp_has_mac(
+    addr_status: str | None,
+    mac_address: str | None,
+    duid: str | None = None,
+    address: str | None = None,
+) -> None:
+    """``static_dhcp`` needs an identifier to reserve against (422).
+
+    A MAC on IPv4. On IPv6 a DUID serves instead (#3900): a DHCPv6 client is
+    identified by its DUID, and a reservation keyed on it needs no MAC. A DUID
+    on an IPv4 address is refused: nothing would ever match it.
+    """
+    is_v6 = address is not None and ":" in str(address)
+    if duid and not is_v6:
         raise HTTPException(
             status_code=422,
-            detail="mac_address is required when status is 'static_dhcp'",
+            detail="duid only identifies a DHCPv6 client; it is only valid on an IPv6 address",
+        )
+    if addr_status == "static_dhcp" and not mac_address and not duid:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "mac_address or duid is required when status is 'static_dhcp'"
+                if is_v6
+                else "mac_address is required when status is 'static_dhcp'"
+            ),
         )
 
 

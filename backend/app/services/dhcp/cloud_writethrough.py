@@ -133,6 +133,7 @@ async def build_scope_def(
             options_override=canonical_domain_options(s.options_override) or None,
         )
         for s in static_rows
+        if s.mac_address is not None  # DUID-only DHCPv6 rows (#3900): no MAC-keyed form
     )
     return ScopeDef(
         subnet_cidr=subnet_cidr,

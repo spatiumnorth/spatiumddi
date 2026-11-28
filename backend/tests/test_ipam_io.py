@@ -557,7 +557,17 @@ async def test_reimport_skips_computed_address_columns(db_session: AsyncSession,
         buf = io.StringIO()
         w = _csv.writer(buf)
         w.writerow(ADDRESS_COLUMNS + ["rack"])
-        w.writerow(["10.7.1.0/24", "10.7.1.5", "allocated", "h", "", "", "", "2026-01-01", "r1"])
+        # Keyed by column name so a column added to ADDRESS_COLUMNS (e.g. duid,
+        # #3900) cannot shift the values under the wrong header.
+        vals = {
+            "subnet": "10.7.1.0/24",
+            "address": "10.7.1.5",
+            "status": "allocated",
+            "hostname": "h",
+            "last_seen_at": "2026-01-01",
+            "rack": "r1",
+        }
+        w.writerow([vals.get(c, "") for c in ADDRESS_COLUMNS + ["rack"]])
         parsed = parse_payload(buf.getvalue().encode(), "a.csv", "text/csv")
     else:
         parsed = parse_payload(data, "rt.xlsx", None)

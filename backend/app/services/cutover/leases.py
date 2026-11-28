@@ -107,6 +107,8 @@ async def _live_reservation_maps(
     mac_to_ip: dict[str, str] = {}
     ip_to_mac: dict[str, str] = {}
     for mac, ip in rows:
+        if mac is None:  # DUID-only DHCPv6 reservation (#3900): not a MAC-keyed v4 handover
+            continue
         mac_s = str(mac).lower()
         ip_s = str(ip)
         mac_to_ip[mac_s] = ip_s
