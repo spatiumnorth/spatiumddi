@@ -212,7 +212,9 @@ async def test_emit_alert_happy_path() -> None:
     run = _FakeRun()
     db = MagicMock()
     db.scalar = AsyncMock(return_value=rule)
-    db.execute = AsyncMock()  # #2261: resolves a prior open event first
+    db.execute = AsyncMock(  # #2261: loads a prior open event to resolve first
+        return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: []))
+    )
     db.add = MagicMock()
 
     evt = await upgrade_alerts.emit_upgrade_failed_alert(
@@ -265,7 +267,9 @@ async def test_emit_alert_disabled_rule_returns_none() -> None:
     rule = _FakeRule(enabled=False)
     db = MagicMock()
     db.scalar = AsyncMock(return_value=rule)
-    db.execute = AsyncMock()  # #2261: resolves a prior open event first
+    db.execute = AsyncMock(  # #2261: loads a prior open event to resolve first
+        return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: []))
+    )
     db.add = MagicMock()
 
     out = await upgrade_alerts.emit_upgrade_failed_alert(
@@ -286,7 +290,9 @@ async def test_emit_alert_chart_bump_no_node() -> None:
     rule = _FakeRule()
     db = MagicMock()
     db.scalar = AsyncMock(return_value=rule)
-    db.execute = AsyncMock()  # #2261: resolves a prior open event first
+    db.execute = AsyncMock(  # #2261: loads a prior open event to resolve first
+        return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: []))
+    )
     db.add = MagicMock()
 
     evt = await upgrade_alerts.emit_upgrade_failed_alert(
@@ -504,7 +510,9 @@ async def test_emit_alert_delivers_to_forward_targets(
     run = _FakeRun()
     db = MagicMock()
     db.scalar = AsyncMock(return_value=rule)
-    db.execute = AsyncMock()  # #2261: resolves a prior open event first
+    db.execute = AsyncMock(  # #2261: loads a prior open event to resolve first
+        return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: []))
+    )
     db.add = MagicMock()
     db.flush = AsyncMock()
 
@@ -557,7 +565,9 @@ def test_release_failure_reads_stuck_from_step_dicts_and_objects() -> None:
 async def test_emit_alert_names_what_is_stuck() -> None:
     db = MagicMock()
     db.scalar = AsyncMock(return_value=_FakeRule())
-    db.execute = AsyncMock()  # #2261: resolves a prior open event first
+    db.execute = AsyncMock(  # #2261: loads a prior open event to resolve first
+        return_value=MagicMock(scalars=lambda: MagicMock(all=lambda: []))
+    )
     db.add = MagicMock()
     await upgrade_alerts.emit_upgrade_failed_alert(
         db,

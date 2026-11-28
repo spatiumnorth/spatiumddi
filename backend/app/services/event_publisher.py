@@ -31,6 +31,7 @@ Design choices:
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -38,10 +39,13 @@ from typing import Any
 
 import structlog
 from sqlalchemy import event, select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
 from app.models.event_subscription import EventOutbox, EventSubscription
+from app.models.settings import PlatformSettings
 from app.services import dispatch_db
 from app.services.after_commit_dispatch import dispatch
 from app.services.audit_redact import redact_audit_value
@@ -224,6 +228,77 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
 }
 
 
+# ── Alert events (#2145) ───────────────────────────────────────────────────
+#
+# Not derived from audit rows: an alert firing or resolving writes no audit
+# row. The ``after_flush`` hook below watches ``AlertEvent`` itself -- an
+# INSERT is ``alert.fired``, ``resolved_at`` going NULL -> a timestamp is
+# ``alert.resolved`` -- so every evaluator, whichever of its many code paths
+# opened or closed the event, publishes exactly once per transition.
+ALERT_FIRED = "alert.fired"
+ALERT_RESOLVED = "alert.resolved"
+ALERT_EVENT_TYPES: tuple[str, ...] = (ALERT_FIRED, ALERT_RESOLVED)
+# Bump when a field of the alert payload changes meaning or is removed
+# (adding a field does not bump it). Documented in docs/features/SYSTEM_ADMIN.md.
+ALERT_SCHEMA_VERSION = 1
+_ALERTS_UI_PATH = "/admin/alerts"
+
+
+def _serialize_alert(
+    ev: AlertEvent, event_type: str, *, resolved_at: datetime | None
+) -> dict[str, Any]:
+    """Body for ``alert.fired`` / ``alert.resolved`` (schema version 1).
+
+    ``rule_name`` / ``rule_type`` / ``url`` are filled in after the commit by
+    :func:`_enrich_alert_payloads` -- the flush hook cannot load the rule
+    without blocking on a lazy relationship. ``event_id`` is the
+    ``alert_event`` row id and is the SAME for the fired and the resolved
+    event of one alert; dedupe on ``(event_id, event_type)``.
+    """
+    return {
+        "schema_version": ALERT_SCHEMA_VERSION,
+        "event_id": str(ev.id),
+        "event_type": event_type,
+        "occurred_at": (
+            resolved_at if event_type == ALERT_RESOLVED and resolved_at else ev.fired_at
+        ).isoformat(),
+        "rule_id": str(ev.rule_id),
+        "rule_name": None,
+        "rule_type": None,
+        "severity": ev.severity,
+        "subject_type": ev.subject_type,
+        "subject_id": ev.subject_id,
+        "subject_display": ev.subject_display,
+        "message": ev.message,
+        "fired_at": ev.fired_at.isoformat(),
+        "resolved_at": resolved_at.isoformat() if resolved_at else None,
+        "url": _ALERTS_UI_PATH,
+    }
+
+
+async def _enrich_alert_payloads(session: AsyncSession, snapshots: list[dict[str, Any]]) -> None:
+    """Fill the rule name / type and the absolute UI link on alert snapshots."""
+    alerts = [s for s in snapshots if s["event_type"] in ALERT_EVENT_TYPES]
+    if not alerts:
+        return
+    rule_ids = {uuid.UUID(s["payload"]["rule_id"]) for s in alerts}
+    rules = {
+        r.id: r
+        for r in (await session.execute(select(AlertRule).where(AlertRule.id.in_(rule_ids))))
+        .scalars()
+        .all()
+    }
+    row = await session.get(PlatformSettings, 1)
+    base = (row.app_base_url if row else "").rstrip("/")
+    for snap in alerts:
+        payload = snap["payload"]
+        rule = rules.get(uuid.UUID(payload["rule_id"]))
+        if rule is not None:
+            payload["rule_name"] = rule.name
+            payload["rule_type"] = rule.rule_type
+        payload["url"] = f"{base}{_ALERTS_UI_PATH}"
+
+
 # Audit rows recording a refused request (a route permission gate or a
 # handler invariant) — the action did not happen, so no event describes it.
 # A denylist rather than a ``== "success"`` allowlist: ``error`` / ``accepted``
@@ -349,6 +424,7 @@ async def _publish_outbox_rows(snapshots: list[dict[str, Any]]) -> None:
                 subscriptions_cache.mark_empty()
                 return
 
+            await _enrich_alert_payloads(session, snapshots)
             now = datetime.now(UTC)
             written = 0
             for snap in snapshots:
@@ -386,6 +462,31 @@ async def _publish_outbox_rows(snapshots: list[dict[str, Any]]) -> None:
 # ── Listener wiring ────────────────────────────────────────────────────────
 
 
+def _collect_alert_snapshots(session: Any, snapshots: list[dict[str, Any]]) -> None:
+    """Queue ``alert.fired`` for inserted events, ``alert.resolved`` for
+    events whose ``resolved_at`` just went from NULL to a timestamp."""
+    for obj in session.new:
+        if isinstance(obj, AlertEvent):
+            snapshots.append(
+                {
+                    "event_type": ALERT_FIRED,
+                    "payload": _serialize_alert(obj, ALERT_FIRED, resolved_at=None),
+                }
+            )
+    for obj in session.dirty:
+        if not isinstance(obj, AlertEvent) or obj.resolved_at is None:
+            continue
+        hist = sa_inspect(obj).attrs.resolved_at.history
+        if not hist.added or any(old is not None for old in hist.deleted):
+            continue
+        snapshots.append(
+            {
+                "event_type": ALERT_RESOLVED,
+                "payload": _serialize_alert(obj, ALERT_RESOLVED, resolved_at=obj.resolved_at),
+            }
+        )
+
+
 def _register_session_listener() -> None:
     """Install the ``after_flush`` + ``after_commit`` listeners.
 
@@ -396,10 +497,13 @@ def _register_session_listener() -> None:
 
     @event.listens_for(AsyncSession.sync_session_class, "after_flush")
     def _after_flush(session: Any, flush_context: Any) -> None:  # noqa: ARG001
+        snapshots = getattr(session, _PENDING_ATTR, None) or []
+        _collect_alert_snapshots(session, snapshots)
         new_audits = [obj for obj in session.new if isinstance(obj, AuditLog)]
         if not new_audits:
+            if snapshots:
+                setattr(session, _PENDING_ATTR, snapshots)
             return
-        snapshots = getattr(session, _PENDING_ATTR, None) or []
         for row in new_audits:
             if _records_refusal(row):
                 continue
