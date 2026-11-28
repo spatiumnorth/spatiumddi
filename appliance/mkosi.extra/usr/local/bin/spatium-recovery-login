@@ -13,13 +13,14 @@
 # session to end wins: the other prompts are killed and the boot continues
 # to the default target (what systemd-sulogin-shell does after sulogin).
 #
-# Overridable for tests: SPATIUM_RECOVERY_{PROC_CONSOLES,DEV,SUDO_GROUP,DELAY,OUT_SUFFIX}.
+# Overridable for tests: SPATIUM_RECOVERY_{PROC_CONSOLES,DEV,SUDO_GROUP,DELAY,OUT_SUFFIX,NOLOGIN}.
 set -u
 
 PROC_CONSOLES=${SPATIUM_RECOVERY_PROC_CONSOLES:-/proc/consoles}
 DEV=${SPATIUM_RECOVERY_DEV:-/dev}
 GROUP=${SPATIUM_RECOVERY_SUDO_GROUP:-sudo}
 DELAY=${SPATIUM_RECOVERY_DELAY:-2}
+NOLOGIN=${SPATIUM_RECOVERY_NOLOGIN:-/run/nologin}
 OUT_SUFFIX=${SPATIUM_RECOVERY_OUT_SUFFIX:-} # tests: a regular file cannot be read and written as one
 
 # Enabled consoles (flag E), as device names. The virtual console tty0 is
@@ -65,6 +66,12 @@ prompt_loop() {
             printf '\r\nLogin incorrect (not root or a member of the %s group)\r\n\r\n' "$GROUP"
             continue
         fi
+        # pam_nologin (auth requisite in /etc/pam.d/login) refuses every non-root
+        # login while /run/nologin exists. tmpfiles creates it at boot and only
+        # systemd-user-sessions.service removes it, which rescue.target never
+        # starts. Do what that unit's `start` does: remove /run/nologin, and
+        # nothing else (an operator's /etc/nologin stays and still applies).
+        rm -f -- "$NOLOGIN"
         # login(1) exits 0 once a session has ended, 1 on a failed login.
         if setsid -w -c login -- "$user"; then
             return 0

@@ -81,7 +81,8 @@ def test_grub_rescue_entry_describes_the_login() -> None:
 
 # ── the script ────────────────────────────────────────────────────────────────
 
-def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str, int]):
+def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str, int],
+         nologin: bool = True):
     """Run the script. logins maps username -> exit status of the stubbed login."""
     bindir = tmp_path / "bin"
     dev = tmp_path / "dev"
@@ -89,6 +90,8 @@ def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str
     dev.mkdir()
     log = tmp_path / "calls.log"
     (tmp_path / "consoles").write_text(consoles)
+    if nologin:
+        (tmp_path / "nologin").write_text("System is booting up.\n")
     for name, text in inputs.items():
         (dev / name).write_text(text)
     # id -nG: root -> root; alice -> sudo; bob -> users; others unknown.
@@ -96,7 +99,9 @@ def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str
         '#!/bin/sh\nfor a; do u=$a; done\ncase "$u" in root) echo root;; alice) echo "alice sudo";;'
         ' bob) echo "bob users";; *) exit 1;; esac\n')
     cases = "".join(f"{u}) echo login {u} >>{log}; exit {rc};; " for u, rc in logins.items())
-    (bindir / "login").write_text(f'#!/bin/sh\ncase "$2" in {cases}esac; exit 1\n')
+    # pam_nologin: while the file exists login refuses everyone (here: exit 1, no log line).
+    (bindir / "login").write_text(
+        f'#!/bin/sh\n[ -e {tmp_path / "nologin"} ] && exit 1\ncase "$2" in {cases}esac; exit 1\n')
     # setsid -w -c login -- USER  ->  login -- USER
     (bindir / "setsid").write_text('#!/bin/sh\nwhile [ "${1#-}" != "$1" ]; do shift; done\nexec "$@"\n')
     # never signal by tty on the machine running the tests
@@ -111,6 +116,7 @@ def _run(tmp_path: Path, consoles: str, inputs: dict[str, str], logins: dict[str
         "SPATIUM_RECOVERY_DEV": str(dev),
         "SPATIUM_RECOVERY_DELAY": "0",
         "SPATIUM_RECOVERY_OUT_SUFFIX": ".out",
+        "SPATIUM_RECOVERY_NOLOGIN": str(tmp_path / "nologin"),
     }
     r = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True,
                        timeout=60)
@@ -158,3 +164,32 @@ def test_nothing_is_accepted_without_a_password_check(tmp_path) -> None:
     text = SCRIPT.read_text()
     assert re.search(r"setsid -w -c login -- ", text)
     assert "autologin" not in text.lower() and "login -f" not in text
+
+
+def test_run_nologin_is_cleared_so_the_admin_can_log_in(tmp_path) -> None:
+    """/run/nologin (tmpfiles, boot) makes pam_nologin refuse every non-root
+    login; rescue.target never starts systemd-user-sessions to remove it."""
+    r, calls = _run(tmp_path, TTY, {"tty1": "alice\n"}, {"alice": 0}, nologin=True)
+    assert calls == ["login alice", "systemctl --no-block default"], r.stderr
+    assert not (tmp_path / "nologin").exists()
+
+
+def test_nologin_is_removed_only_after_the_group_check() -> None:
+    """A refused name must not lift the boot-time restriction."""
+    text = SCRIPT.read_text()
+    assert text.index("if ! allowed") < text.index('rm -f -- "$NOLOGIN"') < text.index("setsid -w -c login")
+
+
+def test_only_run_nologin_is_touched_by_default() -> None:
+    """systemd-user-sessions start removes /run/nologin only; /etc/nologin is
+    the operator's and keeps applying."""
+    text = SCRIPT.read_text()
+    assert "${SPATIUM_RECOVERY_NOLOGIN:-/run/nologin}" in text
+    assert "/etc/nologin" not in text.replace("/etc/nologin stays", "")
+
+
+def test_pkill_comes_from_procps_which_the_image_lists() -> None:
+    """The script uses pkill; procps must be in the image on purpose, not by
+    accident of openssh-server / cloud-init depending on it."""
+    pkgs = (APPLIANCE / "mkosi.conf").read_text().split()
+    assert "procps" in pkgs
