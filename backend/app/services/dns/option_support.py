@@ -97,6 +97,18 @@ _DNSDIST_FIELDS = (
     "dnsdist_dynblock_seconds",
 )
 
+#: The extra BIND9 rate-limit knobs (#3577); null = BIND's own default.
+RRL_EXTRA_FIELDS = (
+    "rrl_nxdomains_per_second",
+    "rrl_errors_per_second",
+    "rrl_referrals_per_second",
+    "rrl_nodata_per_second",
+    "rrl_all_per_second",
+    "rrl_ipv4_prefix_length",
+    "rrl_ipv6_prefix_length",
+    "rrl_max_table_size",
+)
+
 _BIND9_NOT_APPLIED: dict[str, str] = {
     **dict.fromkeys(_FIXED_FIELDS, _FIXED),
     **dict.fromkeys(_DNSDIST_FIELDS, _DNSDIST),
@@ -138,6 +150,7 @@ _POWERDNS_NOT_APPLIED: dict[str, str] = {
     "rrl_qps_scale": _PDNS_RRL,
     "rrl_exempt_clients": _PDNS_RRL,
     "rrl_log_only": _PDNS_RRL,
+    **dict.fromkeys(RRL_EXTRA_FIELDS, _PDNS_RRL),
     "minimal_responses": "PowerDNS has no minimal-responses setting",
     "tcp_clients": "PowerDNS has no TCP client limit rendered from the group",
     "clients_per_query": "PowerDNS has no clients-per-query setting",
@@ -236,6 +249,7 @@ _BIND9_APPLIED = frozenset(
         "rrl_qps_scale",
         "rrl_exempt_clients",
         "rrl_log_only",
+        *RRL_EXTRA_FIELDS,
         "minimal_responses",
         "tcp_clients",
         "clients_per_query",
