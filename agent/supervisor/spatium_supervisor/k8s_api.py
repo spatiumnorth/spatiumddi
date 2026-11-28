@@ -2964,13 +2964,15 @@ def apply_metallb_overrides(
     ``aggregation_length``) — translated here to the chart's camelCase
     BGPPeer/BGPAdvertisement CR field names (myASN/peerASN/peerAddress/
     peerPort/holdTime, ipAddressPools/communities/aggregationLength).
-    ``frrk8s.enabled`` is driven by the SAME ``bgp_enabled`` flag as
-    ``bgp.enabled`` — the chart's speaker/controller only wire up to
-    frr-k8s when frrk8s.enabled is true, and BGP peers/advertisements
-    are inert without it. ``speaker.frr.enabled`` is NEVER written here
-    — it stays the chart's baked ``false`` (mutually exclusive with
-    frrk8s.enabled; the chart's own template hard-``fail``s if both are
-    true).
+    ``frrk8s.external`` is driven by the SAME ``bgp_enabled`` flag as
+    ``bgp.enabled`` — it points the speaker at the chart's own ``frr-k8s``
+    dependency (and is that dependency's ``condition``, #2245), and BGP
+    peers/advertisements are inert without it. ``frrk8s.enabled`` (the
+    frr-k8s 0.0.21 vendored inside metallb) is written ``false`` in every
+    state: it cannot run the pinned frr-k8s and the chart refuses it.
+    ``speaker.frr.enabled`` is NEVER written here — it stays the chart's
+    baked ``false`` (mutually exclusive with frrk8s.external; the metallb
+    chart's own template hard-``fail``s if both are true).
 
     Every key is written explicitly in both states (``enabled: false``,
     empty lists) because the write MERGES into the live document (#2024)
@@ -3004,7 +3006,7 @@ def apply_metallb_overrides(
         "metallb": {
             "enabled": bool(metallb_enabled),
             "ipPool": {"addresses": pool},
-            "frrk8s": {"enabled": bool(bgp_enabled)},
+            "frrk8s": {"enabled": False, "external": bool(bgp_enabled)},
             "bgp": {
                 "enabled": bool(bgp_enabled),
                 "peers": [_peer(p) for p in (bgp_peers or [])],

@@ -19,10 +19,10 @@
 # binary doesn't serve (it exposes /metrics on the monitoring port), so
 # the speaker crashloops. The dependency in Chart.yaml is therefore
 # pinned to the 0.15.3 chart end-to-end. Revert to the chart default
-# once #3063 is fixed upstream. KEEP the controller / speaker / frr-k8s
-# image tags below in lock-step with the chart version; FRR and
-# kube-rbac-proxy are pinned past the chart's defaults as a security
-# override (#2239). Every tag must match appliance/scripts/bake-images.sh
+# once #3063 is fixed upstream. KEEP the controller / speaker image
+# tags below in lock-step with the chart version. frr-k8s (BGP mode) is its
+# own dependency on its own version (#2245, see the ``frr-k8s:`` block at the
+# bottom). Every tag must match appliance/scripts/bake-images.sh
 # ``METALLB_IMAGES``.
 # POD POSTURE (#983) — the ``priorityClassName`` values below name classes
 # rendered by a DIFFERENT release (spatium-bootstrap, the spatiumddi-appliance
@@ -64,14 +64,23 @@ metallb:
     validationFailurePolicy: Ignore
 
   # ── L2 (native) mode ──────────────────────────────────────────────
-  # Native L2 — no FRR, no frr-k8s. ``frrk8s.enabled=false`` matches the
-  # 0.15.3 chart default but is set explicitly so a future chart bump
-  # (0.16.0 flips it TRUE) can't silently pull the frr-k8s + frr images
-  # we don't bake. ``speaker.frr.enabled=false`` is load-bearing: the
-  # 0.15.3 chart defaults it TRUE, which would run the in-speaker FRR
-  # sidecar (another unbaked image). L2 ARP/NDP needs neither.
+  # Native L2 — no FRR, no frr-k8s. ``speaker.frr.enabled=false`` is
+  # load-bearing: the 0.15.3 chart defaults it TRUE, which would run the
+  # in-speaker FRR sidecar (another unbaked image). L2 ARP/NDP needs neither.
+  #
+  # #2245 — ``frrk8s.enabled`` is false in EVERY state and must stay that
+  # way: it deploys the frr-k8s 0.0.21 subchart vendored inside metallb
+  # 0.15.3, which cannot run a frr-k8s >= v0.0.23 binary. BGP mode instead
+  # sets ``frrk8s.external=true``, which (a) points the speaker at the
+  # frr-k8s release below (the top-level ``frr-k8s:`` block, this chart's own
+  # dependency) and (b) is the ``condition`` that turns that dependency on.
+  # ``namespace`` is where the speaker looks for it — this release's own
+  # namespace, which is always metallb-system on the appliance.
+  # templates/guard-frrk8s.yaml refuses the vendored one being switched on.
   frrk8s:
     enabled: false
+    external: false
+    namespace: metallb-system
   speaker:
     frr:
       enabled: false
@@ -158,149 +167,115 @@ metallb:
     peers: []
     advertisements: []
 
-  # ── frr-k8s subchart config (issue #566 decision D1 — BGP mode) ────
-  # NOTE the hyphen: this is a DIFFERENT key from `frrk8s:` above, and
-  # it MUST live nested inside this `metallb:` block (same indent as
-  # `frrk8s:` / `speaker:` / `bgp:`), NOT as a top-level sibling of
-  # `metallb:` — Helm only threads subchart overrides through a chart's
-  # OWN values scope. Our wrapper Chart.yaml depends on `metallb`
-  # (unaliased), so wrapper `metallb.*` becomes the metallb chart's own
-  # `.Values.*`; the metallb chart's OWN Chart.yaml then depends on
-  # `frr-k8s` (also unaliased), so ITS `.Values.frr-k8s.*` — i.e. our
-  # `metallb.frr-k8s.*` — is what reaches the nested frr-k8s dependency.
-  # A top-level (0-indent) `frr-k8s:` key here never reaches it at all
-  # (verified empirically via `helm template` — every field silently
-  # fell back to the frr-k8s chart's own bundled defaults, including
-  # `crds.enabled: true`, re-introducing the double-owner CRD conflict
-  # §0c exists to avoid).
-  #
-  # `frrk8s:` (no hyphen, above) is the metallb chart's own "am I
-  # frrk8s-backed" flag; `frr-k8s:` (hyphen) is the values block for the
-  # nested frr-k8s dependency chart itself (matches its Chart.yaml
-  # `name:`).
-  #
-  # A SECOND, easy-to-miss nesting quirk lives one level further down:
-  # the frr-k8s chart's OWN values.yaml has a top-level `crds:` key
-  # (its nested CRDs sub-subchart, gated by `condition: crds.enabled`
-  # in ITS Chart.yaml — reached at exactly `frr-k8s.crds.enabled` from
-  # here) but puts image/nodeSelector/frr-image config under its OWN
-  # internal (also no-hyphen) `frrk8s:` key instead of at its top level
-  # — verified against the vendored tarball's
-  # `charts/frr-k8s/templates/controller.yaml`, which reads
-  # `.Values.frrk8s.image.repository` / `.Values.frrk8s.nodeSelector` /
-  # `.Values.frrk8s.frr.image...`. So from OUR root values.yaml, the
-  # working paths are `metallb.frr-k8s.crds.enabled` (no extra nesting)
-  # but `metallb.frr-k8s.frrk8s.nodeSelector` /
-  # `metallb.frr-k8s.frrk8s.image.*` /
-  # `metallb.frr-k8s.frrk8s.frr.image.*` (one extra `frrk8s:` level) —
-  # confirmed empirically via `helm template` after the first attempt
-  # (image/nodeSelector at `frr-k8s.*` directly) silently no-op'd and
-  # every field rendered as the chart's own bundled default instead.
-  #
-  # Gated off in step with `frrk8s.enabled` above — the frr-k8s
-  # DaemonSet only actually deploys when BOTH `metallb.enabled` AND
-  # `metallb.frrk8s.enabled` are true (see the metallb chart's
-  # speaker.yaml / controller.yaml
-  # `{{- if or .Values.frrk8s.enabled .Values.frrk8s.external }}` gates),
-  # so leaving this block populated while frrk8s.enabled stays false is
-  # inert.
-  frr-k8s:
-    # CRDs (frrconfigurations / frrnodestates / bgpsessionstates,
-    # frrk8s.metallb.io group) are pre-loaded outside Helm exactly like
-    # the metallb.io CRDs above — same "no double-owner conflict" reason.
-    crds:
-      enabled: false
-    # #575 — the frr-k8s controller wires a kube-rbac-proxy sidecar (twice
-    # per pod) whose image defaults to `gcr.io/kubebuilder/kube-rbac-proxy`,
-    # which Google sunset (now 404 — broke the bake + any non-airgap pull).
-    # Repoint to kube-rbac-proxy's maintained upstream home, quay.io/brancz.
-    # #2239 — and pinned PAST the subchart's v0.12.0 default as a security
-    # override (v0.12.0 is a 2022 build carrying go-restful CVE-2022-1996, an
-    # auth bypass, on the only BGP-mode container with an authenticated
-    # listener). The subchart's args still parse on v0.23: ``--logtostderr``
-    # is accepted and ignored with a warning; ``--secure-listen-address``,
-    # ``--upstream`` and ``--tls-cipher-suites`` are unchanged.
-    # NOTE `rbacProxy` lives at the frr-k8s chart's TOP level under
-    # `prometheus:` (controller.yaml:397/423 read
-    # `.Values.prometheus.rbacProxy.*`), NOT under the `frrk8s:` block below.
-    # KEEP in lock-step with appliance/scripts/bake-images.sh METALLB_IMAGES.
-    prometheus:
-      rbacProxy:
-        repository: quay.io/brancz/kube-rbac-proxy
-        tag: v0.23.0
-    # frr-k8s chart's OWN internal `frrk8s:` key (see the long comment
-    # above) — nodeSelector / image / frr-image config all live here,
-    # NOT at this block's top level.
-    frrk8s:
-      # Same control-plane-only placement as the speaker/controller
-      # above (non-negotiable #16) — BGP is a control-plane concern.
-      nodeSelector:
-        spatium.io/role-control-plane: "true"
-      # #983 — in BGP mode frr-k8s IS the data path: the speaker delegates
-      # advertisement to it, so an evicted frr-k8s withdraws the VIP's route
-      # exactly as an evicted speaker stops answering ARP in L2 mode. Same
-      # class as the speaker for the same reason. One key covers both the
-      # DaemonSet and the status-cleaner Deployment (the chart reads
-      # ``.Values.frrk8s.priorityClassName`` in both templates).
-      priorityClassName: spatium-service
-      # #965 — floors, not measurements. Upstream ships ``resources: {}`` for
-      # all five containers, i.e. a five-container BestEffort pod holding the
-      # BGP session. ``frrk8s.resources`` covers the controller container AND
-      # the status-cleaner Deployment; the other four are per-container keys.
+# ── frr-k8s (issue #566 decision D1 — BGP mode; #2245 own dependency) ──
+# Top-level, a sibling of ``metallb:``: frr-k8s is a direct dependency of
+# THIS chart (Chart.yaml), no longer a subchart of metallb, so its values
+# live at ``frr-k8s.*`` and are NOT nested under ``metallb.``. The key is
+# hyphenated (its chart name); the frr-k8s chart's own values put the image /
+# nodeSelector / FRR config under its internal ``frrk8s:`` key, hence
+# ``frr-k8s.frrk8s.*`` below. Rendered only when ``metallb.frrk8s.external``
+# is true (the dependency's ``condition``); the supervisor sets that, together
+# with ``metallb.bgp.enabled``, when an operator configures a BGP peer.
+#
+# frr-k8s >= v0.0.23 serves its own metrics over native TLS (9140 controller,
+# 9141 FRR exporter) and probes itself, so there is NO kube-rbac-proxy
+# sidecar and no ``prometheus.rbacProxy`` override any more; the metrics
+# listeners authenticate scrapers with a TokenReview / SubjectAccessReview
+# against the apiserver (the chart's RBAC carries it).
+frr-k8s:
+  # CRDs (frrconfigurations / frrk8sconfigurations / frrnodestates /
+  # bgpsessionstates, frrk8s.metallb.io group) are pre-loaded outside Helm
+  # exactly like the metallb.io CRDs above — same "no double-owner conflict"
+  # reason (appliance/mkosi.extra/usr/local/share/spatiumddi/frrk8s-crds.yaml).
+  crds:
+    enabled: false
+  frrk8s:
+    # Same control-plane-only placement as the speaker/controller above
+    # (non-negotiable #16) — BGP is a control-plane concern. The chart gives
+    # the status-cleaner Deployment no nodeSelector at all, so the same label
+    # is repeated as a required node affinity: ``frrk8s.affinity`` is read by
+    # BOTH the DaemonSet and the status-cleaner.
+    nodeSelector:
+      spatium.io/role-control-plane: "true"
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: spatium.io/role-control-plane
+                  operator: In
+                  values: ["true"]
+    # #983 — in BGP mode frr-k8s IS the data path: the speaker delegates
+    # advertisement to it, so an evicted frr-k8s withdraws the VIP's route
+    # exactly as an evicted speaker stops answering ARP in L2 mode. Same
+    # class as the speaker for the same reason. One key covers both the
+    # DaemonSet and the status-cleaner Deployment.
+    priorityClassName: spatium-service
+    # #965 — floors, not measurements. Upstream ships ``resources: {}`` for
+    # every container, i.e. a BestEffort pod holding the BGP session.
+    # ``frrk8s.resources`` covers the controller container AND the
+    # status-cleaner Deployment; the others are per-container keys.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+    initContainers:
+      cpFrrFiles:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+      cpReloader:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+      cpMetrics:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+      cpFrrStatus:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 16Mi
+    reloader:
+      resources:
+        requests:
+          cpu: 5m
+          memory: 32Mi
+    frrMetrics:
+      resources:
+        requests:
+          cpu: 5m
+          memory: 32Mi
+    frrStatus:
+      resources:
+        requests:
+          cpu: 5m
+          memory: 32Mi
+    # #983 — NO seccomp profile here, and it is not an oversight: the
+    # frr-k8s chart exposes no pod-securityContext knob at all (its
+    # templates hard-code the container contexts), so no values override can
+    # supply one. The render check therefore exempts the two workloads by
+    # name rather than skipping the chart. Revisit on a chart bump.
+    # Explicit image tags — pin explicitly so a ``helm dependency update``
+    # re-fetch that silently changes upstream defaults (the chart falls back
+    # to its appVersion / FRR 10.6.2) can't drift the pin unnoticed. KEEP in
+    # lock-step with appliance/scripts/bake-images.sh ``METALLB_IMAGES``.
+    image:
+      repository: quay.io/metallb/frr-k8s
+      tag: v0.0.27
+    frr:
+      image:
+        repository: quay.io/frrouting/frr
+        tag: 10.6.2
+      # #965 — the FRR daemon itself; see the resources note above.
       resources:
         requests:
           cpu: 10m
           memory: 64Mi
-      reloader:
-        resources:
-          requests:
-            cpu: 5m
-            memory: 32Mi
-      frrMetrics:
-        resources:
-          requests:
-            cpu: 5m
-            memory: 32Mi
-      frrStatus:
-        resources:
-          requests:
-            cpu: 5m
-            memory: 32Mi
-      # #983 — NO seccomp profile here, and it is not an oversight: the
-      # frr-k8s 0.0.21 chart exposes no pod-securityContext knob at all
-      # (grep its templates — ``.Values.frrk8s.*`` covers image, nodeSelector,
-      # resources and priorityClassName, nothing else), so no values override
-      # can supply one. The render check therefore exempts these two
-      # workloads by name rather than skipping the chart, which is how they
-      # went unnoticed until #983. Revisit on a chart bump.
-      # Explicit image tags — pin explicitly so a `helm dependency update`
-      # re-fetch that silently changes upstream defaults can't drift the pin
-      # unnoticed. KEEP in lock-step with
-      # appliance/scripts/bake-images.sh ``METALLB_IMAGES``.
-      #
-      # frr-k8s itself stays at the vendored frr-k8s@0.0.21 subchart's own
-      # version. It is NOT image-bumpable within this chart (#2239): from
-      # v0.0.23 the binary serves its metrics over HTTPS and watches an
-      # FRRK8sConfiguration CRD, while these 0.0.21 templates probe it over
-      # plain HTTP, pass a --metrics-bind-address that collides with the new
-      # health-probe default, and grant no RBAC for that CRD — so the pod
-      # never goes Ready. versions.json ``frr-k8s.hold`` has the details.
-      #
-      # FRR is pinned past the subchart's 10.4.1 default to the newest patch
-      # on the same 10.4 line (#2239, OpenSSL CRITICAL) — security fixes
-      # only, no config-syntax changes, and the line frr-k8s 0.0.21 targets.
-      image:
-        repository: quay.io/metallb/frr-k8s
-        tag: v0.0.21
-      frr:
-        image:
-          repository: quay.io/frrouting/frr
-          tag: 10.4.5
-        # #965 — the FRR daemon itself; see the resources note above.
-        resources:
-          requests:
-            cpu: 10m
-            memory: 64Mi
 
 # Cross-namespace pod-read for the control-plane api SA so the
 # Network & Host MetalLB status card works now that MetalLB is in

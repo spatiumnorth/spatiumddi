@@ -127,34 +127,24 @@ OBSERVABILITY_IMAGES=(
 # serve → crashloop), so charts/spatiumddi-metallb pins the 0.15.3 chart
 # end-to-end. Bump back to the chart default once #3063 is fixed upstream.
 #
-# #566 decision D1 — BGP mode (frr-k8s backend). Bake all three images
-# the frr-k8s DaemonSet's pod spec pulls unconditionally: the FRR daemon
-# itself (GPL v2 — flag distinctly in NOTICE), the frr-k8s reconciler
-# (Apache 2.0), and the kube-rbac-proxy metrics sidecar (present TWICE
-# per pod, same image, Apache 2.0) that the vendored charts/frr-k8s
-# templates/controller.yaml wires in unconditionally. frr-k8s is the
-# vendored metallb-0.15.3.tgz's own subchart version (frr-k8s@0.0.21);
-# frr and kube-rbac-proxy are pinned past that subchart's defaults as a
-# security override (#2239, see versions.json) — keep in lock-step with the
-# charts/spatiumddi-metallb/values.yaml `metallb.frr-k8s.frrk8s.image` /
-# `.frr.image` pins, and `metallb.frr-k8s.prometheus.rbacProxy.*` for the
-# kube-rbac-proxy sidecar. #575 — kube-rbac-proxy moved off the sunset
-# `gcr.io/kubebuilder` mirror (now 404, which broke this bake + any
-# non-airgap frr-k8s pull) to its upstream home `quay.io/brancz`; the chart
-# override and the bake entry below MUST match so the baked image name is
-# exactly what the frr-k8s pod pulls.
+# #566 decision D1 — BGP mode (frr-k8s backend). Bake the two images the
+# frr-k8s pod specs pull: the FRR daemon itself (GPL v2 — flag distinctly in
+# NOTICE; the DaemonSet runs it in four containers) and the frr-k8s
+# reconciler (Apache 2.0; controller, init containers and status-cleaner).
+# #2245 — frr-k8s is charts/spatiumddi-metallb's OWN dependency (0.0.27), no
+# longer the 0.0.21 subchart vendored in metallb-0.15.3.tgz, and from v0.0.23
+# it serves metrics over native TLS: there is no kube-rbac-proxy sidecar and
+# so no kube-rbac-proxy image to bake. Keep in lock-step with the
+# charts/spatiumddi-metallb/values.yaml `frr-k8s.frrk8s.image` / `.frr.image`
+# pins (versions.json carries both).
 # ``metallb.speaker.frr.enabled`` stays FALSE (the
 # in-speaker FRR sidecar is mutually exclusive with the frr-k8s backend
 # and unused either way) so no image is baked for that path.
 METALLB_IMAGES=(
     "quay.io/metallb/controller:v0.15.3"
     "quay.io/metallb/speaker:v0.15.3"
-    "quay.io/metallb/frr-k8s:v0.0.21"
-    "quay.io/frrouting/frr:10.4.5"
-    # #575 — was gcr.io/kubebuilder/kube-rbac-proxy (sunset → 404); same image,
-    # maintained registry. Keep in lock-step with charts/spatiumddi-metallb
-    # values.yaml `metallb.frr-k8s.prometheus.rbacProxy.repository`.
-    "quay.io/brancz/kube-rbac-proxy:v0.23.0"
+    "quay.io/metallb/frr-k8s:v0.0.27"
+    "quay.io/frrouting/frr:10.6.2"
 )
 
 # CloudNativePG (#272 / #277) — PostgreSQL is CNPG on every appliance
