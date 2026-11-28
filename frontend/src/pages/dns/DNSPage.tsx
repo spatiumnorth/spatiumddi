@@ -1,3 +1,4 @@
+import { isNameTargetType, resolveTarget } from "@/lib/dns-target";
 import { armRemovalFocus } from "@/components/ui/focus-return";
 import { useOwnershipModules } from "@/hooks/useOwnershipModules";
 import { handOffFocusOnRemove } from "@/components/ui/focus-return";
@@ -3795,6 +3796,10 @@ function RecordModalForm({
   const recordTypes = canWriteLua
     ? RECORD_TYPES
     : RECORD_TYPES.filter((t) => t !== "LUA" || type === "LUA");
+  // #5021 — what a name target (CNAME / MX / ...) resolves to in this zone.
+  const nameTarget = isNameTargetType(type)
+    ? resolveTarget(value, zoneName)
+    : null;
   // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
   const nameErr = recordOwnerError(name, type, zoneName);
 
@@ -4001,6 +4006,32 @@ function RecordModalForm({
               secondary receives the record as an opaque type and cannot answer
               it.
             </p>
+          )}
+          {nameTarget && (
+            <div role="status" className="mt-1 space-y-1">
+              <p className="text-[11px] text-muted-foreground">
+                Points to{" "}
+                <code className="font-mono">
+                  {nameTarget.fqdn ?? value.trim()}
+                </code>
+              </p>
+              {nameTarget.looksLikeOutsideName && (
+                <p className="flex flex-wrap items-center gap-2 text-xs text-amber-600 dark:text-amber-400">
+                  <span>
+                    No trailing dot, so this is relative to the zone. Add a dot
+                    for an outside name.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setValue(`${value.trim()}.`)}
+                    aria-label="Add the trailing dot to the value"
+                    className="rounded border px-1.5 py-0.5 text-[11px] hover:bg-accent"
+                  >
+                    Add the dot
+                  </button>
+                </p>
+              )}
+            </div>
           )}
           {isSrv && (
             <p className="mt-1 text-[11px] text-muted-foreground">
