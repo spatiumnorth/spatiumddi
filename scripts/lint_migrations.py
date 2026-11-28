@@ -145,6 +145,72 @@ ADD_COLUMN_RE = re.compile(
     re.DOTALL,
 )
 
+# Safe-DDL rule (#1253). On a table that grows without bound a plain
+# ``CREATE INDEX`` blocks every write for the whole build, and an ``ADD
+# CONSTRAINT`` without ``NOT VALID`` scans the table under a lock that blocks
+# writes; both queue every later query behind them. Use
+# ``postgresql_concurrently=True`` inside ``op.get_context().autocommit_block()``
+# for the index, and ``postgresql_not_valid=True`` + a later
+# ``VALIDATE CONSTRAINT`` for the constraint. Tables created in the same file
+# are empty and exempt.
+LARGE_TABLES = frozenset(
+    {
+        "audit_log",
+        "ip_address",
+        "ip_mac_history",
+        "subnet_utilization_history",
+        "network_fdb_entry",
+        "alert_event",
+        "dns_record",
+        "dns_query_log_entry",
+        "dns_rpz_hit",
+        "dns_metric_sample",
+        "dhcp_metric_sample",
+        "dhcp_lease",
+        "dhcp_lease_history",
+        "dhcp_log_entry",
+    }
+)
+
+UNSAFE_DDL_RE = re.compile(
+    r"\bop\.(?P<fn>create_index|create_foreign_key|create_check_constraint)\s*\("
+    r"(?P<args>[^)]*(?:\([^)]*\)[^)]*)*)\)",
+    re.DOTALL,
+)
+STR_ARG_RE = re.compile(r"['\"]([^'\"]+)['\"]")
+CREATE_TABLE_RE = re.compile(r"\bop\.create_table\s*\(\s*['\"](?P<table>[^'\"]+)['\"]")
+
+
+def _scan_unsafe_ddl(content: str, path: Path) -> list[Finding]:
+    created = {m.group("table") for m in CREATE_TABLE_RE.finditer(content)}
+    findings: list[Finding] = []
+    for m in UNSAFE_DDL_RE.finditer(content):
+        args = m.group("args")
+        # create_index(name, table, ...), create_foreign_key(name, source, ...),
+        # create_check_constraint(name, table, ...): the table is the 2nd string.
+        strings = STR_ARG_RE.findall(args)
+        kw = re.search(r"(?:table_name|source_table)\s*=\s*['\"]([^'\"]+)['\"]", args)
+        table = kw.group(1) if kw else (strings[1] if len(strings) > 1 else "")
+        if table not in LARGE_TABLES or table in created:
+            continue
+        if m.group("fn") == "create_index":
+            if re.search(r"postgresql_concurrently\s*=\s*True", args):
+                continue
+            rule = "create_index_blocking"
+        else:
+            if re.search(r"postgresql_not_valid\s*=\s*True", args):
+                continue
+            rule = "add_constraint_validating"
+        findings.append(
+            Finding(
+                path=str(path.relative_to(REPO_ROOT)),
+                rule=rule,
+                line=_line_of(content, m.start()),
+                detail=_snippet(content, m.start()),
+            )
+        )
+    return findings
+
 
 # ---------------------------------------------------------------------------
 # Data shapes
@@ -253,6 +319,7 @@ def scan_file(path: Path) -> list[Finding]:
             )
 
     findings.extend(_scan_alter_not_null(content, path))
+    findings.extend(_scan_unsafe_ddl(content, path))
 
     # Deterministic ordering for stable baseline diffs.
     findings.sort(key=lambda f: (f.path, f.line, f.rule))
@@ -330,6 +397,16 @@ def reason_for(rule: str) -> str:
         return (
             "tightening NOT NULL on an existing column — backfill every NULL row first; "
             "one-shot will crash on any remaining NULL"
+        )
+    if rule == "create_index_blocking":
+        return (
+            "CREATE INDEX on a large table blocks writes for the whole build — use "
+            "postgresql_concurrently=True inside op.get_context().autocommit_block()"
+        )
+    if rule == "add_constraint_validating":
+        return (
+            "adding a constraint to a large table scans it under a write-blocking lock — "
+            "use postgresql_not_valid=True, then VALIDATE CONSTRAINT in a later step"
         )
     for _re, r, reason in PATTERNS:
         if r == rule:

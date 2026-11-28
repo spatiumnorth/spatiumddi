@@ -118,6 +118,9 @@ def do_run_migrations(connection: Connection) -> None:
         # revision leaves the lock queue (and stops stalling every query
         # queued behind it) instead of waiting silently.
         migrate_guard.apply_lock_timeout(connection)
+        # #1253 — opt-in ceiling on a statement's run time (off by default:
+        # a data migration may legitimately take minutes).
+        migrate_guard.apply_statement_timeout(connection)
     context.configure(
         connection=connection,
         target_metadata=target_metadata,

@@ -46,8 +46,15 @@ logger = structlog.get_logger(__name__)
 LOCK_TIMEOUT_ENV = "MIGRATION_LOCK_TIMEOUT_SECONDS"
 LOCK_RETRIES_ENV = "MIGRATION_LOCK_RETRIES"
 STALE_IDLE_ENV = "MIGRATION_STALE_IDLE_TXN_SECONDS"
+STATEMENT_TIMEOUT_ENV = "MIGRATION_STATEMENT_TIMEOUT_SECONDS"
 
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30
+# 0 = no statement_timeout. Off by default (#1253): a data migration on a big
+# table legitimately runs for minutes, and killing it midway on a guessed
+# ceiling is worse than a slow upgrade. An operator who wants a ceiling sets
+# MIGRATION_STATEMENT_TIMEOUT_SECONDS; a single revision can still tighten or
+# lift it for itself with ``SET LOCAL statement_timeout``.
+DEFAULT_STATEMENT_TIMEOUT_SECONDS = 0
 # None = retry until the lock is granted (see the module docstring); an
 # operator can bound it with MIGRATION_LOCK_RETRIES.
 DEFAULT_LOCK_RETRIES: int | None = None
@@ -73,6 +80,10 @@ def _int_env(name: str, default: int) -> int:
 
 def lock_timeout_seconds() -> int:
     return _int_env(LOCK_TIMEOUT_ENV, DEFAULT_LOCK_TIMEOUT_SECONDS)
+
+
+def statement_timeout_seconds() -> int:
+    return _int_env(STATEMENT_TIMEOUT_ENV, DEFAULT_STATEMENT_TIMEOUT_SECONDS)
 
 
 def lock_retries() -> int | None:
@@ -128,6 +139,17 @@ def apply_lock_timeout(connection: Connection, seconds: int | None = None) -> in
     seconds = lock_timeout_seconds() if seconds is None else seconds
     if seconds > 0:
         connection.execute(text(f"SET lock_timeout = '{int(seconds)}s'"))
+        connection.commit()
+    return seconds
+
+
+def apply_statement_timeout(connection: Connection, seconds: int | None = None) -> int:
+    """``SET statement_timeout`` for this session; 0 (the default) leaves the
+    server's own setting alone. Unlike ``lock_timeout`` this bounds how long a
+    statement may RUN, so it is opt-in (see ``DEFAULT_STATEMENT_TIMEOUT_SECONDS``)."""
+    seconds = statement_timeout_seconds() if seconds is None else seconds
+    if seconds > 0:
+        connection.execute(text(f"SET statement_timeout = '{int(seconds)}s'"))
         connection.commit()
     return seconds
 

@@ -704,6 +704,33 @@ python3 scripts/lint_migrations.py              # what CI runs (exit 1 on non-ba
 python3 scripts/lint_migrations.py --show       # every finding, baselined or not
 ```
 
+#### Safe DDL on large tables, and migration timeouts (#1253)
+
+`alembic/env.py` bounds how long an `upgrade` can wait or run
+(`app/core/migrate_guard.py`; `alembic current` / `stamp` / `downgrade` are
+untouched). All knobs are environment variables on the migrate command:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MIGRATION_LOCK_TIMEOUT_SECONDS` | `30` | `lock_timeout` for the session (#3932); a timed-out wait is retried, logging the blocking pids. `0` leaves the server default. |
+| `MIGRATION_LOCK_RETRIES` | unlimited | Bound the retries of a revision stuck behind a lock. |
+| `MIGRATION_STALE_IDLE_TXN_SECONDS` | `300` | Only abandoned `idle in transaction` sessions that block the migration are ended; `0` disables. |
+| `MIGRATION_STATEMENT_TIMEOUT_SECONDS` | `0` (off) | `statement_timeout` for the session. Off by default because some data migrations legitimately run for minutes; set it to give an upgrade a ceiling. A revision can override it for itself with `SET LOCAL statement_timeout`. |
+
+The lock timeout covers DDL lock acquisition; it does not limit how long
+a statement then runs, which is what the statement timeout is for.
+
+Write DDL on a table that grows without bound the safe way: build indexes
+with `postgresql_concurrently=True` inside
+`with op.get_context().autocommit_block():`, and add a foreign key or
+check constraint with `postgresql_not_valid=True`, then `VALIDATE
+CONSTRAINT` (which takes only a weak lock) in the same or a later revision.
+Batch any table-wide `UPDATE`. The linter enforces the first two for the
+tables in `LARGE_TABLES` in `scripts/lint_migrations.py` (rules
+`create_index_blocking`, `add_constraint_validating`); a table created in the
+same migration is empty and exempt. Add a table to that list when it gets
+one row per lease, query or event. Existing findings are in the baseline.
+
 ---
 
 ## 9. Version Pins — `versions.json`

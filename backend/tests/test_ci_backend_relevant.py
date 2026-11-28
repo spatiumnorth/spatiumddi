@@ -41,6 +41,8 @@ _MANIFEST = _REPO_ROOT / ".github" / "scripts" / "ci-backend-must-run.txt"
 # declaring only one of them would leave the other manifest prefix looking
 # unnecessary, which is the drift this guard exists to prevent.
 _KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
+    # #1253: the safe-DDL rules live in the migration linter itself.
+    "test_migration_safety_1253.py": "scripts/lint_migrations.py",
     "test_spatium_console.py": "appliance/mkosi.extra/usr/local/bin/spatium-console",
     "test_appliance_join_auto_retry.py": (
         "appliance/mkosi.extra/usr/local/bin/spatium-cluster-join"
