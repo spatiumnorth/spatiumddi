@@ -24,12 +24,24 @@ report already carries real served serials, and its 0 means "not reported").
 packed runs (``blocklist_entries``) as well as one object per entry. The
 control plane sends the packed shape only to a server whose agent said so, and
 the per-entry shape to every other.
+
+``blocklist-stream`` (#4041) — the agent fetches blocklist entries from their
+own versioned document (``GET /api/v1/dns/agents/blocklist``) and merges them
+into the bundle, which then carries no entries. The control plane leaves the
+entries out of the bundle only for a server whose agent said so, so a blocklist
+edit moves the stream's ETag and not the bundle's; every other agent keeps the
+entries embedded.
 """
 
 from __future__ import annotations
 
 FEATURES_HEADER = "X-Spatium-Agent-Features"
-FEATURES: tuple[str, ...] = ("soa-timers", "served-serials", "packed-blocklists")
+FEATURES: tuple[str, ...] = (
+    "soa-timers",
+    "served-serials",
+    "packed-blocklists",
+    "blocklist-stream",
+)
 
 
 def headers() -> dict[str, str]:
