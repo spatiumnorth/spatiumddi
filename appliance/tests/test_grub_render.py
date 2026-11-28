@@ -545,8 +545,17 @@ def test_serial_and_terminal_directives_present() -> None:
 def test_insmod_directives_present() -> None:
     """Required insmod directives must be present."""
     out = _render()
-    for mod in ("insmod part_gpt", "insmod ext2", "insmod ext4", "insmod search_fs_uuid"):
+    for mod in ("insmod part_gpt", "insmod ext2", "insmod search_fs_uuid"):
         assert mod in out, f"{mod!r} directive missing"
+
+
+def test_no_insmod_for_a_module_grub_does_not_have() -> None:
+    """#5036: GRUB has no ``ext4`` module (``ext2`` reads ext4), so
+    ``insmod ext4`` printed "file `/grub/i386-pc/ext4.mod' not found" before
+    every boot menu. Every insmod must name a module GRUB ships."""
+    out = _render()
+    insmods = [line.strip() for line in out.splitlines() if line.strip().startswith("insmod ")]
+    assert "insmod ext4" not in insmods, insmods
 
 
 def test_next_entry_boot_counting_block() -> None:

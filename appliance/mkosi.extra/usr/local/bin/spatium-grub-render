@@ -339,8 +339,10 @@ def render_text(uuid_a: str, uuid_b: str,
         "terminal_output console serial",
         "",
         "insmod part_gpt",
+        # ext2 reads ext2, ext3 and ext4: GRUB has no `ext4` module, and
+        # `insmod ext4` printed "file `/grub/i386-pc/ext4.mod' not found"
+        # before every boot menu (#5036).
         "insmod ext2",
-        "insmod ext4",
         "insmod search_fs_uuid",
         # #999 Part C2 — a mirrored install puts BOTH slot roots on
         # /dev/md/root_*, and grub reaches them with `search --fs-uuid`
