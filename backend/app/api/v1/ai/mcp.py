@@ -46,6 +46,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.api.deps import DB, CurrentUser
+from app.api.tenant_binding import tenant_aware
 from app.api.token_binding import honours_token_binding
 from app.models.auth import User
 from app.models.settings import PlatformSettings
@@ -169,6 +170,7 @@ _INTERNAL_ERROR = -32603
 
 @router.get("")
 @honours_token_binding
+@tenant_aware
 async def mcp_get(request: Request, current_user: CurrentUser, db: DB) -> dict[str, Any]:
     """A bare GET on ``/mcp`` returns server info — useful for browser
     sanity-checks and for Streamable-HTTP clients that probe for
@@ -187,6 +189,7 @@ async def mcp_get(request: Request, current_user: CurrentUser, db: DB) -> dict[s
 
 @router.post("")
 @honours_token_binding
+@tenant_aware
 async def mcp_post(
     request: Request, current_user: CurrentUser, db: DB
 ) -> dict[str, Any] | list[dict[str, Any]]:

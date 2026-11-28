@@ -108,6 +108,7 @@ class ListSpacesArgs(BaseModel):
 @register_tool(
     name="list_ip_spaces",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "ip_space"),
     description=(
         "List IP spaces (top-level routing domains / VRFs). "
@@ -169,6 +170,7 @@ class ListBlocksArgs(BaseModel):
 @register_tool(
     name="list_ip_blocks",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "ip_block"),
     description=(
         "List IP blocks (aggregate / supernet ranges). Each block "
@@ -252,6 +254,7 @@ class ListSubnetsArgs(BaseModel):
 @register_tool(
     name="list_subnets",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "subnet"),
     description=(
         "List subnets — the routable units that own IP addresses. "
@@ -343,6 +346,7 @@ class FindSubnetsDecommissioningArgs(BaseModel):
 @register_tool(
     name="find_subnets_decommissioning",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "subnet"),
     description=(
         "List subnets with a planned decommission date (issue #46) "
@@ -403,6 +407,7 @@ class SubnetSummaryArgs(BaseModel):
 @register_tool(
     name="get_subnet_summary",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "subnet"),
     description=(
         "Detailed summary for one subnet: status counts (allocated, "
@@ -470,6 +475,7 @@ class SubnetReconciliationArgs(BaseModel):
 @register_tool(
     name="find_subnet_reconciliation",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "subnet"),
     description=(
         "IP-discovery reconciliation for one subnet (issue #23): which "
@@ -514,6 +520,7 @@ class SubnetUtilizationTrendArgs(BaseModel):
 @register_tool(
     name="get_subnet_utilization_trend",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "subnet"),
     description=(
         "Daily IP-utilization history for one subnet (issue #44): a "
@@ -604,6 +611,7 @@ class FindStaleIPsArgs(BaseModel):
 @register_tool(
     name="find_stale_ips",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "ip_address"),
     description=(
         "Address-space hygiene report (issue #45): allocated IPs that "
@@ -663,6 +671,7 @@ class FindIPArgs(BaseModel):
 @register_tool(
     name="find_ip",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "ip_address"),
     description=(
         "Look up a single IP address by its dotted-decimal value "
@@ -758,6 +767,7 @@ class FindIPAddressesArgs(BaseModel):
 @register_tool(
     name="find_ip_addresses",
     honours_token_binding=True,
+    tenant_aware=True,
     permission=("read", "ip_address"),
     description=(
         "Search IP addresses ACROSS every subnet by substring (``q``), "
@@ -1131,6 +1141,7 @@ class CountResourcesArgs(BaseModel):
 
 @register_tool(
     name="count_ipam_resources",
+    tenant_aware=True,
     permission=("read", ("ip_space", "ip_block", "subnet", "ip_address")),
     description=(
         "Total counts of IPAM resources — spaces, blocks, subnets, IP "
@@ -1305,6 +1316,7 @@ class FindIPHygieneFindingsArgs(BaseModel):
 
 @register_tool(
     name="find_ip_hygiene_findings",
+    tenant_aware=True,
     permission=("read", "ip_address"),
     description=(
         "Fleet-wide IPAM hygiene findings (issue #369), in three buckets: "

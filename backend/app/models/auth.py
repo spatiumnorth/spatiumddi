@@ -201,8 +201,32 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class Group(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "group"
+    __table_args__ = (
+        Index(
+            "ix_group_name",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("tenant_id IS NULL"),
+        ),
+        Index(
+            "ix_group_tenant_name",
+            "tenant_id",
+            "name",
+            unique=True,
+            postgresql_where=sa_text("tenant_id IS NOT NULL"),
+        ),
+    )
 
-    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    # Unique install-wide among groups without a tenant, unique per tenant among
+    # groups with one (#4263): partial indexes below, not a column constraint.
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # A group bound to a tenant makes its members tenant users (#4263).
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenant.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     description: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
     auth_source: Mapped[str] = mapped_column(String(20), nullable=False, default="local")
     external_dn: Mapped[str | None] = mapped_column(String(1000), nullable=True)  # LDAP DN
@@ -287,6 +311,15 @@ class APIToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
     token_hash: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    # Pins the token to one tenant (#4263). A tenant user's token is narrowed to
+    # their tenant already; this lets a token of a non-tenant user be confined
+    # to one tenant too. Never widens: see ``app.services.tenancy``.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenant.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     prefix: Mapped[str] = mapped_column(
         String(10), nullable=False
     )  # First 8 chars for identification

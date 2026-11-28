@@ -58,11 +58,26 @@ def _may_read(user: User, provider: SearchProvider) -> bool:
     return any(user_has_permission(user, "read", rt) for rt in provider.resource_types)
 
 
+# Result types a tenant user may search (#4263): the IPAM rows the tenant
+# filter narrows (``app.services.tenancy``). Every other type reads install-wide
+# DNS / DHCP / network / admin tables the filter does not cover.
+TENANT_SEARCH_TYPES: frozenset[str] = frozenset(
+    {"ip_address", "subnet", "block", "space", "custom_field"}
+)
+
+
 async def visible_providers(db: AsyncSession, user: User) -> list[SearchProvider]:
     """Providers this user may run, after RBAC and feature-module gating."""
+    from app.services.tenancy import session_scope
+
     enabled = await get_enabled_modules(db)
+    tenant_user = session_scope(db) is not None
     return [
-        p for p in PROVIDERS if (p.module is None or p.module in enabled) and _may_read(user, p)
+        p
+        for p in PROVIDERS
+        if (p.module is None or p.module in enabled)
+        and _may_read(user, p)
+        and (not tenant_user or p.type in TENANT_SEARCH_TYPES)
     ]
 
 

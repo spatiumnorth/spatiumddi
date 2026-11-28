@@ -151,6 +151,7 @@ from app.models.saved_view import SavedView
 from app.models.settings import BrandingAsset, PlatformSettings
 from app.models.system_upgrade import SystemUpgradeRun
 from app.models.tailscale import TailscaleTenant
+from app.models.tenant import Tenant
 from app.models.time_bound_grant import TimeBoundGrant
 from app.models.tls_cert import TLSCertProbe, TLSCertTarget
 from app.models.unifi import UnifiController
@@ -313,6 +314,7 @@ __all__ = [
     "EventSubscription",
     "EventOutbox",
     "Customer",
+    "Tenant",
     "Site",
     "Provider",
     "Circuit",

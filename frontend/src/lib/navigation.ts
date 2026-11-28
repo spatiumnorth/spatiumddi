@@ -91,6 +91,9 @@ export interface NavEntry {
   anyModule?: string[];
   /** react-router `end` matching for the active state. */
   end?: boolean;
+  /** Offered to a tenant user (#4263). Every other page reads install-wide
+   *  data the API refuses them, so a tenant user's navigation is only these. */
+  tenant?: boolean;
 }
 
 export interface NavExternalEntry {
@@ -104,7 +107,7 @@ export interface NavExternalEntry {
 // sub-headings by family below.
 export const baseMainNav: NavEntry[] = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
-  { label: "IPAM", icon: Network, to: "/ipam", end: true },
+  { label: "IPAM", icon: Network, to: "/ipam", end: true, tenant: true },
   // #1068 — the two subsystems an install may legitimately not run. Both
   // ship enabled; an IPAM-only or single-subsystem install turns the
   // unused one off under Settings → Features and the anchor goes with it.
@@ -130,8 +133,8 @@ export const coreIpamNav: NavEntry[] = [
     to: "/ipam/nat",
     module: "ipam.nat",
   },
-  { label: "Stale IPs", icon: History, to: "/ipam/stale" },
-  { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
+  { label: "Stale IPs", icon: History, to: "/ipam/stale", tenant: true },
+  { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans", tenant: true },
 ];
 
 // DNS-family children. "Domains" keeps its /admin/domains route — it's the
@@ -401,6 +404,13 @@ export const adminIdentityNav: NavEntry[] = [
   { label: "Groups", icon: UsersRound, to: "/admin/groups" },
   { label: "Roles", icon: KeyRound, to: "/admin/roles" },
   { label: "Sessions", icon: Monitor, to: "/admin/sessions" },
+  // #4263 — tenants own IP spaces; groups bound to one confine their members.
+  {
+    label: "Tenants",
+    icon: Building2,
+    to: "/admin/tenants",
+    module: "ipam.tenants",
+  },
   { label: "Users", icon: Users, to: "/admin/users" },
 ];
 
@@ -538,9 +548,11 @@ export const ALL_NAV_DESTINATIONS: NavDestination[] = NAV_SECTIONS.flatMap(
 
 /** Shared module-gating predicate for a nav entry. */
 export function navEntryVisible(
-  entry: Pick<NavEntry, "module" | "anyModule">,
+  entry: Pick<NavEntry, "module" | "anyModule" | "tenant">,
   moduleEnabled: (id: string) => boolean,
+  tenantUser = false,
 ): boolean {
+  if (tenantUser && !entry.tenant) return false;
   if (entry.module && !moduleEnabled(entry.module)) return false;
   if (entry.anyModule && !entry.anyModule.some((m) => moduleEnabled(m)))
     return false;
@@ -548,9 +560,8 @@ export function navEntryVisible(
 }
 
 /** Filter a nav list by the enabled feature modules. */
-export function filterNav<T extends Pick<NavEntry, "module" | "anyModule">>(
-  items: T[],
-  moduleEnabled: (id: string) => boolean,
-): T[] {
-  return items.filter((it) => navEntryVisible(it, moduleEnabled));
+export function filterNav<
+  T extends Pick<NavEntry, "module" | "anyModule" | "tenant">,
+>(items: T[], moduleEnabled: (id: string) => boolean, tenantUser = false): T[] {
+  return items.filter((it) => navEntryVisible(it, moduleEnabled, tenantUser));
 }

@@ -52,6 +52,7 @@ from app.models.audit import AuditLog
 from app.models.auth import APIToken, User
 from app.models.dns import DNSZone
 from app.models.ipam import Subnet
+from app.models.tenant import Tenant
 from app.services.api_token_scopes import validate_resource_grant_shape, validate_scopes
 
 router = APIRouter()
@@ -77,6 +78,9 @@ class ApiTokenCreate(BaseModel):
     # dns_zone}. Empty = no resource restriction. Validated against the
     # issuing user's RBAC + resource existence in the create handler.
     resource_grants: list[dict] = Field(default_factory=list)
+    # Pins the token to one tenant (#4263): every request it makes sees that
+    # tenant's IPAM rows only. It can only narrow its owner, never widen.
+    tenant_id: uuid.UUID | None = None
     # #1355 — the owner's step-up (password, or authenticator code for an
     # account without one). A token outlives the session that minted it, so a
     # stolen session must not be able to mint itself one.
@@ -115,6 +119,7 @@ class ApiTokenResponse(BaseModel):
     scope: str
     scopes: list[str] = Field(default_factory=list)
     resource_grants: list[dict] = Field(default_factory=list)
+    tenant_id: uuid.UUID | None = None
     user_id: uuid.UUID | None
     # Whose token this is (#2443), which a superadmin sees across users.
     # None only for an ownerless token.
@@ -363,6 +368,10 @@ async def create_token(
         )
     # Resource grants (#374): existence + "can't exceed yourself" checks.
     await _validate_resource_grants(db, current_user, body.resource_grants)
+    if body.tenant_id is not None and await db.get(Tenant, body.tenant_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Tenant not found"
+        )
     # #3432 — disabling an account revokes its tokens under a lock on the
     # account row. Re-read ``is_active`` under a share lock here: the caller
     # was authenticated before that disable may have committed, and a token
@@ -385,6 +394,7 @@ async def create_token(
         scope="user",
         scopes=body.scopes,
         resource_grants=body.resource_grants or None,
+        tenant_id=body.tenant_id,
         user_id=current_user.id,
         created_by_user_id=current_user.id,
         expires_at=expires_at,
@@ -408,6 +418,7 @@ async def create_token(
                 "expires_at": expires_at.isoformat() if expires_at else None,
                 "scopes": body.scopes,
                 "resource_grants": body.resource_grants,
+                "tenant_id": str(body.tenant_id) if body.tenant_id else None,
                 "stepup_method": method,
             },
         )
@@ -422,6 +433,7 @@ async def create_token(
         "scope": token.scope,
         "scopes": token.scopes,
         "resource_grants": token.resource_grants or [],
+        "tenant_id": token.tenant_id,
         "user_id": token.user_id,
         "expires_at": token.expires_at,
         "last_used_at": token.last_used_at,

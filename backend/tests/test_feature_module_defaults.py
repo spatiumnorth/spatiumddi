@@ -91,6 +91,7 @@ EXPECTED_DEFAULTS: dict[str, bool] = {
     # data, so an upgraded install that uses NAT keeps it. This file pins
     # the fresh-install value; ``test_feature_module_nat_2100.py`` pins the rest.
     "ipam.nat": False,
+    "ipam.tenants": False,
     # ── Integrations ────────────────────────────────────────────────
     "integrations.kubernetes": False,
     "integrations.docker": False,

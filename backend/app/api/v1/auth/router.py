@@ -133,6 +133,7 @@ from app.services.reauth import (
     sign_in_is_recent,
     uses_local_password,
 )
+from app.services.tenancy import is_tenant_user
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -201,6 +202,9 @@ class UserResponse(BaseModel):
     is_superadmin: bool
     force_password_change: bool
     auth_source: str
+    # True for a tenant user (#4263): the console narrows its navigation to the
+    # IPAM surface. Informational only; the API enforces the boundary itself.
+    is_tenant_user: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -1186,6 +1190,7 @@ async def get_me(current_user: CurrentUser) -> UserResponse:
         is_superadmin=is_effective_superadmin(current_user),
         force_password_change=current_user.password_change_required,
         auth_source=current_user.auth_source,
+        is_tenant_user=is_tenant_user(current_user),
     )
 
 

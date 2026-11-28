@@ -68,6 +68,7 @@ from app.models.ipam import (
     SubnetUtilizationHistory,
 )
 from app.models.settings import PlatformSettings
+from app.models.tenant import Tenant
 from app.models.vlans import VLAN
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import (
@@ -164,6 +165,7 @@ from app.services.search.providers import IP_MAC_NORMALIZED_SQL
 from app.services.search.ranking import escape_like, like_pattern
 from app.services.search.schemas import shape_of
 from app.services.tags import apply_tag_filter
+from app.services.tenancy import session_scope
 
 logger = structlog.get_logger(__name__)
 
@@ -1541,8 +1543,13 @@ async def _assert_scoped_zones(
     this a grant on one subnet or set would publish into any zone whose id the
     holder knew. A scoped grant must not reach a zone it never named. A zone in
     ``already`` (a row's current binding) passes, so a re-save is not refused.
-    A caller holding the type-level subnet write is not checked."""
-    if not _subnet_write_is_scoped(user):
+    A caller holding the type-level subnet write is not checked.
+
+    A tenant user (#4263) is always checked, and no grant lets them past: DNS
+    zones stay install-wide in multi-tenancy phase 1, so a tenant publishes
+    only into the zones its subnet was given by a global operator."""
+    tenant_user = session_scope(db) is not None
+    if not tenant_user and not _subnet_write_is_scoped(user):
         return
     wanted = {str(z) for z in zone_ids if z}
     if not wanted:
@@ -1553,6 +1560,14 @@ async def _assert_scoped_zones(
     if primary is not None:
         allowed.add(str(primary))
     for zid in sorted(wanted - allowed):
+        if tenant_user:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "A tenant user can publish only into the DNS zones the subnet already "
+                    "uses (DNS zones are shared across tenants)"
+                ),
+            )
         if not user_has_permission(user, "write", "dns_zone", zid):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -4140,6 +4155,10 @@ def _validate_ddns_policy_optional(v: str | None) -> str | None:
 
 class IPSpaceCreate(BaseModel):
     name: str
+    # Tenant that owns the space (#4263). A tenant user's spaces always belong
+    # to their tenant: it is filled in for them (a user of several tenants must
+    # name one), and naming a tenant outside their scope reads as not found.
+    tenant_id: uuid.UUID | None = None
     description: str = ""
     is_default: bool = False
     tags: dict[str, Any] = {}
@@ -4259,6 +4278,7 @@ class IPSpaceUpdate(BaseModel):
 class IPSpaceResponse(BaseModel):
     id: uuid.UUID
     name: str
+    tenant_id: uuid.UUID | None = None
     description: str
     is_default: bool
     tags: dict[str, Any]
@@ -5444,7 +5464,20 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
     await _assert_dns_groups_exist(db, body.dns_group_ids)
     # Pre-check the unique-name constraint so we can return a clean 409
     # instead of letting the DB raise an IntegrityError (→ 500).
-    existing = await db.execute(select(IPSpace).where(IPSpace.name == body.name))
+    if body.tenant_id is not None and await db.get(Tenant, body.tenant_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    # Names are unique per tenant (#4263); a tenant user's own spaces are all a
+    # tenant session can see, and an untenanted name is only compared to other
+    # untenanted ones.
+    scope = session_scope(db)
+    clash_tenant = body.tenant_id
+    if clash_tenant is None and scope is not None and len(scope) == 1:
+        clash_tenant = next(iter(scope))
+    existing = await db.execute(
+        select(IPSpace).where(
+            IPSpace.name == body.name, IPSpace.tenant_id.is_not_distinct_from(clash_tenant)
+        )
+    )
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -5460,7 +5493,7 @@ async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -
         await db.flush()
     except IntegrityError as exc:
         await db.rollback()
-        if "ix_ip_space_name" not in str(exc.orig):
+        if not any(n in str(exc.orig) for n in ("ix_ip_space_name", "ix_ip_space_tenant_name")):
             raise
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -5527,7 +5560,11 @@ async def update_space(
     # would otherwise raise a raw IntegrityError → 500 on a colliding rename.
     if body.name is not None and body.name != space.name:
         clash = await db.execute(
-            select(IPSpace.id).where(IPSpace.name == body.name, IPSpace.id != space_id)
+            select(IPSpace.id).where(
+                IPSpace.name == body.name,
+                IPSpace.id != space_id,
+                IPSpace.tenant_id.is_not_distinct_from(space.tenant_id),
+            )
         )
         if clash.scalar_one_or_none():
             raise HTTPException(

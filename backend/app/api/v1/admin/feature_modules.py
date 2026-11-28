@@ -29,6 +29,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.stepup import refuse_if_stepup_blocked
+from app.api.tenant_binding import tenant_aware
 from app.core.agent_wake import publish_wake
 from app.core.auth_throttle import login_rate_limited, record_stepup_password_failure
 from app.core.demo_mode import DEMO_RESTRICTED_MODULES, is_demo_mode
@@ -147,6 +148,7 @@ class FeatureModuleToggleBody(BaseModel):
 
 
 @router.get("/feature-modules", response_model=list[FeatureModuleEntry])
+@tenant_aware  # the console builds its navigation from this; it names no estate data
 async def list_feature_modules(db: DB, current_user: CurrentUser) -> list[FeatureModuleEntry]:
     # The same derivation the route gate uses (#2100), so the frontend's
     # ``resolveEnabled`` resolves exactly what ``require_module`` enforces.

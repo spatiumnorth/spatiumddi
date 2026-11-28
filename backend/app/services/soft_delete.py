@@ -1084,7 +1084,14 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
 
     if isinstance(obj, IPSpace):
         existing = (
-            await db.execute(select(IPSpace).where(IPSpace.name == obj.name, IPSpace.id != obj.id))
+            await db.execute(
+                select(IPSpace).where(
+                    IPSpace.name == obj.name,
+                    IPSpace.id != obj.id,
+                    # Names are unique per tenant (#4263).
+                    IPSpace.tenant_id.is_not_distinct_from(obj.tenant_id),
+                )
+            )
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active IP space named {obj.name!r} already exists"

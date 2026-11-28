@@ -76,6 +76,7 @@ SECTIONS: tuple[Section, ...] = (
             "pointing at users that don't exist in the destination."
         ),
         tables=(
+            "tenant",
             "user",
             "group",
             "role",

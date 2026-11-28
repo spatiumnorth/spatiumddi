@@ -146,6 +146,7 @@ import {
   type IpDnsState,
 } from "@/lib/gatewayDns";
 import { CustomFieldMultiSelect } from "@/components/CustomFieldMultiSelect";
+import { TenantChip } from "@/components/TenantChip";
 import { GatewayHostnameNote } from "@/components/GatewayHostnameNote";
 import { cn, selectedRowClass, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { withoutEmptyValues } from "@/lib/withoutEmptyValues";
@@ -17539,6 +17540,7 @@ export function SpaceSection({
               >
                 {space.name}
               </span>
+              <TenantChip tenantId={space.tenant_id} />
               <CustomerChip customerId={space.customer_id} />
             </button>
           </div>

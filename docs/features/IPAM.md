@@ -1114,6 +1114,24 @@ operator flags a field searchable — worth doing, not yet done.
 
 ---
 
+## 13. Multi-tenancy (#4263)
+
+IP spaces may belong to a **tenant** (`ip_space.tenant_id`; blocks, subnets and
+addresses belong to the tenant of their space). For a tenant user every page and route in
+this document answers for the tenant's rows only: the IPAM tree, subnet and address
+lists and detail, address search, free space, the planner, import and export, utilization
+history, the stale-IP and hygiene reports and global search. Another tenant's rows are not
+hidden but absent, so counts and totals cover the tenant alone and an id outside it reads
+`404`. Two tenants may use the same CIDRs and the same space name.
+
+What a tenant user cannot do in phase 1: assign DNS or DHCP server groups to IPAM rows,
+use the NAT and IPAM template catalogues, the DNS-sync and reverse-zone routes, the
+effective DNS / DHCP views, discovery and WoL, or the vendor rollups (they join install-wide
+leases). Those routes answer `403`. Spaces and tenants are managed under Administration →
+Tenants (superadmin); the tenant is shown as a badge beside the space in the tree. See
+[AUTH.md](AUTH.md#tenants-and-tenant-users-4263) and
+[PERMISSIONS.md](../PERMISSIONS.md#tenant-users-4263).
+
 ## 11. UI Conventions
 
 ### Combined IPAM Tree View

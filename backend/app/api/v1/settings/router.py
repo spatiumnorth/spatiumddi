@@ -28,6 +28,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pre_body_auth import PreBodyAuthUploadRoute
+from app.api.tenant_binding import tenant_aware
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.celery_dispatch import dispatch
 from app.core.config_text import has_control_chars, reject_control_chars
@@ -2253,12 +2254,19 @@ async def _settings_response(db: DB, settings: PlatformSettings) -> SettingsResp
 
 
 def _may_read_settings(user: Any) -> bool:
+    # A tenant user never reads the install's settings, whatever role they
+    # hold: they get the reduced public view (#4263).
+    from app.services.tenancy import is_tenant_user
+
+    if is_tenant_user(user):
+        return False
     return user_has_permission(user, "read", "settings") or user_has_permission(
         user, "write", "settings"
     )
 
 
 @router.get("", response_model=SettingsResponse | SettingsPublicResponse)
+@tenant_aware  # a tenant user gets only the reduced public view (_may_read_settings)
 async def get_settings(
     current_user: CurrentUser, db: DB
 ) -> SettingsResponse | SettingsPublicResponse:

@@ -56,6 +56,7 @@ from app.services.ipam.subnet_placeholders import (
     subnet_kind_for,
 )
 from app.services.ipam_io.parser import ParsedPayload
+from app.services.tenancy import session_scope
 
 logger = structlog.get_logger(__name__)
 
@@ -138,8 +139,12 @@ async def _resolve_space(
             )
         return space
     if space_name:
-        result = await db.execute(select(IPSpace).where(IPSpace.name == space_name))
-        space = result.scalar_one_or_none()
+        stmt = select(IPSpace).where(IPSpace.name == space_name)
+        # Names are unique per tenant (#4263). A tenant user's session already
+        # sees only their tenant's spaces; anyone else matches an untenanted one.
+        if session_scope(db) is None:
+            stmt = stmt.where(IPSpace.tenant_id.is_(None))
+        space = (await db.execute(stmt.limit(1))).scalar_one_or_none()
         if space is not None:
             return space
     raise HTTPException(

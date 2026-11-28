@@ -10,6 +10,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
+from app.api.tenant_binding import route_is_tenant_aware
 from app.api.token_binding import route_honours_token_binding
 from app.core.denial_audit import remember_caller
 from app.core.jwt_compat import JWTError
@@ -223,8 +224,32 @@ async def _resolve_api_token(
                 "and this endpoint cannot be limited to them"
             ),
         )
+    user._api_token_tenant_id = token.tenant_id
+    _apply_tenant_scope(db, request, user)
     remember_caller(request, user)
     return user
+
+
+def _apply_tenant_scope(db: AsyncSession, request: Request, user: User) -> None:
+    """Confine a tenant user's request (#4263, ``app.services.tenancy``).
+
+    Stores the tenant ids on the request's session, which narrows every IPAM
+    read and guards every write, and refuses the request outright when the
+    matched route has not declared itself tenant-aware, so a route added later
+    starts closed for tenants. A non-tenant caller is untouched.
+    """
+    from app.services.tenancy import set_session_scope, tenant_scope_for
+
+    scope = tenant_scope_for(user)
+    set_session_scope(db, scope)
+    if scope is None:
+        return
+    request.state.tenant_scope = scope
+    if not route_is_tenant_aware(request):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This endpoint is not available to tenant users",
+        )
 
 
 async def get_current_user(
@@ -363,6 +388,7 @@ async def authenticate_bearer(
         )
 
     await _load_time_bound_grants(db, user)
+    _apply_tenant_scope(db, request, user)
     remember_caller(request, user)
     return user
 

@@ -387,6 +387,36 @@ starts at the server groups). The built-in roles keep what they had
 (`Auditor` and `Compliance Editor` gain `read` on `dns_group` and
 `dns_record`, which their zone read used to open).
 
+## Tenant users (#4263)
+
+Multi-tenancy phase 1 of #695 adds a boundary *around* the grammar above rather
+than a new entry in it. A **tenant** owns IP spaces; a **group** bound to a tenant
+makes its members **tenant users**. Roles keep their meaning: a tenant user holding
+`IPAM Editor` edits IPAM, but only inside the tenant's spaces, with no id list in the
+role and nothing for the role to name when a subnet is added later.
+
+| Question | Answer |
+| --- | --- |
+| Who is a tenant user? | A user, not an effective superadmin, with at least one group whose `tenant_id` is set. Users of several tenant groups are confined to the union of those tenants; one tenant group plus an ordinary group still makes a tenant user. |
+| Who is never confined? | An effective superadmin (the legacy flag or a `*` / `*` role). A group bound to a tenant therefore cannot carry a `*` / `*` role: the API refuses that combination (422). |
+| How do tenant and role combine? | The role decides *what* the user may do, the tenant decides *where*. Both must allow: a refusal by either wins. |
+| What do they see? | Spaces whose `tenant_id` is theirs, and every block, subnet and address under them. Anything else is **absent**: a guessed id answers `404`, never `403`, so existence is not revealed. This holds for lists, detail, address search, free space, the planner, imports and exports, utilization history and the IPAM reports, global search (IPAM types only) and the Copilot / MCP tools that declare themselves tenant-aware. |
+| What if the route is not tenant-aware? | It answers `403` ("This endpoint is not available to tenant users"). The default is closed, so a feature added later starts closed for tenants until someone decides how it behaves. DNS, DHCP, audit, alerts, dashboards, settings, integrations, users and groups are all in this state in phase 1. |
+| Can a tenant user write outside the tenant? | No. A new space lands in the user's own tenant (a user of several tenants must name one), moving a space to another tenant or assigning a DNS / DHCP server group to an IPAM row is refused, and a block or subnet under another tenant's space is not found. |
+| API tokens | A token may be pinned to a tenant (`tenant_id` on create). A pin only narrows: for a tenant user it intersects with their own tenants, so a token pinned to a tenant its owner does not belong to sees nothing. The existing resource-bound tokens (#374) are unaffected, and combine with tenancy as an intersection. |
+| An install with no tenants | Behaves exactly as before: nothing is bound, nothing is filtered. |
+
+Enforcement is one rule in one place (`app/services/tenancy.py`): the auth dependency
+stores the user's tenants on the request's database session, and an ORM hook then adds
+the tenant predicate to every `SELECT` over an IPAM model, joins and subqueries
+included, the same way the soft-delete filter works. A trashed row of another tenant is
+as invisible as a live one (the filter does not depend on `include_deleted`). Raw SQL over
+IPAM tables is not covered by the hook and must filter by hand.
+
+Managing tenants (create, assign spaces, bind groups, pin tokens) is superadmin-only.
+The `ipam.tenants` feature module gates the Tenants page and routes only; it is not what
+confines a bound group, so turning it off never widens anyone's access.
+
 ## Built-in roles (seeded on first start)
 
 | Role           | Permissions                                                  |

@@ -511,6 +511,25 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     # mirrors: they keep writing ``nat_mapping`` provenance rows while this is
     # off, so turning it on later shows a current picture rather than a gap.
     # Disabling is allowed with rows present — the data is hidden, not lost.
+    # Multi-tenancy phase 1 (#4263). The module gates the management surface
+    # (Tenants page, /tenants routes, sidebar row); it is NOT what enforces the
+    # boundary: a group bound to a tenant stays confined while the module is
+    # off, so switching it off can never widen anyone's access. Off on a fresh
+    # install, on wherever a tenant already exists.
+    ModuleSpec(
+        id="ipam.tenants",
+        label="Tenants",
+        group="IPAM",
+        description=(
+            "Multi-tenancy for managed-service use: a tenant owns IP spaces, and groups "
+            "bound to it confine their members to that tenant's spaces on every IPAM page, "
+            "search and export. Off on a fresh install, but on wherever a tenant already "
+            "exists. Turning it off hides the Tenants page; it does not lift the "
+            "confinement of groups already bound to a tenant."
+        ),
+        default_enabled=False,
+        default_on_if_rows_in="tenant",
+    ),
     ModuleSpec(
         id="ipam.nat",
         label="NAT mappings",
