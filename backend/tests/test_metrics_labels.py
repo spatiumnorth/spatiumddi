@@ -89,6 +89,9 @@ def test_metrics_endpoint_renders_and_does_not_count_itself(
 ) -> None:
     # #1159 — the endpoint needs a bearer token now.
     monkeypatch.setattr(settings, "prometheus_metrics_token", "labels-test-token")
+    # #2146 — the scrape token also reads the business series, which need the
+    # database; this module's tests are about the request labels and run none.
+    monkeypatch.setattr(settings, "prometheus_business_metrics_enabled", False)
     client = TestClient(_app())
     before = _count("GET", "/metrics", "200")
 
