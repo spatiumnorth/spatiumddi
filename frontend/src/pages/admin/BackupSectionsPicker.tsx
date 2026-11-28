@@ -6,6 +6,7 @@ import { ListReadError } from "@/components/ui/list-read-error";
 import { backupApi, type BackupSection } from "@/lib/api";
 
 import { reachOutsideSelection } from "./backupSelectiveReach";
+import { countNoun } from "@/lib/count-noun";
 
 /**
  * Shared section-checklist for both restore flows (issue #117
@@ -182,7 +183,7 @@ export function BackupSectionsPicker({
                       <span className="flex items-center gap-2">
                         <strong>{s.label}</strong>
                         <span className="text-[10px] text-muted-foreground">
-                          {s.table_count} tables
+                          {countNoun(s.table_count, "table")}
                         </span>
                         {s.volatile && (
                           <span className="rounded bg-zinc-500/15 px-1.5 py-0.5 text-[10px] text-zinc-600 dark:text-zinc-400">

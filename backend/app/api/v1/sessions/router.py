@@ -30,17 +30,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import Select, func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
-from app.core.session_idle import get_session_timeout_minutes, idle_cutoff
+from app.core.session_idle import only_live_sessions
 from app.core.session_rotation import (
     request_session_jti,
     resolve_live_session_id,
@@ -95,15 +94,6 @@ def _row(
     )
 
 
-async def _exclude_idle(stmt: Select[Any], db: AsyncSession, now: datetime) -> Select[Any]:
-    """Leave out sessions idle past the configured Session Timeout. The auth
-    layer already refuses them, so listing them as live would be wrong."""
-    cutoff = idle_cutoff(await get_session_timeout_minutes(db), now)
-    if cutoff is None:
-        return stmt
-    return stmt.where(func.coalesce(UserSession.last_seen_at, UserSession.created_at) > cutoff)
-
-
 async def _caller_session_id(request: Request, db: AsyncSession, now: datetime) -> str | None:
     """The session the caller's access token stands for, resolved through
     the rotation grace (#2941): a tab whose token names a session another
@@ -129,8 +119,7 @@ async def list_my_sessions(
     now = datetime.now(UTC)
     stmt = select(UserSession).where(UserSession.user_id == current_user.id)
     if not include_expired:
-        stmt = stmt.where(UserSession.revoked.is_(False)).where(UserSession.expires_at > now)
-        stmt = await _exclude_idle(stmt, db, now)
+        stmt = await only_live_sessions(stmt, db, now)
     stmt = stmt.order_by(UserSession.created_at.desc())
     rows = (await db.execute(stmt)).scalars().all()
     current_jti = await _caller_session_id(request, db, now)
@@ -161,8 +150,7 @@ async def list_all_sessions(
     now = datetime.now(UTC)
     stmt = select(UserSession, User).join(User, UserSession.user_id == User.id)
     if not include_expired:
-        stmt = stmt.where(UserSession.revoked.is_(False)).where(UserSession.expires_at > now)
-        stmt = await _exclude_idle(stmt, db, now)
+        stmt = await only_live_sessions(stmt, db, now)
     stmt = stmt.order_by(UserSession.created_at.desc())
     rows = (await db.execute(stmt)).all()
     current_jti = await _caller_session_id(request, db, now)

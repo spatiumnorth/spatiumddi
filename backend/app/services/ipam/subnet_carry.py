@@ -16,6 +16,7 @@ provenance.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.services.integration_ownership import INTEGRATION_OWNERSHIP_FKS
@@ -95,12 +96,24 @@ def _comparable(column: str, value: Any) -> Any:
     return value
 
 
+def readable(value: Any) -> str:
+    """``value`` as an operator reads it, never Python's repr (#4831).
+
+    ``None`` is "none", a flag is true / false, a list or object is compact
+    JSON (#4421's ``custom_field_text``, keys sorted), a date is ISO.
+    """
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+    return str(value)
+
+
 def _shown(column: str, value: Any) -> str:
     """A bounded, stable rendering of ``value`` for a warning."""
-    value = _comparable(column, value)
-    if isinstance(value, dict):
-        value = dict(sorted(value.items()))
-    text = repr(value)
+    text = readable(_comparable(column, value))
     if len(text) > _SHOWN_VALUE_MAX:
         text = text[: _SHOWN_VALUE_MAX - 3] + "..."
     return text
@@ -139,7 +152,7 @@ def merge_conflicts_and_warnings(sources: list[Any]) -> tuple[list[tuple[str, st
     warnings: list[str] = []
     target = sources[0]
     for c in HARD_MERGE_COLUMNS:
-        vals = {repr(getattr(s, c)) for s in sources}
+        vals = {readable(getattr(s, c)) for s in sources}
         if len(vals) > 1:
             conflicts.append(
                 (
@@ -158,11 +171,11 @@ def merge_conflicts_and_warnings(sources: list[Any]) -> tuple[list[tuple[str, st
     for c in CARRIED_COLUMNS:
         if c in HARD_MERGE_COLUMNS:
             continue
-        vals = {repr(getattr(s, c)) for s in sources}
+        vals = {readable(getattr(s, c)) for s in sources}
         if len(vals) > 1:
             warnings.append(
                 f"Sources disagree on {c}: {', '.join(sorted(vals))}. The merged "
-                f"subnet takes the target's value ({getattr(target, c)!r})."
+                f"subnet takes the target's value ({readable(getattr(target, c))})."
             )
     for c in TARGET_WINS_COLUMNS:
         norm = [_comparable(c, getattr(s, c)) for s in sources]

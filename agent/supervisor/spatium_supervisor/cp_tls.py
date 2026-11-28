@@ -26,7 +26,9 @@ The model:
 * **Check the first-contact pin once approved.** Trust on first use is only
   as good as that first contact. Once the CA arrives, the supervisor checks
   that the certificate it pinned is one the CA vouches for, and says so
-  loudly if not.
+  loudly (a warning) if not. Behind an ingress, Route or reverse proxy the
+  pin is the router's certificate and is never vouched for (#4647): the
+  warning is expected there, and a router rotation needs a manual re-pin.
 
 What this does not cover, stated so nobody reads more into it: an attacker
 present at pairing who also substitutes the CA certificate the supervisor
@@ -585,7 +587,13 @@ def try_repin(state_dir: Path, url: str) -> bool:
                 detail=(
                     "The control plane is presenting a certificate its own CA "
                     "does not vouch for: an interception, or a certificate the "
-                    "control plane has not recorded. Keeping the old pin."
+                    "control plane has not recorded. Keeping the old pin. "
+                    "Behind a Route, Ingress or reverse proxy the CA never "
+                    "vouches for the router's certificate, so a router "
+                    "certificate rotation is not adopted automatically: after "
+                    "confirming the new fingerprint, delete tls/control-plane.pem "
+                    "under the supervisor state directory and restart "
+                    "spatium-supervisor to pin the new certificate."
                 ),
             )
             return False
@@ -625,15 +633,26 @@ def check_pin_vouched_once(state_dir: Path, url: str) -> None:
             sha256=[display_fingerprint(fp) for fp in sorted(pinned & vouched)],
         )
         return
-    log.error(
+    # WARNING, not ERROR (#4647): a control plane published through an
+    # OpenShift Route, a Kubernetes Ingress or the operator's own reverse
+    # proxy presents the router's certificate, which the appliance CA never
+    # saw and so cannot vouch for. That is a supported topology, and this
+    # supervisor works fine in it. It is also exactly what an interception at
+    # pairing looks like from here, so the line stays loud and names both.
+    log.warning(
         "supervisor.tls.pin_not_vouched",
         pinned=[display_fingerprint(fp) for fp in sorted(pinned)],
         vouched=[display_fingerprint(fp) for fp in sorted(vouched)],
         detail=(
             "The certificate this supervisor pinned when it first contacted the "
             "control plane is not one the control plane's CA vouches for. "
-            "Either something intercepted the first contact, or the certificate "
-            "has changed since; compare with Appliance -> Fleet -> Web UI "
-            "Certificate on the control plane."
+            "Expected when the control plane is published through an OpenShift "
+            "Route, a Kubernetes Ingress or your own reverse proxy: that "
+            "certificate belongs to the router, not to SpatiumDDI. Confirm the "
+            "pinned fingerprint is the router's (for a Route: "
+            "`openssl s_client -connect <host>:443 | openssl x509 -noout "
+            "-fingerprint -sha256`). Otherwise something intercepted the first "
+            "contact, or the certificate has changed since; compare with "
+            "Appliance -> Fleet -> Web UI Certificate on the control plane."
         ),
     )

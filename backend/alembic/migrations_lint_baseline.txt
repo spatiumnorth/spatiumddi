@@ -390,6 +390,11 @@ backend/alembic/versions/c4a8e1f26d93_subnet_show_free_ranges.py:drop_column:31
 backend/alembic/versions/c4a8e2f7b913_dns_blocklist_last_success_at.py:drop_column:39
 backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_column:127
 backend/alembic/versions/c4d1e7f90a2b_dns_agent_bundle.py:drop_table:129
+backend/alembic/versions/c4d8e1a7b9f2_dhcp_agentless_intervals.py:drop_column:72
+backend/alembic/versions/c4d8e1a7b9f2_dhcp_agentless_intervals.py:drop_column:73
+backend/alembic/versions/c4d8e1a7b9f2_dhcp_agentless_intervals.py:drop_column:74
+backend/alembic/versions/c4d8e1a7b9f2_dhcp_agentless_intervals.py:drop_column:75
+backend/alembic/versions/c4d8e1a7b9f2_dhcp_agentless_intervals.py:drop_column:76
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_column:106
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_table:104
 backend/alembic/versions/c4d9a1e6f827_add_auth_providers_and_app_base_url.py:drop_table:105
@@ -690,6 +695,7 @@ backend/alembic/versions/e4a7c1f08b9d_firewall_policy_schema.py:drop_table:143
 backend/alembic/versions/e4a7c1f08b9d_firewall_policy_schema.py:drop_table:144
 backend/alembic/versions/e4a7f10b2c39_agent_last_seen_ip.py:drop_column:41
 backend/alembic/versions/e4a7f10b2c39_agent_last_seen_ip.py:drop_column:42
+backend/alembic/versions/e4a91c7d52b3_appliance_roles_awaiting_key.py:drop_column:42
 backend/alembic/versions/e4b8073af215_wol_run_target_verify_evidence.py:drop_column:53
 backend/alembic/versions/e4b8c27d91f3_dns_server_zone_resync_seq.py:drop_column:32
 backend/alembic/versions/e4b9f07d25a1_dhcp_group_centric_refactor.py:drop_column:321
@@ -721,6 +727,12 @@ backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:3
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:376
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:381
 backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:385
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:115
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:116
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:117
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:118
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:119
+backend/alembic/versions/e5a2c8d4f7b1_audit_forward_target_log_streams.py:drop_column:120
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:108
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:109
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:110

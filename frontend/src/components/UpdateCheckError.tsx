@@ -1,4 +1,4 @@
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, CloudOff } from "lucide-react";
 import type { VersionInfo } from "@/lib/api";
 
 /**
@@ -20,7 +20,10 @@ export function UpdateCheckError({
 }: {
   info: Pick<
     VersionInfo,
-    "latest_check_error" | "release_check_enabled" | "latest_checked_at"
+    | "latest_check_error"
+    | "latest_check_error_kind"
+    | "release_check_enabled"
+    | "latest_checked_at"
   >;
   compact?: boolean;
 }) {
@@ -29,6 +32,36 @@ export function UpdateCheckError({
   const when = info.latest_checked_at
     ? ` (last attempt ${new Date(info.latest_checked_at).toLocaleString()})`
     : "";
+  // No route to GitHub is a normal state for an air-gapped install, not a
+  // fault (#4799): neutral, with the way out. Amber stays for an HTTP error.
+  if (info.latest_check_error_kind === "unreachable") {
+    const hint =
+      "GitHub isn't reachable from this install. If it has no internet, turn the release check off in Settings → Updates.";
+    if (compact) {
+      return (
+        <span
+          role="status"
+          title={`${hint} ${err}${when}`}
+          className="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+        >
+          <CloudOff className="h-3 w-3" />
+          GitHub unreachable
+        </span>
+      );
+    }
+    return (
+      <p
+        role="status"
+        className="flex items-start gap-1.5 pb-2 text-xs text-muted-foreground"
+      >
+        <CloudOff className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+        <span className="min-w-0 break-words">
+          {hint}
+          {when}
+        </span>
+      </p>
+    );
+  }
   const title = `Update check failed: ${err}${when}`;
   if (compact) {
     return (

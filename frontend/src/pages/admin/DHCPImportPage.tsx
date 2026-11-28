@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
@@ -364,7 +365,12 @@ function ConfigureForm({
         <div className="space-y-3">
           {isFileSource ? (
             <div>
-              <label className="block text-sm font-medium">Config file</label>
+              <label
+                htmlFor="dhcpimport-file"
+                className="block text-sm font-medium"
+              >
+                Config file
+              </label>
               <p className="mb-2 text-[11px] text-muted-foreground">
                 {source === "kea"
                   ? "Kea kea-dhcp4.conf / kea-dhcp6.conf (JSON, comments OK). Max 25 MB."
@@ -383,6 +389,7 @@ function ConfigureForm({
                     : "Choose file…"}
                 </span>
                 <input
+                  id="dhcpimport-file"
                   type="file"
                   accept={accept}
                   className="sr-only"
@@ -400,7 +407,10 @@ function ConfigureForm({
             </div>
           ) : (
             <div>
-              <label className="block text-sm font-medium">
+              <label
+                htmlFor="dhcpimport-windows-dhcp-server"
+                className="block text-sm font-medium"
+              >
                 Windows DHCP server
               </label>
               <p className="mb-2 text-[11px] text-muted-foreground">
@@ -408,6 +418,7 @@ function ConfigureForm({
                 without credentials are greyed out.
               </p>
               <select
+                id="dhcpimport-windows-dhcp-server"
                 value={state.serverId}
                 onChange={(e) =>
                   setState((s) => ({
@@ -452,7 +463,10 @@ function ConfigureForm({
           )}
 
           <div>
-            <label className="block text-sm font-medium">
+            <label
+              htmlFor="dhcpimport-target-dhcp-server-group"
+              className="block text-sm font-medium"
+            >
               Target DHCP server group
             </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
@@ -460,6 +474,7 @@ function ConfigureForm({
               server so the agent renders them on its next sync.
             </p>
             <select
+              id="dhcpimport-target-dhcp-server-group"
               value={state.groupId}
               onChange={(e) =>
                 setState((s) => ({ ...s, groupId: e.target.value }))
@@ -489,8 +504,14 @@ function ConfigureForm({
               to link-only (unmatched scopes will report an error you can fix
               and re-run).
             </p>
-            <label className="block text-sm font-medium">IP space</label>
+            <label
+              htmlFor="dhcpimport-ip-space"
+              className="block text-sm font-medium"
+            >
+              IP space
+            </label>
             <select
+              id="dhcpimport-ip-space"
               value={state.spaceId}
               onChange={(e) =>
                 setState((s) => ({
@@ -510,10 +531,14 @@ function ConfigureForm({
             </select>
             {state.spaceId && (
               <>
-                <label className="block text-sm font-medium">
+                <label
+                  htmlFor="dhcpimport-parent-block"
+                  className="block text-sm font-medium"
+                >
                   Parent block (for new subnets)
                 </label>
                 <select
+                  id="dhcpimport-parent-block"
                   value={state.blockId}
                   onChange={(e) =>
                     setState((s) => ({ ...s, blockId: e.target.value }))
@@ -595,15 +620,18 @@ export function PreviewPanel({
             </span>
             <span>·</span>
             <span>
-              <strong>{preview.total_pools}</strong> pools
+              <strong>{preview.total_pools}</strong>{" "}
+              {pluralize(preview.total_pools, "pool")}
             </span>
             <span>·</span>
             <span>
-              <strong>{preview.total_reservations}</strong> reservations
+              <strong>{preview.total_reservations}</strong>{" "}
+              {pluralize(preview.total_reservations, "reservation")}
             </span>
             <span>·</span>
             <span>
-              <strong>{supportedClasses.length}</strong> classes
+              <strong>{supportedClasses.length}</strong>{" "}
+              {pluralize(supportedClasses.length, "class", "classes")}
             </span>
           </div>
         </div>

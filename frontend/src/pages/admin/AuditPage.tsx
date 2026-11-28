@@ -1,3 +1,4 @@
+import { pluralize } from "@/lib/count-noun";
 import { Fragment, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ListEmpty } from "@/components/ui/list-read-error";
@@ -597,8 +598,8 @@ function ChainIntegrityBadge() {
         className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
         title={
           data.partial
-            ? `Newest ${data.rows_checked.toLocaleString()} rows verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify checks the rows added since its last run, and the whole chain again once its last full pass is more than 7 days old.`
-            : `Whole chain verified (${data.rows_checked.toLocaleString()} rows)`
+            ? `Newest ${data.rows_checked.toLocaleString()} ${pluralize(data.rows_checked, "row")} verified (seq ${data.first_seq}–${data.last_seq}). Older rows are not re-checked here; the nightly verify checks the rows added since its last run, and the whole chain again once its last full pass is more than 7 days old.`
+            : `Whole chain verified (${data.rows_checked.toLocaleString()} ${pluralize(data.rows_checked, "row")})`
         }
       >
         <ShieldCheck className="h-3 w-3" />

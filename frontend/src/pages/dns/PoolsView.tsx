@@ -996,10 +996,14 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
                 </div>
                 <div className="mt-2 grid grid-cols-2 gap-2">
                   <div className="space-y-1">
-                    <label className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                    <label
+                      htmlFor={`pool-member-cidrs-${idx}`}
+                      className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
+                    >
                       Serving scope — client CIDRs
                     </label>
                     <input
+                      id={`pool-member-cidrs-${idx}`}
                       value={m.servingCidrs}
                       onChange={(e) =>
                         updateMember(idx, { servingCidrs: e.target.value })
@@ -1009,10 +1013,14 @@ function PoolModalForm({ group, zone, pool, onClose }: PoolModalProps) {
                     />
                   </div>
                   <div className="space-y-1">
-                    <label className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                    <label
+                      htmlFor={`pool-member-site-${idx}`}
+                      className="block text-[10px] font-medium uppercase tracking-wider text-muted-foreground"
+                    >
                       Serving scope — Site
                     </label>
                     <select
+                      id={`pool-member-site-${idx}`}
                       value={m.siteId ?? ""}
                       onChange={(e) =>
                         updateMember(idx, {

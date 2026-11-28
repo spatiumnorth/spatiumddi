@@ -131,6 +131,8 @@ describe("IPAM Add address (#3900)", () => {
           strategy: "sequential",
         }),
       getSubnet: () => Promise.resolve({ id: "sub-1", network }),
+      // Allocate waits for the first read of the subnet's DNS (#4860).
+      getEffectiveSubnetDns: () => Promise.resolve({ dns_group_ids: [] }),
     };
     const nextAddress = vi.fn((..._a: unknown[]) =>
       Promise.resolve({ id: "ip-new" }),

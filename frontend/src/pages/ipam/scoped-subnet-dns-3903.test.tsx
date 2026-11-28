@@ -172,3 +172,28 @@ describe("Allocate IP for a subnet-scoped writer (#3903)", () => {
     ).toBe(false);
   });
 });
+
+describe("Allocate IP while the subnet's DNS is loading (#4860)", () => {
+  it("shows no 'needs a DNS zone' hint and no live Allocate until it lands", async () => {
+    signInAs("superadmin");
+    await openSubnet();
+    let release: (v: unknown) => void = () => {};
+    const base = answers.ipamApi.getEffectiveSubnetDns;
+    answers.ipamApi.getEffectiveSubnetDns = () =>
+      new Promise((r) => {
+        release = r;
+      });
+    fireEvent.click(screen.getByRole("button", { name: "Allocate IP" }));
+    const hostname = await screen.findByPlaceholderText("Required");
+    fireEvent.change(hostname, { target: { value: "web1" } });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+    expect(screen.queryByText(/Requires a DNS zone on this subnet/)).toBeNull();
+    const btn = screen
+      .getAllByRole("button")
+      .find((b) => b.textContent === "Allocate") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    release(await base());
+  });
+});

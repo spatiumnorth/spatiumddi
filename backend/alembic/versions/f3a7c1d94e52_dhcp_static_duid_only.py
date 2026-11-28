@@ -9,7 +9,7 @@ on the DUID, and adds ``ip_address.duid`` so a ``static_dhcp`` v6 address
 can carry it into the reservation it mirrors to.
 
 Revision ID: f3a7c1d94e52
-Revises: d8b3f6a1c274
+Revises: c4d8e1a7b9f2
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "f3a7c1d94e52"
-down_revision: str | None = "d8b3f6a1c274"
+down_revision: str | None = "c4d8e1a7b9f2"
 branch_labels: str | None = None
 depends_on: str | None = None
 

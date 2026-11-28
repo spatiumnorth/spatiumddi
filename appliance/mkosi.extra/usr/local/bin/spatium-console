@@ -194,6 +194,20 @@ _WEBUI_SELFCHECK_STATE = Path("/run/spatiumddi/webui-selfcheck.json")
 # the authoritative value ships IN the file so a timer-cadence change
 # can't silently outrun a constant hardcoded here.
 _WEBUI_SELFCHECK_DEFAULT_TTL_S = 900
+# #4591 — spatium-etcd-peer-reset writes the reason here when this member's
+# address changed in a multi-member etcd (it never resets one). tmpfs, rewritten
+# at every k3s start.
+_ETCD_PEER_MISMATCH = Path("/run/spatiumddi/etcd-peer-mismatch")
+
+
+def etcd_peer_mismatch_reason() -> str:
+    """The recorded reason, or ``""``. Read-only and cheap: one small file."""
+    try:
+        return _ETCD_PEER_MISMATCH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 # mtime-memoized parse so the 0.5 s render loop pays one stat() per tick,
 # not a read+parse — same tier discipline as supervisor_watchdog_status
 # (see the P1.2 comment on DashboardState). Keyed by (path, mtime): the
@@ -2766,6 +2780,13 @@ def overall_verdict(
     # single-node appliance; an empty state.etcd (sqlite backend) is skipped.
     if len(state.nodes) > 1 and state.etcd.get("has_leader") == 0:
         return ("CRITICAL", "etcd quorum lost")
+    # #4591 — names why k3s keeps failing on a rebuilt HA member; ahead of the
+    # generic "k3s failed" so the operator is told the cause and the fix.
+    if etcd_peer_mismatch_reason():
+        return (
+            "CRITICAL",
+            "etcd member address changed: restore the old address or remove + re-add the node",
+        )
     if k3s_state is not None and "failed" in k3s_state[0]:
         return ("CRITICAL", "k3s failed")
     for mp, _used_g, _total_g, pct in state.disks:

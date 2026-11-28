@@ -15,6 +15,7 @@ helm or a cluster.
 | `test_cluster_join_failure_reason.py` | `spatium-cluster-join`'s failure-reason classifier (#590) |
 | `test_cluster_join_identity.py` | `spatium-cluster-join`'s cluster-identity wipe (#590) |
 | `test_firewall_webui_sentinel.py` | Web UI reachability before the supervisor exists (#769) |
+| `test_etcd_peer_reset.py` | `spatium-etcd-peer-reset`: a kept single-node etcd whose address changed gets one `--cluster-reset`; multi-member, joined and unrelated cases untouched (#4591) |
 | `test_firstboot_member_guard.py` | `spatiumddi-firstboot` not re-seeding manifests on a joined member (#590) |
 | `test_firstboot_priority_class_reassert.py` | `spatiumddi-firstboot` having spatium-bootstrap re-create a missing `spatium-control-plane` before the control chart is released, and every guard around it, driven against a stub apiserver (#1123) |
 | `test_firstboot_pod_posture.py` | `spatiumddi-firstboot`'s PSA namespace labels, the control-plane PriorityClass overlay, and the release-time gate that strips it when the class is absent (#983) |
