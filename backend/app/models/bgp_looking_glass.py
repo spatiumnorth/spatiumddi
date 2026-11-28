@@ -278,6 +278,13 @@ class BGPLGRoute(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_bgp_lg_route_peer", "peer_id"),
         Index("ix_bgp_lg_route_origin_asn", "origin_asn"),
         Index("ix_bgp_lg_route_prefix", "prefix"),
+        # Containment (``>>=`` / ``<<=``): btree cannot serve these, GiST can (#1255).
+        Index(
+            "ix_bgp_lg_route_prefix_gist",
+            "prefix",
+            postgresql_using="gist",
+            postgresql_ops={"prefix": "inet_ops"},
+        ),
         Index("ix_bgp_lg_route_rpki_status", "rpki_status"),
         # The "active RIB" scan — everything not withdrawn.
         Index(
