@@ -101,7 +101,7 @@ def fresh_session_per_request() -> Any:
     """Each request gets its own session, as in production (the shared
     ``client`` fixture would hand the poll and the read one identity map)."""
 
-    async def _get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def _get_db() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as session:
             yield session
 

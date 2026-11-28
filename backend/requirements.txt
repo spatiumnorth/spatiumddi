@@ -1,9 +1,9 @@
 # Pinned Python set for the api image and CI (#3693). Generated — regenerate with
 # the command below (it rewrites the file; put this comment block back on top):
 #
-#   cd backend && docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \
+#   cd backend && docker run --rm -v "$PWD":/w -w /w python:3.14-slim sh -c \
 #     'pip -q install uv && uv pip compile pyproject.toml --extra dev \
-#        --python-version 3.12 --python-platform x86_64-unknown-linux-gnu \
+#        --python-version 3.14 --python-platform x86_64-unknown-linux-gnu \
 #        --no-header --no-annotate -o requirements.txt'
 #
 # The set is identical for aarch64-unknown-linux-gnu (checked when generated);

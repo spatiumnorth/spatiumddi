@@ -158,7 +158,7 @@ async def test_refused_header_value_is_not_quoted() -> None:
 
 def test_tld_registry_stays_stdlib_only_at_import() -> None:
     """scripts/refresh_iana_tlds.py loads the module by path from a bare
-    python:3.12, so the httpx / describe_http_exc imports must stay inside
+    python:3.14, so the httpx / describe_http_exc imports must stay inside
     ``fetch_remote_payload``."""
     import subprocess
     import sys

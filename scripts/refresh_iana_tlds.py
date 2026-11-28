@@ -49,7 +49,7 @@ def _load_shared_parser():
     because ``app/__init__.py`` installs the #907 datetime patcher at
     import time, which needs pydantic. The module itself is stdlib-only,
     so this keeps the script runnable at release-prep from a bare
-    ``python:3.12`` with no backend dependencies installed.
+    ``python:3.14`` with no backend dependencies installed.
     """
     path = _REPO / "backend" / "app" / "services" / "dns" / "tld_registry.py"
     spec = importlib.util.spec_from_file_location("_spatium_tld_registry", path)

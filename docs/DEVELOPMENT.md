@@ -19,8 +19,8 @@ build, test, and ship changes.
 - **Node 20+** (CI builds the frontend on **Node 22**) — only needed for
   the frontend dev loop and the frontend lint/build jobs, which run on
   the host.
-- **Python 3.12** is the pinned interpreter version (`backend/pyproject.toml`
-  → `target-version = "py312"`). You only need it on the host if you want
+- **Python 3.14** is the pinned interpreter version (`backend/pyproject.toml`
+  → `target-version = "py314"`). You only need it on the host if you want
   to run the migration-shape linter or backend tooling outside Docker.
 
 ---
@@ -82,9 +82,9 @@ recipe in [`CLAUDE.md`](https://github.com/spatiumnorth/spatiumddi/blob/main/CLA
 
 | Tool | Config | Notes |
 |---|---|---|
-| `ruff` | `[tool.ruff]` in `backend/pyproject.toml` | `line-length = 100`, `target-version = "py312"`. E501 is delegated to black. |
-| `black` | `[tool.black]` | `line-length = 100`, `target-version = ["py312"]`. Black owns formatting; ruff owns lint rules. |
-| `mypy` | `[tool.mypy]` | `python_version = "3.12"`, `strict = false` (default mode), `plugins = ["pydantic.mypy"]`. |
+| `ruff` | `[tool.ruff]` in `backend/pyproject.toml` | `line-length = 100`, `target-version = "py314"`. E501 is delegated to black. |
+| `black` | `[tool.black]` | `line-length = 100`, `target-version = ["py313"]` (py314 would rewrite every `except (A, B):` to the PEP 758 bare form). Black owns formatting; ruff owns lint rules. |
+| `mypy` | `[tool.mypy]` | `python_version = "3.14"`, `strict = false` (default mode), `plugins = ["pydantic.mypy"]`. |
 
 Run them via Docker so you get the exact pinned versions:
 
@@ -96,7 +96,7 @@ make lint-backend  # backend only
 > **Note:** the dev container ships whatever ruff/black/mypy versions
 > were installed when the image was built, which can drift from the
 > versions CI installs from `pyproject.toml`'s `[dev]` extra. If you have
-> a host Python 3.12 with the `[dev]` extras installed, running ruff,
+> a host Python 3.14 with the `[dev]` extras installed, running ruff,
 > black, and mypy on the host gives the closest match to the CI gate.
 
 ### Frontend (TypeScript)
@@ -453,12 +453,12 @@ triggered on push to `main` and on every pull request:
 
 | Job | What it does |
 |---|---|
-| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -c requirements.txt -e ".[dev]"` on Python 3.12 (the pinned set, #3693), then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8), the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9) and the **workflow shell-status linter** (`python3 scripts/lint_workflow_shell.py` — see §10). |
+| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -c requirements.txt -e ".[dev]"` on Python 3.14 (the pinned set, #3693), then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8), the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9) and the **workflow shell-status linter** (`python3 scripts/lint_workflow_shell.py` — see §10). |
 | **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.2-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a full `main` run (a push that ran the shards, the daily schedule or a dispatch) it builds the `test-impact-map` artifact from the shards' coverage contexts. A push to `main` whose tree a green full PR run already tested skips the shards (#2429 — see §Skipping the shards on a push to main). Coverage is otherwise **not** collected here (#1019). |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
 | **Charts — Lint & Template** (`charts-lint`) | Helm v4.3.1 + a checksum-pinned kubeconform. `helm lint --strict` all three charts at defaults and with every role / feature toggle on, `helm template` 14 value sets (umbrella: defaults, all-on, external DB + Redis, the CNPG + Sentinel HA shape, and two pod-posture shapes; appliance: defaults, all-on, the single-node full-stack shape, and the two release-bootstrap / release-supervisor shapes; metallb: defaults, all-on, BGP mode), `kubeconform -strict` against the Kubernetes 1.36 + CRD-catalog schemas (kept at the version the appliance's k3s serves — it was five minors behind until #974), and `.github/scripts/chart-no-besteffort.py` on every render (#965 — no serving container may lack CPU + memory requests or limits; init containers are exempt, they finish before the pod serves) plus `chart-toggle-coverage.py`, which fails if a template is gated on a values key none of the value sets flips, and `chart-webhooks-fail-open.py` on the MetalLB render (#1103 — its validating webhooks must be `failurePolicy: Ignore`, or the pool CRs in the same install are refused while the controller serving the webhook starts; `helm lint` and `helm template` pass either way). Rendered manifests are uploaded as the `rendered-charts` artifact. Until #966 nothing on a PR parsed the appliance chart at all; it was first read by helm during the release. `make charts-lint` runs the same script in a helm container. |
-| **Perf — Tests** (`perf-test`) | Python 3.12 + pytest, `python -m pytest perf`. Hermetic (fake sockets, no network, no appliance). Tests only — `perf/` is outside the Backend Lint scope and carries pre-existing ruff/black drift (#968). `make perf-test` reproduces it. |
+| **Perf — Tests** (`perf-test`) | Python 3.14 + pytest, `python -m pytest perf`. Hermetic (fake sockets, no network, no appliance). Tests only — `perf/` is outside the Backend Lint scope and carries pre-existing ruff/black drift (#968). `make perf-test` reproduces it. |
 
 Branch protection on `main` (the `protect-main` ruleset) requires every
 stable check name above — the two aggregators (`Backend — Tests`,

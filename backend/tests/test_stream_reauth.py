@@ -55,7 +55,7 @@ async def stream_env(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
     engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    async def _get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def _get_db() -> AsyncGenerator[AsyncSession]:
         async with factory() as s:
             yield s
 

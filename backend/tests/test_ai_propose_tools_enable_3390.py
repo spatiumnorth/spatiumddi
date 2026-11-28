@@ -116,7 +116,7 @@ async def test_mcp_never_offers_an_enabled_propose_tool(
 
 
 @pytest_asyncio.fixture
-async def app_session(db_session: AsyncSession) -> AsyncGenerator[AsyncSession, None]:
+async def app_session(db_session: AsyncSession) -> AsyncGenerator[AsyncSession]:
     """A session on the test database whose engine serializes JSONB as the
     app's engine does (``app.db``): a proposal's stored args carry UUIDs."""
     engine = create_async_engine(

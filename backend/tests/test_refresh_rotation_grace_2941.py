@@ -219,7 +219,7 @@ async def test_concurrent_refreshes_with_one_cookie_land_on_one_successor(
     connection holds the row so both are queued before either runs, which
     makes the interleaving deterministic rather than lucky."""
 
-    async def own_session() -> AsyncGenerator[AsyncSession, None]:
+    async def own_session() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as s:
             yield s
 
@@ -595,7 +595,7 @@ async def test_logout_racing_a_rotation_revokes_the_successor(
     revoked once the refresh commits, and never see S (its snapshot
     predates S), leaving S live and A's cookie graced into it."""
 
-    async def own_session() -> AsyncGenerator[AsyncSession, None]:
+    async def own_session() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as s:
             yield s
 

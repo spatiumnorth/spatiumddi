@@ -32,7 +32,7 @@ from tests.test_longpoll_holds_no_lock_3479 import _Park, _truncate_lock
 
 @pytest.fixture
 def fresh_session_per_request() -> Any:
-    async def _get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def _get_db() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as session:
             yield session
 

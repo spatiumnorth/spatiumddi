@@ -50,7 +50,7 @@ _PARK_DEADLINE_S = 20.0
 
 
 @pytest.fixture
-async def engine() -> AsyncGenerator[AsyncEngine, None]:
+async def engine() -> AsyncGenerator[AsyncEngine]:
     """Sessions of their own, each on its own connection."""
     eng = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     try:

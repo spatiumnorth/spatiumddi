@@ -65,7 +65,7 @@ async def _estate(db: AsyncSession) -> dict[str, Any]:
 def fresh_session_per_request() -> Any:
     """Each request gets its own session, as in production (see the DHCP test)."""
 
-    async def _get_db() -> AsyncGenerator[AsyncSession, None]:
+    async def _get_db() -> AsyncGenerator[AsyncSession]:
         async with _TestSessionLocal() as session:
             yield session
 

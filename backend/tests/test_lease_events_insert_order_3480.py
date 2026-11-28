@@ -48,12 +48,12 @@ _HOLD_S = 3.0
 
 
 @pytest.fixture
-async def concurrent_client() -> AsyncGenerator[AsyncClient, None]:
+async def concurrent_client() -> AsyncGenerator[AsyncClient]:
     """A client whose every request runs on its own session + connection."""
     engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-    async def _own_session() -> AsyncGenerator[AsyncSession, None]:
+    async def _own_session() -> AsyncGenerator[AsyncSession]:
         async with factory() as session:
             yield session
 

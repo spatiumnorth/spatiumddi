@@ -393,7 +393,7 @@ async def exception_domains(db: AsyncSession, lists: list[DNSBlockList]) -> set[
 
 async def stream_entries(
     db: AsyncSession, lists: list[DNSBlockList], batch: int
-) -> AsyncGenerator[list[RenderEntry], None]:
+) -> AsyncGenerator[list[RenderEntry]]:
     """Every entry ``_collect_lists`` collects for ``lists``, in the same order,
     at most ``batch`` at a time: one server-side cursor per list, so neither
     the driver nor this process ever holds more than a batch of a list."""

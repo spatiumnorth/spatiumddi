@@ -148,7 +148,7 @@ async def dispose_probe_engine() -> None:
         await engine.dispose()
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_db() -> AsyncGenerator[AsyncSession]:
     # The close is where a failover surfaces AFTER the response has started:
     # its rollback meets ``InterfaceError: cannot call Transaction.rollback():
     # the underlying connection is closed`` or a ``TimeoutError``. Raised from
@@ -213,7 +213,7 @@ def task_connect_args(command_timeout: float | None = None) -> dict[str, float]:
 @asynccontextmanager
 async def task_sessionmaker(
     *, command_timeout: float | None = None
-) -> AsyncGenerator[async_sessionmaker[AsyncSession], None]:
+) -> AsyncGenerator[async_sessionmaker[AsyncSession]]:
     """Per-Celery-task session factory, for task code that opens several
     sessions in turn (a poll loop) and must not reach for the shared
     ``AsyncSessionLocal``. One throwaway engine bound to the current loop,
@@ -254,9 +254,7 @@ async def task_sessionmaker(
 
 
 @asynccontextmanager
-async def task_session(
-    *, command_timeout: float | None = None
-) -> AsyncGenerator[AsyncSession, None]:
+async def task_session(*, command_timeout: float | None = None) -> AsyncGenerator[AsyncSession]:
     """Per-Celery-task DB session — fresh engine, fresh loop binding.
 
     ``command_timeout`` is passed to :func:`task_sessionmaker`.

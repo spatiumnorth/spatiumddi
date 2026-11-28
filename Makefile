@@ -356,17 +356,17 @@ openapi:
 # refuses to run if it is missing rather than emitting a registry that would
 # reclassify every reserved zone as public.
 #
-# Runs in a bare python:3.12 with no backend dependencies, which is why the
+# Runs in a bare python:3.14 with no backend dependencies, which is why the
 # parser it shares with the product is stdlib-only. `tld-registry-check`
 # reports whether the bundled copy is behind IANA without writing anything
 # (exit 1 when stale) — that is the release-prep question.
 .PHONY: tld-registry tld-registry-check
 tld-registry:
-	@docker run --rm -v "$(PWD)":/repo -w /repo python:3.12-slim \
+	@docker run --rm -v "$(PWD)":/repo -w /repo python:3.14-slim \
 	  python3 scripts/refresh_iana_tlds.py
 
 tld-registry-check:
-	@docker run --rm -v "$(PWD)":/repo -w /repo python:3.12-slim \
+	@docker run --rm -v "$(PWD)":/repo -w /repo python:3.14-slim \
 	  python3 scripts/refresh_iana_tlds.py --check
 
 # ── Untyped-route guard (issue #917) ─────────────────────────────────────────
@@ -511,7 +511,7 @@ image-upgrade-check:
 # HdrHistogram backend is gated on it in the test.
 perf-test:
 	@echo "→ Perf — Tests (matches .github/workflows/ci.yml)"
-	docker run --rm -v "$(PWD):/repo" -w /repo python:3.12-slim sh -c \
+	docker run --rm -v "$(PWD):/repo" -w /repo python:3.14-slim sh -c \
 	  'pip -q install pytest pyyaml dnspython httpx >/dev/null \
 	   && (pip -q install --only-binary=:all: hdrhistogram >/dev/null 2>&1 \
 	       || echo "hdrhistogram: no binary wheel for this arch; the .hdr assertion is gated") \

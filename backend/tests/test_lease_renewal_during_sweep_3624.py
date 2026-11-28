@@ -63,7 +63,7 @@ async def _wait_for_lock_waiter(conn: AsyncConnection | AsyncSession) -> None:
 
 
 @pytest.fixture
-async def other_conn() -> AsyncGenerator[AsyncConnection, None]:
+async def other_conn() -> AsyncGenerator[AsyncConnection]:
     engine = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     try:
         async with engine.connect() as conn:

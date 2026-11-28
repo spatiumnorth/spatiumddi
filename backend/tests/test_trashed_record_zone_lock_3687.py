@@ -46,7 +46,7 @@ _STEP = 30.0
 
 
 @pytest.fixture
-async def engine() -> AsyncGenerator[AsyncEngine, None]:
+async def engine() -> AsyncGenerator[AsyncEngine]:
     eng = create_async_engine(os.environ["DATABASE_URL"], poolclass=NullPool)
     try:
         yield eng

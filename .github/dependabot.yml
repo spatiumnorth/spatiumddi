@@ -24,8 +24,8 @@
 #     image set (a rebuild of one commit used to resolve different packages),
 #     so a bump of that file IS the change that reaches production — minor and
 #     patch PRs are grouped weekly, majors stay deferred.
-#   * The backend Docker base is pinned to Python 3.12 (mypy target-version
-#     py312 / setup-python 3.12) — no 3.13/3.14 until a deliberate move.
+#   * The backend Docker base is pinned to Python 3.14 (mypy python_version,
+#     ruff / black py314, setup-python 3.14) — a later minor is a deliberate move.
 # Net effect: at most a couple of grouped minor/patch PRs a week (docker, npm,
 # actions) plus security updates.
 version: 2
@@ -77,10 +77,10 @@ updates:
       docker-base-images:
         update-types: ["minor", "patch"]
     ignore:
-      # The codebase + CI target Python 3.12 (mypy ``target-version = py312``,
-      # setup-python 3.12). Keep the backend runtime image on 3.12 so Dependabot
-      # doesn't push 3.13/3.14 ahead of a deliberate interpreter upgrade (a
-      # 3.12→3.14 bump lands as a Docker "minor", so it must be ignored by name
+      # The codebase + CI target Python 3.14 (#2229: mypy ``python_version``,
+      # ruff / black py314, setup-python 3.14). Keep the backend runtime image on
+      # 3.14 so Dependabot doesn't push a later minor ahead of a deliberate
+      # interpreter upgrade (a minor bump lands as a Docker "minor", so it must be ignored by name
       # here rather than by update-type).
       - dependency-name: "python"
         update-types:
