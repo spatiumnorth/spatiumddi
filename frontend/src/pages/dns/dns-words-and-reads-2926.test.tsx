@@ -243,6 +243,7 @@ function entry(
     pending_ops: 0,
     freshness,
     counted: freshness === "ok",
+    in_sync: true,
   };
 }
 

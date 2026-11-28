@@ -61,6 +61,10 @@ logger = structlog.get_logger(__name__)
 SERIAL_GRACE = timedelta(seconds=120)
 
 
+#: Drivers whose daemon owns the zone's serial and reports the one it serves.
+TECHNITIUM_DRIVERS = frozenset({"technitium", "technitium_api"})
+
+
 def zone_state_in_sync(
     zone: DNSZone,
     current: int,
@@ -85,15 +89,28 @@ def zone_state_in_sync(
     secondary it holds (rc.3 ``served_zone_serials``, at start-up and after),
     so its 0 is unknown, not "holds no copy": it reads as it always did,
     against the target (#4440). PowerDNS read a secondary back from its API
-    before #3940, so its 0 always means "not transferred". Other drivers
-    compare with the target."""
+    before #3940, so its 0 always means "not transferred". Technitium reads
+    back the serial it serves like PowerDNS, and a primary there is in sync at
+    or past our serial (#1779). Other drivers compare with the target."""
     if (zone.zone_type or "primary") in ("secondary", "stub"):
-        if driver in ("powerdns", "bind9"):
+        if driver in ("powerdns", "bind9") or driver in TECHNITIUM_DRIVERS:
             if driver == "bind9" and not reports_served_serials:
                 return current != 0 or current == target
             return current != 0
         return current == target
+    if driver in TECHNITIUM_DRIVERS:
+        # Technitium numbers the zone itself: it starts at 1 and every record
+        # write moves it on (#1779), so it cannot be made to equal ours. A
+        # server AT OR PAST our serial serves every saved change, as an
+        # inline-signed BIND zone does; one BELOW it does not (a zone created
+        # later, or re-created at 1), and the agent raises it to ours.
+        return _serial_at_or_past(current, target)
     return current == target
+
+
+def _serial_at_or_past(current: int, target: int) -> bool:
+    """``current`` is ``target`` or later in RFC 1982 serial arithmetic."""
+    return current == target or 0 < (current - target) % 2**32 < 2**31
 
 
 @dataclass

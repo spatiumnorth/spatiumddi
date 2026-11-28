@@ -1,7 +1,7 @@
 """#1784 — the experimental agentless ``technitium_api`` driver refuses what it can't do.
 
-One server per group, Primary zones SpatiumDDI creates, no pools, no group or
-zone options, no blocklists. Every refusal names the experimental status and
+One server per group, Primary zones SpatiumDDI creates, no pools, no group
+options, no zone transfer / notify / query ACLs, no blocklists. Every refusal names the experimental status and
 the reason; BIND9 / PowerDNS / agent-managed Technitium are untouched.
 """
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
@@ -197,10 +198,6 @@ async def test_other_drivers_may_have_several_servers(
         {"zone_type": "secondary", "masters": ["10.0.0.1"]},
         {"zone_type": "stub", "masters": ["10.0.0.1"]},
         {"zone_type": "forward", "forwarders": ["9.9.9.9"]},
-        {"primary_ns": "ns.example.com."},
-        {"admin_email": "hostmaster.example.com."},
-        {"refresh": 7200},
-        {"ttl": 60},
         {"allow_transfer": ["10.0.0.0/8"]},
         {"also_notify": ["10.0.0.2"]},
         {"allow_query": ["any"]},
@@ -248,17 +245,17 @@ async def test_zone_update_refuses_changed_unapplied_value_but_allows_resave(
 ) -> None:
     t = await _token(db_session)
     g = await _group(db_session, "technitium_api")
-    z = await _zone(db_session, g, refresh=1234)
+    z = await _zone(db_session, g, allow_transfer=["10.0.0.0/8"])
     await db_session.commit()
     url = f"/api/v1/dns/groups/{g.id}/zones/{z.id}"
     # Unchanged stored non-default values re-saved with an unrelated change.
     ok = await client.put(
         url,
         headers=_h(t),
-        json={"refresh": 1234, "primary_ns": "ns1.example.com.", "color": "red"},
+        json={"allow_transfer": ["10.0.0.0/8"], "primary_ns": "ns1.example.com.", "color": "red"},
     )
     assert ok.status_code == 200, ok.text
-    _assert_refused(await client.put(url, headers=_h(t), json={"refresh": 4321}))
+    _assert_refused(await client.put(url, headers=_h(t), json={"allow_transfer": ["10.1.0.0/16"]}))
     _assert_refused(await client.put(url, headers=_h(t), json={"allow_transfer": ["any"]}))
     _assert_refused(await client.put(url, headers=_h(t), json={"zone_type": "forward"}))
 
@@ -589,8 +586,10 @@ async def test_stored_option_can_be_cleared_back_to_default(
 
 @pytest.mark.asyncio
 async def test_zone_field_can_be_put_back_to_default_and_ui_resave_passes(
-    client: AsyncClient, db_session: AsyncSession
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The SOA is written to the server on a change (#1774); not under test here.
+    monkeypatch.setattr(TechnitiumAPIDriver, "apply_zone_apex", AsyncMock(return_value=None))
     t = await _token(db_session)
     g = await _group(db_session, "technitium_api")
     z = await _zone(db_session, g, ttl=300)
@@ -634,7 +633,7 @@ async def test_copilot_create_zone_is_held_to_the_rest_scope(db_session: AsyncSe
     await db_session.flush()
     op = get_operation("create_dns_zone")
     assert op is not None
-    for bad in ({"zone_type": "secondary"}, {"ttl": 300}, {"primary_ns": "ns1.example.com."}):
+    for bad in ({"zone_type": "secondary"},):
         args = CreateDNSZoneArgs(name="c.example.com", group_id=str(g.id), **bad)
         pv = await op.preview(db_session, user, args)
         assert pv.ok is False and EXPERIMENTAL in pv.detail
