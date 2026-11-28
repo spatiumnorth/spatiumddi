@@ -3941,7 +3941,9 @@ async def _sync_single_server(
 
     # 4. Per-zone record sync.
     zones_res = await db.execute(
-        select(DNSZone).where(DNSZone.group_id == group_id).order_by(DNSZone.name)
+        select(DNSZone)
+        .where(DNSZone.group_id == group_id)
+        .order_by(DNSZone.name, DNSZone.view_id, DNSZone.id)
     )
     zones = list(zones_res.scalars().all())
 
@@ -6291,7 +6293,11 @@ async def list_zones(
     tag: list[str] = Query(default_factory=list),
 ) -> list[ZoneResponse]:
     await _require_group(group_id, db)
-    stmt = select(DNSZone).where(DNSZone.group_id == group_id).order_by(DNSZone.name)
+    stmt = (
+        select(DNSZone)
+        .where(DNSZone.group_id == group_id)
+        .order_by(DNSZone.name, DNSZone.view_id, DNSZone.id)
+    )
     if customer_id is not None:
         stmt = stmt.where(DNSZone.customer_id == customer_id)
     stmt = apply_tag_filter(stmt, DNSZone.tags, tag)
@@ -6541,7 +6547,7 @@ async def export_all_zones(
     zone_ids = _zone_token_id_filter(current_user)
     if zone_ids is not None:
         stmt = stmt.where(DNSZone.id.in_(zone_ids))
-    result = await db.execute(stmt.order_by(DNSZone.name))
+    result = await db.execute(stmt.order_by(DNSZone.name, DNSZone.view_id, DNSZone.id))
     zones = list(result.scalars().all())
 
     buf = io.BytesIO()
@@ -6858,7 +6864,7 @@ async def get_server_zone_state(
     token_zone_ids = _zone_token_id_filter(current_user)
     if token_zone_ids is not None:
         zone_stmt = zone_stmt.where(DNSZone.id.in_(token_zone_ids))
-    zones_res = await db.execute(zone_stmt.order_by(DNSZone.name))
+    zones_res = await db.execute(zone_stmt.order_by(DNSZone.name, DNSZone.view_id, DNSZone.id))
     zones = list(zones_res.scalars().all())
 
     state_res = await db.execute(
