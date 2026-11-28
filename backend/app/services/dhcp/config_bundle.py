@@ -62,6 +62,7 @@ from app.services.dhcp.option_validation import (
     canonical_domain_options,
     options_for_family,
     phone_options_loadable,
+    relay_info_retention,
     vendor_class_match_renderable,
     vendor_class_match_test,
 )
@@ -481,6 +482,12 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     _pktlog = getattr(group, "kea_packet_logging", None) if group else None
     kea_packet_logging = True if _pktlog is None else bool(_pktlog)
 
+    # #54 — a Dhcp4 class that tests option 82 needs Kea to keep the relay
+    # agent information on the lease, or every unicast renewal from a pool
+    # restricted to it is NAKed. PXE / phone / device-policy classes never
+    # test option 82, so only the operator's classes are inspected.
+    relay_info = relay_info_retention(client_classes)
+
     bundle = ConfigBundle(
         server_id=str(server.id),
         server_name=server.name,
@@ -500,6 +507,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         lease_cache_max_age=lease_cache_max_age,
         kea_thread_pool_size=kea_thread_pool_size,
         kea_packet_logging=kea_packet_logging,
+        relay_info_retention=relay_info,
         ra_configs=tuple(ra_configs),
         radvd_conf=radvd_conf,
     )

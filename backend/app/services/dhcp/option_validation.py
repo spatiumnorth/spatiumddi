@@ -47,9 +47,9 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from functools import lru_cache
-from typing import Any
+from typing import Any, Protocol
 
 from app.core.dns_names import contains_control_chars, validate_fqdn
 from app.drivers.dhcp.base import STANDARD_OPTION_NAMES
@@ -602,6 +602,49 @@ def validate_class_test(expression: str, address_family: str) -> None:
                 f"kea-dhcp{other[-1]} understands; a class rendered for {label} "
                 f"cannot use it — set the class's address family to {other}"
             )
+
+
+# #54 — a test that reads the relay agent information option (option 82):
+# ``relay4[N]``, or the option itself by code or by Kea's name for it.
+_RELAY_AGENT_TOKENS = re.compile(r"\brelay4\b|\boption\s*\[\s*(?:82|dhcp-agent-options)\s*\]")
+
+
+class _ClassTest(Protocol):
+    @property
+    def match_expression(self) -> str | None: ...
+
+    @property
+    def address_family(self) -> str | None: ...
+
+
+def uses_relay_agent_info(expression: str | None) -> bool:
+    """Does a Kea class test read option 82 (#54)?
+
+    String literals are blanked first, as in :func:`validate_class_test`: a
+    test comparing against the text ``'relay4'`` does not use the token.
+    """
+    return bool(_RELAY_AGENT_TOKENS.search(_KEA_STRING.sub("''", expression or "")))
+
+
+def relay_info_retention(classes: Iterable[_ClassTest]) -> bool:
+    """Should the group's Kea keep each client's relay agent information (#54)?
+
+    True when any class rendered into Dhcp4 tests option 82. The relay is not
+    in the path of a unicast renewal, so the renewal carries no option 82.
+    Measured on kea-dhcp4 3.0.3: a lease from a pool restricted to such a class
+    is NAKed at every renewal unless BOTH ``stash-agent-options`` and
+    ``store-extended-info`` are on; either one alone still NAKs. The bundle
+    turns both on from this answer.
+
+    Takes ORM rows or ``ClientClassDef``s. A class built from a structured
+    match is covered as well, because it is stored compiled to
+    ``match_expression``.
+    """
+    return any(
+        (c.address_family or "ipv4") in ("ipv4", "dual")
+        and uses_relay_agent_info(c.match_expression)
+        for c in classes
+    )
 
 
 def validate_options(

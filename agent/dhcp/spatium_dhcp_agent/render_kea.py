@@ -1437,6 +1437,18 @@ def render(
     if _global_max_age is not None:
         dhcp4["cache-max-age"] = int(_global_max_age)
 
+    # #54 — the group has a class that tests option 82 (relay4). The relay is
+    # not in the path of a unicast renewal, so the renewal carries no option
+    # 82 and no longer matches the class; Kea then NAKs any lease from a pool
+    # restricted to it. ``stash-agent-options`` replays the relay information
+    # kept on the lease, and that is only kept with ``store-extended-info``.
+    # Measured on kea-dhcp4 3.0.3: both are needed, either one alone still
+    # NAKs. Dhcp4 only; both keys default to false, so nothing is emitted for
+    # a group without such a class (or from a control plane that predates it).
+    if server.get("relay_info_retention"):
+        dhcp4["stash-agent-options"] = True
+        dhcp4["store-extended-info"] = True
+
     # HA hook — only present when the control plane pins this server to
     # a DHCPFailoverChannel. Kea rejects a config that references
     # ``libdhcp_ha.so`` without matching ``libdhcp_lease_cmds.so``, so

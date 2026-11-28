@@ -345,6 +345,14 @@ class ConfigBundle:
     # at the cost of the two per-packet log codes that carry the source
     # address and interface). See DHCPServerGroup.kea_packet_logging.
     kea_packet_logging: bool = True
+    # #54 — keep each client's relay agent information (option 82) on its
+    # lease, so a unicast renewal, which never carries option 82, still
+    # matches the class its pool is restricted to. Set when a Dhcp4 client
+    # class of the group tests option 82 (``option_validation.
+    # relay_info_retention``). Kea renders it as ``stash-agent-options`` +
+    # ``store-extended-info``; the Windows driver ignores it. Hashed into the
+    # ETag only when True, so a group with no such class keeps its ETag.
+    relay_info_retention: bool = False
     # IPv6 Router-Advertisement config (issue #524) — one entry per
     # RA-enabled IPv6 subnet the server's group serves. ``radvd_conf`` is
     # the pre-rendered radvd.conf text the agent writes verbatim; the
@@ -375,6 +383,10 @@ class ConfigBundle:
             "ra_configs": [asdict(r) for r in self.ra_configs],
             "radvd_conf": self.radvd_conf,
         }
+        # #54 — only when set: adding the key unconditionally would move the
+        # ETag of every group on upgrade and re-push a config nothing changed.
+        if self.relay_info_retention:
+            payload["relay_info_retention"] = True
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return "sha256:" + hashlib.sha256(blob).hexdigest()
 

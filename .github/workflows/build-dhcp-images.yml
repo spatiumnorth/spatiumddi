@@ -31,6 +31,8 @@ on:
       - ".github/workflows/build-dhcp-images.yml"
       # #3464 — the shared Trivy install step this lane scans with.
       - ".github/actions/install-trivy/**"
+      # #54 — the script the kea-dhcp4 -t step below runs.
+      - "scripts/kea-config-check.sh"
   workflow_dispatch:
 
 # Read-only (#1022): this workflow builds and scans, it never publishes.
@@ -84,6 +86,14 @@ jobs:
             APT_SNAPSHOT=${{ steps.snap.outputs.snapshot }}
           cache-from: type=gha,scope=dhcp-${{ matrix.flavor }}
           cache-to: type=gha,mode=max,scope=dhcp-${{ matrix.flavor }}
+
+      # #54 — Kea's own parser over the golden rendered config (the fixture
+      # under agent/dhcp/tests/fixtures, which the agent suite keeps equal to
+      # what render_kea produces). One unknown key or bad class test fails
+      # the WHOLE config on a live agent, which then reverts the bundle; this
+      # catches it on the PR, against the Kea this image actually ships.
+      - name: Kea config check (kea-dhcp4 -t on the golden render)
+        run: bash scripts/kea-config-check.sh "ghcr.io/spatiumnorth/dhcp-${{ matrix.flavor }}:pr-scan"
 
       # get.trivy.dev, which trivy-action's own setup downloads from,
       # is gone (#3464): install from the GitHub release instead.
