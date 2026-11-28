@@ -1,0 +1,6 @@
+// #4800 — record the last apt-get update attempt and success where the
+// supervisor can read them. apt-daily exits 0 even when every mirror is
+// unreachable, so without these the Fleet APT chip cannot tell an operator
+// that security updates have stopped arriving.
+APT::Update::Pre-Invoke { "touch /var/lib/spatiumddi/release-state/apt-update-attempt 2>/dev/null || true"; };
+APT::Update::Post-Invoke-Success { "touch /var/lib/spatiumddi/release-state/apt-update-success 2>/dev/null || true"; };

@@ -958,6 +958,19 @@ def approval_refusal(approver: User, cr: ChangeRequest) -> DecisionError | None:
     except OperationPermissionError as exc:
         return DecisionForbidden(str(exc))
 
+    # A superadmin step inside the operation (a permanent delete, #4790): the
+    # apply refuses a non-superadmin with the same error, which leaves the
+    # request pending for one who may.
+    if op.superadmin_when is not None:
+        try:
+            step_args = op.args_model.model_validate(cr.args or {})
+        except Exception:  # noqa: BLE001 — the approve answers a stale schema itself
+            step_args = None
+        if step_args is not None and op.superadmin_when(step_args):
+            step = operations.superadmin_step_refusal(approver, "This change")
+            if step is not None:
+                return DecisionForbidden(str(step))
+
     # Self-governance control ops (#62) are SUPERADMIN-ONLY to approve — IN
     # ADDITION to the checks above. A control op weakens the approval control
     # plane itself, so only a *different* superadmin may sign off. Without

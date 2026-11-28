@@ -27,7 +27,11 @@ async def test_scope_drift_refusal_names_reject_not_cancel(
     await _enable_delete_subnet_policy(db_session)
     subnet = await _subnet(db_session, "10.24.9.0/24")
     _, rtoken = await _user(db_session, name="requester", permissions=[_DELETE])
-    _, atoken = await _user(db_session, name="approver", permissions=[_APPROVE, _DELETE])
+    # A permanent delete needs a superadmin approver (#4790); the words under
+    # test are the scope-changed refusal, which that approver still gets.
+    _, atoken = await _user(
+        db_session, name="approver", permissions=[_APPROVE, _DELETE], superadmin=True
+    )
     r = await client.delete(
         f"/api/v1/ipam/subnets/{subnet.id}?permanent=true&force=true", headers=_auth(rtoken)
     )

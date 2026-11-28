@@ -105,6 +105,15 @@ class ZoneData:
     update_acl: tuple[UpdateAclEntry, ...] = ()
 
 
+class UpdateAclConflictError(ValueError):
+    """An ACL whose entries cannot combine on this driver (#4569).
+
+    Refused when a save changes the ACL, but only warned about when the save
+    leaves a stored ACL untouched: an install that already holds the
+    combination must be able to save the rest of the zone.
+    """
+
+
 @dataclass(frozen=True)
 class UpdateAclEntry:
     """One neutral dynamic-update ACL grant/deny (issue #641).
@@ -682,6 +691,7 @@ __all__ = [
     "ServerOptions",
     "TrustAnchorData",
     "TsigKey",
+    "UpdateAclConflictError",
     "UpdateAclEntry",
     "ViewData",
     "ZoneData",

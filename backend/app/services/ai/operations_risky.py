@@ -18,7 +18,7 @@ pre-#62 handler when the module is off:
   is preserved in the same order.
 * ``apply()`` / ``preview()`` raise the original handler's HTTP statuses —
   ``HTTPException(404)`` for not-found, ``HTTPException(409)`` for
-  not-empty / conflict, ``HTTPException(403)`` for superadmin-required —
+  not-empty / conflict, ``OperationPermissionError`` for superadmin-required (#4790) —
   CONSISTENTLY across all six ops. (A bare ``ValueError`` here would
   surface as a 500 to the inline caller — fixed.)
 * ``apply()`` does NOT call ``enforce_operation_permission``: the inline
@@ -35,7 +35,8 @@ pre-#62 handler when the module is off:
   were fully ``SuperAdmin``-gated until #1861 opened their soft-delete to
   the resource's ``delete`` permission); ``delete_group`` is still fully
   ``SuperAdmin``-gated at the route, so its ``apply()`` requires superadmin
-  ALWAYS. A failed check raises ``HTTPException(403)``.
+  ALWAYS. A failed check raises ``OperationPermissionError`` (#4790), so the
+  request stays pending for a superadmin approver instead of ending ``failed``.
 * The ``permanent`` / ``force`` flags are frozen into the args model so
   the approved replay takes the *identical* branch the requester intended.
 * Audit ``action`` strings stay exactly as today (``soft_delete`` on the
@@ -69,6 +70,7 @@ from app.models.auth import User
 from app.services.ai.operations import (
     Operation,
     PreviewResult,
+    ensure_superadmin_step,
     get_operation,
     register,
 )
@@ -180,7 +182,9 @@ def _mirrors_torn_down_first(root: Any, batch: Any) -> Any:
     reverse zone the delete trashes, so the preview's count of that zone's
     records leaves them out too (spatiumddi#3511)."""
     from app.models.dhcp import DHCPLease, DHCPScope, DHCPStaticAssignment  # noqa: PLC0415
+    from app.models.dns import DNSRecord  # noqa: PLC0415
     from app.models.ipam import IPAddress, Subnet  # noqa: PLC0415
+    from app.models.ot import OTDevice  # noqa: PLC0415
 
     # Uncorrelated, so Postgres builds each set once per statement and probes
     # it per address (a hashed SubPlan), and costs it that way. A correlated
@@ -218,6 +222,15 @@ def _mirrors_torn_down_first(root: Any, batch: Any) -> Any:
         and_(
             IPAddress.static_assignment_id.is_not(None),
             IPAddress.static_assignment_id.in_(reservations),
+            # A reservation's row a DNS alias or an OT descriptor hangs off is kept
+            # through the Trash (#4870), so its records are not withdrawn here: they
+            # ride the batch and the restore brings them back.
+            IPAddress.id.not_in(
+                select(DNSRecord.ip_address_id).where(
+                    DNSRecord.ip_alias.is_(True), DNSRecord.ip_address_id.is_not(None)
+                )
+            ),
+            IPAddress.id.not_in(select(OTDevice.ip_address_id)),
         ),
     ]
     if isinstance(root, Subnet):
@@ -403,8 +416,13 @@ async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | N
             )
         )
     ).scalar_one()
+    # Trashed scopes count: the FK cascade takes them with no audit row (#4871).
     scope_count = (
-        await db.execute(select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == subnet_id))
+        await db.execute(
+            select(func.count(DHCPScope.id))
+            .where(DHCPScope.subnet_id == subnet_id)
+            .execution_options(include_deleted=True)
+        )
     ).scalar_one()
     if not (user_ip_count or scope_count):
         return None
@@ -415,7 +433,8 @@ async def _subnet_not_empty_detail(db: AsyncSession, subnet_id: UUID) -> str | N
         parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
     return (
         f"Subnet is not empty: {', '.join(parts)}. "
-        "Delete the contents first, or retry with force=true to cascade."
+        "Delete the contents first (scopes in the Trash count: restore or empty them), "
+        "or retry with force=true to cascade."
     )
 
 
@@ -457,7 +476,9 @@ async def _preview_delete_subnet(
         # catches a subnet that gained IPs/scopes since it was requested.
         scope_count = (
             await db.execute(
-                select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == args.subnet_id)
+                select(func.count(DHCPScope.id))
+                .where(DHCPScope.subnet_id == args.subnet_id)
+                .execution_options(include_deleted=True)
             )
         ).scalar_one()
         ip_count = (
@@ -483,7 +504,6 @@ async def _apply_delete_subnet(
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_subnet."""
 
-    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import (
         _audit,
         _enforce_subnet_token_scope,
@@ -575,7 +595,7 @@ async def _apply_delete_subnet(
             await _revoke_residual_subnet_mirrors(db, subnet_id, _revoke_subnet_lease_mirrors)
         return {"subnet_id": str(args.subnet_id), "mode": "soft_delete"}
 
-    ensure_superadmin(user)
+    ensure_superadmin_step(user, "A permanent subnet delete")
 
     # An E911 binding on the subnet or an address in it would go with the
     # cascade; ``force`` skips the non-empty check, never this (#3891).
@@ -595,6 +615,21 @@ async def _apply_delete_subnet(
         .scalars()
         .all()
     )
+    # Scopes already in the Trash go by the FK cascade, which runs no Python:
+    # one audit row each, as the Trash's own purge writes (#1957, #4871).
+    trashed_scopes = (
+        (
+            await db.execute(
+                select(DHCPScope)
+                .where(DHCPScope.subnet_id == args.subnet_id, DHCPScope.deleted_at.is_not(None))
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for tsc in trashed_scopes:
+        db.add(_audit(user, "delete", "dhcp_scope", str(tsc.id), tsc.name))
     agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
     # Recounted with the block below, never per scope: a recount holds its
     # locks to commit, through the next scope's push (#3354).
@@ -703,6 +738,7 @@ _OP_DELETE_SUBNET = Operation(
     preview=_preview_delete_subnet,
     apply=_apply_delete_subnet,
     category="ipam",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "subnet"),
 )
 register(_OP_DELETE_SUBNET)
@@ -717,17 +753,26 @@ class DeleteBlockArgs(BaseModel):
 
 
 async def _block_not_empty_detail(db: AsyncSession, block_id: UUID, network: Any) -> str | None:
-    """Shared non-empty check for block permanent-delete (#17)."""
+    """Shared non-empty check for block permanent-delete (#17).
+
+    Children in the Trash count: the FK cascade would take them silently (#4871).
+    """
     from app.models.ipam import IPBlock, Subnet
 
     subnet_count = (
         await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
+            select(func.count())
+            .select_from(Subnet)
+            .where(Subnet.block_id == block_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     child_block_count = (
         await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
+            select(func.count())
+            .select_from(IPBlock)
+            .where(IPBlock.parent_block_id == block_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     if not (subnet_count or child_block_count):
@@ -739,7 +784,8 @@ async def _block_not_empty_detail(db: AsyncSession, block_id: UUID, network: Any
         parts.append(f"{subnet_count} subnet(s)")
     return (
         f"Block {network} still contains {' and '.join(parts)}. "
-        "Delete or move them before deleting the block."
+        "Delete or move them before deleting the block (rows in the Trash count: "
+        "restore them or empty the Trash first)."
     )
 
 
@@ -779,7 +825,6 @@ async def _apply_delete_block(
     db: AsyncSession, user: User, args: DeleteBlockArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_block."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import _audit, _update_block_utilization
     from app.models.ipam import IPBlock
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
@@ -789,7 +834,7 @@ async def _apply_delete_block(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
 
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent block delete")
         detail = await _block_not_empty_detail(db, args.block_id, block.network)
         if detail is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
@@ -870,6 +915,7 @@ _OP_DELETE_BLOCK = Operation(
     preview=_preview_delete_block,
     apply=_apply_delete_block,
     category="ipam",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "ip_block"),
 )
 register(_OP_DELETE_BLOCK)
@@ -884,17 +930,26 @@ class DeleteSpaceArgs(BaseModel):
 
 
 async def _space_not_empty_detail(db: AsyncSession, space_id: UUID, name: str) -> str | None:
-    """Shared non-empty check for space permanent-delete (#17)."""
+    """Shared non-empty check for space permanent-delete (#17).
+
+    Blocks and subnets in the Trash count (#4871).
+    """
     from app.models.ipam import IPBlock, Subnet
 
     subnet_count = (
         await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
+            select(func.count())
+            .select_from(Subnet)
+            .where(Subnet.space_id == space_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     block_count = (
         await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
+            select(func.count())
+            .select_from(IPBlock)
+            .where(IPBlock.space_id == space_id)
+            .execution_options(include_deleted=True)
         )
     ).scalar_one()
     if not (subnet_count or block_count):
@@ -906,7 +961,8 @@ async def _space_not_empty_detail(db: AsyncSession, space_id: UUID, name: str) -
         parts.append(f"{subnet_count} subnet(s)")
     return (
         f"IP space {name!r} still contains {' and '.join(parts)}. "
-        "Delete or move them before deleting the space."
+        "Delete or move them before deleting the space (rows in the Trash count: "
+        "restore them or empty the Trash first)."
     )
 
 
@@ -946,7 +1002,6 @@ async def _apply_delete_space(
     db: AsyncSession, user: User, args: DeleteSpaceArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from ipam/router.py:delete_space."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.ipam.router import _audit
     from app.models.ipam import IPSpace
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
@@ -956,7 +1011,7 @@ async def _apply_delete_space(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent space delete")
         detail = await _space_not_empty_detail(db, args.space_id, space.name)
         if detail is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
@@ -1030,6 +1085,7 @@ _OP_DELETE_SPACE = Operation(
     preview=_preview_delete_space,
     apply=_apply_delete_space,
     category="ipam",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "ip_space"),
 )
 register(_OP_DELETE_SPACE)
@@ -1091,7 +1147,6 @@ async def _preview_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArg
 
 async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs) -> dict[str, Any]:
     """Body factored verbatim from dns/router.py:delete_zone."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.dns.router import (
         _push_zone_to_agentless_servers,
         _reject_if_synthesised_zone,
@@ -1105,9 +1160,9 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # default soft-delete (#1861), and only the permanent branch takes a
     # superadmin, as on the IPAM deletes. The approve path bypasses the route's
     # dependencies, so this is where it is enforced for it. Checked before any
-    # side effect; ensure_superadmin raises HTTPException(403).
+    # side effect; ensure_superadmin_step raises OperationPermissionError (#4790).
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent zone delete")
 
     zone = await _require_zone(args.group_id, args.zone_id, db)  # raises 404 if absent
     _reject_if_synthesised_zone(zone, "delete")
@@ -1243,6 +1298,7 @@ _OP_DELETE_ZONE = Operation(
     preview=_preview_delete_zone,
     apply=_apply_delete_zone,
     category="dns",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "dns_zone"),
 )
 register(_OP_DELETE_ZONE)
@@ -1430,7 +1486,6 @@ async def _apply_delete_scope(
     db: AsyncSession, user: User, args: DeleteScopeArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/scopes.py:delete_scope."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.api.v1.dhcp.phone_profiles import refuse_scope_removal_orphaning_classes
     from app.core.agent_wake import collect_wake, dhcp_group_channel, publish_wake
@@ -1444,7 +1499,7 @@ async def _apply_delete_scope(
     # (#1861), the permanent branch superadmin-only, checked before any side
     # effect.
     if args.permanent:
-        ensure_superadmin(user)
+        ensure_superadmin_step(user, "A permanent scope delete")
 
     # #3748 — the scope's gate, exclusive, before any row lock: lease-events
     # batches from both members of an HA pair hold the scope ``FOR KEY SHARE``
@@ -1571,6 +1626,7 @@ _OP_DELETE_SCOPE = Operation(
     preview=_preview_delete_scope,
     apply=_apply_delete_scope,
     category="dhcp",
+    superadmin_when=lambda a: a.permanent,
     required_permission=("delete", "dhcp_scope"),
 )
 register(_OP_DELETE_SCOPE)
@@ -1652,12 +1708,11 @@ async def _apply_delete_group(
     db: AsyncSession, user: User, args: DeleteGroupArgs
 ) -> dict[str, Any]:
     """Body factored verbatim from dhcp/server_groups.py:delete_group."""
-    from app.api.deps import ensure_superadmin
     from app.api.v1.dhcp._audit import write_audit
     from app.models.dhcp import DHCPServer, DHCPServerGroup
 
     # The original DELETE route was fully SuperAdmin-gated (#8).
-    ensure_superadmin(user)
+    ensure_superadmin_step(user, "Deleting a DHCP server group")
 
     g = await db.get(DHCPServerGroup, args.group_id)
     if g is None:
@@ -1820,6 +1875,7 @@ _OP_DELETE_GROUP = Operation(
     category="dhcp",
     # The REST route is SuperAdmin-only; this declares the granular backstop
     # the approver is checked against (a superadmin approver passes via {*,*}).
+    superadmin_when=lambda a: True,
     required_permission=("delete", "dhcp_server_group"),
 )
 register(_OP_DELETE_GROUP)
@@ -1965,6 +2021,92 @@ _OP_CREATE_NETWORK_BLOCK = Operation(
 register(_OP_CREATE_NETWORK_BLOCK)
 
 
+# ── purge_trashed_<type> ───────────────────────────────────────────────────
+#
+# The Trash's "Delete permanently" (``DELETE /admin/trash/{type}/{id}``) is a
+# permanent delete of a row that is already soft-deleted, so it takes the same
+# ``delete`` policy as the object's own permanent delete. One operation per
+# covered type, because the gate keys the policy on the operation's single
+# ``required_permission`` pair. All five share one body, the endpoint's own.
+
+PURGE_TRASHED_TYPES: dict[str, str] = {
+    "subnet": "subnet",
+    "ip_block": "block",
+    "ip_space": "space",
+    "dns_zone": "zone",
+    "dhcp_scope": "scope",
+}
+PURGE_TRASHED_OPERATIONS: dict[str, str] = {t: f"purge_trashed_{t}" for t in PURGE_TRASHED_TYPES}
+
+
+class PurgeTrashedArgs(BaseModel):
+    row_id: UUID
+
+
+def _purge_trashed_preview(trash_type: str) -> Any:
+    async def _preview(db: AsyncSession, user: User, args: PurgeTrashedArgs) -> PreviewResult:
+        from app.api.v1.admin.trash import (  # noqa: PLC0415
+            _find_trashed,
+            _row_label,
+            _trashed_ipam_subtree,
+        )
+
+        try:
+            target = await _find_trashed(db, trash_type, args.row_id)
+        except HTTPException as exc:
+            return PreviewResult(ok=False, detail=str(exc.detail))
+        text = (
+            f"Permanently delete trashed {PURGE_TRASHED_TYPES[trash_type]} "
+            f"`{_row_label(target)}` from the Trash"
+        )
+        if trash_type in ("ip_block", "ip_space"):
+            # Counts move as the subtree grows, so the approve-time drift check
+            # catches a Trash that gained rows under it since the request.
+            blocks, subnets = await _trashed_ipam_subtree(db, target)
+            text += (
+                f"; also removes {len(subnets)} subnet(s) and "
+                f"{max(len(blocks) - (1 if trash_type == 'ip_block' else 0), 0)} block(s) under it"
+            )
+        return PreviewResult(ok=True, detail="ready", preview_text=text + "; it cannot be restored")
+
+    return _preview
+
+
+def _purge_trashed_apply(trash_type: str) -> Any:
+    async def _apply(db: AsyncSession, user: User, args: PurgeTrashedArgs) -> dict[str, Any]:
+        from app.api.v1.admin.trash import purge_trashed_row  # noqa: PLC0415
+
+        # The Trash endpoint is superadmin-only; the approve path does not run its
+        # dependency, so the step is enforced here (#4790).
+        ensure_superadmin_step(user, f"A permanent {PURGE_TRASHED_TYPES[trash_type]} delete")
+        kept = await purge_trashed_row(db, user, trash_type, args.row_id)
+        return {"row_id": str(args.row_id), "mode": "purge", "provider_copies_kept": kept}
+
+    return _apply
+
+
+for _trash_type, _op_name in PURGE_TRASHED_OPERATIONS.items():
+    register(
+        Operation(
+            name=_op_name,
+            description=(
+                f"Permanently delete a trashed {PURGE_TRASHED_TYPES[_trash_type]} "
+                "(the Trash's Delete permanently)."
+            ),
+            args_model=PurgeTrashedArgs,
+            preview=_purge_trashed_preview(_trash_type),
+            apply=_purge_trashed_apply(_trash_type),
+            category=(
+                "ipam"
+                if _trash_type in ("subnet", "ip_block", "ip_space")
+                else "dhcp" if _trash_type == "dhcp_scope" else "dns"
+            ),
+            superadmin_when=lambda a: True,
+            required_permission=("delete", _trash_type),
+        )
+    )
+
+
 # Registry-completeness anchor for the startup assertion (sibling slice):
 # every operation name the seeded policies reference must exist here.
 RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
@@ -1976,6 +2118,7 @@ RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
         "delete_scope",
         "delete_group",
         "create_network_block",
+        *PURGE_TRASHED_OPERATIONS.values(),
     }
 )
 

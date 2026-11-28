@@ -76,19 +76,29 @@ export function customFieldDefault(def: CustomField): unknown {
   }
 }
 
+const isBlank = (v: unknown): boolean =>
+  v === undefined ||
+  v === null ||
+  (typeof v === "string" && v.trim() === "") ||
+  (Array.isArray(v) && v.length === 0);
+
 /**
  * `values` with every field it does not hold set to its definition's
  * default: what a create dialog shows, and so what it sends (#1303). The
  * console applies the default because the API applies none on create.
+ * A field the parent chain gives a value (`inherited`) is left unset, so the
+ * row inherits it rather than pinning the default over it (#4556).
  * Returns `values` itself when there is nothing to add.
  */
 export function withCustomFieldDefaults(
   definitions: CustomField[],
   values: Record<string, unknown>,
+  inherited: Record<string, unknown> = {},
 ): Record<string, unknown> {
   let out = values;
   for (const def of definitions) {
     if (values[def.name] !== undefined) continue;
+    if (!isBlank(inherited[def.name])) continue;
     const value = customFieldDefault(def);
     if (value === undefined) continue;
     if (out === values) out = { ...values };
@@ -96,12 +106,6 @@ export function withCustomFieldDefaults(
   }
   return out;
 }
-
-const isBlank = (v: unknown): boolean =>
-  v === undefined ||
-  v === null ||
-  (typeof v === "string" && v.trim() === "") ||
-  (Array.isArray(v) && v.length === 0);
 
 /**
  * Labels of the Required custom fields a save would leave empty (#2478), the

@@ -64,6 +64,10 @@ class EventStreamResponse(Response):
     media_type = "text/event-stream"
 
 
+class PemResponse(Response):
+    media_type = "application/x-pem-file"
+
+
 class CsvResponse(Response):
     media_type = "text/csv"
 

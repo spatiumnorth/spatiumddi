@@ -1,3 +1,4 @@
+import { countNoun } from "@/lib/count-noun";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
@@ -191,7 +192,7 @@ function capabilityChips(caps: SupervisorCapabilities): {
 function serviceChips(row: ApplianceRow): {
   key: string;
   label: string;
-  status: "ready" | "failed" | "pending" | "neutral" | "stale";
+  status: "ready" | "failed" | "pending" | "neutral" | "stale" | "needs-key";
 }[] {
   const roles = row.assigned_roles ?? [];
   if (roles.length === 0) return [];
@@ -209,7 +210,7 @@ function serviceChips(row: ApplianceRow): {
   const out: {
     key: string;
     label: string;
-    status: "ready" | "failed" | "pending" | "neutral" | "stale";
+    status: "ready" | "failed" | "pending" | "neutral" | "stale" | "needs-key";
   }[] = [];
   if (roles.includes("dns-bind9"))
     out.push({ key: "dns-bind9", label: "DNS · BIND9", status: serviceStatus });
@@ -239,11 +240,35 @@ function serviceChips(row: ApplianceRow): {
       label: "Observer",
       status: stale ? "stale" : "neutral",
     });
+  // #4646 — a role the supervisor holds back for a missing agent key is not
+  // "pending": nothing will start until the key is set on the control plane.
+  const awaiting = new Set(row.roles_awaiting_key ?? []);
+  if (!stale && awaiting.size > 0) {
+    for (const chip of out) {
+      if (awaiting.has(chip.key)) {
+        chip.status = "needs-key";
+        chip.label = `${chip.label} · needs key`;
+      }
+    }
+  }
   return out;
 }
 
+// The control-plane agent key a held-back role is waiting on, for the
+// warning text (#4646). Every DNS engine shares one key.
+function awaitingKeyNames(roles: string[] | undefined): string[] {
+  const names = new Set<string>();
+  for (const role of roles ?? []) {
+    if (role.startsWith("dns-")) names.add("DNS agent key");
+    else if (role === "dhcp") names.add("DHCP agent key");
+    else if (role === "looking-glass") names.add("Looking Glass agent key");
+    else names.add(`${role} agent key`);
+  }
+  return [...names].sort();
+}
+
 const SERVICE_CHIP_STYLES: Record<
-  "ready" | "failed" | "pending" | "neutral" | "stale",
+  "ready" | "failed" | "pending" | "neutral" | "stale" | "needs-key",
   string
 > = {
   stale:
@@ -254,6 +279,8 @@ const SERVICE_CHIP_STYLES: Record<
   pending:
     "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
   neutral: "bg-muted text-muted-foreground border-border",
+  "needs-key":
+    "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
 };
 
 // #272 Phase 1 — Fleet UI two-table split. Control-plane variants run
@@ -283,6 +310,16 @@ function isControlPlaneRow(row: ApplianceRow): boolean {
     row.cluster_role === "primary" ||
     row.cluster_role === "member"
   );
+}
+
+// #4613 — one rule and one reason for "this row cannot be revoked", shared
+// by the table's Revoke button and the drilldown's Delete (which opens the
+// same revoke dialog). The server refuses the only control-plane node with
+// 409, so every entry point to the revoke must agree with it.
+const REVOKE_BLOCKED_REASON =
+  "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking.";
+function canRevokeRow(row: ApplianceRow): boolean {
+  return !isControlPlaneRow(row);
 }
 
 // #590 — is this row pinned in a cluster transition that will never
@@ -486,7 +523,10 @@ function PromotionProgressModal({
             certificate.
           </p>
         ) : anyFailed ? (
-          <p className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-rose-700 dark:text-rose-300">
+          <p
+            role="alert"
+            className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-rose-700 dark:text-rose-300"
+          >
             A node failed to join — check the Fleet list / supervisor logs. You
             can reload to refresh the view.
           </p>
@@ -687,7 +727,7 @@ function ClusterMembershipModal({
               </p>
             )}
             {promote.error && (
-              <p className="text-xs text-rose-500">
+              <p role="alert" className="text-xs text-rose-500">
                 {formatApiError(promote.error)}
               </p>
             )}
@@ -739,7 +779,7 @@ function ClusterMembershipModal({
               </p>
             )}
             {demote.error && (
-              <p className="text-xs text-rose-500">
+              <p role="alert" className="text-xs text-rose-500">
                 {formatApiError(demote.error)}
               </p>
             )}
@@ -1502,8 +1542,10 @@ export function FleetTab({
                       </p>
                       <p className="mt-1 text-sm text-muted-foreground">
                         This control plane has{" "}
-                        <strong>{approvedControlPlaneCount} nodes</strong> but
-                        no MetalLB virtual IP (VIP) is configured. Without a
+                        <strong>
+                          {countNoun(approvedControlPlaneCount, "node")}
+                        </strong>{" "}
+                        but no MetalLB virtual IP (VIP) is configured. Without a
                         VIP, operator browsers and every off-cluster DNS / DHCP
                         agent are pinned to a single node&apos;s address — if
                         that node goes down they lose the control plane even
@@ -1550,7 +1592,10 @@ export function FleetTab({
               )}
 
               {error ? (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
+                <div
+                  role="alert"
+                  className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300"
+                >
                   Failed to load appliances: {formatApiError(error)}
                 </div>
               ) : isLoading ? (
@@ -1875,7 +1920,7 @@ export function FleetTab({
                 cluster…" instead.
               </p>
               {replace.isError && (
-                <p className="mt-2 text-xs text-rose-600">
+                <p role="alert" className="mt-2 text-xs text-rose-600">
                   {formatApiError(replace.error)}
                 </p>
               )}
@@ -1928,7 +1973,7 @@ export function FleetTab({
                 appliance if the node is gone for good.
               </p>
               {clearClusterState.isError && (
-                <p className="mt-2 text-xs text-rose-600">
+                <p role="alert" className="mt-2 text-xs text-rose-600">
                   {formatApiError(clearClusterState.error)}
                 </p>
               )}
@@ -2024,7 +2069,7 @@ export function ReplacementCodeModal({
 // in the Appliances list. Empty assigned_roles → ``—``; non-empty
 // renders one chip per role with colour driven by the supervisor's
 // last ``role_switch_state`` heartbeat.
-function ServiceChipList({ row }: { row: ApplianceRow }) {
+export function ServiceChipList({ row }: { row: ApplianceRow }) {
   const services = serviceChips(row);
   if (services.length === 0) {
     return <span className="text-xs text-muted-foreground">—</span>;
@@ -2045,13 +2090,17 @@ function ServiceChipList({ row }: { row: ApplianceRow }) {
                 ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
                 : s.status === "failed"
                   ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
-                  : s.status === "pending"
-                    ? `Assigned, supervisor hasn't reported ready yet`
-                    : `Assigned (no service container — supervisor is the runtime)`
+                  : s.status === "needs-key"
+                    ? `Assigned, but not started: the control plane has no agent key for this role. Set the ${awaitingKeyNames([s.key]).join(", ")} on the control plane — inspect drilldown`
+                    : s.status === "pending"
+                      ? `Assigned, supervisor hasn't reported ready yet`
+                      : `Assigned (no service container — supervisor is the runtime)`
           }
         >
           {s.status === "ready" && <CheckCircle2 className="h-2.5 w-2.5" />}
-          {s.status === "failed" && <AlertCircle className="h-2.5 w-2.5" />}
+          {(s.status === "failed" || s.status === "needs-key") && (
+            <AlertCircle className="h-2.5 w-2.5" />
+          )}
           {s.status === "pending" && <Loader2 className="h-2.5 w-2.5" />}
           {s.label}
         </span>
@@ -2184,7 +2233,9 @@ function AptChip({ row }: { row: ApplianceRow }) {
       ? "APT: synced"
       : status === "unmanaged"
         ? "APT: unmanaged"
-        : `APT: ${status}`;
+        : status === "update-stale"
+          ? "APT: sources unreachable"
+          : `APT: ${status}`;
   return (
     <span
       className={cn(
@@ -2196,7 +2247,9 @@ function AptChip({ row }: { row: ApplianceRow }) {
           ? "Managed apt config applied + apt-get update succeeded on this host"
           : status === "unmanaged"
             ? "SpatiumDDI isn't managing apt — Debian's baked sources are in effect"
-            : "The managed apt config failed to validate/apply on this host"
+            : status === "update-stale"
+              ? "The last apt-get update on this host succeeded more than 3 days ago (or never): the apt sources are unreachable, so security updates are not arriving"
+              : "The managed apt config failed to validate/apply on this host"
       }
     >
       {label}
@@ -2291,7 +2344,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={!isControlPlaneRow(row)}
+                  canRevoke={canRevokeRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
                   onClearClusterState={
                     onClearClusterState
@@ -2312,7 +2365,7 @@ function ApplianceTableSection({
                   onDelete={() => onDelete(row)}
                   onReauthorize={() => onReauthorize(row)}
                   onPermanentDelete={() => onPermanentDelete(row)}
-                  canRevoke={!isControlPlaneRow(row)}
+                  canRevoke={canRevokeRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
                   onClearClusterState={
                     onClearClusterState
@@ -2568,7 +2621,7 @@ export function ApplianceTableRow({
                 title={
                   canRevoke
                     ? "Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
-                    : "Demote this node from the control-plane cluster first (Manage control plane cluster…) before revoking."
+                    : REVOKE_BLOCKED_REASON
                 }
               >
                 <Ban className="h-3 w-3" />
@@ -2604,7 +2657,7 @@ export function ApplianceTableRow({
   );
 }
 
-function ApplianceDrilldownModal({
+export function ApplianceDrilldownModal({
   row,
   onClose,
   onApprove,
@@ -2891,8 +2944,10 @@ function ApplianceDrilldownModal({
             <>
               <button
                 type="button"
-                onClick={onDelete}
-                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+                onClick={canRevokeRow(row) ? onDelete : undefined}
+                disabled={!canRevokeRow(row)}
+                title={canRevokeRow(row) ? undefined : REVOKE_BLOCKED_REASON}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 Delete
@@ -3365,7 +3420,10 @@ function StorageActionModal({
         )}
 
         {error && (
-          <p className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-700 dark:text-rose-300">
+          <p
+            role="alert"
+            className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-700 dark:text-rose-300"
+          >
             {error}
           </p>
         )}
@@ -4615,7 +4673,10 @@ export function PodLogsModal({
             Refresh
           </button>
           {logsQuery.error && (
-            <span className="text-[11px] text-rose-700 dark:text-rose-300">
+            <span
+              role="alert"
+              className="text-[11px] text-rose-700 dark:text-rose-300"
+            >
               {formatApiError(logsQuery.error)}
             </span>
           )}
@@ -4699,14 +4760,18 @@ function KubeapiCidrEditorModal({
       onClose={onClose}
     >
       <div className="space-y-3 text-sm">
-        <p className="text-xs text-muted-foreground">
+        <label
+          htmlFor="fleet-kubeapi-source-ranges"
+          className="block text-xs text-muted-foreground"
+        >
           One CIDR or IP per line. Each entry opens this appliance's tcp/6443
           kubeapi port to that source range — bypassing the supervisor's mTLS
           proxy for sub-millisecond local-network <code>kubectl</code>. Leave
           empty for proxy-only (the recommended posture; kubeapi stays on
           127.0.0.1 and only the supervisor's outbound channel can drive it).
-        </p>
+        </label>
         <textarea
+          id="fleet-kubeapi-source-ranges"
           value={text}
           onChange={(e) => setText(e.target.value)}
           rows={6}
@@ -4714,7 +4779,7 @@ function KubeapiCidrEditorModal({
           className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
         />
         {save.error && (
-          <p className="text-xs text-rose-700 dark:text-rose-300">
+          <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
             {formatApiError(save.error)}
           </p>
         )}
@@ -4791,7 +4856,7 @@ function RestartWorkloadModal({
           </p>
         )}
         {workloads.error && (
-          <p className="text-xs text-rose-700 dark:text-rose-300">
+          <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
             {formatApiError(workloads.error)}
           </p>
         )}
@@ -4852,7 +4917,7 @@ function RestartWorkloadModal({
           </div>
         )}
         {restart.error && (
-          <p className="text-xs text-rose-700 dark:text-rose-300">
+          <p role="alert" className="text-xs text-rose-700 dark:text-rose-300">
             {formatApiError(restart.error)}
           </p>
         )}
@@ -4965,7 +5030,10 @@ function RevealKubeconfigModal({
               </button>
             </div>
             {reveal.error && (
-              <p className="text-xs text-rose-700 dark:text-rose-300">
+              <p
+                role="alert"
+                className="text-xs text-rose-700 dark:text-rose-300"
+              >
                 {formatApiError(reveal.error)}
               </p>
             )}
@@ -5226,8 +5294,14 @@ export function ApplianceRoleAssignmentSection({
       )}
       {dnsRoleActive && dnsOn && (
         <div className="mt-3">
-          <label className="text-xs text-muted-foreground">DNS group</label>
+          <label
+            htmlFor="fleet-tab-dns-group"
+            className="text-xs text-muted-foreground"
+          >
+            DNS group
+          </label>
           <select
+            id="fleet-tab-dns-group"
             value={dnsGroupId ?? ""}
             onChange={(e) => setDnsGroupId(e.target.value || null)}
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
@@ -5250,8 +5324,14 @@ export function ApplianceRoleAssignmentSection({
       )}
       {dhcpRoleActive && dhcpOn && (
         <div className="mt-3">
-          <label className="text-xs text-muted-foreground">DHCP group</label>
+          <label
+            htmlFor="fleet-tab-dhcp-group"
+            className="text-xs text-muted-foreground"
+          >
+            DHCP group
+          </label>
           <select
+            id="fleet-tab-dhcp-group"
             value={dhcpGroupId ?? ""}
             onChange={(e) => setDhcpGroupId(e.target.value || null)}
             className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
@@ -5285,6 +5365,9 @@ export function ApplianceRoleAssignmentSection({
           reason on failure (#3295). Green-tinted chip on ready. */}
       <RoleSwitchStateBanner row={row} />
 
+      {/* #4646 — assigned roles held back for a missing agent key. */}
+      <AwaitingKeyBanner row={row} />
+
       {/* #170 Wave C3 — firewall preview + operator-override textarea.
           The preview mirrors the supervisor's firewall_renderer.py
           output for the currently-selected roles so the operator can
@@ -5314,10 +5397,14 @@ export function ApplianceRoleAssignmentSection({
             " No per-role ports (idle)."
           )}
         </p>
-        <label className="mt-3 block text-xs text-muted-foreground">
+        <label
+          htmlFor="fleet-tab-operator-override-raw-nft-frag"
+          className="mt-3 block text-xs text-muted-foreground"
+        >
           Operator override (raw nft fragment)
         </label>
         <textarea
+          id="fleet-tab-operator-override-raw-nft-frag"
           value={firewallExtra}
           onChange={(e) => setFirewallExtra(e.target.value)}
           placeholder={`# e.g. allow SNMP from monitoring subnet\n# udp dport 161 ip saddr 10.0.0.0/24 accept`}
@@ -5351,7 +5438,10 @@ export function ApplianceRoleAssignmentSection({
           </span>
         )}
         {save.error && (
-          <span className="text-xs text-rose-700 dark:text-rose-300">
+          <span
+            role="alert"
+            className="text-xs text-rose-700 dark:text-rose-300"
+          >
             {formatApiError(save.error)}
           </span>
         )}
@@ -5440,7 +5530,7 @@ function ApplianceSlotsCell({ row }: { row: ApplianceRow }) {
           className="rounded-full bg-sky-500/10 px-1.5 py-0 font-mono text-[10px] text-sky-700 dark:text-sky-300"
           title={
             row.cluster_health?.kubeapi_ready
-              ? `k3s ready · ${row.cluster_health?.nodes_ready ?? 0}/${row.cluster_health?.nodes_total ?? 0} nodes`
+              ? `k3s ready · ${row.cluster_health?.nodes_ready ?? 0}/${countNoun(row.cluster_health?.nodes_total ?? 0, "node")}`
               : "k3s baked, kubeapi unreachable"
           }
         >
@@ -6164,6 +6254,22 @@ function ApplianceOsUpgradeSection({
         </p>
       )}
 
+      {row.cluster_health?.control_plane_not_converged && (
+        <p
+          role="alert"
+          className="mt-3 flex items-start gap-1.5 rounded border border-amber-500/40 bg-amber-500/10 p-2 text-[11px] text-amber-800 dark:text-amber-200"
+        >
+          <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
+          <span>
+            <span className="font-medium">Control plane not converged.</span>{" "}
+            {row.cluster_health.control_plane_not_converged.detail ??
+              "The slot was committed before its control chart applied."}{" "}
+            Check <code>k3s kubectl -n kube-system get helmchart</code> on this
+            node.
+          </span>
+        </p>
+      )}
+
       {!isApplianceHost ? (
         <p className="mt-3 text-xs text-muted-foreground">
           OS slot upgrades + host reboot are only available on the SpatiumDDI
@@ -6335,7 +6441,10 @@ function ApplianceOsUpgradeSection({
             Reboot host
           </button>
           {reboot.error && (
-            <span className="text-xs text-rose-700 dark:text-rose-300">
+            <span
+              role="alert"
+              className="text-xs text-rose-700 dark:text-rose-300"
+            >
               {formatApiError(reboot.error)}
             </span>
           )}
@@ -6529,6 +6638,37 @@ function FirewallRefusalBanner({ row }: { row: ApplianceRow }) {
               {state.reason}
             </p>
           ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── AwaitingKeyBanner (#4646) ───────────────────────────────────
+
+function AwaitingKeyBanner({ row }: { row: ApplianceRow }) {
+  const roles = row.roles_awaiting_key ?? [];
+  if (roles.length === 0) return null;
+  const keys = awaitingKeyNames(roles);
+  return (
+    <div
+      role="alert"
+      className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs"
+    >
+      <div className="flex items-start gap-2">
+        <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700 dark:text-amber-300" />
+        <div>
+          <p className="font-medium text-amber-700 dark:text-amber-300">
+            Waiting on an agent key: {roles.join(", ")} not started
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            The control plane has no {keys.join(" or ")} configured, so this
+            appliance started nothing for{" "}
+            {roles.length === 1 ? "this" : "these"} role
+            {roles.length === 1 ? "" : "s"}. Set the {keys.join(" and ")} on the
+            control plane (see the Appliance docs); the role starts on the next
+            heartbeat once the key is there.
+          </p>
         </div>
       </div>
     </div>

@@ -16,6 +16,10 @@ import { permissionGate, usePermissions } from "@/hooks/usePermissions";
 import { cn } from "@/lib/utils";
 import { FormError } from "@/components/ui/form-error";
 
+// The Value label names whichever control the kind draws: the standard
+// select or the free-text input. Only one is rendered at a time (#4786).
+const VALUE_ID = "communities-tab-value";
+
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
@@ -140,10 +144,17 @@ function CommunityFormModal({
         {!isEdit && (
           <>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <span
+                id="communities-tab-kind-label"
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Kind
-              </label>
-              <div className="flex flex-col gap-1">
+              </span>
+              <div
+                role="radiogroup"
+                aria-labelledby="communities-tab-kind-label"
+                className="flex flex-col gap-1"
+              >
                 {(["standard", "regular", "large"] as BGPCommunityKind[]).map(
                   (k) => (
                     <label
@@ -170,11 +181,15 @@ function CommunityFormModal({
               </div>
             </div>
             <div className="space-y-1">
-              <label className="text-xs font-medium text-muted-foreground">
+              <label
+                htmlFor={VALUE_ID}
+                className="text-xs font-medium text-muted-foreground"
+              >
                 Value
               </label>
               {kind === "standard" ? (
                 <select
+                  id={VALUE_ID}
                   className={inputCls}
                   value={value}
                   onChange={(e) => setValue(e.target.value)}
@@ -188,6 +203,7 @@ function CommunityFormModal({
                 </select>
               ) : (
                 <input
+                  id={VALUE_ID}
                   className={cn(
                     inputCls,
                     valueError && value && "border-destructive",
@@ -206,10 +222,14 @@ function CommunityFormModal({
           </>
         )}
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="communities-tab-name-operator-friendly-label"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Name (operator-friendly label)
           </label>
           <input
+            id="communities-tab-name-operator-friendly-label"
             className={inputCls}
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -217,10 +237,14 @@ function CommunityFormModal({
           />
         </div>
         <div className="space-y-1">
-          <label className="text-xs font-medium text-muted-foreground">
+          <label
+            htmlFor="communities-tab-description"
+            className="text-xs font-medium text-muted-foreground"
+          >
             Description
           </label>
           <textarea
+            id="communities-tab-description"
             className={cn(inputCls, "min-h-[60px]")}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -229,10 +253,14 @@ function CommunityFormModal({
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="communities-tab-inbound-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Inbound action
             </label>
             <input
+              id="communities-tab-inbound-action"
               className={inputCls}
               value={inboundAction}
               onChange={(e) => setInboundAction(e.target.value)}
@@ -240,10 +268,14 @@ function CommunityFormModal({
             />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-muted-foreground">
+            <label
+              htmlFor="communities-tab-outbound-action"
+              className="text-xs font-medium text-muted-foreground"
+            >
               Outbound action
             </label>
             <input
+              id="communities-tab-outbound-action"
               className={inputCls}
               value={outboundAction}
               onChange={(e) => setOutboundAction(e.target.value)}
@@ -330,8 +362,10 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           Operator-defined community values for this AS plus a copy of the
-          well-known catalog. The catalog rows are read-only — use the "Use on
-          this AS" button to attach one to this row with operator notes.
+          well-known catalog. The catalog rows are read-only
+          {!writeGate.disabled &&
+            ' — use the "Use on this AS" button to attach one to this row with operator notes'}
+          .
         </p>
         <button
           type="button"

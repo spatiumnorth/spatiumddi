@@ -5,7 +5,7 @@ token per UTC day, kept 90 days) so operators can find tokens that are idle
 or never used. Both are additive; a not-yet-upgraded api pod ignores them.
 
 Revision ID: c7e1a4d92b36
-Revises: d8b3f6a1c274
+Revises: c4d8e1a7b9f2
 Create Date: 2026-11-19 10:00:00.000000
 """
 
@@ -17,7 +17,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 revision = "c7e1a4d92b36"
-down_revision = "d8b3f6a1c274"
+down_revision = "c4d8e1a7b9f2"
 branch_labels = None
 depends_on = None
 
